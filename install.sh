@@ -1465,11 +1465,30 @@ configure_codex() {
   # Codex CLI (https://github.com/openai/codex) is OpenAI's coding assistant.
   # Detection: check for ~/.codex directory or `codex` command in PATH.
   #
-  # Codex CLI supports experimental PreToolUse hooks via ~/.codex/hooks.json.
-  # The hook wire format is compatible with Claude Code's hookSpecificOutput
-  # protocol: Codex sends { tool_name: "Bash", tool_input: { command: "..." },
-  # hook_event_name: "PreToolUse" } on stdin and expects the same
-  # hookSpecificOutput response with permissionDecision: "deny".
+  # Codex 0.125.0 marked PreToolUse hooks as STABLE (codex_hooks feature is
+  # default-enabled). Hooks are loaded from either ~/.codex/hooks.json or
+  # [[hooks.PreToolUse]] tables in ~/.codex/config.toml; both files in each
+  # config layer are honored. We use hooks.json so install/uninstall touch
+  # one dedicated file rather than mutating the user's main config.
+  #
+  # Wire shape mirrors Claude Code's: stdin carries
+  # { tool_name: "Bash", tool_input: { command: "..." },
+  #   hook_event_name: "PreToolUse", turn_id, tool_use_id, ... }.
+  # Codex's denial parser is strict (#[serde(deny_unknown_fields)] on every
+  # output struct in codex-rs/hooks/src/schema.rs), so dcg cannot send its
+  # standard hookSpecificOutput here -- the extra fields (allowOnceCode,
+  # ruleId, severity, remediation) cause the parser to fail and codex marks
+  # the hook as Failed rather than Blocked, letting the destructive command
+  # through.
+  #
+  # dcg disambiguates Codex from Claude Code via the `turn_id` stdin field
+  # (codex-rs/hooks/src/schema.rs documents it as "Codex extension"; Claude
+  # Code does not send it -- and `tool_use_id` is NOT a usable signal here
+  # because Claude Code's PreToolUse stdin includes it too). On Codex
+  # payloads dcg switches to codex's documented alternative
+  # (codex-rs/hooks/src/events/pre_tool_use.rs): exit code 2 with the deny
+  # reason on stderr. The hook config below is therefore unchanged from the
+  # Claude Code shape -- the protocol switch is handled inside dcg.
   #
   # Note: The model can still work around this by writing its own script to
   # disk and then running that script, so treat this as a useful guardrail

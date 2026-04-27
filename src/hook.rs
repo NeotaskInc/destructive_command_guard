@@ -55,6 +55,18 @@ pub struct HookInput {
     /// May be a JSON string (e.g. "{\"command\":\"...\"}") or an object.
     #[serde(alias = "toolArgs")]
     pub tool_args: Option<serde_json::Value>,
+
+    /// Codex CLI active-turn identifier. Documented in
+    /// `codex-rs/hooks/src/schema.rs` as "Codex extension: expose the active
+    /// turn id to internal turn-scoped hooks" -- i.e. Codex's intentional
+    /// divergence from Claude's public hook docs. Claude Code does NOT send
+    /// this field (Claude does send `tool_use_id`, so that field can't be
+    /// used to disambiguate the two otherwise-similar wire formats). When
+    /// `turn_id` is present we switch to Codex's strict exit-2 + stderr
+    /// deny path because Codex's JSON parser uses `deny_unknown_fields` and
+    /// would silently drop dcg's standard hookSpecificOutput payload.
+    #[serde(alias = "turnId")]
+    pub turn_id: Option<String>,
 }
 
 /// Tool-specific input containing the command to execute.
@@ -218,12 +230,22 @@ pub struct GeminiHookOutput<'a> {
 /// Hook protocol variant for response formatting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookProtocol {
-    /// Claude Code / Codex CLI / Augment-compatible `hookSpecificOutput` protocol.
+    /// Claude Code / Augment-compatible `hookSpecificOutput` protocol.
+    /// Tolerant JSON parser; accepts dcg's full deny payload with
+    /// `allowOnceCode`, `ruleId`, `severity`, `remediation`, etc.
     ClaudeCompatible,
     /// Copilot hook protocol (`continue` / `stopReason` + permission fields).
     Copilot,
     /// Gemini hook protocol (`decision` / `reason`).
     Gemini,
+    /// Codex CLI 0.125.0+ protocol. Wire shape mirrors Claude Code's, but
+    /// Codex's JSON parser annotates every output struct with
+    /// `#[serde(deny_unknown_fields)]` and silently treats any extra field
+    /// as an invalid hook (the deny is dropped and the command runs).
+    /// To make blocks stick we use Codex's documented "exit code 2 +
+    /// stderr reason" alternative path: dcg writes its colored message
+    /// to stderr (existing behavior) and the process exits with code 2.
+    Codex,
 }
 
 /// Allow-once metadata for denial output.
@@ -343,13 +365,28 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
         return HookProtocol::Copilot;
     }
 
+    // --- Codex CLI indicators (checked before Claude Code) ---
+    // Codex 0.125.0+ shares Claude Code's tool name and most envelope
+    // fields, so we disambiguate via `turn_id`, which the codex source
+    // explicitly documents as "Codex extension: expose the active turn id
+    // to internal turn-scoped hooks" (codex-rs/hooks/src/schema.rs). Claude
+    // Code does NOT send `turn_id`. (We can't use `tool_use_id` for this
+    // because Claude Code's PreToolUse stdin includes it too.) We must
+    // classify Codex separately because its JSON parser is strict
+    // (`deny_unknown_fields`) and would silently drop dcg's standard deny
+    // payload, letting the destructive command through.
+    let is_claude_tool = matches!(tool_name.as_str(), "bash" | "launch-process");
+    let has_codex_turn_id = input.turn_id.as_deref().is_some_and(|s| !s.is_empty());
+    if is_claude_tool && has_codex_turn_id {
+        return HookProtocol::Codex;
+    }
+
     // --- Claude Code indicators ---
     // Claude Code uses tool_name="Bash" or "launch-process". These tool
     // names are never used by Gemini (which uses "run_shell_command").
     // Check this BEFORE Gemini envelope fields, because Claude Code
     // payloads also include session_id/cwd/transcript_path which would
     // otherwise trigger a false Gemini classification (issue #77).
-    let is_claude_tool = matches!(tool_name.as_str(), "bash" | "launch-process");
     if is_claude_tool {
         return HookProtocol::ClaudeCompatible;
     }
@@ -823,6 +860,18 @@ pub fn output_denial_for_protocol(
             let _ = serde_json::to_writer(&mut handle, &output);
             let _ = writeln!(handle);
         }
+        HookProtocol::Codex => {
+            // Codex 0.125.0+ uses a strict JSON parser
+            // (`#[serde(deny_unknown_fields)]` on every output struct) that
+            // would reject dcg's hookSpecificOutput because of fields like
+            // allowOnceCode / ruleId / severity / remediation, silently
+            // turning the deny into a "Failed" hook and letting the
+            // destructive command run. The codex-documented alternative
+            // (codex-rs/hooks/src/events/pre_tool_use.rs) is exit code 2
+            // with the deny reason on stderr. The colored stderr message
+            // has already been written by `print_colorful_warning` above;
+            // main.rs propagates exit code 2 when this protocol is active.
+        }
         HookProtocol::Copilot => {
             let output = CopilotHookOutput {
                 continue_execution: false,
@@ -999,6 +1048,13 @@ pub fn output_warning_for_protocol(
             let _ = serde_json::to_writer(&mut handle, &output);
             let _ = writeln!(handle);
         }
+        HookProtocol::Codex => {
+            // Codex's strict parser would reject any dcg JSON that includes
+            // our ergonomic fields (ruleId, packId, etc.), so for "warn"
+            // severity matches we let the command through with only the
+            // human-visible stderr above. Codex surfaces hook stderr to the
+            // model, so the warning is still seen.
+        }
     }
 }
 
@@ -1155,6 +1211,71 @@ mod tests {
         let json = r#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#;
         let input: HookInput = serde_json::from_str(json).unwrap();
         assert_eq!(extract_command(&input), Some("git status".to_string()));
+    }
+
+    #[test]
+    fn test_codex_protocol_detected_via_turn_id() {
+        // Codex 0.125.0+ stdin: same Bash tool name as Claude Code, but
+        // codex-rs/hooks/src/schema.rs annotates `turn_id` as "Codex
+        // extension: expose the active turn id to internal turn-scoped
+        // hooks". Claude Code does not send turn_id, so its presence on a
+        // Bash payload is the disambiguator.
+        let json = r#"{
+            "session_id":"019dd11d-b795-7261-a9cb-9b85a5dad632",
+            "turn_id":"turn-1",
+            "transcript_path":null,
+            "cwd":"/tmp/x",
+            "hook_event_name":"PreToolUse",
+            "model":"gpt-5.5",
+            "permission_mode":"bypassPermissions",
+            "tool_name":"Bash",
+            "tool_input":{"command":"git reset --hard"},
+            "tool_use_id":"call_abc123"
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Codex);
+        assert_eq!(
+            extract_command(&input),
+            Some("git reset --hard".to_string())
+        );
+    }
+
+    #[test]
+    fn test_empty_turn_id_is_not_treated_as_codex() {
+        // Defense in depth: only a non-empty turn_id flips us into Codex
+        // mode. A literal empty string from a malformed client should fall
+        // through to the Claude-compatible default rather than silently
+        // dropping our deny payload.
+        let json = r#"{
+            "tool_name":"Bash",
+            "tool_input":{"command":"git status"},
+            "turn_id":""
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::ClaudeCompatible);
+    }
+
+    #[test]
+    fn test_claude_code_with_tool_use_id_is_not_codex() {
+        // Regression guard: Claude Code's PreToolUse stdin includes
+        // `tool_use_id` (per code.claude.com/docs/en/hooks). A naive
+        // disambiguator that keyed on tool_use_id would mis-classify Claude
+        // Code as Codex and drop our full deny payload from stdout, which
+        // would let destructive commands through. Detection must use
+        // turn_id (Codex-only), so this Claude-shaped payload that has
+        // tool_use_id but NOT turn_id stays Claude-compatible.
+        let json = r#"{
+            "session_id":"abc123",
+            "transcript_path":"/home/user/.claude/projects/x/transcript.jsonl",
+            "cwd":"/home/user/my-project",
+            "permission_mode":"default",
+            "hook_event_name":"PreToolUse",
+            "tool_name":"Bash",
+            "tool_input":{"command":"git status"},
+            "tool_use_id":"toolu_01ABC"
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::ClaudeCompatible);
     }
 
     #[test]

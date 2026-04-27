@@ -637,6 +637,24 @@ fn main() {
             if let Some(log_file) = &config.general.log_file {
                 let _ = hook::log_blocked_command(log_file, &command, &info.reason, pack);
             }
+
+            // Codex 0.125.0+ ignores stdout JSON whose hookSpecificOutput
+            // contains unknown fields; its supported alternative is exit 2 +
+            // stderr reason (codex-rs/hooks/src/events/pre_tool_use.rs).
+            // The colored deny message has already been written to stderr by
+            // output_denial_for_protocol(); exit 2 here makes the block stick.
+            //
+            // process::exit() skips Rust destructors, so flush the async
+            // history writer first -- the Deny entry was just queued via
+            // writer.log() above and would otherwise be lost when the worker
+            // thread is killed by libc::exit. The other deny paths fall off
+            // the end of main and let HistoryWriter::Drop handle this.
+            if matches!(hook_protocol, hook::HookProtocol::Codex) {
+                if let Some(writer) = history_writer.as_ref() {
+                    writer.flush_sync();
+                }
+                std::process::exit(2);
+            }
         }
         DecisionMode::Warn => {
             hook::output_warning_for_protocol(

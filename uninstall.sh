@@ -334,6 +334,95 @@ unconfigure_aider() {
     return 0
 }
 
+# Remove dcg hook from Codex CLI (~/.codex/hooks.json).
+#
+# install.sh writes a Claude-shaped PreToolUse Bash matcher block into
+# ~/.codex/hooks.json. Now that Codex 0.125.0 has stable hooks and dcg
+# emits its protocol-specific exit-2 deny path for Codex, leaving the
+# hook entry behind after `dcg uninstall` removes the binary would cause
+# every Bash invocation to log "PreToolUse Failed" because codex would
+# spawn a path that no longer exists.
+unconfigure_codex() {
+    local hooks_json="$HOME/.codex/hooks.json"
+
+    if [ ! -f "$hooks_json" ]; then
+        return 0
+    fi
+
+    if ! grep -q '"command".*dcg' "$hooks_json" 2>/dev/null; then
+        return 0
+    fi
+
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$hooks_json" <<'PYEOF'
+import json
+import os
+import sys
+
+hooks_file = sys.argv[1]
+
+try:
+    with open(hooks_file, 'r') as f:
+        config = json.load(f)
+except (IOError, ValueError, json.JSONDecodeError):
+    sys.exit(0)
+
+if not isinstance(config, dict):
+    sys.exit(0)
+
+hooks = config.get('hooks')
+if not isinstance(hooks, dict):
+    sys.exit(0)
+
+pre_tool_use = hooks.get('PreToolUse')
+if not isinstance(pre_tool_use, list):
+    sys.exit(0)
+
+new_pre_tool_use = []
+for entry in pre_tool_use:
+    if not isinstance(entry, dict):
+        new_pre_tool_use.append(entry)
+        continue
+    inner = entry.get('hooks', [])
+    if not isinstance(inner, list):
+        new_pre_tool_use.append(entry)
+        continue
+    filtered = [
+        h for h in inner
+        if not (isinstance(h, dict) and 'dcg' in str(h.get('command', '')))
+    ]
+    if filtered:
+        entry['hooks'] = filtered
+        new_pre_tool_use.append(entry)
+    # else: drop the matcher entry entirely (it had only dcg hooks)
+
+if new_pre_tool_use:
+    hooks['PreToolUse'] = new_pre_tool_use
+else:
+    hooks.pop('PreToolUse', None)
+
+if not hooks:
+    config.pop('hooks', None)
+
+# If the file is now effectively empty, remove it so codex doesn't keep
+# parsing a stub. install.sh creates this file dedicated for dcg, so
+# leaving it as an empty {} is just litter.
+if not config:
+    os.remove(hooks_file)
+else:
+    with open(hooks_file, 'w') as f:
+        json.dump(config, f, indent=2)
+
+print("removed", file=sys.stderr)
+PYEOF
+        return $?
+    else
+        warn "python3 not available - cannot safely edit Codex hooks.json"
+        warn "Please manually remove dcg from $hooks_json"
+        return 1
+    fi
+}
+
 # Remove dcg hook from Cursor IDE
 unconfigure_cursor() {
     local hooks_json="$HOME/.cursor/hooks.json"
@@ -460,6 +549,11 @@ main() {
         log "  • Cursor IDE hook ($cursor_hooks_json, $cursor_hook_script)"
         found_anything=1
     fi
+    local codex_hooks_json="$HOME/.codex/hooks.json"
+    if [ -f "$codex_hooks_json" ] && grep -q '"command".*dcg' "$codex_hooks_json" 2>/dev/null; then
+        log "  • Codex CLI hook ($codex_hooks_json)"
+        found_anything=1
+    fi
 
     # Config
     if [ "$KEEP_CONFIG" -eq 0 ] && [ -d "$config_dir" ]; then
@@ -539,6 +633,11 @@ main() {
     # Remove Cursor IDE hook
     if unconfigure_cursor 2>&1 | grep -q "removed"; then
         ok "Removed Cursor IDE hook"
+    fi
+
+    # Remove Codex CLI hook
+    if unconfigure_codex 2>&1 | grep -q "removed"; then
+        ok "Removed Codex CLI hook"
     fi
 
     # Remove Aider config

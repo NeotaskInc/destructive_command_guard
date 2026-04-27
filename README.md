@@ -673,7 +673,7 @@ The installer also verifies Sigstore cosign bundles when available (falls back t
 
 - **Aider:** No PreToolUse-style interception. The installer enables `git-commit-verify: true` in `~/.aider.conf.yml` so git hooks run. For full protection, install dcg as a [git pre-commit hook](docs/scan-precommit-guide.md).
 - **Continue:** No shell command interception hooks. The installer detects Continue but cannot auto-configure protection. Use a [git pre-commit hook](docs/scan-precommit-guide.md) instead.
-- **Codex CLI:** Experimental PreToolUse hooks via `~/.codex/hooks.json`. Wire format is compatible with Claude Code. Caveat: the model can write scripts to disk to bypass hook-based blocking.
+- **Codex CLI:** PreToolUse hooks via `~/.codex/hooks.json` (stable in codex 0.125.0+; the `codex_hooks` feature is on by default). Codex's hook input shape mirrors Claude Code's, but its JSON deny parser is strict (`#[serde(deny_unknown_fields)]`), so dcg detects Codex from the `turn_id` stdin field (codex's documented extension over Claude's hook spec) and switches to Codex's documented exit-2 + stderr deny path; the colored block message goes to stderr where codex shows it to the model. Caveat: the model can still write scripts to disk to bypass hook-based blocking.
 - **GitHub Copilot CLI:** Hooks are repository-local (`.github/hooks/*.json`). Run the installer from each repository where you want protection.
 - **OpenCode:** Not auto-configured. Requires a Bun-based plugin with `"tool.execute.before"` hook key. A working community plugin: [aspiers/ai-config/dcg-guard.js](https://github.com/aspiers/ai-config/blob/main/.config/opencode/plugins/dcg-guard.js).
 
@@ -742,7 +742,7 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/destructive_comma
 ```
 
 The uninstaller:
-- Removes dcg hooks from Claude Code, Gemini CLI, GitHub Copilot CLI (repo-local), and Aider
+- Removes dcg hooks from Claude Code, Codex CLI, Cursor IDE, Gemini CLI, GitHub Copilot CLI (repo-local), and Aider
 - Removes the dcg binary
 - Removes configuration (`~/.config/dcg/`) and history (`~/.local/share/dcg/`)
 - Prompts for confirmation before making changes
