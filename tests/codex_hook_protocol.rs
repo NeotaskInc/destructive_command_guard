@@ -1657,11 +1657,7 @@ fn codex_allow_once_round_trip() {
 // ===========================================================================
 
 /// Helper: spawn dcg with a hermetic HOME that has an allowlist.toml.
-fn run_with_user_allowlist(
-    allowlist_toml: &str,
-    command: &str,
-    use_codex: bool,
-) -> HookOutcome {
+fn run_with_user_allowlist(allowlist_toml: &str, command: &str, use_codex: bool) -> HookOutcome {
     let home = tempfile::tempdir().expect("tempdir");
     let config_dir = home.path().join(".config/dcg");
     std::fs::create_dir_all(&config_dir).unwrap();
@@ -2255,5 +2251,213 @@ fn parallel_mixed_protocol_storm() {
         n * 2,
         "all 16 spawns must use distinct HOMEs, got {} unique",
         all_homes.len()
+    );
+}
+
+// ==========================================================================
+// P2.8: Heredoc-extracted destructive command blocked under Codex
+//
+// Proves dcg's Tier 3 heredoc/inline-script analysis works identically under
+// the Codex output path (exit 2 + stderr) as under Claude (exit 0 + JSON).
+// ==========================================================================
+
+/// Build a Codex payload with proper JSON escaping for commands containing newlines.
+fn build_codex_payload_raw(command: &str) -> String {
+    let escaped = command
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+    format!(
+        r#"{{"session_id":"s","turn_id":"turn-test-1","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{{"command":"{escaped}"}},"tool_use_id":"call_test"}}"#
+    )
+}
+
+/// Build a Claude payload with proper JSON escaping for commands containing newlines.
+fn build_claude_payload_raw(command: &str) -> String {
+    let escaped = command
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+    format!(
+        r#"{{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{{"command":"{escaped}"}},"tool_use_id":"toolu_01TEST"}}"#
+    )
+}
+
+/// Run dcg with a Codex payload for a command that may contain newlines.
+fn run_codex_heredoc(command: &str) -> HookOutcome {
+    let payload = build_codex_payload_raw(command);
+    run_hook_raw(payload.as_bytes(), &[])
+}
+
+/// Run dcg with a Claude payload for a command that may contain newlines.
+fn run_claude_heredoc(command: &str) -> HookOutcome {
+    let payload = build_claude_payload_raw(command);
+    run_hook_raw(payload.as_bytes(), &[])
+}
+
+#[test]
+fn heredoc_python_shutil_rmtree_codex_deny() {
+    let cmd = r#"python3 -c "import shutil; shutil.rmtree('/tmp/data')""#;
+    let o = run_codex_hook(cmd);
+    assert!(
+        o.is_codex_block_shape(),
+        "python shutil.rmtree should be blocked under Codex\n{o}"
+    );
+    assert!(
+        o.stderr_contains("heredoc.python"),
+        "stderr should mention heredoc.python pack\n{o}"
+    );
+    assert!(
+        o.stderr_contains("shutil_rmtree"),
+        "stderr should mention shutil_rmtree pattern\n{o}"
+    );
+}
+
+#[test]
+fn heredoc_python_shutil_rmtree_claude_deny() {
+    let cmd = r#"python3 -c "import shutil; shutil.rmtree('/tmp/data')""#;
+    let o = run_claude_hook(cmd);
+    assert!(
+        o.is_claude_block_shape(),
+        "python shutil.rmtree should be blocked under Claude\n{o}"
+    );
+    let json = o.stdout_json();
+    let rule_id = json["hookSpecificOutput"]["ruleId"].as_str().unwrap_or("");
+    assert_eq!(
+        rule_id, "heredoc.python:shutil_rmtree",
+        "ruleId should be heredoc.python:shutil_rmtree\n{o}"
+    );
+    assert_eq!(
+        json["hookSpecificOutput"]["permissionDecision"].as_str(),
+        Some("deny"),
+        "permissionDecision should be deny\n{o}"
+    );
+    assert_eq!(
+        json["hookSpecificOutput"]["packId"].as_str(),
+        Some("heredoc.python"),
+        "packId should be heredoc.python\n{o}"
+    );
+}
+
+#[test]
+fn heredoc_javascript_fs_rmsync_codex_deny() {
+    let cmd = "node <<EOF\nconst fs = require('fs');\nfs.rmSync('/etc', { recursive: true });\nEOF";
+    let o = run_codex_heredoc(cmd);
+    assert!(
+        o.is_codex_block_shape(),
+        "node fs.rmSync heredoc should be blocked under Codex\n{o}"
+    );
+    assert!(
+        o.stderr_contains("heredoc.javascript"),
+        "stderr should mention heredoc.javascript pack\n{o}"
+    );
+    assert!(
+        o.stderr_contains("fs_rmsync"),
+        "stderr should mention fs_rmsync pattern\n{o}"
+    );
+}
+
+#[test]
+fn heredoc_javascript_fs_rmsync_claude_deny() {
+    let cmd = "node <<EOF\nconst fs = require('fs');\nfs.rmSync('/etc', { recursive: true });\nEOF";
+    let o = run_claude_heredoc(cmd);
+    assert!(
+        o.is_claude_block_shape(),
+        "node fs.rmSync heredoc should be blocked under Claude\n{o}"
+    );
+    let json = o.stdout_json();
+    let rule_id = json["hookSpecificOutput"]["ruleId"].as_str().unwrap_or("");
+    assert!(
+        rule_id.starts_with("heredoc.javascript:fs_rmsync"),
+        "ruleId should start with heredoc.javascript:fs_rmsync, got: {rule_id}\n{o}"
+    );
+    assert_eq!(
+        json["hookSpecificOutput"]["packId"].as_str(),
+        Some("heredoc.javascript"),
+        "packId should be heredoc.javascript\n{o}"
+    );
+}
+
+#[test]
+fn heredoc_python_cross_protocol_parity() {
+    let cmd = r#"python3 -c "import shutil; shutil.rmtree('/tmp/data')""#;
+    let codex = run_codex_hook(cmd);
+    let claude = run_claude_hook(cmd);
+
+    assert!(codex.is_codex_block_shape(), "Codex must block\n{codex}");
+    assert!(claude.is_claude_block_shape(), "Claude must block\n{claude}");
+
+    let json = claude.stdout_json();
+    let claude_rule = json["hookSpecificOutput"]["ruleId"]
+        .as_str()
+        .unwrap_or("");
+    let claude_pack = json["hookSpecificOutput"]["packId"]
+        .as_str()
+        .unwrap_or("");
+
+    assert!(
+        codex.stderr_contains(claude_pack),
+        "Codex stderr must mention same pack '{claude_pack}' as Claude JSON\n\
+         Codex stderr: {}\nClaude JSON: {}",
+        codex.stderr_str(),
+        claude.stdout_str()
+    );
+    let pattern_part = claude_rule.split(':').last().unwrap_or("");
+    assert!(
+        codex.stderr_contains(pattern_part),
+        "Codex stderr must mention same pattern '{pattern_part}' from Claude ruleId '{claude_rule}'\n\
+         Codex stderr: {}",
+        codex.stderr_str()
+    );
+}
+
+#[test]
+fn heredoc_javascript_cross_protocol_parity() {
+    let cmd = "node <<EOF\nconst fs = require('fs');\nfs.rmSync('/etc', { recursive: true });\nEOF";
+    let codex = run_codex_heredoc(cmd);
+    let claude = run_claude_heredoc(cmd);
+
+    assert!(codex.is_codex_block_shape(), "Codex must block\n{codex}");
+    assert!(claude.is_claude_block_shape(), "Claude must block\n{claude}");
+
+    let json = claude.stdout_json();
+    let claude_pack = json["hookSpecificOutput"]["packId"]
+        .as_str()
+        .unwrap_or("");
+
+    assert!(
+        codex.stderr_contains(claude_pack),
+        "Codex stderr must mention same pack '{claude_pack}' as Claude JSON\n\
+         Codex stderr: {}\nClaude JSON: {}",
+        codex.stderr_str(),
+        claude.stdout_str()
+    );
+}
+
+#[test]
+fn heredoc_node_inline_exec_codex_deny() {
+    let cmd = r#"node -e "require('child_process').execSync('rm -rf /')""#;
+    let o = run_codex_hook(cmd);
+    assert!(
+        o.is_codex_block_shape(),
+        "node -e with child_process execSync should be blocked under Codex\n{o}"
+    );
+    assert!(
+        o.stderr_contains("heredoc."),
+        "stderr should mention a heredoc pack\n{o}"
+    );
+}
+
+#[test]
+fn heredoc_safe_python_codex_allows() {
+    let cmd = r#"python3 -c "print('hello world')""#;
+    let o = run_codex_hook(cmd);
+    assert!(
+        o.is_allow_shape(),
+        "safe python one-liner should be allowed\n{o}"
     );
 }
