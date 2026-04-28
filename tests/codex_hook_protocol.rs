@@ -1648,6 +1648,167 @@ fn codex_allow_once_round_trip() {
 }
 
 // ===========================================================================
+// P2.12 — Allowlist precedence under Codex (user tier)
+//
+// Verifies that allowlist entries produce silent allow (exit 0) under both
+// protocols. Uses the user-tier allowlist at $HOME/.config/dcg/allowlist.toml
+// since project-tier requires a .git root at CWD (not guaranteed in hermetic
+// tests) and system-tier requires /etc (not writable).
+// ===========================================================================
+
+/// Helper: spawn dcg with a hermetic HOME that has an allowlist.toml.
+fn run_with_user_allowlist(
+    allowlist_toml: &str,
+    command: &str,
+    use_codex: bool,
+) -> HookOutcome {
+    let home = tempfile::tempdir().expect("tempdir");
+    let config_dir = home.path().join(".config/dcg");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(config_dir.join("allowlist.toml"), allowlist_toml.as_bytes()).unwrap();
+
+    let payload = if use_codex {
+        build_codex_payload(command)
+    } else {
+        build_claude_payload(command)
+    };
+    let system_path = std::env::var("PATH").unwrap_or_default();
+
+    let mut cmd = Command::new(dcg_binary());
+    cmd.env_clear()
+        .env("PATH", &system_path)
+        .env("HOME", home.path())
+        .env("TMPDIR", home.path().join("tmp"))
+        .env("NO_COLOR", "1")
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("spawn");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin.write_all(payload.as_bytes()).unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    HookOutcome {
+        stdout: output.stdout,
+        stderr: output.stderr,
+        exit_code: output.status.code().unwrap_or(-1),
+        stdin_sent: payload.into_bytes(),
+        home_dir: home.path().to_path_buf(),
+    }
+}
+
+#[test]
+fn allowlist_user_rule_allows_codex() {
+    let allowlist = r#"
+[[allow]]
+rule = "core.git:reset-hard"
+reason = "Team accepts this risk in CI"
+"#;
+    let outcome = run_with_user_allowlist(allowlist, "git reset --hard HEAD~1", true);
+    assert!(
+        outcome.is_allow_shape(),
+        "user allowlist rule must produce silent allow under Codex\n{outcome}"
+    );
+}
+
+#[test]
+fn allowlist_user_rule_allows_claude() {
+    let allowlist = r#"
+[[allow]]
+rule = "core.git:reset-hard"
+reason = "Team accepts this risk in CI"
+"#;
+    let outcome = run_with_user_allowlist(allowlist, "git reset --hard HEAD~1", false);
+    assert!(
+        outcome.is_allow_shape(),
+        "user allowlist rule must produce silent allow under Claude\n{outcome}"
+    );
+}
+
+#[test]
+fn allowlist_exact_command_allows_codex() {
+    let allowlist = r#"
+[[allow]]
+exact_command = "git clean -fd"
+reason = "Build script cleanup"
+"#;
+    let outcome = run_with_user_allowlist(allowlist, "git clean -fd", true);
+    assert!(
+        outcome.is_allow_shape(),
+        "exact_command allowlist must produce silent allow under Codex\n{outcome}"
+    );
+}
+
+#[test]
+fn allowlist_exact_command_allows_claude() {
+    let allowlist = r#"
+[[allow]]
+exact_command = "git clean -fd"
+reason = "Build script cleanup"
+"#;
+    let outcome = run_with_user_allowlist(allowlist, "git clean -fd", false);
+    assert!(
+        outcome.is_allow_shape(),
+        "exact_command allowlist must produce silent allow under Claude\n{outcome}"
+    );
+}
+
+#[test]
+fn allowlist_does_not_affect_unrelated_commands_codex() {
+    let allowlist = r#"
+[[allow]]
+rule = "core.git:reset-hard"
+reason = "Only allow reset-hard"
+"#;
+    // git clean -fd is NOT in the allowlist → should still be blocked
+    let outcome = run_with_user_allowlist(allowlist, "git clean -fd", true);
+    assert_eq!(
+        outcome.exit_code, 2,
+        "non-allowlisted command must still be blocked under Codex\n{outcome}"
+    );
+}
+
+#[test]
+fn allowlist_does_not_affect_unrelated_commands_claude() {
+    let allowlist = r#"
+[[allow]]
+rule = "core.git:reset-hard"
+reason = "Only allow reset-hard"
+"#;
+    let outcome = run_with_user_allowlist(allowlist, "git clean -fd", false);
+    assert!(
+        outcome.is_claude_block_shape(),
+        "non-allowlisted command must still be blocked under Claude\n{outcome}"
+    );
+}
+
+#[test]
+fn allowlist_empty_file_still_blocks_codex() {
+    let outcome = run_with_user_allowlist("", "git reset --hard HEAD~1", true);
+    assert_eq!(
+        outcome.exit_code, 2,
+        "empty allowlist must still block under Codex\n{outcome}"
+    );
+}
+
+#[test]
+fn allowlist_cross_protocol_parity() {
+    let allowlist = r#"
+[[allow]]
+rule = "core.git:reset-hard"
+reason = "Accepted risk"
+"#;
+    let codex = run_with_user_allowlist(allowlist, "git reset --hard HEAD~1", true);
+    let claude = run_with_user_allowlist(allowlist, "git reset --hard HEAD~1", false);
+
+    assert!(codex.is_allow_shape(), "Codex must allow\n{codex}");
+    assert!(claude.is_allow_shape(), "Claude must allow\n{claude}");
+}
+
+// ===========================================================================
 // P2.6 — History entry persists across Codex's process::exit(2)
 //
 // The fix at src/main.rs:653-655 calls writer.flush_sync() before
@@ -1696,10 +1857,7 @@ fn codex_deny_writes_history_entry_despite_exit_2() {
         home_dir: home.path().to_path_buf(),
     };
 
-    assert_eq!(
-        outcome.exit_code, 2,
-        "Codex deny must exit 2\n{outcome}"
-    );
+    assert_eq!(outcome.exit_code, 2, "Codex deny must exit 2\n{outcome}");
 
     // Despite process::exit(2), flush_sync() runs first → DB exists with data.
     // fsqlite/sqlite page size is 4096; a newly-created DB with schema + one row
@@ -1708,9 +1866,7 @@ fn codex_deny_writes_history_entry_despite_exit_2() {
         db_path.exists(),
         "history DB must exist after Codex deny (flush_sync before exit 2)\n{outcome}"
     );
-    let db_size = std::fs::metadata(&db_path)
-        .expect("stat history DB")
-        .len();
+    let db_size = std::fs::metadata(&db_path).expect("stat history DB").len();
     assert!(
         db_size >= 4096,
         "history DB must contain at least one page (>= 4096 bytes), got {db_size}\n{outcome}"
@@ -1826,9 +1982,7 @@ fn codex_rapid_fire_denies_all_persist_to_history() {
         db_path.exists(),
         "history DB must exist after 5 rapid-fire Codex denies"
     );
-    let db_size = std::fs::metadata(&db_path)
-        .expect("stat history DB")
-        .len();
+    let db_size = std::fs::metadata(&db_path).expect("stat history DB").len();
     // With 5 entries, the DB should be at least one page (4096 bytes)
     assert!(
         db_size >= 4096,
@@ -1894,8 +2048,16 @@ fn codex_deny_history_write_protected_dir_no_panic() {
         "must not panic when history write fails\nstderr: {stderr}"
     );
 
-    // Restore permissions for cleanup
-    perms.set_readonly(false);
+    // Restore permissions for cleanup.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perms.set_mode(perms.mode() | 0o700);
+    }
+    #[cfg(not(unix))]
+    {
+        perms.set_readonly(false);
+    }
     std::fs::set_permissions(&readonly_dir, perms).unwrap();
 }
 
