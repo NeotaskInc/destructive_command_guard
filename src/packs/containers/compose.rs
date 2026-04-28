@@ -128,3 +128,78 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packs::test_helpers::*;
+    use crate::packs::Severity;
+
+    #[test]
+    fn compose_blocks_down_with_volumes() {
+        let pack = create_pack();
+        assert_blocks(&pack, "docker-compose down -v", "removes volumes");
+        assert_blocks(&pack, "docker-compose down --volumes", "removes volumes");
+        assert_blocks(&pack, "docker compose down -v", "removes volumes");
+        assert_blocks(&pack, "docker compose down --volumes", "removes volumes");
+    }
+
+    #[test]
+    fn compose_blocks_down_rmi_all() {
+        let pack = create_pack();
+        assert_blocks(&pack, "docker-compose down --rmi all", "removes all images");
+        assert_blocks(&pack, "docker compose down --rmi all", "removes all images");
+    }
+
+    #[test]
+    fn compose_blocks_rm_with_volumes() {
+        let pack = create_pack();
+        assert_blocks(&pack, "docker-compose rm -v", "removes volumes");
+        assert_blocks(&pack, "docker compose rm --volumes", "removes volumes");
+    }
+
+    #[test]
+    fn compose_blocks_rm_force() {
+        let pack = create_pack();
+        assert_blocks(&pack, "docker-compose rm -f", "forcibly removes");
+        assert_blocks(&pack, "docker compose rm --force", "forcibly removes");
+    }
+
+    #[test]
+    fn compose_blocks_with_correct_severity() {
+        let pack = create_pack();
+        assert_blocks_with_severity(&pack, "docker-compose down -v", Severity::Critical);
+        assert_blocks_with_severity(&pack, "docker-compose down --rmi all", Severity::High);
+        assert_blocks_with_severity(&pack, "docker-compose rm -v", Severity::High);
+        assert_blocks_with_severity(&pack, "docker-compose rm -f", Severity::Medium);
+    }
+
+    #[test]
+    fn compose_all_safe_patterns_match() {
+        let pack = create_pack();
+        assert_safe_pattern_matches(&pack, "docker-compose config");
+        assert_safe_pattern_matches(&pack, "docker compose config");
+        assert_safe_pattern_matches(&pack, "docker-compose ps");
+        assert_safe_pattern_matches(&pack, "docker compose ps");
+        assert_safe_pattern_matches(&pack, "docker-compose logs");
+        assert_safe_pattern_matches(&pack, "docker compose logs");
+        assert_safe_pattern_matches(&pack, "docker-compose up");
+        assert_safe_pattern_matches(&pack, "docker compose up -d");
+        assert_safe_pattern_matches(&pack, "docker-compose build");
+        assert_safe_pattern_matches(&pack, "docker compose pull");
+    }
+
+    #[test]
+    fn compose_down_without_volumes_is_safe() {
+        let pack = create_pack();
+        assert_allows(&pack, "docker-compose down");
+        assert_allows(&pack, "docker compose down");
+    }
+
+    #[test]
+    fn compose_unrelated_commands_no_match() {
+        let pack = create_pack();
+        assert_no_match(&pack, "ls -la");
+        assert_no_match(&pack, "git status");
+    }
+}
