@@ -22,7 +22,9 @@ use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::time::{Duration, Instant};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 /// Default timeout for interactive prompts (5 seconds).
 pub const DEFAULT_TIMEOUT_SECONDS: u64 = 5;
@@ -416,7 +418,7 @@ pub fn run_interactive_prompt(
                     // Check verification code (case-insensitive)
                     if validate_code(input, &code) {
                         // Code correct - show scope selection
-                        match select_allowlist_scope() {
+                        match select_allowlist_scope(timeout) {
                             Ok(scope) => InteractiveResult::AllowlistRequested(scope),
                             Err(_) => InteractiveResult::Cancelled,
                         }
@@ -447,7 +449,7 @@ pub fn run_interactive_prompt(
                     }
 
                     if input == command {
-                        match select_allowlist_scope() {
+                        match select_allowlist_scope(timeout) {
                             Ok(scope) => InteractiveResult::AllowlistRequested(scope),
                             Err(_) => InteractiveResult::Cancelled,
                         }
@@ -469,7 +471,7 @@ pub fn run_interactive_prompt(
                 timeout,
             );
 
-            match select_allowlist_scope() {
+            match select_allowlist_scope(timeout) {
                 Ok(scope) => InteractiveResult::AllowlistRequested(scope),
                 Err(_) => InteractiveResult::Cancelled,
             }
@@ -735,51 +737,52 @@ enum InputError {
     Interrupted,
 }
 
-/// Read a line of input with a timeout.
-///
-/// # Platform Notes
-///
-/// On Unix, this uses a simple polling approach with non-blocking stdin.
-/// On Windows, this falls back to blocking read (timeout not enforced).
 fn read_input_with_timeout(timeout: Duration) -> Result<String, InputError> {
-    let start = Instant::now();
-    let stdin = io::stdin();
+    read_line_with_timeout(
+        || {
+            let stdin = io::stdin();
+            let handle = stdin.lock();
+            let mut reader = io::BufReader::new(handle);
+            read_line_from_reader(&mut reader)
+        },
+        timeout,
+    )
+}
 
-    // Simple polling approach - check if data is available
-    // This works on most Unix systems with TTY
+fn read_line_with_timeout<F>(read_line: F, timeout: Duration) -> Result<String, InputError>
+where
+    F: FnOnce() -> Result<String, InputError> + Send + 'static,
+{
+    let (tx, rx) = mpsc::sync_channel(1);
+    let _input_thread = thread::Builder::new()
+        .name("dcg-interactive-input".to_string())
+        .spawn(move || {
+            let _ = tx.send(read_line());
+        })
+        .map_err(InputError::Io)?;
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(InputError::Timeout),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(InputError::Interrupted),
+    }
+}
+
+fn read_line_from_reader<R>(reader: &mut R) -> Result<String, InputError>
+where
+    R: BufRead,
+{
     let mut input = String::new();
-
-    // For simplicity and cross-platform compatibility, we use a blocking read
-    // with a check after. A more sophisticated implementation would use
-    // platform-specific async I/O or select/poll.
-    //
-    // TODO: Implement proper timeout with platform-specific code:
-    // - Unix: use libc::select or mio
-    // - Windows: use WaitForSingleObject
-    //
-    // For now, we rely on the user to respond or press Enter to cancel.
-    // The timeout is checked after the read completes.
-
-    let handle = stdin.lock();
-    let mut reader = io::BufReader::new(handle);
-
-    // Read a line (blocking)
     match reader.read_line(&mut input) {
         Ok(0) => Err(InputError::Interrupted), // EOF
-        Ok(_) => {
-            // Check if we exceeded timeout
-            if start.elapsed() > timeout {
-                return Err(InputError::Timeout);
-            }
-            Ok(input)
-        }
+        Ok(_) => Ok(input),
         Err(e) if e.kind() == io::ErrorKind::Interrupted => Err(InputError::Interrupted),
         Err(e) => Err(InputError::Io(e)),
     }
 }
 
 /// Display the scope selection menu and get user choice.
-fn select_allowlist_scope() -> Result<AllowlistScope, InputError> {
+fn select_allowlist_scope(timeout: Duration) -> Result<AllowlistScope, InputError> {
     let stderr = io::stderr();
     let mut handle = stderr.lock();
 
@@ -799,14 +802,8 @@ fn select_allowlist_scope() -> Result<AllowlistScope, InputError> {
     let _ = write!(handle, "{} ", "Choice [o/s/t/p]:".white());
     let _ = handle.flush();
 
-    let stdin = io::stdin();
-    let mut input = String::new();
-    let handle = stdin.lock();
-    let mut reader = io::BufReader::new(handle);
-
-    match reader.read_line(&mut input) {
-        Ok(0) => Err(InputError::Interrupted),
-        Ok(_) => {
+    match read_input_with_timeout(timeout) {
+        Ok(input) => {
             let choice = input.trim().to_lowercase();
             match choice.as_str() {
                 "o" | "once" | "1" => Ok(AllowlistScope::Once),
@@ -819,8 +816,7 @@ fn select_allowlist_scope() -> Result<AllowlistScope, InputError> {
                 _ => Ok(AllowlistScope::Once),  // Invalid input defaults to once (safest)
             }
         }
-        Err(e) if e.kind() == io::ErrorKind::Interrupted => Err(InputError::Interrupted),
-        Err(e) => Err(InputError::Io(e)),
+        Err(err) => Err(err),
     }
 }
 
@@ -862,6 +858,7 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
 
     const CI_ENV_VARS: [&str; 5] = ["CI", "GITHUB_ACTIONS", "GITLAB_CI", "JENKINS", "TRAVIS"];
 
@@ -1194,5 +1191,44 @@ mod tests {
             check_interactive_available_with_context(&config, true, false, false),
             Ok(())
         );
+    }
+
+    #[test]
+    fn test_read_line_with_timeout_returns_input_before_deadline() {
+        let input = read_line_with_timeout(
+            || Ok("verification-code\n".to_string()),
+            Duration::from_millis(100),
+        )
+        .expect("input should arrive before timeout");
+
+        assert_eq!(input, "verification-code\n");
+    }
+
+    #[test]
+    fn test_read_line_with_timeout_enforces_deadline() {
+        let start = Instant::now();
+        let result = read_line_with_timeout(
+            || {
+                std::thread::sleep(Duration::from_millis(250));
+                Ok("late input\n".to_string())
+            },
+            Duration::from_millis(20),
+        );
+
+        assert!(matches!(result, Err(InputError::Timeout)));
+        assert!(
+            start.elapsed() < Duration::from_millis(150),
+            "timeout should return before the blocking reader finishes"
+        );
+    }
+
+    #[test]
+    fn test_read_line_from_reader_maps_eof_to_interrupted() {
+        let mut reader = io::Cursor::new(Vec::<u8>::new());
+
+        assert!(matches!(
+            read_line_from_reader(&mut reader),
+            Err(InputError::Interrupted)
+        ));
     }
 }
