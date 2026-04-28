@@ -1508,6 +1508,60 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "rich-output"))]
+    fn test_denial_box_legacy_fallback_preserves_contract_without_rich_output() {
+        let span = HighlightSpan::with_label(0, 16, "Matched: git reset --hard");
+        let denial = DenialBox::new(
+            "git reset --hard HEAD~1",
+            span,
+            "core.git:reset-hard",
+            Severity::Critical,
+        )
+        .with_pattern_regex(r"^git\s+reset\s+--hard")
+        .with_explanation("Discards staged and unstaged changes.")
+        .with_alternatives(vec!["git stash push".to_string()]);
+
+        for border_style in [BorderStyle::Unicode, BorderStyle::Ascii, BorderStyle::None] {
+            let theme = Theme {
+                border_style,
+                colors_enabled: false,
+                ..Default::default()
+            };
+
+            let output = denial.render(&theme);
+
+            assert!(
+                output.contains("BLOCKED"),
+                "{border_style:?} fallback should identify the denial"
+            );
+            assert!(
+                output.contains("git reset --hard HEAD~1"),
+                "{border_style:?} fallback should preserve the command"
+            );
+            assert!(
+                output.contains("Pattern: reset-hard"),
+                "{border_style:?} fallback should render pattern identity"
+            );
+            assert!(
+                output.contains("Pack: core.git"),
+                "{border_style:?} fallback should render pack identity"
+            );
+            assert!(
+                output.contains("Discards staged and unstaged changes"),
+                "{border_style:?} fallback should render explanations"
+            );
+            assert!(
+                output.contains("git stash push"),
+                "{border_style:?} fallback should render alternatives"
+            );
+            assert!(
+                !output.contains('\x1b'),
+                "{border_style:?} no-color fallback should strip ANSI escapes"
+            );
+        }
+    }
+
+    #[test]
     fn test_denial_box_low_severity_render() {
         let span = HighlightSpan::new(0, 10);
         let denial = DenialBox::new("chmod 777 .", span, "core:chmod", Severity::Low);

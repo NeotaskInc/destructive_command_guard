@@ -1595,4 +1595,77 @@ mod tests {
         assert!(!output.contains('\x1b'));
         assert!(output.contains("CRIT"));
     }
+
+    #[test]
+    #[cfg(not(feature = "rich-output"))]
+    fn test_scan_results_legacy_unicode_fallback_preserves_contract_without_rich_output() {
+        let rows = vec![ScanResultRow {
+            file: "src/main.rs".to_string(),
+            line: 42,
+            severity: Severity::High,
+            pattern_id: "core.git:clean-force".to_string(),
+            command_preview: Some("git clean -fd".to_string()),
+        }];
+
+        let table = ScanResultsTable::new(rows)
+            .with_style(TableStyle::Unicode)
+            .with_command_preview()
+            .with_max_width(120);
+        let output = table.render();
+
+        for expected in [
+            "File",
+            "Line",
+            "Severity",
+            "Pattern",
+            "Command",
+            "src/main.rs",
+            "42",
+            "HIGH",
+            "core.git:clean-force",
+            "git clean -fd",
+        ] {
+            assert!(
+                output.contains(expected),
+                "legacy scan table should contain {expected:?}: {output}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "rich-output"))]
+    fn test_stats_legacy_unicode_fallback_preserves_contract_without_rich_output() {
+        let rows = vec![StatsRow {
+            name: "core.filesystem:rm-rf".to_string(),
+            hits: 12,
+            allowed: 2,
+            denied: 10,
+            noise_pct: Some(16.7),
+        }];
+
+        let table = StatsTable::new(rows)
+            .with_style(TableStyle::Unicode)
+            .with_title("Rule Statistics")
+            .with_max_width(100);
+        let output = table.render();
+
+        for expected in [
+            "Rule Statistics",
+            "Rule",
+            "Hits",
+            "Allowed",
+            "Denied",
+            "Noise%",
+            "core.filesystem:rm-rf",
+            "12",
+            "2",
+            "10",
+            "16.7%",
+        ] {
+            assert!(
+                output.contains(expected),
+                "legacy stats table should contain {expected:?}: {output}"
+            );
+        }
+    }
 }
