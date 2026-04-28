@@ -16,9 +16,10 @@
 //!
 //! The module automatically detects whether rich output should be used based on:
 //! 1. Explicit flags (--json, --no-color)
-//! 2. `NO_COLOR` environment variable
-//! 3. Whether stdout is a TTY
-//! 4. TERM environment variable (dumb terminals)
+//! 2. `DCG_NO_RICH`, `NO_COLOR`, or `DCG_NO_COLOR` environment variables
+//! 3. `CI` environment variable
+//! 4. Whether stdout is a TTY
+//! 5. TERM environment variable (dumb terminals)
 
 pub mod console;
 pub mod denial;
@@ -73,7 +74,8 @@ pub fn init_suggestions(enabled: bool) {
 ///
 /// Returns `true` if all of the following are true:
 /// - `--no-color` flag was not passed (or `init(false)` was called)
-/// - `NO_COLOR` environment variable is not set
+/// - `DCG_NO_RICH`, `NO_COLOR`, and `DCG_NO_COLOR` environment variables are not set
+/// - `CI` environment variable is not set
 /// - stdout is a TTY
 /// - TERM is not "dumb"
 ///
@@ -90,31 +92,47 @@ pub fn init_suggestions(enabled: bool) {
 /// ```
 #[must_use]
 pub fn should_use_rich_output() -> bool {
+    should_use_rich_output_with_env(
+        FORCE_PLAIN.get().copied().unwrap_or(false),
+        ::console::Term::stdout().is_term(),
+        |name| std::env::var_os(name),
+    )
+}
+
+fn should_use_rich_output_with_env(
+    force_plain: bool,
+    stdout_is_tty: bool,
+    mut env_var: impl FnMut(&str) -> Option<std::ffi::OsString>,
+) -> bool {
     // 1. Check if explicitly disabled
-    if FORCE_PLAIN.get().copied().unwrap_or(false) {
+    if force_plain {
         return false;
     }
 
-    // 2. Check NO_COLOR environment variable (https://no-color.org/)
-    if std::env::var("NO_COLOR").is_ok() || std::env::var("DCG_NO_COLOR").is_ok() {
+    // 2. Check explicit environment disables.
+    if env_var("DCG_NO_RICH").is_some()
+        || env_var("NO_COLOR").is_some()
+        || env_var("DCG_NO_COLOR").is_some()
+    {
         return false;
     }
 
     // 3. Check CI environment variable (common in CI/CD systems)
-    if std::env::var("CI").is_ok() {
+    if env_var("CI").is_some() {
         return false;
     }
 
     // 4. Check if stdout is a TTY
-    if !::console::Term::stdout().is_term() {
+    if !stdout_is_tty {
         return false;
     }
 
     // 5. Check for dumb terminal
-    if let Ok(term) = std::env::var("TERM") {
-        if term == "dumb" {
-            return false;
-        }
+    if matches!(
+        env_var("TERM").as_deref(),
+        Some(term) if term == std::ffi::OsStr::new("dumb")
+    ) {
+        return false;
     }
 
     true
@@ -270,6 +288,18 @@ pub fn suggestions_requested() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+
+    fn test_env<'a>(
+        entries: &'a [(&'a str, &'a str)],
+    ) -> impl FnMut(&str) -> Option<OsString> + 'a {
+        move |name| {
+            entries
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| OsString::from(value))
+        }
+    }
 
     #[test]
     fn test_auto_theme_returns_theme() {
@@ -323,6 +353,70 @@ mod tests {
                 "{value:?} should be disabled"
             );
         }
+    }
+
+    #[test]
+    fn test_dcg_no_rich_disables_rich_output() {
+        assert!(!should_use_rich_output_with_env(
+            false,
+            true,
+            test_env(&[("DCG_NO_RICH", "1")])
+        ));
+    }
+
+    #[test]
+    fn test_no_color_disables_rich_output() {
+        assert!(!should_use_rich_output_with_env(
+            false,
+            true,
+            test_env(&[("NO_COLOR", "")])
+        ));
+    }
+
+    #[test]
+    fn test_dcg_no_color_disables_rich_output() {
+        assert!(!should_use_rich_output_with_env(
+            false,
+            true,
+            test_env(&[("DCG_NO_COLOR", "1")])
+        ));
+    }
+
+    #[test]
+    fn test_ci_environment_disables_rich_output() {
+        assert!(!should_use_rich_output_with_env(
+            false,
+            true,
+            test_env(&[("CI", "true")])
+        ));
+    }
+
+    #[test]
+    fn test_term_dumb_disables_rich_output() {
+        assert!(!should_use_rich_output_with_env(
+            false,
+            true,
+            test_env(&[("TERM", "dumb")])
+        ));
+    }
+
+    #[test]
+    fn test_non_tty_disables_rich_output() {
+        assert!(!should_use_rich_output_with_env(
+            false,
+            false,
+            test_env(&[])
+        ));
+    }
+
+    #[test]
+    fn test_rich_output_enabled_for_tty_without_disabling_env() {
+        assert!(should_use_rich_output_with_env(false, true, test_env(&[])));
+    }
+
+    #[test]
+    fn test_force_plain_disables_rich_output() {
+        assert!(!should_use_rich_output_with_env(true, true, test_env(&[])));
     }
 
     #[test]
