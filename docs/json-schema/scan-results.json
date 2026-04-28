@@ -123,12 +123,12 @@
           },
           "decision": {
             "type": "string",
-            "enum": ["Allow", "Warn", "Deny"],
+            "enum": ["allow", "warn", "deny"],
             "description": "The evaluation decision for this command"
           },
           "severity": {
             "type": "string",
-            "enum": ["Info", "Warning", "Error"],
+            "enum": ["info", "warning", "error"],
             "description": "Severity level of the finding"
           },
           "rule_id": {
@@ -176,8 +176,8 @@
           "col": 5,
           "extractor_id": "shell_script",
           "extracted_command": "rm -rf /var/cache/*",
-          "decision": "Deny",
-          "severity": "Error",
+          "decision": "deny",
+          "severity": "error",
           "rule_id": "core.filesystem:rm-rf-general",
           "reason": "rm -rf outside temp directories can cause data loss",
           "suggestion": "Consider using 'rm -rf /tmp/*' for temporary files only"
