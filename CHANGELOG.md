@@ -21,7 +21,7 @@ Post-v0.4.3 work on `main` that has not yet been tagged.
 
 ### Hook & Agent Detection
 
-- **Codex CLI PreToolUse hook support**: Codex CLI now fully supported via experimental `~/.codex/hooks.json` PreToolUse hooks. The wire format is compatible with Claude Code's `hookSpecificOutput` protocol, so no new protocol variant was needed. The installer auto-configures `~/.codex/hooks.json` when Codex CLI is detected. Closes [#84](https://github.com/Dicklesworthstone/destructive_command_guard/issues/84).
+- **Codex CLI PreToolUse hook support**: Codex CLI 0.125.0+ is supported via stable `~/.codex/hooks.json` PreToolUse hooks. dcg detects Codex hook input from the `turn_id` field and uses the strict stderr-deny contract with exit code 2 required by Codex, not the Claude/Gemini JSON-deny payload. The Unix installer writes `~/.codex/hooks.json` when Codex CLI is detected; Windows installs document the manual hook path while PowerShell parity is tracked separately. Closes [#84](https://github.com/Dicklesworthstone/destructive_command_guard/issues/84).
 - Hook system expansion with additional interception patterns and strict git pack hardening ([031e84a](https://github.com/Dicklesworthstone/destructive_command_guard/commit/031e84a))
 - Disambiguate Claude Code from Gemini in `detect_protocol()` -- closes [#77](https://github.com/Dicklesworthstone/destructive_command_guard/issues/77) ([8815b54](https://github.com/Dicklesworthstone/destructive_command_guard/commit/8815b54))
 
