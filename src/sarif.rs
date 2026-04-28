@@ -403,7 +403,7 @@ impl SarifReport {
                 short_description: finding.reason.as_ref().map(SarifMessage::text),
                 full_description: None,
                 help_uri: Some(format!(
-                    "https://github.com/Dicklesworthstone/destructive_command_guard/blob/master/docs/rules/{}.md",
+                    "https://github.com/Dicklesworthstone/destructive_command_guard/blob/main/docs/rules/{}.md",
                     rule_id.replace([':', '.'], "/")
                 )),
                 default_configuration: Some(SarifReportingConfiguration {

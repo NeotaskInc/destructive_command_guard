@@ -9,7 +9,7 @@ on:
       - "tests/e2e/run_history_e2e.sh"
       - ".github/workflows/history-e2e.yml"
   push:
-    branches: [master, main]
+    branches: [main]
     paths:
       - "src/history/**"
       - "tests/common/**"
