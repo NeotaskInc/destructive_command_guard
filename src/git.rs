@@ -23,6 +23,7 @@
 //! ```
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -92,7 +93,7 @@ impl CachedBranch {
 thread_local! {
     /// Per-thread cache for branch information.
     /// Keyed by working directory to handle directory changes.
-    static BRANCH_CACHE: RefCell<Option<CachedBranch>> = const { RefCell::new(None) };
+    static BRANCH_CACHE: RefCell<HashMap<PathBuf, CachedBranch>> = RefCell::new(HashMap::new());
 }
 
 /// Get the current git branch, using cache if available.
@@ -119,15 +120,21 @@ pub fn get_current_branch() -> Option<String> {
 #[must_use]
 pub fn get_branch_info() -> BranchInfo {
     let current_dir = std::env::current_dir().unwrap_or_default();
+    cached_branch_info_for_dir(current_dir, fetch_branch_info)
+}
 
-    // Check cache first
+fn cached_branch_info_for_dir(
+    current_dir: PathBuf,
+    fetch: impl FnOnce() -> BranchInfo,
+) -> BranchInfo {
     let cached = BRANCH_CACHE.with(|cache| {
-        let borrow = cache.borrow();
-        if let Some(ref entry) = *borrow {
+        let mut entries = cache.borrow_mut();
+        if let Some(entry) = entries.get(&current_dir) {
             if entry.is_valid(&current_dir) {
                 return Some(entry.info.clone());
             }
         }
+        entries.remove(&current_dir);
         None
     });
 
@@ -136,15 +143,16 @@ pub fn get_branch_info() -> BranchInfo {
     }
 
     // Cache miss - fetch fresh info
-    let info = fetch_branch_info();
+    let info = fetch();
 
     // Update cache
     BRANCH_CACHE.with(|cache| {
-        *cache.borrow_mut() = Some(CachedBranch {
-            working_dir: current_dir,
+        let entry = CachedBranch {
+            working_dir: current_dir.clone(),
             info: info.clone(),
             cached_at: Instant::now(),
-        });
+        };
+        cache.borrow_mut().insert(current_dir, entry);
     });
 
     info
@@ -164,7 +172,7 @@ pub fn get_branch_info_at_path(path: &std::path::Path) -> BranchInfo {
 /// Useful for testing or when you know the branch has changed.
 pub fn clear_cache() {
     BRANCH_CACHE.with(|cache| {
-        *cache.borrow_mut() = None;
+        cache.borrow_mut().clear();
     });
 }
 
@@ -361,6 +369,7 @@ pub fn is_in_git_repo_at_path(path: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::fs;
     use std::path::Path;
     use std::process::Command;
@@ -431,6 +440,70 @@ mod tests {
 
         // Different directory
         assert!(!cache.is_valid(&other_dir));
+    }
+
+    #[test]
+    fn test_branch_cache_keeps_entries_per_directory() {
+        clear_cache();
+
+        let fetch_count = Cell::new(0);
+        let dir_a = PathBuf::from("/test/repo-a");
+        let dir_b = PathBuf::from("/test/repo-b");
+
+        let first = cached_branch_info_for_dir(dir_a.clone(), || {
+            fetch_count.set(fetch_count.get() + 1);
+            BranchInfo::Branch("main".to_string())
+        });
+        let second = cached_branch_info_for_dir(dir_b, || {
+            fetch_count.set(fetch_count.get() + 1);
+            BranchInfo::Branch("feature/cache".to_string())
+        });
+        let third = cached_branch_info_for_dir(dir_a, || {
+            panic!("expected repo-a branch info to come from cache")
+        });
+
+        assert_eq!(first, BranchInfo::Branch("main".to_string()));
+        assert_eq!(second, BranchInfo::Branch("feature/cache".to_string()));
+        assert_eq!(third, BranchInfo::Branch("main".to_string()));
+        assert_eq!(fetch_count.get(), 2);
+
+        clear_cache();
+    }
+
+    #[test]
+    fn test_branch_cache_refreshes_expired_entries() {
+        clear_cache();
+
+        let dir = PathBuf::from("/test/expired-repo");
+        let expired_at = Instant::now()
+            .checked_sub(CACHE_TTL + Duration::from_secs(1))
+            .expect("system uptime should exceed cache TTL");
+
+        BRANCH_CACHE.with(|cache| {
+            cache.borrow_mut().insert(
+                dir.clone(),
+                CachedBranch {
+                    working_dir: dir.clone(),
+                    info: BranchInfo::Branch("stale".to_string()),
+                    cached_at: expired_at,
+                },
+            );
+        });
+
+        let fetch_count = Cell::new(0);
+        let refreshed = cached_branch_info_for_dir(dir.clone(), || {
+            fetch_count.set(fetch_count.get() + 1);
+            BranchInfo::Branch("fresh".to_string())
+        });
+        let cached_again = cached_branch_info_for_dir(dir, || {
+            panic!("expected refreshed branch info to come from cache")
+        });
+
+        assert_eq!(refreshed, BranchInfo::Branch("fresh".to_string()));
+        assert_eq!(cached_again, BranchInfo::Branch("fresh".to_string()));
+        assert_eq!(fetch_count.get(), 1);
+
+        clear_cache();
     }
 
     #[test]
