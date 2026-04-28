@@ -214,7 +214,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // TRUNCATE (faster than DELETE, no rollback)
         destructive_pattern!(
             "truncate-table",
-            r"(?i)TRUNCATE\s+(?:TABLE\s+)?[a-zA-Z_]",
+            r"(?i)\bTRUNCATE\s+(?:TABLE\s+)?[a-zA-Z_]",
             "TRUNCATE permanently deletes all rows without logging individual deletions.",
             High,
             "TRUNCATE is faster than DELETE but more dangerous:\n\n\
@@ -253,7 +253,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // dropdb CLI command
         destructive_pattern!(
             "dropdb-cli",
-            r"dropdb\s+",
+            r"\bdropdb\s+",
             "dropdb permanently deletes the entire database. Verify the database name carefully.",
             Critical,
             "dropdb is the CLI equivalent of DROP DATABASE:\n\n\
@@ -363,5 +363,41 @@ mod tests {
         let pack = create_pack();
         assert_no_match(&pack, "ls -la");
         assert_no_match(&pack, "git status");
+    }
+
+    #[test]
+    fn truncate_pattern_requires_word_boundary() {
+        // Regression: `truncate-table` regex previously had no `\b` anchor,
+        // so any word ENDING in `TRUNCATE` (e.g. `MYTRUNCATE TABLE foo`)
+        // matched and caused false-positive blocks. With the keywords list
+        // including `TRUNCATE`, commands like
+        //   echo "MYTRUNCATE TABLE foo described in the docs"
+        // would block.
+        let pack = create_pack();
+        assert_no_match(
+            &pack,
+            "echo \"MYTRUNCATE TABLE foo described in the docs\"",
+        );
+        assert_no_match(&pack, "echo NEEDSTRUNCATE TABLE later");
+        assert_no_match(&pack, "ls myTRUNCATE-table-script.sh");
+        // Real TRUNCATE still blocks.
+        assert_blocks(&pack, "TRUNCATE TABLE users", "TRUNCATE");
+        assert_blocks(&pack, "psql -c 'TRUNCATE users'", "TRUNCATE");
+    }
+
+    #[test]
+    fn dropdb_pattern_requires_word_boundary() {
+        // Regression: `dropdb-cli` regex previously was `dropdb\s+`, so any
+        // word ending in `dropdb` (e.g. `superdropdb mydb` or
+        // `cat mydropdb-readme`) matched. With the keywords list including
+        // `dropdb`, even `cat superdropdb-script.sh` would be processed
+        // by this pack and `superdropdb foo` would block.
+        let pack = create_pack();
+        assert_no_match(&pack, "echo superdropdb mydb");
+        assert_no_match(&pack, "ls mydropdb-readme.md");
+        assert_no_match(&pack, "echo \"my_dropdb_alias mydb\"");
+        // Real dropdb still blocks.
+        assert_blocks(&pack, "dropdb mydb", "dropdb");
+        assert_blocks(&pack, "/usr/bin/dropdb mydb", "dropdb");
     }
 }

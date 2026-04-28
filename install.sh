@@ -1135,11 +1135,37 @@ configure_claude_code() {
     if command -v python3 >/dev/null 2>&1; then
       python3 - "$settings_file" "$DEST/dcg" "$cleanup_predecessor" <<'PYEOF'
 import json
+import os
+import shlex
 import sys
 
 settings_file = sys.argv[1]
 dcg_path = sys.argv[2]
 cleanup_predecessor = sys.argv[3] == "1" if len(sys.argv) > 3 else True
+
+def is_dcg_command(cmd):
+    """True iff `cmd` invokes the dcg binary (basename match, not substring).
+
+    Without this, a substring check `'dcg' in cmd` would match unrelated
+    user tools whose path or name happens to contain "dcg" — for example
+    /opt/dcgrep/bin/scan, ~/.local/bin/dcgworkflow, my-dcg-helper.sh —
+    causing the installer to skip merge ("dcg already there!") or, worse,
+    causing the uninstaller to delete those entries on its --purge run.
+    """
+    if not cmd:
+        return False
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        # Unparseable shell command (mismatched quotes, etc.) — treat as
+        # NOT-dcg so we don't accidentally drop or replace it.
+        return False
+    if not tokens:
+        return False
+    name = os.path.basename(tokens[0])
+    if name.endswith('.exe'):
+        name = name[:-4]
+    return name == 'dcg'
 
 try:
     with open(settings_file, 'r') as f:
@@ -1172,9 +1198,9 @@ for entry in settings['hooks']['PreToolUse']:
                             continue  # Skip predecessor
                         else:
                             bash_hooks.append(hook)  # Keep predecessor
-                    elif 'dcg' not in cmd:  # Don't duplicate dcg
+                    elif not is_dcg_command(cmd):  # Don't duplicate dcg
                         bash_hooks.append(hook)
-                    elif 'dcg' in cmd:
+                    else:
                         # Keep existing dcg hook but ensure path is updated
                         bash_hooks.append({"type": "command", "command": dcg_path})
                 else:
@@ -1184,7 +1210,11 @@ for entry in settings['hooks']['PreToolUse']:
 
 # Add dcg hook at the beginning if not already present
 dcg_hook = {"type": "command", "command": dcg_path}
-dcg_exists = any('dcg' in h.get('command', '') for h in bash_hooks if isinstance(h, dict))
+dcg_exists = any(
+    is_dcg_command(h.get('command', ''))
+    for h in bash_hooks
+    if isinstance(h, dict)
+)
 if not dcg_exists:
     bash_hooks.insert(0, dcg_hook)
 
@@ -1271,10 +1301,27 @@ configure_gemini() {
     if command -v python3 >/dev/null 2>&1; then
       python3 - "$settings_file" "$DEST/dcg" <<'PYEOF'
 import json
+import os
+import shlex
 import sys
 
 settings_file = sys.argv[1]
 dcg_path = sys.argv[2]
+
+def is_dcg_command(cmd):
+    """True iff `cmd` invokes the dcg binary (basename match, not substring)."""
+    if not cmd:
+        return False
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    name = os.path.basename(tokens[0])
+    if name.endswith('.exe'):
+        name = name[:-4]
+    return name == 'dcg'
 
 try:
     with open(settings_file, 'r') as f:
@@ -1300,7 +1347,11 @@ for entry in settings['hooks']['BeforeTool']:
 if shell_matcher:
     if 'hooks' not in shell_matcher:
         shell_matcher['hooks'] = []
-    dcg_exists = any('dcg' in h.get('command', '') for h in shell_matcher['hooks'] if isinstance(h, dict))
+    dcg_exists = any(
+        is_dcg_command(h.get('command', ''))
+        for h in shell_matcher['hooks']
+        if isinstance(h, dict)
+    )
     if not dcg_exists:
         shell_matcher['hooks'].insert(0, dcg_hook)
 else:
