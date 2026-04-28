@@ -19,6 +19,8 @@
 
 use clap::Parser;
 use colored::Colorize;
+use destructive_command_guard::agent::{Agent, detect_agent};
+use destructive_command_guard::allowlist::LayeredAllowlist;
 use destructive_command_guard::cli::{self, Cli};
 // Exit codes are used by cli.rs for robot mode; main.rs uses them for hook mode errors
 use destructive_command_guard::config::Config;
@@ -114,6 +116,38 @@ fn install_history_shutdown_handler(
         handle.flush_sync();
         std::process::exit(130);
     });
+}
+
+fn remove_disabled_packs_for_agent(
+    enabled_packs: &mut HashSet<String>,
+    config: &Config,
+    agent: &Agent,
+) {
+    let profile = config.agents.profile_for_agent(agent);
+    for disabled in &profile.disabled_packs {
+        enabled_packs.remove(disabled);
+        enabled_packs.retain(|pack| !pack.starts_with(&format!("{disabled}.")));
+    }
+}
+
+fn apply_agent_allowlist_profile(
+    config: &Config,
+    agent: &Agent,
+    mut allowlists: LayeredAllowlist,
+) -> LayeredAllowlist {
+    if config.allowlist_disabled_for_agent(agent) {
+        return LayeredAllowlist::default();
+    }
+
+    allowlists.prepend_agent_exact_commands(
+        agent.config_key(),
+        config.additional_allowlist_for_agent(agent),
+    );
+    allowlists
+}
+
+fn load_effective_allowlists_for_agent(config: &Config, agent: &Agent) -> LayeredAllowlist {
+    apply_agent_allowlist_profile(config, agent, load_default_allowlists())
 }
 
 // NOTE: Denial output functions (format_denial_message, print_colorful_warning, deny)
@@ -251,6 +285,7 @@ fn main() {
 
     // Load configuration
     let config = Config::load();
+    let detected_agent = detect_agent();
 
     // Check if bypass is requested (escape hatch)
     if Config::is_bypassed() {
@@ -269,14 +304,14 @@ fn main() {
 
     // Load layered allowlists (project/user/system). Missing/invalid files are treated
     // as empty for hook safety; allowlist decisions are only consulted on matches.
-    let allowlists = load_default_allowlists();
+    let allowlists = load_effective_allowlists_for_agent(&config, &detected_agent);
 
     // Compute effective heredoc settings once (avoid per-command parsing/allocations).
     let heredoc_settings = config.heredoc_settings();
 
     // Get enabled pack IDs early for pack-aware quick reject.
     // This is done before stdin read to minimize latency on the critical path.
-    let mut enabled_packs: HashSet<String> = config.enabled_pack_ids();
+    let mut enabled_packs: HashSet<String> = config.enabled_pack_ids_for_agent(&detected_agent);
     let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
 
     // Load external packs from custom_paths (glob + tilde expansion).
@@ -296,6 +331,7 @@ fn main() {
     for id in external_store.pack_ids() {
         enabled_packs.insert(id.clone());
     }
+    remove_disabled_packs_for_agent(&mut enabled_packs, &config, &detected_agent);
 
     // Merge external pack keywords into enabled keywords for quick rejection.
     // This ensures commands with external pack keywords are not prematurely rejected.
@@ -1267,6 +1303,176 @@ mod tests {
                 !result.blocked,
                 "docker ps should be allowed (matches safe pattern)"
             );
+        }
+    }
+
+    mod agent_profile_hook_tests {
+        use super::*;
+        use destructive_command_guard::allowlist::{
+            AllowEntry, AllowSelector, AllowlistFile, AllowlistLayer, LoadedAllowlistLayer, RuleId,
+        };
+        use destructive_command_guard::config::AgentProfile;
+        use destructive_command_guard::evaluator::EvaluationResult;
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        fn project_allowlist_for_rule(rule: &str) -> LayeredAllowlist {
+            LayeredAllowlist {
+                layers: vec![LoadedAllowlistLayer {
+                    layer: AllowlistLayer::Project,
+                    path: PathBuf::from("project-allowlist.toml"),
+                    file: AllowlistFile {
+                        entries: vec![AllowEntry {
+                            selector: AllowSelector::Rule(
+                                RuleId::parse(rule).expect("rule id should parse"),
+                            ),
+                            reason: "project override".to_string(),
+                            added_by: None,
+                            added_at: None,
+                            expires_at: None,
+                            ttl: None,
+                            session: None,
+                            session_id: None,
+                            context: None,
+                            conditions: HashMap::new(),
+                            environments: Vec::new(),
+                            paths: None,
+                            risk_acknowledged: false,
+                        }],
+                        errors: Vec::new(),
+                    },
+                }],
+            }
+        }
+
+        fn evaluate_with_agent(config: &Config, agent: &Agent, command: &str) -> EvaluationResult {
+            let mut enabled_packs = config.enabled_pack_ids_for_agent(agent);
+            remove_disabled_packs_for_agent(&mut enabled_packs, config, agent);
+            let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
+            let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
+            let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
+            let compiled_overrides = config.overrides.compile();
+            let allowlists =
+                apply_agent_allowlist_profile(config, agent, LayeredAllowlist::default());
+
+            evaluate_command_with_pack_order_deadline_at_path(
+                command,
+                &enabled_keywords,
+                &ordered_packs,
+                keyword_index.as_ref(),
+                &compiled_overrides,
+                &allowlists,
+                &config.heredoc_settings(),
+                None,
+                None,
+                None,
+            )
+        }
+
+        #[test]
+        fn hook_agent_disabled_allowlist_ignores_base_and_agent_entries() {
+            let mut config = Config::default();
+            config.agents.profiles.insert(
+                "unknown".to_string(),
+                AgentProfile {
+                    disabled_allowlist: true,
+                    additional_allowlist: vec!["git reset --hard".to_string()],
+                    ..Default::default()
+                },
+            );
+
+            let allowlists = apply_agent_allowlist_profile(
+                &config,
+                &Agent::Unknown,
+                project_allowlist_for_rule("core.git:reset-hard"),
+            );
+
+            assert!(
+                allowlists.layers.is_empty(),
+                "disabled_allowlist should suppress project/user/system and agent entries"
+            );
+
+            let compiled_overrides = config.overrides.compile();
+            let result = destructive_command_guard::evaluate_command(
+                "git reset --hard",
+                &config,
+                &["git"],
+                &compiled_overrides,
+                &allowlists,
+            );
+
+            assert_eq!(result.decision, EvaluationDecision::Deny);
+            assert!(result.allowlist_override.is_none());
+        }
+
+        #[test]
+        fn hook_agent_additional_allowlist_allows_exact_command() {
+            let mut config = Config::default();
+            config.agents.profiles.insert(
+                "claude-code".to_string(),
+                AgentProfile {
+                    additional_allowlist: vec!["git reset --hard".to_string()],
+                    ..Default::default()
+                },
+            );
+
+            let allowlists = apply_agent_allowlist_profile(
+                &config,
+                &Agent::ClaudeCode,
+                LayeredAllowlist::default(),
+            );
+            let compiled_overrides = config.overrides.compile();
+            let result = destructive_command_guard::evaluate_command(
+                "git reset --hard",
+                &config,
+                &["git"],
+                &compiled_overrides,
+                &allowlists,
+            );
+
+            assert_eq!(result.decision, EvaluationDecision::Allow);
+            assert_eq!(allowlists.layers[0].layer, AllowlistLayer::Agent);
+        }
+
+        #[test]
+        fn hook_agent_extra_packs_participate_in_evaluation() {
+            let mut config = Config::default();
+            config.agents.profiles.insert(
+                "unknown".to_string(),
+                AgentProfile {
+                    extra_packs: vec!["containers.docker".to_string()],
+                    ..Default::default()
+                },
+            );
+
+            let result = evaluate_with_agent(&config, &Agent::Unknown, "docker system prune");
+
+            assert_eq!(result.decision, EvaluationDecision::Deny);
+            assert_eq!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pack_id.as_deref()),
+                Some("containers.docker")
+            );
+        }
+
+        #[test]
+        fn hook_agent_disabled_packs_are_removed_from_evaluation() {
+            let mut config = Config::default();
+            config.packs.enabled = vec!["containers.docker".to_string()];
+            config.agents.profiles.insert(
+                "unknown".to_string(),
+                AgentProfile {
+                    disabled_packs: vec!["containers".to_string()],
+                    ..Default::default()
+                },
+            );
+
+            let result = evaluate_with_agent(&config, &Agent::Unknown, "docker system prune");
+
+            assert_eq!(result.decision, EvaluationDecision::Allow);
+            assert!(result.pattern_info.is_none());
         }
     }
 

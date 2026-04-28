@@ -10725,6 +10725,7 @@ fn diagnose_allowlists() -> AllowlistDiagnostics {
 
         // Count as found if path exists
         let path = match loaded.layer {
+            AllowlistLayer::Agent => continue,
             AllowlistLayer::Project => {
                 if let Some(repo_root) = find_repo_root_from_cwd() {
                     repo_root.join(".dcg").join("allowlist.toml")
@@ -10825,6 +10826,7 @@ fn find_repo_root_from_cwd() -> Option<std::path::PathBuf> {
 /// Get the path to the allowlist file for a given layer.
 fn allowlist_path_for_layer(layer: AllowlistLayer) -> std::path::PathBuf {
     match layer {
+        AllowlistLayer::Agent => std::path::PathBuf::from("<agent-profile>"),
         AllowlistLayer::Project => {
             let repo_root = find_repo_root_from_cwd()
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());

@@ -833,6 +833,7 @@ impl EvalSnapshot {
                 });
 
         let allowlist_layer = result.allowlist_override.as_ref().map(|ao| match ao.layer {
+            AllowlistLayer::Agent => "agent".to_string(),
             AllowlistLayer::Project => "project".to_string(),
             AllowlistLayer::User => "user".to_string(),
             AllowlistLayer::System => "system".to_string(),

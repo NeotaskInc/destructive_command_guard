@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 /// Allowlist layer identity (used for precedence and diagnostics).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AllowlistLayer {
+    Agent,
     Project,
     User,
     System,
@@ -30,6 +31,7 @@ impl AllowlistLayer {
     #[must_use]
     pub const fn label(&self) -> &'static str {
         match self {
+            Self::Agent => "agent",
             Self::Project => "project",
             Self::User => "user",
             Self::System => "system",
@@ -211,6 +213,56 @@ impl LayeredAllowlist {
         }
 
         Self { layers }
+    }
+
+    /// Prepend agent-profile exact command entries to the allowlist stack.
+    ///
+    /// Agent profile entries have the highest precedence and are intentionally
+    /// exact-command only. The config field is named `additional_allowlist`, but
+    /// accepting these strings as regexes would create a bypass path without the
+    /// normal `risk_acknowledged` review gate.
+    pub fn prepend_agent_exact_commands(&mut self, agent_key: &str, commands: &[String]) {
+        let entries: Vec<AllowEntry> = commands
+            .iter()
+            .filter_map(|command| {
+                let command = command.trim();
+                if command.is_empty() {
+                    return None;
+                }
+
+                Some(AllowEntry {
+                    selector: AllowSelector::ExactCommand(command.to_string()),
+                    reason: format!("agent profile `{agent_key}` additional allowlist"),
+                    added_by: Some(format!("agent-profile:{agent_key}")),
+                    added_at: None,
+                    expires_at: None,
+                    ttl: None,
+                    session: None,
+                    session_id: None,
+                    context: None,
+                    conditions: HashMap::new(),
+                    environments: Vec::new(),
+                    paths: None,
+                    risk_acknowledged: false,
+                })
+            })
+            .collect();
+
+        if entries.is_empty() {
+            return;
+        }
+
+        self.layers.insert(
+            0,
+            LoadedAllowlistLayer {
+                layer: AllowlistLayer::Agent,
+                path: PathBuf::from("<agent-profile>"),
+                file: AllowlistFile {
+                    entries,
+                    errors: Vec::new(),
+                },
+            },
+        );
     }
 
     /// Find the first matching rule entry across layers (project > user > system).
