@@ -4079,4 +4079,184 @@ mod tests {
             assert!(!branch_context.affected_decision);
         }
     }
+
+    mod heredoc_fail_open {
+        use super::*;
+
+        fn heredoc_config(
+            fallback_on_parse_error: bool,
+            fallback_on_timeout: bool,
+        ) -> crate::config::HeredocSettings {
+            crate::config::HeredocSettings {
+                enabled: true,
+                fallback_on_parse_error,
+                fallback_on_timeout,
+                limits: crate::heredoc::ExtractionLimits::default(),
+                allowed_languages: None,
+                content_allowlist: None,
+            }
+        }
+
+        fn heredoc_config_with_limits(
+            limits: crate::heredoc::ExtractionLimits,
+        ) -> crate::config::HeredocSettings {
+            crate::config::HeredocSettings {
+                enabled: true,
+                fallback_on_parse_error: true,
+                fallback_on_timeout: true,
+                limits,
+                allowed_languages: None,
+                content_allowlist: None,
+            }
+        }
+
+        fn eval_with_heredoc(
+            command: &str,
+            settings: &crate::config::HeredocSettings,
+        ) -> EvaluationResult {
+            let config = default_config();
+            let enabled_packs = config.enabled_pack_ids();
+            let ordered_packs =
+                crate::packs::REGISTRY.expand_enabled_ordered(&enabled_packs);
+            let enabled_keywords =
+                crate::packs::REGISTRY.collect_enabled_keywords(&enabled_packs);
+            let keyword_index =
+                crate::packs::REGISTRY.build_enabled_keyword_index(&ordered_packs);
+            let compiled = default_compiled_overrides();
+            let allowlists = default_allowlists();
+
+            evaluate_command_with_pack_order(
+                command,
+                enabled_keywords.as_slice(),
+                ordered_packs.as_slice(),
+                keyword_index.as_ref(),
+                &compiled,
+                &allowlists,
+                settings,
+            )
+        }
+
+        #[test]
+        fn unterminated_heredoc_allows_in_failopen_mode() {
+            let settings = heredoc_config(true, true);
+            let cmd = "python3 -c 'import shutil' << EOF\nsome content without closing";
+            let result = eval_with_heredoc(cmd, &settings);
+            assert!(
+                result.is_allowed(),
+                "unterminated heredoc should fail-open when fallback_on_parse_error=true"
+            );
+        }
+
+        #[test]
+        fn exceeded_size_limit_allows_in_failopen_mode() {
+            let limits = crate::heredoc::ExtractionLimits {
+                max_body_bytes: 10,
+                max_body_lines: 10_000,
+                max_heredocs: 10,
+                timeout_ms: 50,
+            };
+            let settings = heredoc_config_with_limits(limits);
+            let cmd = "bash -c 'echo test' << EOF\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\nEOF";
+            let result = eval_with_heredoc(cmd, &settings);
+            assert!(
+                result.is_allowed(),
+                "exceeded size limit should fail-open with default settings"
+            );
+        }
+
+        #[test]
+        fn exceeded_line_limit_allows_in_failopen_mode() {
+            let limits = crate::heredoc::ExtractionLimits {
+                max_body_bytes: 1024 * 1024,
+                max_body_lines: 1,
+                max_heredocs: 10,
+                timeout_ms: 50,
+            };
+            let settings = heredoc_config_with_limits(limits);
+            let cmd = "bash -c 'echo test' << EOF\nline1\nline2\nline3\nEOF";
+            let result = eval_with_heredoc(cmd, &settings);
+            assert!(
+                result.is_allowed(),
+                "exceeded line limit should fail-open with default settings"
+            );
+        }
+
+        #[test]
+        fn exceeded_heredoc_limit_allows_in_failopen_mode() {
+            let limits = crate::heredoc::ExtractionLimits {
+                max_body_bytes: 1024 * 1024,
+                max_body_lines: 10_000,
+                max_heredocs: 0,
+                timeout_ms: 50,
+            };
+            let settings = heredoc_config_with_limits(limits);
+            let cmd = "bash -c 'echo test' << EOF\ncontent\nEOF";
+            let result = eval_with_heredoc(cmd, &settings);
+            assert!(
+                result.is_allowed(),
+                "exceeded heredoc limit should fail-open with default settings"
+            );
+        }
+
+        #[test]
+        fn binary_content_allows_in_failopen_mode() {
+            let settings = heredoc_config(true, true);
+            let cmd = "python3 -c '\x00\x01\x02\x03\x04\x05\x06\x07'";
+            let result = eval_with_heredoc(cmd, &settings);
+            assert!(
+                result.is_allowed(),
+                "binary content should fail-open with default settings"
+            );
+        }
+
+        #[test]
+        fn strict_parse_error_denies_on_unterminated_heredoc() {
+            let settings = heredoc_config(false, true);
+            let cmd = "cat << EOF\ncontent without closing delimiter";
+            let result = eval_with_heredoc(cmd, &settings);
+            assert!(
+                result.is_denied(),
+                "unterminated heredoc should deny when fallback_on_parse_error=false, \
+                 got: {result:?}"
+            );
+        }
+
+        #[test]
+        fn strict_parse_error_denies_on_exceeded_size() {
+            let mut settings = heredoc_config(false, true);
+            settings.limits.max_body_bytes = 5;
+            let cmd = "cat << EOF\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\nEOF";
+            let result = eval_with_heredoc(cmd, &settings);
+            assert!(
+                result.is_denied(),
+                "exceeded size should deny when fallback_on_parse_error=false, \
+                 got: {result:?}"
+            );
+        }
+
+        #[test]
+        fn heredoc_disabled_skips_all_extraction() {
+            let settings = crate::config::HeredocSettings {
+                enabled: false,
+                ..Default::default()
+            };
+            let cmd = "python3 -c 'import shutil; shutil.rmtree(\"/tmp\")'";
+            let result = eval_with_heredoc(cmd, &settings);
+            assert!(
+                result.is_allowed(),
+                "with heredoc disabled, inline scripts should not be analyzed"
+            );
+        }
+
+        #[test]
+        fn safe_command_with_heredoc_trigger_still_allowed() {
+            let settings = heredoc_config(true, true);
+            let cmd = "python3 -c 'print(42)'";
+            let result = eval_with_heredoc(cmd, &settings);
+            assert!(
+                result.is_allowed(),
+                "safe heredoc content should be allowed"
+            );
+        }
+    }
 }
