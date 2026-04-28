@@ -1717,6 +1717,31 @@ block = [
     }
 
     #[test]
+    fn hook_mode_config_block_wins_over_overlapping_allow_override() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("dcg.toml");
+        std::fs::write(
+            &config_path,
+            r"
+[overrides]
+allow = ['git reset --hard']
+block = [
+  { pattern = 'git reset --hard', reason = 'explicit config block' },
+]
+",
+        )
+        .expect("write dcg config");
+
+        let result = run_dcg_hook_in_dir_with_env(
+            temp.path(),
+            "git reset --hard",
+            &[("DCG_CONFIG", config_path.as_os_str())],
+        );
+
+        assert_hook_denies_output(&result, "explicit config block");
+    }
+
+    #[test]
     fn hook_mode_allow_once_can_override_config_block_with_force_flag() {
         let temp = tempfile::tempdir().expect("tempdir");
         let allow_once_path = temp.path().join("allow_once.jsonl");

@@ -7,8 +7,8 @@
 //!
 //! The evaluator performs the following steps in order:
 //!
-//! 1. **Config allow overrides** - Check if command matches an explicit allow pattern
-//! 2. **Config block overrides** - Check if command matches an explicit block pattern
+//! 1. **Config block overrides** - Explicit block patterns deny before allow patterns
+//! 2. **Config allow overrides** - Explicit allow patterns permit non-blocked commands
 //! 3. **Heredoc/inline scripts** - Extract + AST-scan embedded code (fail-open)
 //! 4. **Quick rejection** - Skip pack evaluation if no relevant keywords present
 //! 5. **Context sanitization** - Mask known-safe string arguments (reduce false positives)
@@ -1246,17 +1246,19 @@ pub fn evaluate_command_with_pack_order_deadline_at_path(
         return EvaluationResult::allowed();
     }
 
-    // Step 1: Check precompiled allow overrides first
-    if compiled_overrides.check_allow(command) {
-        return EvaluationResult::allowed();
-    }
-
-    // Step 1.5: Check precompiled block overrides (allow-once may optionally override).
+    // Step 1: Check precompiled block overrides first. Deny wins when
+    // allow/block override patterns overlap; only a force allow-once exception
+    // may intentionally bypass an explicit config block.
     if let Some(reason) = compiled_overrides.check_block(command) {
         if allow_once_match_force_config(command, allow_once_audit).is_some() {
             return EvaluationResult::allowed();
         }
         return EvaluationResult::denied_by_config(reason.to_string());
+    }
+
+    // Step 1.5: Check precompiled allow overrides after blocks.
+    if compiled_overrides.check_allow(command) {
+        return EvaluationResult::allowed();
     }
 
     if deadline_exceeded(deadline) {
@@ -1717,15 +1719,12 @@ where
         return EvaluationResult::allowed();
     }
 
-    // Step 1: Check precompiled allow overrides first
-    if compiled_overrides.check_allow(command) {
-        return EvaluationResult::allowed();
-    }
-
-    // Step 1.5: Check allow-once overrides (may be superseded by config blocklist).
+    // Step 1: Check allow-once overrides (may be superseded by config blocklist).
     let allow_once = allow_once_match(command, None);
 
-    // Step 2: Check precompiled block overrides
+    // Step 2: Check precompiled block overrides before allow overrides. Deny
+    // wins on overlapping config overrides unless allow-once was granted with
+    // force_allow_config.
     if let Some(reason) = compiled_overrides.check_block(command) {
         if allow_once
             .as_ref()
@@ -1734,6 +1733,10 @@ where
             return EvaluationResult::allowed();
         }
         return EvaluationResult::denied_by_config(reason.to_string());
+    }
+
+    if compiled_overrides.check_allow(command) {
+        return EvaluationResult::allowed();
     }
 
     if allow_once.is_some() {
@@ -3152,6 +3155,69 @@ mod tests {
         );
         assert!(result.is_allowed());
         assert!(result.allowlist_override.is_some());
+    }
+
+    #[test]
+    fn config_block_override_wins_over_overlapping_allow_in_main_path() {
+        let mut config = default_config();
+        config.overrides.allow = vec![crate::config::AllowOverride::Simple(
+            r"\bgit\s+reset\s+--hard\b".to_string(),
+        )];
+        config.overrides.block = vec![crate::config::BlockOverride {
+            pattern: r"\bgit\s+reset\s+--hard\b".to_string(),
+            reason: "explicit config block".to_string(),
+        }];
+
+        let compiled = config.overrides.compile();
+        let allowlists = default_allowlists();
+        let result = evaluate_command(
+            "git reset --hard",
+            &config,
+            &["git"],
+            &compiled,
+            &allowlists,
+        );
+
+        assert!(result.is_denied());
+        assert_eq!(result.reason(), Some("explicit config block"));
+        assert_eq!(
+            result.pattern_info.as_ref().unwrap().source,
+            MatchSource::ConfigOverride
+        );
+    }
+
+    #[test]
+    fn config_block_override_wins_over_overlapping_allow_in_legacy_path() {
+        let mut config = default_config();
+        config.overrides.allow = vec![crate::config::AllowOverride::Simple(
+            r"\bgit\s+reset\s+--hard\b".to_string(),
+        )];
+        config.overrides.block = vec![crate::config::BlockOverride {
+            pattern: r"\bgit\s+reset\s+--hard\b".to_string(),
+            reason: "explicit config block".to_string(),
+        }];
+
+        let compiled = config.overrides.compile();
+        let allowlists = default_allowlists();
+        let result = evaluate_command_with_legacy::<
+            crate::packs::SafePattern,
+            crate::packs::DestructivePattern,
+        >(
+            "git reset --hard",
+            &config,
+            &["git"],
+            &compiled,
+            &allowlists,
+            &[],
+            &[],
+        );
+
+        assert!(result.is_denied());
+        assert_eq!(result.reason(), Some("explicit config block"));
+        assert_eq!(
+            result.pattern_info.as_ref().unwrap().source,
+            MatchSource::ConfigOverride
+        );
     }
 
     // =========================================================================

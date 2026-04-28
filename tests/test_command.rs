@@ -155,6 +155,53 @@ allow = ["git reset --hard"]
 }
 
 #[test]
+fn test_config_block_override_wins_over_overlapping_allow_override() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let config_path = temp.path().join("custom.toml");
+    std::fs::write(
+        &config_path,
+        r#"
+[overrides]
+allow = ["git reset --hard"]
+block = [
+  { pattern = "git reset --hard", reason = "explicit config block" },
+]
+"#,
+    )
+    .expect("write config");
+
+    let config_arg = config_path.to_string_lossy().to_string();
+    let output = run_dcg_isolated(
+        &[
+            "test",
+            "--format",
+            "json",
+            "--config",
+            config_arg.as_str(),
+            "git reset --hard",
+        ],
+        None,
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "overlapping config block should deny command\nstdout: {}\nstderr: {}",
+        stdout_text(&output),
+        stderr_text(&output)
+    );
+
+    let json = parse_json(&output);
+    assert_eq!(json["decision"], "deny");
+    assert!(
+        stdout_text(&output).contains("explicit config block"),
+        "deny output should include config block reason\nstdout: {}\nstderr: {}",
+        stdout_text(&output),
+        stderr_text(&output)
+    );
+}
+
+#[test]
 fn test_project_config_discovery_is_applied_without_config_flag() {
     let repo = tempfile::tempdir().expect("temp repo");
     std::fs::create_dir_all(repo.path().join(".git")).expect("create .git marker");
