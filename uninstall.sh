@@ -108,9 +108,33 @@ unconfigure_claude_code() {
     if command -v python3 >/dev/null 2>&1; then
         python3 - "$settings" <<'PYEOF'
 import json
+import os
+import shlex
 import sys
 
 settings_file = sys.argv[1]
+
+def is_dcg_command(cmd):
+    """True iff `cmd` invokes the dcg binary (basename match, not substring).
+
+    Uninstall correctness is critical here: a substring check would
+    drop hooks for unrelated tools whose path or name happens to
+    contain "dcg" (e.g. /opt/dcgrep/bin/scan, ~/.local/bin/dcgworkflow,
+    custom-dcg-helper.sh). Since this code can DELETE entries, false
+    positives correspond to data loss for the user's other tooling.
+    """
+    if not cmd:
+        return False
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    name = os.path.basename(tokens[0])
+    if name.endswith('.exe'):
+        name = name[:-4]
+    return name == 'dcg'
 
 try:
     with open(settings_file, 'r') as f:
@@ -127,12 +151,15 @@ pre_tool_use = settings['hooks']['PreToolUse']
 if not isinstance(pre_tool_use, list):
     sys.exit(0)
 
-# Filter out dcg hooks
+# Filter out ONLY dcg hooks (basename match)
 new_hooks = []
 for entry in pre_tool_use:
     if isinstance(entry, dict) and entry.get('matcher') == 'Bash':
         hooks = entry.get('hooks', [])
-        filtered = [h for h in hooks if 'dcg' not in h.get('command', '')]
+        filtered = [
+            h for h in hooks
+            if not (isinstance(h, dict) and is_dcg_command(h.get('command', '')))
+        ]
         if filtered:
             entry['hooks'] = filtered
             new_hooks.append(entry)
@@ -170,9 +197,26 @@ unconfigure_gemini() {
     if command -v python3 >/dev/null 2>&1; then
         python3 - "$settings" <<'PYEOF'
 import json
+import os
+import shlex
 import sys
 
 settings_file = sys.argv[1]
+
+def is_dcg_command(cmd):
+    """True iff `cmd` invokes the dcg binary (basename match, not substring)."""
+    if not cmd:
+        return False
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    name = os.path.basename(tokens[0])
+    if name.endswith('.exe'):
+        name = name[:-4]
+    return name == 'dcg'
 
 try:
     with open(settings_file, 'r') as f:
@@ -189,12 +233,15 @@ before_tool = settings['hooks']['BeforeTool']
 if not isinstance(before_tool, list):
     sys.exit(0)
 
-# Filter out dcg hooks
+# Filter out ONLY dcg hooks (basename match)
 new_hooks = []
 for entry in before_tool:
     if isinstance(entry, dict):
         hooks = entry.get('hooks', [])
-        filtered = [h for h in hooks if 'dcg' not in h.get('command', '')]
+        filtered = [
+            h for h in hooks
+            if not (isinstance(h, dict) and is_dcg_command(h.get('command', '')))
+        ]
         if filtered:
             entry['hooks'] = filtered
             new_hooks.append(entry)

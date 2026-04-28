@@ -1626,10 +1626,27 @@ PYEOF
     if command -v python3 >/dev/null 2>&1; then
       python3 - "$settings_file" "$DEST/dcg" <<'PYEOF'
 import json
+import os
+import shlex
 import sys
 
 hooks_file = sys.argv[1]
 dcg_path = sys.argv[2]
+
+def is_dcg_command(cmd):
+    """True iff `cmd` invokes the dcg binary (basename match, not substring)."""
+    if not cmd:
+        return False
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    name = os.path.basename(tokens[0])
+    if name.endswith('.exe'):
+        name = name[:-4]
+    return name == 'dcg'
 
 try:
     with open(hooks_file, 'r') as f:
@@ -1653,9 +1670,9 @@ for entry in config['hooks']['PreToolUse']:
             for hook in entry['hooks']:
                 if isinstance(hook, dict) and 'command' in hook:
                     cmd = str(hook.get('command', ''))
-                    if 'dcg' not in cmd:  # Don't duplicate dcg
+                    if not is_dcg_command(cmd):  # Don't duplicate dcg
                         bash_hooks.append(hook)
-                    elif 'dcg' in cmd:
+                    else:
                         # Keep existing dcg hook but ensure path is updated
                         bash_hooks.append({"type": "command", "command": dcg_path})
                 else:
@@ -1665,7 +1682,11 @@ for entry in config['hooks']['PreToolUse']:
 
 # Add dcg hook at the beginning if not already present
 dcg_hook = {"type": "command", "command": dcg_path}
-dcg_exists = any('dcg' in h.get('command', '') for h in bash_hooks if isinstance(h, dict))
+dcg_exists = any(
+    is_dcg_command(h.get('command', ''))
+    for h in bash_hooks
+    if isinstance(h, dict)
+)
 if not dcg_exists:
     bash_hooks.insert(0, dcg_hook)
 
