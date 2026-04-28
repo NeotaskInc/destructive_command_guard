@@ -68,6 +68,30 @@ As of 2026-01-09, CI enforces the initial targets:
 Threshold enforcement lives in `.github/workflows/ci.yml` under the
 "Check coverage thresholds (enforced)" step.
 
+The same thresholds are also enforced by `scripts/coverage.sh`, which writes
+`coverage-summary.txt` for human review and `coverage.json` for file-level
+checks. The script fails if overall, `src/evaluator.rs`, or `src/hook.rs`
+coverage falls below the targets above.
+
+### Codex Hook Protocol Coverage (2026-04-28)
+
+The Codex-specific match arms in `src/hook.rs` are covered without spawning the
+real `dcg` binary:
+
+- `test_write_denial_codex_produces_empty_stdout` exercises
+  `write_denial_to(..., HookProtocol::Codex, ...)` and verifies the Codex
+  contract: zero stdout bytes and a non-empty stderr denial.
+- `test_write_warning_codex_produces_empty_stdout` exercises
+  `write_warning_to(..., HookProtocol::Codex, ...)` and verifies warnings use
+  stderr only for Codex.
+- Protocol detection tests cover `turn_id` / `turnId` payloads and confirm they
+  resolve to `HookProtocol::Codex`.
+
+These tests keep the Codex deny/warn formatting arms visible to the
+`src/hook.rs >= 80%` coverage gate. They intentionally use injected
+`Vec<u8>` writers so coverage can observe formatting behavior without relying
+on process exit semantics.
+
 ## Mock/Fake Inventory
 
 ### 1. MockSafePattern / MockDestructivePattern (evaluator.rs)

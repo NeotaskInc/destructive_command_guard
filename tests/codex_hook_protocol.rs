@@ -568,10 +568,7 @@ fn claude_deny_matrix_multiple_destructive_commands() {
         );
         assert!(
             hso["permissionDecisionReason"].is_string()
-                && !hso["permissionDecisionReason"]
-                    .as_str()
-                    .unwrap()
-                    .is_empty(),
+                && !hso["permissionDecisionReason"].as_str().unwrap().is_empty(),
             "permissionDecisionReason must be non-empty string for '{cmd}'\n{outcome}"
         );
 
@@ -742,10 +739,7 @@ fn claude_warn_path_exits_zero_with_ask_json() {
         home_dir: home.path().to_path_buf(),
     };
 
-    assert_eq!(
-        outcome.exit_code, 0,
-        "Claude warn must exit 0\n{outcome}"
-    );
+    assert_eq!(outcome.exit_code, 0, "Claude warn must exit 0\n{outcome}");
     assert!(
         !outcome.stdout.is_empty(),
         "Claude warn must produce stdout JSON (unlike Codex warn which has empty stdout)\n{outcome}"
@@ -800,8 +794,7 @@ fn claude_bypass_destructive_command_fully_silent() {
 
 #[test]
 fn claude_bypass_empty_string_also_triggers() {
-    let outcome =
-        run_claude_hook_with_env("git reset --hard HEAD~1", &[("DCG_BYPASS", "")], &[]);
+    let outcome = run_claude_hook_with_env("git reset --hard HEAD~1", &[("DCG_BYPASS", "")], &[]);
     assert_eq!(
         outcome.exit_code, 0,
         "DCG_BYPASS='' (empty) must still trigger bypass\n{outcome}"
@@ -994,8 +987,14 @@ fn cross_protocol_deny_structural_parity() {
     let claude = run_claude_hook(cmd);
 
     // Both block the command
-    assert!(codex.is_codex_block_shape(), "Codex block shape expected\n{codex}");
-    assert!(claude.is_claude_block_shape(), "Claude block shape expected\n{claude}");
+    assert!(
+        codex.is_codex_block_shape(),
+        "Codex block shape expected\n{codex}"
+    );
+    assert!(
+        claude.is_claude_block_shape(),
+        "Claude block shape expected\n{claude}"
+    );
 
     // Codex: exit 2, no stdout
     assert_eq!(codex.exit_code, 2);
@@ -1008,7 +1007,10 @@ fn cross_protocol_deny_structural_parity() {
 
     // Both have non-empty stderr (the human-readable deny block)
     assert!(!codex.stderr.is_empty(), "Codex must have stderr\n{codex}");
-    assert!(!claude.stderr.is_empty(), "Claude must have stderr\n{claude}");
+    assert!(
+        !claude.stderr.is_empty(),
+        "Claude must have stderr\n{claude}"
+    );
 
     // Both stderr mention the command
     assert!(
@@ -1054,69 +1056,117 @@ fn cross_protocol_allow_structural_parity() {
 #[test]
 fn failopen_not_json_at_all() {
     let outcome = run_hook_raw(b"not-json-at-all", &[]);
-    assert_eq!(outcome.exit_code, 0, "malformed input must fail-open\n{outcome}");
-    assert!(outcome.stdout.is_empty(), "no stdout on fail-open\n{outcome}");
+    assert_eq!(
+        outcome.exit_code, 0,
+        "malformed input must fail-open\n{outcome}"
+    );
+    assert!(
+        outcome.stdout.is_empty(),
+        "no stdout on fail-open\n{outcome}"
+    );
 }
 
 #[test]
 fn failopen_incomplete_json_brace() {
     let outcome = run_hook_raw(b"{", &[]);
-    assert_eq!(outcome.exit_code, 0, "incomplete JSON must fail-open\n{outcome}");
-    assert!(outcome.stdout.is_empty(), "no stdout on fail-open\n{outcome}");
+    assert_eq!(
+        outcome.exit_code, 0,
+        "incomplete JSON must fail-open\n{outcome}"
+    );
+    assert!(
+        outcome.stdout.is_empty(),
+        "no stdout on fail-open\n{outcome}"
+    );
 }
 
 #[test]
 fn failopen_json_null() {
     let outcome = run_hook_raw(b"null", &[]);
     assert_eq!(outcome.exit_code, 0, "JSON null must fail-open\n{outcome}");
-    assert!(outcome.stdout.is_empty(), "no stdout on fail-open\n{outcome}");
+    assert!(
+        outcome.stdout.is_empty(),
+        "no stdout on fail-open\n{outcome}"
+    );
 }
 
 #[test]
 fn failopen_json_array() {
     let outcome = run_hook_raw(b"[]", &[]);
     assert_eq!(outcome.exit_code, 0, "JSON array must fail-open\n{outcome}");
-    assert!(outcome.stdout.is_empty(), "no stdout on fail-open\n{outcome}");
+    assert!(
+        outcome.stdout.is_empty(),
+        "no stdout on fail-open\n{outcome}"
+    );
 }
 
 #[test]
 fn failopen_json_missing_tool_input() {
     let payload = br#"{ "tool_name": "Bash" }"#;
     let outcome = run_hook_raw(payload, &[]);
-    assert_eq!(outcome.exit_code, 0, "missing tool_input must fail-open\n{outcome}");
-    assert!(outcome.stdout.is_empty(), "no stdout on fail-open\n{outcome}");
+    assert_eq!(
+        outcome.exit_code, 0,
+        "missing tool_input must fail-open\n{outcome}"
+    );
+    assert!(
+        outcome.stdout.is_empty(),
+        "no stdout on fail-open\n{outcome}"
+    );
 }
 
 #[test]
 fn failopen_json_tool_input_null() {
     let payload = br#"{ "tool_name": "Bash", "tool_input": null }"#;
     let outcome = run_hook_raw(payload, &[]);
-    assert_eq!(outcome.exit_code, 0, "null tool_input must fail-open\n{outcome}");
-    assert!(outcome.stdout.is_empty(), "no stdout on fail-open\n{outcome}");
+    assert_eq!(
+        outcome.exit_code, 0,
+        "null tool_input must fail-open\n{outcome}"
+    );
+    assert!(
+        outcome.stdout.is_empty(),
+        "no stdout on fail-open\n{outcome}"
+    );
 }
 
 #[test]
 fn failopen_json_command_is_number() {
     let payload = br#"{ "tool_name": "Bash", "tool_input": { "command": 42 } }"#;
     let outcome = run_hook_raw(payload, &[]);
-    assert_eq!(outcome.exit_code, 0, "numeric command must fail-open\n{outcome}");
-    assert!(outcome.stdout.is_empty(), "no stdout on fail-open\n{outcome}");
+    assert_eq!(
+        outcome.exit_code, 0,
+        "numeric command must fail-open\n{outcome}"
+    );
+    assert!(
+        outcome.stdout.is_empty(),
+        "no stdout on fail-open\n{outcome}"
+    );
 }
 
 #[test]
 fn failopen_json_command_is_array() {
     let payload = br#"{ "tool_name": "Bash", "tool_input": { "command": ["git", "reset"] } }"#;
     let outcome = run_hook_raw(payload, &[]);
-    assert_eq!(outcome.exit_code, 0, "array command must fail-open\n{outcome}");
-    assert!(outcome.stdout.is_empty(), "no stdout on fail-open\n{outcome}");
+    assert_eq!(
+        outcome.exit_code, 0,
+        "array command must fail-open\n{outcome}"
+    );
+    assert!(
+        outcome.stdout.is_empty(),
+        "no stdout on fail-open\n{outcome}"
+    );
 }
 
 #[test]
 fn failopen_json_command_is_object() {
     let payload = br#"{ "tool_name": "Bash", "tool_input": { "command": {"cmd": "git reset"} } }"#;
     let outcome = run_hook_raw(payload, &[]);
-    assert_eq!(outcome.exit_code, 0, "object command must fail-open\n{outcome}");
-    assert!(outcome.stdout.is_empty(), "no stdout on fail-open\n{outcome}");
+    assert_eq!(
+        outcome.exit_code, 0,
+        "object command must fail-open\n{outcome}"
+    );
+    assert!(
+        outcome.stdout.is_empty(),
+        "no stdout on fail-open\n{outcome}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1126,8 +1176,14 @@ fn failopen_json_command_is_object() {
 #[test]
 fn failopen_empty_stdin() {
     let outcome = run_hook_raw(b"", &[]);
-    assert_eq!(outcome.exit_code, 0, "empty stdin must fail-open\n{outcome}");
-    assert!(outcome.stdout.is_empty(), "no stdout on fail-open\n{outcome}");
+    assert_eq!(
+        outcome.exit_code, 0,
+        "empty stdin must fail-open\n{outcome}"
+    );
+    assert!(
+        outcome.stdout.is_empty(),
+        "no stdout on fail-open\n{outcome}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1138,8 +1194,14 @@ fn failopen_empty_stdin() {
 fn failopen_truncated_json() {
     let payload = br#"{ "tool_name": "Bash", "tool_input": { "command": "git reset --ha"#;
     let outcome = run_hook_raw(payload, &[]);
-    assert_eq!(outcome.exit_code, 0, "truncated JSON must fail-open\n{outcome}");
-    assert!(outcome.stdout.is_empty(), "no stdout on fail-open\n{outcome}");
+    assert_eq!(
+        outcome.exit_code, 0,
+        "truncated JSON must fail-open\n{outcome}"
+    );
+    assert!(
+        outcome.stdout.is_empty(),
+        "no stdout on fail-open\n{outcome}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1150,15 +1212,17 @@ fn failopen_truncated_json() {
 fn failopen_oversize_stdin() {
     // Default limit is 256 KiB. Send 300 KiB of valid-looking JSON.
     let padding = "x".repeat(300 * 1024);
-    let payload = format!(
-        r#"{{ "tool_name": "Bash", "tool_input": {{ "command": "{padding}" }} }}"#
-    );
+    let payload =
+        format!(r#"{{ "tool_name": "Bash", "tool_input": {{ "command": "{padding}" }} }}"#);
     let outcome = run_hook_raw(payload.as_bytes(), &[]);
     assert_eq!(
         outcome.exit_code, 0,
         "oversize stdin must fail-open\n{outcome}"
     );
-    assert!(outcome.stdout.is_empty(), "no stdout on fail-open\n{outcome}");
+    assert!(
+        outcome.stdout.is_empty(),
+        "no stdout on fail-open\n{outcome}"
+    );
     assert!(
         outcome.stderr_contains("exceeds limit"),
         "stderr must mention 'exceeds limit' for oversize stdin\n{outcome}"
@@ -1179,7 +1243,10 @@ fn failopen_oversize_command() {
         outcome.exit_code, 0,
         "oversize command must fail-open\n{outcome}"
     );
-    assert!(outcome.stdout.is_empty(), "no stdout on fail-open\n{outcome}");
+    assert!(
+        outcome.stdout.is_empty(),
+        "no stdout on fail-open\n{outcome}"
+    );
     assert!(
         outcome.stderr_contains("exceeds limit"),
         "stderr must mention 'exceeds limit' for oversize command\n{outcome}"
@@ -1220,17 +1287,18 @@ fn failopen_no_crash_signal_on_garbage() {
     let garbage_payloads: &[&[u8]] = &[
         b"\xff\xfe\x00\x01",       // binary garbage
         b"\0\0\0\0",               // null bytes
-        b"}{}{",                    // broken JSON
-        b"true",                    // JSON true
-        b"42",                      // JSON number
-        b"\"just a string\"",       // JSON string
+        b"}{}{",                   // broken JSON
+        b"true",                   // JSON true
+        b"42",                     // JSON number
+        b"\"just a string\"",      // JSON string
         b"{ \"tool_name\": 123 }", // wrong tool_name type
     ];
 
     for payload in garbage_payloads {
         let outcome = run_hook_raw(payload, &[]);
         assert_eq!(
-            outcome.exit_code, 0,
+            outcome.exit_code,
+            0,
             "garbage input must fail-open (exit 0), got {} for {:?}\n{outcome}",
             outcome.exit_code,
             String::from_utf8_lossy(payload)
@@ -1285,6 +1353,130 @@ fn failopen_same_behavior_both_protocols() {
     );
     assert!(codex_outcome.stdout.is_empty());
     assert!(claude_outcome.stdout.is_empty());
+}
+
+// ===========================================================================
+// P2.13 — DCG_PACKS / DCG_DISABLE env vars under both protocols
+//
+// Verifies that pack enable/disable env vars work the same under Codex
+// and Claude. Users use these to opt out of specific protections without
+// disabling dcg entirely (e.g., CI pipelines).
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// P2.13.1 — DCG_DISABLE behavior with core packs
+//
+// KNOWN BEHAVIOR: `DCG_DISABLE=core.git` does NOT disable core.git with
+// default config. The `core` category is unconditionally re-inserted into
+// the enabled set by `PacksConfig::enabled_pack_ids()` AFTER disabled
+// removal, and `expand_enabled` re-expands it to all core.* sub-packs.
+// DCG_DISABLE only removes packs that are EXPLICITLY in the enabled list
+// (not those added by category expansion). This is tested as a regression
+// guard for the current semantics.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn disable_core_git_still_blocks_due_to_core_reinsertion_codex() {
+    // DCG_DISABLE=core.git with default config: core is unconditionally
+    // re-inserted, expanded to core.*, so core.git patterns still fire.
+    let outcome = run_codex_hook_with_env(
+        "git reset --hard HEAD~1",
+        &[("DCG_DISABLE", "core.git")],
+        &[],
+    );
+    assert_eq!(
+        outcome.exit_code, 2,
+        "DCG_DISABLE=core.git does NOT disable core.git with default config (known behavior)\n{outcome}"
+    );
+}
+
+#[test]
+fn disable_core_git_still_blocks_due_to_core_reinsertion_claude() {
+    let outcome = run_claude_hook_with_env(
+        "git reset --hard HEAD~1",
+        &[("DCG_DISABLE", "core.git")],
+        &[],
+    );
+    assert!(
+        outcome.is_claude_block_shape(),
+        "DCG_DISABLE=core.git does NOT disable core.git with default config (known behavior)\n{outcome}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P2.13.3 — DCG_PACKS restricts to only specified packs
+// ---------------------------------------------------------------------------
+
+#[test]
+fn packs_only_core_git_allows_filesystem_destructive_codex() {
+    // Only core.git is enabled → filesystem patterns don't fire
+    let outcome =
+        run_codex_hook_with_env("rm -rf /tmp/important", &[("DCG_PACKS", "core.git")], &[]);
+    assert_eq!(
+        outcome.exit_code, 0,
+        "DCG_PACKS=core.git must not block filesystem commands under Codex\n{outcome}"
+    );
+}
+
+#[test]
+fn packs_only_core_git_allows_filesystem_destructive_claude() {
+    let outcome =
+        run_claude_hook_with_env("rm -rf /tmp/important", &[("DCG_PACKS", "core.git")], &[]);
+    assert!(
+        outcome.is_allow_shape(),
+        "DCG_PACKS=core.git must not block filesystem commands under Claude\n{outcome}"
+    );
+}
+
+#[test]
+fn packs_core_git_still_blocks_git_destructive_codex() {
+    // core.git is explicitly enabled → git destructive commands still blocked
+    let outcome =
+        run_codex_hook_with_env("git reset --hard HEAD~1", &[("DCG_PACKS", "core.git")], &[]);
+    assert_eq!(
+        outcome.exit_code, 2,
+        "DCG_PACKS=core.git must still block git reset under Codex\n{outcome}"
+    );
+}
+
+#[test]
+fn packs_core_git_still_blocks_git_destructive_claude() {
+    let outcome =
+        run_claude_hook_with_env("git reset --hard HEAD~1", &[("DCG_PACKS", "core.git")], &[]);
+    assert!(
+        outcome.is_claude_block_shape(),
+        "DCG_PACKS=core.git must still block git reset under Claude\n{outcome}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P2.13.4 — DCG_DISABLE does not affect unrelated packs
+// ---------------------------------------------------------------------------
+
+#[test]
+fn disable_core_filesystem_still_blocks_git_codex() {
+    let outcome = run_codex_hook_with_env(
+        "git reset --hard HEAD~1",
+        &[("DCG_DISABLE", "core.filesystem")],
+        &[],
+    );
+    assert_eq!(
+        outcome.exit_code, 2,
+        "DCG_DISABLE=core.filesystem must NOT affect git blocks under Codex\n{outcome}"
+    );
+}
+
+#[test]
+fn disable_core_filesystem_still_blocks_git_claude() {
+    let outcome = run_claude_hook_with_env(
+        "git reset --hard HEAD~1",
+        &[("DCG_DISABLE", "core.filesystem")],
+        &[],
+    );
+    assert!(
+        outcome.is_claude_block_shape(),
+        "DCG_DISABLE=core.filesystem must NOT affect git blocks under Claude\n{outcome}"
+    );
 }
 
 // ---------------------------------------------------------------------------
