@@ -163,6 +163,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 mod tests {
     use super::*;
     use crate::packs::test_helpers::*;
+    use crate::packs::Severity;
 
     #[test]
     fn helm_patterns_match_with_global_flags() {
@@ -211,11 +212,7 @@ mod tests {
         assert_blocks(&pack, "helm uninstall my-release", "uninstall");
         assert_blocks(&pack, "helm delete my-release", "uninstall");
         assert_blocks(&pack, "helm rollback my-release 3", "rollback");
-        assert_blocks(
-            &pack,
-            "helm upgrade my-release ./chart --force",
-            "force",
-        );
+        assert_blocks(&pack, "helm upgrade my-release ./chart --force", "force");
         assert_blocks(
             &pack,
             "helm upgrade my-release ./chart --reset-values",
@@ -226,16 +223,8 @@ mod tests {
     #[test]
     fn helm_blocks_with_correct_severity() {
         let pack = create_pack();
-        assert_blocks_with_severity(
-            &pack,
-            "helm uninstall prod-release",
-            Severity::Critical,
-        );
-        assert_blocks_with_severity(
-            &pack,
-            "helm rollback prod-release 2",
-            Severity::High,
-        );
+        assert_blocks_with_severity(&pack, "helm uninstall prod-release", Severity::Critical);
+        assert_blocks_with_severity(&pack, "helm rollback prod-release 2", Severity::High);
         assert_blocks_with_severity(
             &pack,
             "helm upgrade prod-release ./chart --force",
