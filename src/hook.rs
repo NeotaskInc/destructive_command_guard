@@ -619,9 +619,10 @@ fn to_output_severity(s: crate::packs::Severity) -> ThemeSeverity {
 
 const MAX_SUGGESTIONS: usize = 4;
 
-/// Print a colorful warning to stderr for human visibility.
+/// Write a colorful denial warning to an arbitrary writer (test seam).
 #[allow(clippy::too_many_lines)]
-pub fn print_colorful_warning(
+pub(crate) fn print_colorful_warning_to(
+    writer: &mut impl Write,
     command: &str,
     _reason: &str,
     pack: Option<&str>,
@@ -636,7 +637,6 @@ pub fn print_colorful_warning(
     let console_instance = console();
     let theme = auto_theme();
 
-    // Prepare content for DenialBox
     let rule_id = build_rule_id(pack, pattern);
     let pattern_display = rule_id.as_deref().or(pack).unwrap_or("unknown pattern");
 
@@ -646,14 +646,12 @@ pub fn print_colorful_warning(
 
     let explanation_text = explanation.map(str::trim).filter(|text| !text.is_empty());
 
-    // Create span for highlighting
     let span = matched_span
         .map(|s| HighlightSpan::new(s.start, s.end))
-        .unwrap_or_else(|| HighlightSpan::new(0, 0)); // Fallback
+        .unwrap_or_else(|| HighlightSpan::new(0, 0));
 
     let suggestions_enabled = crate::output::suggestions_enabled();
 
-    // Convert suggestions to alternatives (platform-filtered, capped)
     let filtered_suggestions: Vec<&PatternSuggestion> = if suggestions_enabled {
         pattern_suggestions
             .iter()
@@ -668,7 +666,6 @@ pub fn print_colorful_warning(
         .map(|s| format!("{}: {}", s.description, s.command))
         .collect();
 
-    // Add contextual suggestion if available and no pattern suggestions
     if suggestions_enabled && alternatives.is_empty() {
         if let Some(sugg) = get_contextual_suggestion(command) {
             alternatives.push(sugg.to_string());
@@ -686,41 +683,70 @@ pub fn print_colorful_warning(
         denial = denial.with_allow_once_code(code);
     }
 
-    // Render the denial box
-    // Note: DcgConsole auto-detects stderr usage
-    eprintln!("{}", denial.render(&theme));
+    let _ = writeln!(writer, "{}", denial.render(&theme));
 
-    // Secondary info (Legacy: printed after box; Rich: could use panels)
     #[cfg(feature = "rich-output")]
     if !console_instance.is_plain() {
-        // In rich mode, we might want additional panels or info
-        // For now, let's keep it simple as DenialBox handles most things
-        // But we might want to print the "Learn more" links
+        // Rich mode: DenialBox handles most things
     }
 
-    // "Learn more" section (common to both modes, usually printed after the main warning)
     let escaped_cmd = command.replace('"', "\\\"");
     let truncated_cmd = truncate_for_display(&escaped_cmd, 45);
     let explain_cmd = format!("dcg explain \"{truncated_cmd}\"");
 
-    // Let's print the footer links
-    let footer_style = if theme.colors_enabled { "\x1b[90m" } else { "" }; // Bright black
+    let footer_style = if theme.colors_enabled { "\x1b[90m" } else { "" };
     let reset = if theme.colors_enabled { "\x1b[0m" } else { "" };
     let cyan = if theme.colors_enabled { "\x1b[36m" } else { "" };
 
-    eprintln!("{footer_style}Learn more:{reset}");
-    eprintln!("  $ {cyan}{explain_cmd}{reset}");
+    let _ = writeln!(writer, "{footer_style}Learn more:{reset}");
+    let _ = writeln!(writer, "  $ {cyan}{explain_cmd}{reset}");
 
     if let Some(ref rule) = rule_id {
-        eprintln!("  $ {cyan}dcg allowlist add {rule} --project{reset}");
+        let _ = writeln!(
+            writer,
+            "  $ {cyan}dcg allowlist add {rule} --project{reset}"
+        );
     }
 
-    eprintln!();
-    eprintln!("{footer_style}False positive? File an issue:{reset}");
-    eprintln!(
+    let _ = writeln!(writer);
+    let _ = writeln!(
+        writer,
+        "{footer_style}False positive? File an issue:{reset}"
+    );
+    let _ = writeln!(
+        writer,
         "{footer_style}https://github.com/Dicklesworthstone/destructive_command_guard/issues/new?template=false_positive.yml{reset}"
     );
-    eprintln!();
+    let _ = writeln!(writer);
+}
+
+/// Print a colorful warning to stderr for human visibility.
+#[allow(clippy::too_many_lines)]
+pub fn print_colorful_warning(
+    command: &str,
+    reason: &str,
+    pack: Option<&str>,
+    pattern: Option<&str>,
+    explanation: Option<&str>,
+    allow_once_code: Option<&str>,
+    matched_span: Option<&MatchSpan>,
+    pattern_suggestions: &[PatternSuggestion],
+    severity: Option<crate::packs::Severity>,
+) {
+    let stderr = io::stderr();
+    let mut handle = stderr.lock();
+    print_colorful_warning_to(
+        &mut handle,
+        command,
+        reason,
+        pack,
+        pattern,
+        explanation,
+        allow_once_code,
+        matched_span,
+        pattern_suggestions,
+        severity,
+    );
 }
 
 #[cfg(feature = "rich-output")]
@@ -794,11 +820,13 @@ fn get_contextual_suggestion(command: &str) -> Option<&'static str> {
     }
 }
 
-/// Output a denial response to stdout (JSON for hook protocol).
+/// Write a denial response to arbitrary stdout/stderr writers (test seam).
 #[cold]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-pub fn output_denial_for_protocol(
+pub(crate) fn write_denial_to(
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
     protocol: HookProtocol,
     command: &str,
     reason: &str,
@@ -811,9 +839,9 @@ pub fn output_denial_for_protocol(
     confidence: Option<f64>,
     pattern_suggestions: &[PatternSuggestion],
 ) {
-    // Print colorful warning to stderr (visible to user)
     let allow_once_code = allow_once.map(|info| info.code.as_str());
-    print_colorful_warning(
+    print_colorful_warning_to(
+        stderr,
         command,
         reason,
         pack,
@@ -825,7 +853,6 @@ pub fn output_denial_for_protocol(
         severity,
     );
 
-    // Build JSON response for hook protocol (stdout)
     let message = format_denial_message(command, reason, explanation, pack, pattern);
     let rule_id = build_rule_id(pack, pattern);
     let remediation = allow_once.map(|info| {
@@ -836,9 +863,6 @@ pub fn output_denial_for_protocol(
             allow_once_command: format!("dcg allow-once {}", info.code),
         }
     });
-
-    let stdout = io::stdout();
-    let mut handle = stdout.lock();
 
     match protocol {
         HookProtocol::ClaudeCompatible => {
@@ -857,20 +881,13 @@ pub fn output_denial_for_protocol(
                 },
             };
 
-            let _ = serde_json::to_writer(&mut handle, &output);
-            let _ = writeln!(handle);
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
         }
         HookProtocol::Codex => {
-            // Codex 0.125.0+ uses a strict JSON parser
-            // (`#[serde(deny_unknown_fields)]` on every output struct) that
-            // would reject dcg's hookSpecificOutput because of fields like
-            // allowOnceCode / ruleId / severity / remediation, silently
-            // turning the deny into a "Failed" hook and letting the
-            // destructive command run. The codex-documented alternative
-            // (codex-rs/hooks/src/events/pre_tool_use.rs) is exit code 2
-            // with the deny reason on stderr. The colored stderr message
-            // has already been written by `print_colorful_warning` above;
-            // main.rs propagates exit code 2 when this protocol is active.
+            // Codex 0.125.0+: exit code 2 + stderr reason. The colored
+            // stderr message was already written above; main.rs propagates
+            // exit code 2 when this protocol is active. No stdout JSON.
         }
         HookProtocol::Copilot => {
             let output = CopilotHookOutput {
@@ -887,8 +904,8 @@ pub fn output_denial_for_protocol(
                 remediation,
             };
 
-            let _ = serde_json::to_writer(&mut handle, &output);
-            let _ = writeln!(handle);
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
         }
         HookProtocol::Gemini => {
             let output = GeminiHookOutput {
@@ -904,10 +921,48 @@ pub fn output_denial_for_protocol(
                 remediation,
             };
 
-            let _ = serde_json::to_writer(&mut handle, &output);
-            let _ = writeln!(handle);
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
         }
     }
+}
+
+/// Output a denial response to stdout (JSON for hook protocol).
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub fn output_denial_for_protocol(
+    protocol: HookProtocol,
+    command: &str,
+    reason: &str,
+    pack: Option<&str>,
+    pattern: Option<&str>,
+    explanation: Option<&str>,
+    allow_once: Option<&AllowOnceInfo>,
+    matched_span: Option<&MatchSpan>,
+    severity: Option<crate::packs::Severity>,
+    confidence: Option<f64>,
+    pattern_suggestions: &[PatternSuggestion],
+) {
+    let out = io::stdout();
+    let mut out_handle = out.lock();
+    let err = io::stderr();
+    let mut err_handle = err.lock();
+    write_denial_to(
+        &mut out_handle,
+        &mut err_handle,
+        protocol,
+        command,
+        reason,
+        pack,
+        pattern,
+        explanation,
+        allow_once,
+        matched_span,
+        severity,
+        confidence,
+        pattern_suggestions,
+    );
 }
 
 /// Output a denial response to stdout (JSON for hook protocol).
@@ -941,16 +996,12 @@ pub fn output_denial(
     );
 }
 
-/// Output a warning for a warn-severity match.
-///
-/// Prints a human-readable warning to stderr and emits a hook-protocol JSON
-/// response to stdout with `permissionDecision: "ask"` (Claude Code / Copilot)
-/// or `decision: "ask"` (Gemini).  This makes warn-severity matches visible
-/// to AI coding agents that only read stdout JSON, while still allowing the
-/// user to approve the command interactively.
+/// Write a warning response to arbitrary stdout/stderr writers (test seam).
 #[cold]
 #[inline(never)]
-pub fn output_warning_for_protocol(
+pub(crate) fn write_warning_to(
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
     protocol: HookProtocol,
     command: &str,
     reason: &str,
@@ -958,40 +1009,34 @@ pub fn output_warning_for_protocol(
     pattern: Option<&str>,
     explanation: Option<&str>,
 ) {
-    // -- stderr: human-visible warning (unchanged) --
+    // -- stderr: human-visible warning --
     {
-        let stderr = io::stderr();
-        let mut handle = stderr.lock();
-
-        let _ = writeln!(handle);
-        let _ = writeln!(handle, "{} {}", "dcg WARNING:".yellow().bold(), reason);
+        let _ = writeln!(stderr);
+        let _ = writeln!(stderr, "{} {}", "dcg WARNING:".yellow().bold(), reason);
 
         let rule_id = build_rule_id(pack, pattern);
         let explanation_text = format_explanation_text(explanation, rule_id.as_deref(), pack);
         let mut explanation_lines = explanation_text.lines();
 
         if let Some(first) = explanation_lines.next() {
-            let _ = writeln!(handle, "  {} {}", "Explanation:".bright_black(), first);
+            let _ = writeln!(stderr, "  {} {}", "Explanation:".bright_black(), first);
             for line in explanation_lines {
-                let _ = writeln!(handle, "               {line}");
+                let _ = writeln!(stderr, "               {line}");
             }
         }
 
         if let Some(ref rule) = rule_id {
-            let _ = writeln!(handle, "  {} {}", "Rule:".bright_black(), rule);
+            let _ = writeln!(stderr, "  {} {}", "Rule:".bright_black(), rule);
         } else if let Some(pack_name) = pack {
-            let _ = writeln!(handle, "  {} {}", "Pack:".bright_black(), pack_name);
+            let _ = writeln!(stderr, "  {} {}", "Pack:".bright_black(), pack_name);
         }
 
-        let _ = writeln!(handle, "  {} {}", "Command:".bright_black(), command);
+        let _ = writeln!(stderr, "  {} {}", "Command:".bright_black(), command);
     }
 
     // -- stdout: hook-protocol JSON with "ask" decision --
     let rule_id = build_rule_id(pack, pattern);
     let warn_reason = format!("DCG warn: {reason}");
-
-    let stdout = io::stdout();
-    let mut handle = stdout.lock();
 
     match protocol {
         HookProtocol::ClaudeCompatible => {
@@ -1010,8 +1055,8 @@ pub fn output_warning_for_protocol(
                 },
             };
 
-            let _ = serde_json::to_writer(&mut handle, &output);
-            let _ = writeln!(handle);
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
         }
         HookProtocol::Copilot => {
             let output = CopilotHookOutput {
@@ -1028,8 +1073,8 @@ pub fn output_warning_for_protocol(
                 remediation: None,
             };
 
-            let _ = serde_json::to_writer(&mut handle, &output);
-            let _ = writeln!(handle);
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
         }
         HookProtocol::Gemini => {
             let output = GeminiHookOutput {
@@ -1045,17 +1090,40 @@ pub fn output_warning_for_protocol(
                 remediation: None,
             };
 
-            let _ = serde_json::to_writer(&mut handle, &output);
-            let _ = writeln!(handle);
+            let _ = serde_json::to_writer(&mut *stdout, &output);
+            let _ = writeln!(stdout);
         }
         HookProtocol::Codex => {
-            // Codex's strict parser would reject any dcg JSON that includes
-            // our ergonomic fields (ruleId, packId, etc.), so for "warn"
-            // severity matches we let the command through with only the
-            // human-visible stderr above. Codex surfaces hook stderr to the
-            // model, so the warning is still seen.
+            // Codex: stderr warning already written above; no stdout JSON.
         }
     }
+}
+
+/// Output a warning for a warn-severity match.
+#[cold]
+#[inline(never)]
+pub fn output_warning_for_protocol(
+    protocol: HookProtocol,
+    command: &str,
+    reason: &str,
+    pack: Option<&str>,
+    pattern: Option<&str>,
+    explanation: Option<&str>,
+) {
+    let out = io::stdout();
+    let mut out_handle = out.lock();
+    let err = io::stderr();
+    let mut err_handle = err.lock();
+    write_warning_to(
+        &mut out_handle,
+        &mut err_handle,
+        protocol,
+        command,
+        reason,
+        pack,
+        pattern,
+        explanation,
+    );
 }
 
 /// Log a blocked command to a file (if logging is enabled).
@@ -1621,5 +1689,275 @@ mod tests {
         let json = r"{}";
         let input: HookInput = serde_json::from_str(json).unwrap();
         assert_eq!(detect_protocol(&input), HookProtocol::ClaudeCompatible);
+    }
+
+    // =========================================================================
+    // Writer-injected output tests (P1.1 — Codex coverage)
+    // =========================================================================
+
+    fn test_allow_once() -> AllowOnceInfo {
+        AllowOnceInfo {
+            code: "abc123".to_string(),
+            full_hash: "sha256:deadbeef".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_write_denial_claude_produces_valid_json_on_stdout() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let allow = test_allow_once();
+
+        write_denial_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::ClaudeCompatible,
+            "git reset --hard HEAD~1",
+            "destroys uncommitted changes",
+            Some("core.git"),
+            Some("reset-hard"),
+            Some("Rewrites history and discards uncommitted changes."),
+            Some(&allow),
+            None,
+            Some(crate::packs::Severity::Critical),
+            Some(0.95),
+            &[],
+        );
+
+        let stdout_str = String::from_utf8_lossy(&stdout);
+        let json: serde_json::Value = serde_json::from_str(stdout_str.trim())
+            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout bytes: {stdout_str}"));
+
+        let specific = &json["hookSpecificOutput"];
+        assert_eq!(specific["permissionDecision"], "deny");
+        assert_eq!(specific["hookEventName"], "PreToolUse");
+        assert_eq!(specific["ruleId"], "core.git:reset-hard");
+        assert_eq!(specific["packId"], "core.git");
+        assert_eq!(specific["allowOnceCode"], "abc123");
+        assert!(!stderr.is_empty(), "stderr must contain colorful warning");
+    }
+
+    #[test]
+    fn test_write_denial_codex_produces_empty_stdout() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let allow = test_allow_once();
+
+        write_denial_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::Codex,
+            "git reset --hard HEAD~1",
+            "destroys uncommitted changes",
+            Some("core.git"),
+            Some("reset-hard"),
+            Some("Rewrites history."),
+            Some(&allow),
+            None,
+            Some(crate::packs::Severity::Critical),
+            Some(0.95),
+            &[],
+        );
+
+        assert!(
+            stdout.is_empty(),
+            "Codex deny must produce zero bytes on stdout; got {} bytes: {:?}",
+            stdout.len(),
+            String::from_utf8_lossy(&stdout)
+        );
+        assert!(
+            !stderr.is_empty(),
+            "Codex deny must produce non-empty stderr"
+        );
+        let stderr_str = String::from_utf8_lossy(&stderr);
+        assert!(
+            stderr_str.contains("git reset --hard HEAD~1"),
+            "stderr must contain the blocked command; got: {stderr_str}"
+        );
+        assert!(
+            stderr_str.contains("core.git:reset-hard"),
+            "stderr must contain the rule id for agent parsing; got: {stderr_str}"
+        );
+    }
+
+    #[test]
+    fn test_write_denial_copilot_produces_valid_json_on_stdout() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_denial_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::Copilot,
+            "rm -rf /",
+            "catastrophic filesystem deletion",
+            Some("core.filesystem"),
+            Some("rm-rf-root"),
+            None,
+            None,
+            None,
+            Some(crate::packs::Severity::Critical),
+            None,
+            &[],
+        );
+
+        let stdout_str = String::from_utf8_lossy(&stdout);
+        let json: serde_json::Value = serde_json::from_str(stdout_str.trim())
+            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout: {stdout_str}"));
+
+        assert_eq!(json["continue"], false);
+        assert_eq!(json["permissionDecision"], "deny");
+        assert!(
+            json["stopReason"]
+                .as_str()
+                .unwrap()
+                .contains("BLOCKED by dcg")
+        );
+    }
+
+    #[test]
+    fn test_write_denial_gemini_produces_valid_json_on_stdout() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_denial_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::Gemini,
+            "git clean -fd",
+            "removes untracked files",
+            Some("core.git"),
+            Some("clean-force"),
+            None,
+            None,
+            None,
+            Some(crate::packs::Severity::High),
+            None,
+            &[],
+        );
+
+        let stdout_str = String::from_utf8_lossy(&stdout);
+        let json: serde_json::Value = serde_json::from_str(stdout_str.trim())
+            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout: {stdout_str}"));
+
+        assert_eq!(json["decision"], "deny");
+        assert!(
+            json["systemMessage"]
+                .as_str()
+                .unwrap()
+                .contains("BLOCKED by dcg")
+        );
+    }
+
+    #[test]
+    fn test_write_warning_claude_produces_ask_json() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_warning_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::ClaudeCompatible,
+            "git checkout -- file.txt",
+            "may discard local changes",
+            Some("core.git"),
+            Some("checkout-dot"),
+            Some("Check git diff first."),
+        );
+
+        let stdout_str = String::from_utf8_lossy(&stdout);
+        let json: serde_json::Value = serde_json::from_str(stdout_str.trim())
+            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout: {stdout_str}"));
+
+        let specific = &json["hookSpecificOutput"];
+        assert_eq!(specific["permissionDecision"], "ask");
+        assert!(
+            specific["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .starts_with("DCG warn:")
+        );
+        assert!(!stderr.is_empty(), "stderr must contain warning text");
+    }
+
+    #[test]
+    fn test_write_warning_codex_produces_empty_stdout() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_warning_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::Codex,
+            "git checkout -- file.txt",
+            "may discard local changes",
+            Some("core.git"),
+            Some("checkout-dot"),
+            None,
+        );
+
+        assert!(
+            stdout.is_empty(),
+            "Codex warn must produce zero bytes on stdout; got {} bytes: {:?}",
+            stdout.len(),
+            String::from_utf8_lossy(&stdout)
+        );
+        assert!(
+            !stderr.is_empty(),
+            "Codex warn must produce non-empty stderr"
+        );
+        let stderr_str = String::from_utf8_lossy(&stderr);
+        assert!(
+            stderr_str.contains("WARNING"),
+            "stderr must contain WARNING marker"
+        );
+    }
+
+    #[test]
+    fn test_write_warning_copilot_produces_ask_json() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_warning_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::Copilot,
+            "git stash drop",
+            "drops stashed changes",
+            Some("core.git"),
+            Some("stash-drop"),
+            None,
+        );
+
+        let stdout_str = String::from_utf8_lossy(&stdout);
+        let json: serde_json::Value = serde_json::from_str(stdout_str.trim())
+            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout: {stdout_str}"));
+
+        assert_eq!(json["permissionDecision"], "ask");
+        assert_eq!(json["continue"], false);
+    }
+
+    #[test]
+    fn test_write_warning_gemini_produces_ask_json() {
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        write_warning_to(
+            &mut stdout,
+            &mut stderr,
+            HookProtocol::Gemini,
+            "git stash drop",
+            "drops stashed changes",
+            Some("core.git"),
+            Some("stash-drop"),
+            None,
+        );
+
+        let stdout_str = String::from_utf8_lossy(&stdout);
+        let json: serde_json::Value = serde_json::from_str(stdout_str.trim())
+            .unwrap_or_else(|e| panic!("stdout not valid JSON: {e}\nstdout: {stdout_str}"));
+
+        assert_eq!(json["decision"], "ask");
+        assert!(json["reason"].as_str().unwrap().starts_with("DCG warn:"));
     }
 }
