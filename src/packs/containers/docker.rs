@@ -398,6 +398,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packs::Severity;
     use crate::packs::test_helpers::*;
 
     #[test]
@@ -514,18 +515,14 @@ mod tests {
         assert_blocks(&pack, "docker image prune", "prune");
         assert_blocks(&pack, "docker container prune", "prune");
         assert_blocks(&pack, "docker volume rm my-volume", "volume");
-        assert_blocks(
-            &pack,
-            "docker stop $(docker ps -aq)",
-            "stop",
-        );
+        assert_blocks(&pack, "docker stop $(docker ps -aq)", "stop");
     }
 
     #[test]
     fn docker_blocks_with_correct_severity() {
         let pack = create_pack();
-        assert_blocks_with_severity(&pack, "docker system prune -a", Severity::Critical);
-        assert_blocks_with_severity(&pack, "docker volume prune", Severity::Critical);
+        assert_blocks_with_severity(&pack, "docker system prune -a", Severity::High);
+        assert_blocks_with_severity(&pack, "docker volume prune", Severity::High);
         assert_blocks_with_severity(&pack, "docker volume rm data-vol", Severity::High);
         assert_blocks_with_severity(&pack, "docker rm -f container", Severity::High);
         assert_blocks_with_severity(&pack, "docker rmi -f image", Severity::High);

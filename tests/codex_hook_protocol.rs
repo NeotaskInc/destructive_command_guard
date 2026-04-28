@@ -438,13 +438,44 @@ fn regression_claude_tool_use_id_launch_process_stays_claude_path() {
 
 #[test]
 fn codex_warn_path_exits_zero_with_stderr_warning() {
-    // With DCG_POLICY_DEFAULT_MODE=warn, destructive matches become warnings.
-    // Under Codex, warn means: exit 0, no stdout JSON, stderr contains warning.
-    let outcome = run_codex_hook_with_env(
-        "git reset --hard HEAD~1",
-        &[("DCG_POLICY_DEFAULT_MODE", "warn")],
-        &[],
-    );
+    // Critical patterns can only be downgraded via per-rule override in config.
+    // Write a config file with the per-rule override to the hermetic HOME.
+    let home = tempfile::tempdir().expect("tempdir");
+    let config_dir = home.path().join(".config/dcg");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        b"[policy.rules]\n\"core.git:reset-hard\" = \"warn\"\n",
+    )
+    .unwrap();
+
+    let payload = build_codex_payload("git reset --hard HEAD~1");
+    let system_path = std::env::var("PATH").unwrap_or_default();
+
+    let mut cmd = Command::new(dcg_binary());
+    cmd.env_clear()
+        .env("PATH", &system_path)
+        .env("HOME", home.path())
+        .env("TMPDIR", home.path().join("tmp"))
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("spawn");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin.write_all(payload.as_bytes()).unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    let outcome = HookOutcome {
+        stdout: output.stdout,
+        stderr: output.stderr,
+        exit_code: output.status.code().unwrap_or(-1),
+        stdin_sent: payload.into_bytes(),
+        home_dir: home.path().to_path_buf(),
+    };
+
     assert_eq!(
         outcome.exit_code, 0,
         "Codex warn must exit 0 (not 2)\n{outcome}"
@@ -470,15 +501,8 @@ fn codex_warn_path_exits_zero_with_stderr_warning() {
 #[test]
 fn codex_bypass_exits_zero_silently() {
     // DCG_BYPASS=1 must cause silent exit 0 even for Codex destructive commands.
-    let outcome = run_codex_hook_with_env(
-        "git reset --hard HEAD~1",
-        &[("DCG_BYPASS", "1")],
-        &[],
-    );
-    assert_eq!(
-        outcome.exit_code, 0,
-        "bypass must exit 0, not 2\n{outcome}"
-    );
+    let outcome = run_codex_hook_with_env("git reset --hard HEAD~1", &[("DCG_BYPASS", "1")], &[]);
+    assert_eq!(outcome.exit_code, 0, "bypass must exit 0, not 2\n{outcome}");
     assert!(
         outcome.stdout.is_empty(),
         "bypass must produce no stdout\n{outcome}"
@@ -488,15 +512,8 @@ fn codex_bypass_exits_zero_silently() {
 #[test]
 fn claude_bypass_exits_zero_silently() {
     // Same for Claude path — bypass silences everything.
-    let outcome = run_claude_hook_with_env(
-        "git reset --hard HEAD~1",
-        &[("DCG_BYPASS", "1")],
-        &[],
-    );
-    assert_eq!(
-        outcome.exit_code, 0,
-        "Claude bypass must exit 0\n{outcome}"
-    );
+    let outcome = run_claude_hook_with_env("git reset --hard HEAD~1", &[("DCG_BYPASS", "1")], &[]);
+    assert_eq!(outcome.exit_code, 0, "Claude bypass must exit 0\n{outcome}");
     assert!(
         outcome.stdout.is_empty(),
         "Claude bypass must produce no stdout\n{outcome}"
