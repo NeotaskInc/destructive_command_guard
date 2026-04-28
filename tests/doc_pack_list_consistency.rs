@@ -1,5 +1,6 @@
 use destructive_command_guard::packs::PackRegistry;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
 fn read_repo_file(path: &str) -> std::io::Result<String> {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -134,20 +135,55 @@ fn docs_packs_category_counts_match_registry() -> std::io::Result<()> {
         })
         .collect();
 
-    assert!(
-        missing.is_empty(),
-        "docs/packs/README.md is missing category rows:\n{}",
-        missing.join("\n")
+    let mut errors = Vec::new();
+    if !missing.is_empty() {
+        errors.push(format!("Missing category rows:\n{}", missing.join("\n")));
+    }
+    if !extra.is_empty() {
+        errors.push(format!("Unknown category rows:\n{}", extra.join("\n")));
+    }
+    if !mismatched.is_empty() {
+        errors.push(format!("Stale category counts:\n{}", mismatched.join("\n")));
+    }
+
+    if !errors.is_empty() {
+        let mut fix_hint = String::from("\n\nExpected table rows (copy to fix):\n");
+        for (category, count) in &expected {
+            writeln!(fix_hint, "| [{category}]({category}.md) | {count} | ... |")
+                .expect("writing to String cannot fail");
+        }
+        panic!(
+            "docs/packs/README.md category table is out of sync:\n{}\n{}",
+            errors.join("\n\n"),
+            fix_hint
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn docs_total_pack_count_matches_registry() -> std::io::Result<()> {
+    let registry = PackRegistry::new();
+    let total_packs = registry.all_pack_ids().len();
+    let total_categories = registry.all_categories().len();
+    let docs = read_repo_file("docs/packs/README.md")?;
+
+    let category_counts = registry_category_counts();
+    let sum_of_category_counts: usize = category_counts.values().sum();
+
+    assert_eq!(
+        sum_of_category_counts, total_packs,
+        "Sum of category counts ({sum_of_category_counts}) != total pack count ({total_packs}). \
+         A pack may be missing from its category registration."
     );
-    assert!(
-        extra.is_empty(),
-        "docs/packs/README.md contains unknown category rows:\n{}",
-        extra.join("\n")
-    );
-    assert!(
-        mismatched.is_empty(),
-        "docs/packs/README.md category counts are stale:\n{}",
-        mismatched.join("\n")
+
+    let found_categories = docs_pack_category_counts(&docs);
+    assert_eq!(
+        found_categories.len(),
+        total_categories,
+        "docs/packs/README.md has {} categories but registry has {total_categories}",
+        found_categories.len()
     );
 
     Ok(())

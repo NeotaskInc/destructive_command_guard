@@ -86,6 +86,14 @@ fn validate_at(path: &str, schema: &Value, instance: &Value, errors: &mut Vec<St
         }
     }
 
+    if let Some(maximum) = schema.get("maximum").and_then(Value::as_f64) {
+        if let Some(number) = instance.as_f64() {
+            if number > maximum {
+                errors.push(format!("{path}: value {number} is above maximum {maximum}"));
+            }
+        }
+    }
+
     if let Some(pattern) = schema.get("pattern").and_then(Value::as_str) {
         if let Some(text) = instance.as_str() {
             let regex = Regex::new(pattern)
@@ -306,4 +314,27 @@ fn schema_examples_conform_for_scan_stats_and_error_outputs() {
             });
         }
     }
+}
+
+#[test]
+fn maximum_constraint_rejects_out_of_range_value() {
+    let schema: Value = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "confidence": {
+                "type": "number",
+                "minimum": 0.0,
+                "maximum": 1.0
+            }
+        }
+    });
+    let valid = serde_json::json!({"confidence": 0.95});
+    assert!(validate(&schema, &valid).is_ok());
+
+    let too_high = serde_json::json!({"confidence": 1.5});
+    let errors = validate(&schema, &too_high).unwrap_err();
+    assert!(
+        errors.contains("above maximum"),
+        "expected 'above maximum' error, got: {errors}"
+    );
 }
