@@ -1964,4 +1964,91 @@ mod tests {
         assert_eq!(json["decision"], "ask");
         assert!(json["reason"].as_str().unwrap().starts_with("DCG warn:"));
     }
+
+    // =========================================================================
+    // detect_protocol negative-space coverage (P1.4)
+    // =========================================================================
+
+    #[test]
+    fn test_detect_protocol_non_shell_tool_with_turn_id_is_not_codex() {
+        // Non-shell tool_name must not flip to Codex even with turn_id.
+        let json = r#"{"tool_name":"Read","tool_input":{},"turn_id":"turn-1"}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::ClaudeCompatible);
+    }
+
+    #[test]
+    fn test_detect_protocol_launch_process_with_turn_id_is_codex() {
+        // launch-process is a valid shell tool for Codex.
+        let json =
+            r#"{"tool_name":"launch-process","tool_input":{"command":"ls"},"turn_id":"turn-2"}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Codex);
+    }
+
+    #[test]
+    fn test_detect_protocol_whitespace_only_turn_id_is_not_codex() {
+        // is_some_and(|s| !s.is_empty()) does not trim — whitespace turn_id
+        // is non-empty and would classify as Codex. This documents the current
+        // behavior: whitespace-only turn_id IS treated as Codex. A future
+        // hardening could add .trim() before the check.
+        let json = r#"{"tool_name":"Bash","tool_input":{"command":"ls"},"turn_id":"   "}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Codex);
+    }
+
+    #[test]
+    fn test_detect_protocol_uppercase_bash_with_turn_id_is_codex() {
+        // tool_name is lowercased before comparison; "BASH" should match.
+        let json = r#"{"tool_name":"BASH","tool_input":{"command":"ls"},"turn_id":"turn-3"}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Codex);
+    }
+
+    #[test]
+    fn test_detect_protocol_lowercase_bash_with_turn_id_is_codex() {
+        // Lowercase wire form from Codex.
+        let json = r#"{"tool_name":"bash","tool_input":{"command":"ls"},"turn_id":"turn-4"}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Codex);
+    }
+
+    #[test]
+    fn test_detect_protocol_copilot_event_overrides_turn_id() {
+        // Copilot event check fires before Codex turn_id check.
+        let json = r#"{
+            "event":"pre-tool-use",
+            "tool_name":"bash",
+            "tool_input":{"command":"ls"},
+            "turn_id":"turn-5"
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Copilot);
+    }
+
+    #[test]
+    fn test_detect_protocol_gemini_envelope_overrides_turn_id() {
+        // Gemini's (run_shell_command + BeforeTool) signal is stronger than
+        // turn_id because the Codex check only fires for bash/launch-process.
+        let json = r#"{
+            "hook_event_name":"BeforeTool",
+            "tool_name":"run_shell_command",
+            "tool_input":{"command":"ls"},
+            "turn_id":"turn-6"
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Gemini);
+    }
+
+    #[test]
+    fn test_detect_protocol_bash_tool_use_id_no_turn_id_is_claude() {
+        // Regression: tool_use_id alone must not trigger Codex path.
+        let json = r#"{
+            "tool_name":"Bash",
+            "tool_input":{"command":"ls"},
+            "tool_use_id":"toolu_01XYZ"
+        }"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::ClaudeCompatible);
+    }
 }
