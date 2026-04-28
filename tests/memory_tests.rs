@@ -4,7 +4,8 @@
 //! when processing many inputs. Critical because DCG runs on
 //! every Bash command in Claude Code sessions.
 //!
-//! MUST run with: cargo test --test memory_tests --release -- --test-threads=1 --nocapture
+//! RSS measurements are serialized internally so the suite remains stable even
+//! when Cargo runs tests with multiple harness threads.
 //!
 //! ## Why These Tests Matter
 //!
@@ -30,6 +31,16 @@
 
 use destructive_command_guard as dcg;
 use std::hint::black_box;
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+static MEMORY_TEST_LOCK: Mutex<()> = Mutex::new(());
+const WARMUP_ITERATIONS: usize = 100;
+
+fn memory_test_guard() -> MutexGuard<'static, ()> {
+    MEMORY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Check if we're running under coverage instrumentation.
 ///
@@ -76,14 +87,14 @@ fn get_memory_usage() -> Option<usize> {
 /// * `f` - Closure to run repeatedly
 ///
 /// # Behavior
-/// 1. Warms up with 10 iterations (triggers lazy initialization)
+/// 1. Warms up before measurement (triggers lazy initialization and caches)
 /// 2. Measures baseline memory
 /// 3. Runs iterations with periodic progress logging
 /// 4. Asserts final growth is within budget
 ///
 /// # Flakiness Mitigation
 /// - Generous budgets (1-2MB) accommodate measurement noise
-/// - Warm-up phase triggers lazy_static initialization
+/// - Warm-up phase triggers lazy initialization and formatting caches
 /// - Progress logging helps identify gradual leaks vs noise
 pub fn assert_no_leak<F>(name: &str, iterations: usize, max_growth_bytes: usize, mut f: F)
 where
@@ -99,8 +110,14 @@ where
         return;
     }
 
-    println!("memory_{}: warming up (10 iterations)...", name);
-    for _ in 0..10 {
+    let _guard = memory_test_guard();
+
+    let warmup_iterations = iterations.min(WARMUP_ITERATIONS);
+    println!(
+        "memory_{}: warming up ({} iterations)...",
+        name, warmup_iterations
+    );
+    for _ in 0..warmup_iterations {
         f();
     }
 
@@ -193,6 +210,8 @@ echo done",
 #[test]
 fn memory_tracking_sanity_check() {
     println!("memory_tracking_sanity_check: starting");
+
+    let _guard = memory_test_guard();
 
     let initial = get_memory_usage();
     if initial.is_none() {
@@ -616,10 +635,7 @@ fn memory_codex_subprocess_deny_loop() {
         return;
     }
 
-    let Some(baseline) = get_memory_usage() else {
-        println!("memory_codex_subprocess_deny_loop: SKIPPED (no memory tracking)");
-        return;
-    };
+    let _guard = memory_test_guard();
 
     let dcg_bin = std::path::PathBuf::from(env!("CARGO_BIN_EXE_dcg"));
     if !dcg_bin.exists() {
@@ -629,6 +645,20 @@ fn memory_codex_subprocess_deny_loop() {
 
     let codex_payload = sample_codex_input("git reset --hard HEAD~3");
     let iterations = 50;
+    let warmup_iterations = 5;
+
+    println!(
+        "memory_codex_subprocess_deny_loop: warming up ({} subprocesses)",
+        warmup_iterations
+    );
+    for _ in 0..warmup_iterations {
+        run_codex_deny_subprocess(&dcg_bin, &codex_payload);
+    }
+
+    let Some(baseline) = get_memory_usage() else {
+        println!("memory_codex_subprocess_deny_loop: SKIPPED (no memory tracking)");
+        return;
+    };
 
     println!(
         "memory_codex_subprocess_deny_loop: spawning {} dcg subprocesses (baseline: {} KB)",
@@ -637,24 +667,7 @@ fn memory_codex_subprocess_deny_loop() {
     );
 
     for i in 0..iterations {
-        let mut child = std::process::Command::new(&dcg_bin)
-            .env_clear()
-            .env("HOME", "/tmp/dcg_memtest_home")
-            .env("PATH", std::env::var("PATH").unwrap_or_default())
-            .env("NO_COLOR", "1")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn dcg");
-
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write;
-            let _ = stdin.write_all(codex_payload.as_bytes());
-        }
-
-        let output = child.wait_with_output().expect("wait dcg");
-        debug_assert_eq!(output.status.code(), Some(2), "Codex deny should exit 2");
+        run_codex_deny_subprocess(&dcg_bin, &codex_payload);
 
         if i > 0 && i % 10 == 0 {
             if let Some(current) = get_memory_usage() {
@@ -689,6 +702,27 @@ fn memory_codex_subprocess_deny_loop() {
     );
 
     println!("memory_codex_subprocess_deny_loop: PASSED");
+}
+
+fn run_codex_deny_subprocess(dcg_bin: &std::path::Path, codex_payload: &str) {
+    let mut child = std::process::Command::new(dcg_bin)
+        .env_clear()
+        .env("HOME", "/tmp/dcg_memtest_home")
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn dcg");
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        let _ = stdin.write_all(codex_payload.as_bytes());
+    }
+
+    let output = child.wait_with_output().expect("wait dcg");
+    debug_assert_eq!(output.status.code(), Some(2), "Codex deny should exit 2");
 }
 
 #[test]

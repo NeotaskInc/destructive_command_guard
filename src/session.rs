@@ -157,8 +157,14 @@ pub fn record_and_snapshot(command: &str) -> OccurrenceSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, PoisonError};
+
+    static SESSION_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn isolated<F: FnOnce()>(f: F) {
+        let _guard = SESSION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         reset();
         f();
         reset();
