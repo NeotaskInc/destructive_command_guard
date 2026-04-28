@@ -134,6 +134,59 @@ impl std::fmt::Display for RiskLevel {
     }
 }
 
+/// Safety decision for an allowlist suggestion.
+///
+/// `NeverSuggest` patterns are filtered out before suggestions are returned.
+/// `RequireConfirmation` patterns may still be shown, but callers should ensure
+/// a human explicitly accepts the system-path implication before persisting them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "decision", content = "reason")]
+pub enum SuggestionSafetyDecision {
+    /// Safe enough for normal suggestion flow.
+    Allow,
+    /// Can be suggested only with explicit confirmation.
+    RequireConfirmation {
+        /// Human-readable reason for the confirmation requirement.
+        reason: String,
+    },
+    /// Must not be suggested for allowlisting.
+    NeverSuggest {
+        /// Human-readable reason for filtering the suggestion.
+        reason: String,
+    },
+}
+
+impl Default for SuggestionSafetyDecision {
+    fn default() -> Self {
+        Self::Allow
+    }
+}
+
+impl SuggestionSafetyDecision {
+    /// Returns true when this suggestion must be filtered out entirely.
+    #[must_use]
+    pub const fn is_never_suggest(&self) -> bool {
+        matches!(self, Self::NeverSuggest { .. })
+    }
+
+    /// Returns true when this suggestion requires explicit confirmation.
+    #[must_use]
+    pub const fn requires_confirmation(&self) -> bool {
+        matches!(self, Self::RequireConfirmation { .. })
+    }
+
+    /// Returns the safety reason, if this decision carries one.
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Allow => None,
+            Self::RequireConfirmation { reason } | Self::NeverSuggest { reason } => {
+                Some(reason.as_str())
+            }
+        }
+    }
+}
+
 /// Reason why a command is being suggested for allowlisting.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -208,6 +261,9 @@ pub struct AllowlistSuggestion {
     pub suggest_path_specific: bool,
     /// Number of times the command was manually bypassed after being blocked.
     pub bypass_count: usize,
+    /// Safety decision for the proposed allowlist pattern.
+    #[serde(default)]
+    pub safety: SuggestionSafetyDecision,
     /// Overall score (0.0-1.0) combining confidence and inverse risk.
     pub score: f32,
 }
@@ -219,7 +275,9 @@ impl AllowlistSuggestion {
         let confidence = calculate_confidence_tier(cluster.frequency, cluster.unique_count);
         let risk = assess_risk_level(&cluster.commands);
         let reason = determine_primary_reason(cluster.frequency, false, &[]);
-        let score = calculate_suggestion_score(confidence, risk);
+        let safety = check_suggestion_safety(&cluster.proposed_pattern, risk);
+        let score =
+            apply_safety_score_adjustment(calculate_suggestion_score(confidence, risk), &safety);
 
         Self {
             cluster,
@@ -230,6 +288,7 @@ impl AllowlistSuggestion {
             path_patterns: Vec::new(),
             suggest_path_specific: false,
             bypass_count: 0,
+            safety,
             score,
         }
     }
@@ -258,7 +317,10 @@ impl AllowlistSuggestion {
             self.bypass_count > 0,
             &self.path_patterns,
         );
-        self.score = calculate_suggestion_score(self.confidence, self.risk);
+        self.score = apply_safety_score_adjustment(
+            calculate_suggestion_score(self.confidence, self.risk),
+            &self.safety,
+        );
         self
     }
 
@@ -272,7 +334,10 @@ impl AllowlistSuggestion {
             self.confidence = ConfidenceTier::High;
             self.reason = SuggestionReason::ManuallyBypassed;
         }
-        self.score = calculate_suggestion_score(self.confidence, self.risk);
+        self.score = apply_safety_score_adjustment(
+            calculate_suggestion_score(self.confidence, self.risk),
+            &self.safety,
+        );
         self
     }
 }
@@ -391,6 +456,247 @@ pub fn calculate_suggestion_score(confidence: ConfidenceTier, risk: RiskLevel) -
     // Score = confidence * (1 - risk_weight * risk_score)
     // This gives high-confidence, low-risk suggestions the best scores
     (confidence_score * (1.0 - 0.4 * risk_penalty)).clamp(0.0, 1.0)
+}
+
+fn apply_safety_score_adjustment(score: f32, safety: &SuggestionSafetyDecision) -> f32 {
+    match safety {
+        SuggestionSafetyDecision::Allow => score,
+        SuggestionSafetyDecision::RequireConfirmation { .. } => (score * 0.85).clamp(0.0, 1.0),
+        SuggestionSafetyDecision::NeverSuggest { .. } => 0.0,
+    }
+}
+
+/// A suggestion that was removed by the safety filter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilteredSuggestion {
+    /// Pattern that was rejected.
+    pub pattern: String,
+    /// Example commands behind the rejected pattern.
+    pub example_commands: Vec<String>,
+    /// Safety decision with the filter reason.
+    pub safety: SuggestionSafetyDecision,
+}
+
+/// Result of safety filtering allowlist suggestions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SuggestionSafetyFilterResult {
+    /// Suggestions allowed to continue through the suggestion flow.
+    pub suggestions: Vec<AllowlistSuggestion>,
+    /// Suggestions removed with reasons.
+    pub filtered: Vec<FilteredSuggestion>,
+}
+
+/// Check whether a generated allowlist pattern is safe to suggest.
+#[must_use]
+pub fn check_suggestion_safety(pattern: &str, risk: RiskLevel) -> SuggestionSafetyDecision {
+    let normalized = normalize_safety_scan_target(pattern);
+
+    if normalized.is_empty() {
+        return SuggestionSafetyDecision::NeverSuggest {
+            reason: "empty allowlist pattern cannot be suggested safely".to_string(),
+        };
+    }
+
+    if contains_fork_bomb(pattern) {
+        return SuggestionSafetyDecision::NeverSuggest {
+            reason: "fork bomb patterns must never be allowlisted automatically".to_string(),
+        };
+    }
+
+    if targets_root_with_recursive_rm(&normalized) {
+        return SuggestionSafetyDecision::NeverSuggest {
+            reason: "recursive removal of the filesystem root must never be suggested".to_string(),
+        };
+    }
+
+    if overwrites_raw_disk(&normalized) {
+        return SuggestionSafetyDecision::NeverSuggest {
+            reason: "raw disk overwrite patterns must never be suggested".to_string(),
+        };
+    }
+
+    if formats_block_device(&normalized) {
+        return SuggestionSafetyDecision::NeverSuggest {
+            reason: "filesystem formatting patterns must never be suggested".to_string(),
+        };
+    }
+
+    if destroys_database(&normalized) {
+        return SuggestionSafetyDecision::NeverSuggest {
+            reason: "database-destroying patterns must never be suggested".to_string(),
+        };
+    }
+
+    if deletes_every_database_row(&normalized) {
+        return SuggestionSafetyDecision::NeverSuggest {
+            reason: "unbounded DELETE patterns must never be suggested".to_string(),
+        };
+    }
+
+    if let Some(system_path) = referenced_sensitive_system_path(&normalized) {
+        if normalized.contains("rm -rf") || contains_path_wildcard(pattern) {
+            return SuggestionSafetyDecision::NeverSuggest {
+                reason: format!(
+                    "pattern targets sensitive system path `{system_path}` with destructive or broad matching"
+                ),
+            };
+        }
+
+        return SuggestionSafetyDecision::RequireConfirmation {
+            reason: format!(
+                "pattern references sensitive system path `{system_path}` and requires explicit confirmation"
+            ),
+        };
+    }
+
+    if risk == RiskLevel::High && is_high_risk_destructive_pattern(&normalized) {
+        return SuggestionSafetyDecision::NeverSuggest {
+            reason: "high-risk destructive patterns must not be suggested for allowlisting"
+                .to_string(),
+        };
+    }
+
+    SuggestionSafetyDecision::Allow
+}
+
+/// Remove unsafe allowlist suggestions while returning clear filter reasons.
+#[must_use]
+pub fn filter_suggestions_for_safety(
+    suggestions: Vec<AllowlistSuggestion>,
+) -> SuggestionSafetyFilterResult {
+    let mut allowed = Vec::with_capacity(suggestions.len());
+    let mut filtered = Vec::new();
+
+    for mut suggestion in suggestions {
+        let safety = check_suggestion_safety(&suggestion.cluster.proposed_pattern, suggestion.risk);
+        suggestion.safety = safety.clone();
+        suggestion.score = apply_safety_score_adjustment(suggestion.score, &safety);
+
+        if safety.is_never_suggest() {
+            filtered.push(FilteredSuggestion {
+                pattern: suggestion.cluster.proposed_pattern,
+                example_commands: suggestion.cluster.commands,
+                safety,
+            });
+        } else {
+            allowed.push(suggestion);
+        }
+    }
+
+    SuggestionSafetyFilterResult {
+        suggestions: allowed,
+        filtered,
+    }
+}
+
+fn normalize_safety_scan_target(pattern: &str) -> String {
+    let mut normalized = pattern.to_ascii_lowercase();
+    for (needle, replacement) in [
+        (r"\s+", " "),
+        (r"\s*", " "),
+        (r"\ ", " "),
+        (r"\/", "/"),
+        (r"\.", "."),
+        (r"\-", "-"),
+        (r"\*", "*"),
+        (r"\|", "|"),
+    ] {
+        normalized = normalized.replace(needle, replacement);
+    }
+
+    let mut out = String::with_capacity(normalized.len());
+    for ch in normalized.chars() {
+        match ch {
+            '^' | '$' | '(' | ')' | '?' | ':' | '\\' => {}
+            _ => out.push(ch),
+        }
+    }
+
+    collapse_whitespace(&out)
+}
+
+fn contains_fork_bomb(pattern: &str) -> bool {
+    let squashed: String = pattern
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+
+    squashed.contains(":(){:|:&};:") || squashed.contains(":|:&")
+}
+
+fn targets_root_with_recursive_rm(normalized: &str) -> bool {
+    recursive_rm_target(normalized)
+        .is_some_and(|target| matches!(target, "/" | "/*" | "/**" | "/." | "/.." | "/.*" | "/.+"))
+}
+
+fn recursive_rm_target(normalized: &str) -> Option<&str> {
+    let start = normalized.find("rm -rf")? + "rm -rf".len();
+    normalized[start..].split_whitespace().next()
+}
+
+fn overwrites_raw_disk(normalized: &str) -> bool {
+    normalized.contains("dd if=/dev/zero")
+        && ["/dev/sd", "/dev/nvme", "/dev/hd", "/dev/vd"]
+            .iter()
+            .any(|device| normalized.contains(&format!("of={device}")))
+}
+
+fn formats_block_device(normalized: &str) -> bool {
+    normalized
+        .split_whitespace()
+        .any(|token| token == "mkfs" || token.starts_with("mkfs."))
+}
+
+fn destroys_database(normalized: &str) -> bool {
+    normalized.contains("drop database")
+        || normalized.contains("drop table")
+        || normalized.contains("truncate database")
+        || normalized.contains("truncate table")
+}
+
+fn deletes_every_database_row(normalized: &str) -> bool {
+    normalized.contains("delete from")
+        && (normalized.contains("where 1=1") || normalized.contains("where true"))
+}
+
+fn referenced_sensitive_system_path(normalized: &str) -> Option<&'static str> {
+    [
+        "/etc", "/usr", "/bin", "/sbin", "/root", "/dev", "/proc", "/sys", "/boot", "/lib",
+        "/lib64", "/var/lib",
+    ]
+    .into_iter()
+    .find(|path| {
+        normalized.split_whitespace().any(|token| {
+            let token = token.trim_matches(|ch: char| {
+                matches!(ch, '"' | '\'' | ';' | ',' | '[' | ']' | '{' | '}')
+            });
+            token == *path
+                || token.starts_with(&format!("{path}/"))
+                || token.starts_with(&format!("{path}/*"))
+                || token.starts_with(&format!("{path}.*"))
+        })
+    })
+}
+
+fn contains_path_wildcard(pattern: &str) -> bool {
+    pattern.contains(".*")
+        || pattern.contains(".+")
+        || pattern.contains(r"\d+")
+        || pattern.contains("[^")
+        || pattern.contains("]+")
+}
+
+fn is_high_risk_destructive_pattern(normalized: &str) -> bool {
+    normalized.contains("reset --hard")
+        || normalized.contains("clean -f")
+        || normalized.contains("clean -fd")
+        || normalized.contains("branch -d")
+        || normalized.contains("push --force")
+        || normalized.contains("push -f")
+        || normalized.contains("drop ")
+        || normalized.contains("truncate ")
+        || normalized.contains("delete ")
 }
 
 /// Analyze working directories to find path patterns.
@@ -611,6 +917,8 @@ pub fn generate_enhanced_suggestions(
                 .with_bypass_count(bypass_count)
         })
         .collect();
+
+    suggestions = filter_suggestions_for_safety(suggestions).suggestions;
 
     // Sort by score (descending)
     suggestions.sort_by(|a, b| {
@@ -1408,6 +1716,114 @@ fn build_proposed_pattern(commands: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn denied_entry(command: &str) -> CommandEntryInfo {
+        CommandEntryInfo {
+            command: command.to_string(),
+            working_dir: "/data/projects/dcg".to_string(),
+            was_bypassed: false,
+        }
+    }
+
+    // ========================================================================
+    // Safety Filter Tests
+    // ========================================================================
+
+    #[test]
+    fn safety_filter_removes_recursive_root_delete_suggestions() {
+        let entries = vec![
+            denied_entry("rm -rf /"),
+            denied_entry("rm -rf /"),
+            denied_entry("rm -rf /"),
+        ];
+
+        let suggestions = generate_enhanced_suggestions(&entries, 3);
+        assert!(suggestions.is_empty());
+
+        let result = check_suggestion_safety(r"^rm\s+-rf\s+/$", RiskLevel::High);
+        match result {
+            SuggestionSafetyDecision::NeverSuggest { reason } => {
+                assert!(reason.contains("filesystem root"));
+            }
+            other => panic!("expected never-suggest decision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn safety_filter_removes_database_destroying_suggestions() {
+        let decision = check_suggestion_safety(r"^DROP\s+TABLE\s+users$", RiskLevel::High);
+
+        match decision {
+            SuggestionSafetyDecision::NeverSuggest { reason } => {
+                assert!(reason.contains("database-destroying"));
+            }
+            other => panic!("expected never-suggest decision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn safety_filter_removes_sensitive_path_wildcards() {
+        let decision = check_suggestion_safety(r"^rm\s+-rf\s+/etc/cache\d+$", RiskLevel::High);
+
+        match decision {
+            SuggestionSafetyDecision::NeverSuggest { reason } => {
+                assert!(reason.contains("/etc"));
+                assert!(reason.contains("broad"));
+            }
+            other => panic!("expected never-suggest decision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn safety_filter_requires_confirmation_for_system_paths() {
+        let decision = check_suggestion_safety(r"^cat\s+/etc/hosts$", RiskLevel::Low);
+
+        match decision {
+            SuggestionSafetyDecision::RequireConfirmation { reason } => {
+                assert!(reason.contains("/etc"));
+                assert!(reason.contains("explicit confirmation"));
+            }
+            other => panic!("expected confirmation decision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn safety_filter_allows_namespaced_build_patterns() {
+        let decision = check_suggestion_safety(r"^npm\s+run\s+build:[\w.:-]+$", RiskLevel::Low);
+        assert_eq!(decision, SuggestionSafetyDecision::Allow);
+
+        let entries = vec![
+            denied_entry("npm run build:dev"),
+            denied_entry("npm run build:prod"),
+            denied_entry("npm run build:staging"),
+        ];
+        let suggestions = generate_enhanced_suggestions(&entries, 1);
+
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].safety, SuggestionSafetyDecision::Allow);
+        assert!(suggestions[0].cluster.proposed_pattern.contains("build:"));
+    }
+
+    #[test]
+    fn safety_filter_result_returns_reasons_for_filtered_patterns() {
+        let suggestion = AllowlistSuggestion::from_cluster(CommandCluster {
+            commands: vec!["dd if=/dev/zero of=/dev/sda".to_string()],
+            normalized: vec!["dd if=/dev/zero of=/dev/sda".to_string()],
+            proposed_pattern: r"^dd\s+if=/dev/zero\s+of=/dev/sda$".to_string(),
+            frequency: 3,
+            unique_count: 1,
+        });
+
+        let result = filter_suggestions_for_safety(vec![suggestion]);
+
+        assert!(result.suggestions.is_empty());
+        assert_eq!(result.filtered.len(), 1);
+        let reason = result.filtered[0]
+            .safety
+            .reason()
+            .expect("filtered suggestion should include a reason");
+        assert!(reason.contains("raw disk overwrite"));
+    }
 
     // ========================================================================
     // Clustering Tests

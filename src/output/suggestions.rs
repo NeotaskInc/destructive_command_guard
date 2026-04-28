@@ -305,6 +305,7 @@ mod tests {
             ],
             suggest_path_specific: true,
             bypass_count: 2,
+            safety: Default::default(),
             score: 0.92,
         }
     }
