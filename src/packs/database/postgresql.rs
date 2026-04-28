@@ -374,10 +374,7 @@ mod tests {
         //   echo "MYTRUNCATE TABLE foo described in the docs"
         // would block.
         let pack = create_pack();
-        assert_no_match(
-            &pack,
-            "echo \"MYTRUNCATE TABLE foo described in the docs\"",
-        );
+        assert_no_match(&pack, "echo \"MYTRUNCATE TABLE foo described in the docs\"");
         assert_no_match(&pack, "echo NEEDSTRUNCATE TABLE later");
         assert_no_match(&pack, "ls myTRUNCATE-table-script.sh");
         // Real TRUNCATE still blocks.
