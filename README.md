@@ -42,6 +42,9 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_comm
 | **Sub-Millisecond Latency** | SIMD-accelerated filtering—you won't notice it's there |
 | **Heredoc/Inline Script Scanning** | Catches `python -c "os.remove(...)"` and embedded shell scripts |
 | **Smart Context Detection** | Won't block `grep "rm -rf"` (data) but will block `rm -rf /` (execution) |
+| **Rich Terminal Output** | Human-readable denial panels, rule context, and suggestions on stderr |
+| **Agent-Safe Streams** | Machine-readable hook output stays on stdout while rich UI stays on stderr |
+| **Graceful Degradation** | Plain output for CI, pipes, dumb terminals, and no-color environments |
 | **Scan Mode for CI** | Pre-commit hooks and CI integration to catch dangerous commands in code review |
 | **Fail-Open Design** | Never blocks your workflow due to timeouts or parse errors |
 | **Explain Mode** | `dcg explain "command"` shows exactly why something is blocked |
@@ -488,7 +491,10 @@ Environment variables override config files (highest priority):
 - `DCG_VERBOSE=0-3`: verbosity level (0 = quiet, 3 = trace)
 - `DCG_QUIET=1`: suppress non-error output
 - `DCG_COLOR=auto|always|never`: color mode
+- `DCG_NO_RICH=1`: disable rich terminal formatting and use plain rendering
 - `DCG_NO_COLOR=1`: disable colored output (same as NO_COLOR)
+- `DCG_LEGACY_OUTPUT=1`: force legacy/plain output paths (same as `--legacy-output`)
+- `DCG_ROBOT=1`: enable robot mode for JSON stdout and quiet stderr
 - `DCG_HIGH_CONTRAST=1`: enable high-contrast output (ASCII borders + monochrome palette)
 - `DCG_FORMAT=text|json|sarif`: default output format (command-specific; SARIF applies to `dcg scan`)
 - `DCG_BYPASS=1`: bypass dcg entirely (escape hatch; use sparingly)
@@ -1371,7 +1377,12 @@ Your AI agent invokes dcg as a PreToolUse hook before executing each shell comma
 3. **Quick Reject** -- O(n) substring search for keywords like "git" or "rm". Commands without these substrings skip regex matching entirely (handles 99%+ of non-destructive commands).
 4. **Pattern Matching** -- Safe patterns checked first (match = allow). Destructive patterns checked second (match = deny with explanation). No match on either = allow.
 
-If blocked, dcg outputs a JSON denial on stdout and a colorful human-readable warning on stderr. If allowed, dcg exits silently (no output). Colors are automatically disabled when stderr is not a TTY.
+If blocked under a Claude-compatible JSON hook protocol, dcg outputs a JSON
+denial on stdout and a colorful human-readable warning on stderr. If blocked
+under Codex CLI 0.125.0+, dcg follows Codex's strict hook contract: no stdout
+JSON, exit code 2, and a stderr reason that Codex shows to the model. If
+allowed, dcg exits silently. Rich formatting is automatically disabled for CI,
+non-TTY output, dumb terminals, and no-color environments.
 
 ## Architecture
 
@@ -1406,7 +1417,8 @@ If blocked, dcg outputs a JSON denial on stdout and a colorful human-readable wa
 │                                                                  │
 └─────────────────────┬───────────────────────────────────────────┘
                       │
-                      ▼ stdout: JSON (deny) or empty (allow)
+                      ▼ stdout: JSON deny / empty allow
+                        stderr: rich human output / Codex deny reason
 ┌─────────────────────────────────────────────────────────────────┐
 │            Claude Code / Gemini CLI / Copilot CLI                │
 │                                                                  │
@@ -1917,6 +1929,59 @@ Tip: If you need to run this command, execute it manually in a terminal.
      Consider using 'git stash' first to save your changes.
 ════════════════════════════════════════════════════════════════════════
 ```
+
+## Output Modes
+
+dcg separates agent-facing data from human-facing display. This lets agents
+parse stable output while people watching the terminal still get readable,
+high-signal formatting.
+
+| Mode | Trigger | stdout | stderr |
+|------|---------|--------|--------|
+| Hook allow | Safe command | Empty | Empty |
+| JSON-hook deny | Claude Code, Gemini CLI, Copilot CLI, compatible hooks | Denial JSON | Rich or plain warning |
+| Codex deny | Codex CLI 0.125.0+ hook input | Empty | Deny reason with command, rule, and remediation |
+| Robot mode | `--robot` or `DCG_ROBOT=1` | JSON | Silent |
+| Plain fallback | `DCG_NO_RICH=1`, `NO_COLOR=1`, `DCG_NO_COLOR=1`, `TERM=dumb`, `CI=1`, non-TTY output, or `--legacy-output` | Mode-specific data | Plain text only |
+
+### Rich Human Output
+
+Rich output is for humans and always belongs on stderr. It includes the blocked
+command, severity, rule id, pack id, explanation, and safer alternatives when
+available:
+
+```text
+BLOCKED  dcg
+Reason:  git reset --hard destroys uncommitted changes
+Rule:    core.git:reset-hard
+Command: git reset --hard HEAD~1
+Tip:     Use git stash to save your changes first.
+```
+
+### Plain and No-Color Output
+
+Use plain output for logs, terminals with limited capabilities, or tests that
+assert exact strings:
+
+```bash
+DCG_NO_RICH=1 dcg test "git reset --hard HEAD"
+NO_COLOR=1 dcg explain "rm -rf ./build"
+TERM=dumb dcg scan .
+```
+
+### Agent JSON Output
+
+For automation, prefer robot mode or the hook protocol your agent expects:
+
+```bash
+# Robot-mode scripting: parse stdout JSON, ignore stderr.
+dcg --robot test "rm -rf /" >decision.json 2>/dev/null
+
+# Claude-compatible hook integration: parse stdout only when non-empty.
+dcg < hook-input.json >hook-output.json 2>human-warning.txt
+```
+
+Codex integrations should treat exit code 2 plus non-empty stderr as a deny.
 
 ### Suggestion System
 
