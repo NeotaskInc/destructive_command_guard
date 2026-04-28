@@ -1909,7 +1909,11 @@ mod tests {
         let stderr_str = String::from_utf8_lossy(&stderr);
         assert!(
             stderr_str.contains("WARNING"),
-            "stderr must contain WARNING marker"
+            "stderr must contain WARNING marker; got: {stderr_str}"
+        );
+        assert!(
+            stderr_str.contains("core.git:checkout-dot"),
+            "stderr must contain rule id; got: {stderr_str}"
         );
     }
 
