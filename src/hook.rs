@@ -7,15 +7,10 @@
 use crate::evaluator::MatchSpan;
 use crate::highlight::HighlightSpan;
 use crate::output::auto_theme;
-#[cfg(feature = "rich-output")]
-use crate::output::console::console;
 use crate::output::denial::DenialBox;
 use crate::output::theme::Severity as ThemeSeverity;
 use crate::packs::PatternSuggestion;
 use colored::Colorize;
-#[cfg(feature = "rich-output")]
-#[allow(unused_imports)]
-use rich_rust::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::io::{self, IsTerminal, Read, Write};
@@ -634,8 +629,6 @@ pub(crate) fn print_colorful_warning_to(
     severity: Option<crate::packs::Severity>,
     branch_context: Option<&crate::evaluator::BranchContext>,
 ) {
-    #[cfg(feature = "rich-output")]
-    let console_instance = console();
     let theme = auto_theme();
 
     let rule_id = build_rule_id(pack, pattern);
@@ -651,27 +644,11 @@ pub(crate) fn print_colorful_warning_to(
         .map(|s| HighlightSpan::new(s.start, s.end))
         .unwrap_or_else(|| HighlightSpan::new(0, 0));
 
-    let suggestions_enabled = crate::output::suggestions_enabled();
-
-    let filtered_suggestions: Vec<&PatternSuggestion> = if suggestions_enabled {
-        pattern_suggestions
-            .iter()
-            .filter(|s| s.platform.matches_current())
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let mut alternatives: Vec<String> = filtered_suggestions
-        .iter()
-        .take(MAX_SUGGESTIONS)
-        .map(|s| format!("{}: {}", s.description, s.command))
-        .collect();
-
-    if suggestions_enabled && alternatives.is_empty() {
-        if let Some(sugg) = get_contextual_suggestion(command) {
-            alternatives.push(sugg.to_string());
-        }
-    }
+    let alternatives = pattern_suggestion_alternatives(
+        command,
+        crate::output::suggestions_enabled(),
+        pattern_suggestions,
+    );
 
     let mut denial = DenialBox::new(command, span, pattern_display, theme_severity)
         .with_alternatives(alternatives);
@@ -697,11 +674,6 @@ pub(crate) fn print_colorful_warning_to(
     }
 
     let _ = writeln!(writer, "{}", denial.render(&theme));
-
-    #[cfg(feature = "rich-output")]
-    if !console_instance.is_plain() {
-        // Rich mode: DenialBox handles most things
-    }
 
     let escaped_cmd = command.replace('"', "\\\"");
     let truncated_cmd = truncate_for_display(&escaped_cmd, 45);
@@ -733,6 +705,31 @@ pub(crate) fn print_colorful_warning_to(
     let _ = writeln!(writer);
 }
 
+fn pattern_suggestion_alternatives(
+    command: &str,
+    suggestions_enabled: bool,
+    pattern_suggestions: &[PatternSuggestion],
+) -> Vec<String> {
+    if !suggestions_enabled {
+        return Vec::new();
+    }
+
+    let mut alternatives: Vec<String> = pattern_suggestions
+        .iter()
+        .filter(|suggestion| suggestion.platform.matches_current())
+        .take(MAX_SUGGESTIONS)
+        .map(|suggestion| format!("{}: {}", suggestion.description, suggestion.command))
+        .collect();
+
+    if alternatives.is_empty() {
+        if let Some(suggestion) = get_contextual_suggestion(command) {
+            alternatives.push(suggestion.to_string());
+        }
+    }
+
+    alternatives
+}
+
 /// Print a colorful warning to stderr for human visibility.
 #[allow(clippy::too_many_lines)]
 pub fn print_colorful_warning(
@@ -761,38 +758,6 @@ pub fn print_colorful_warning(
         severity,
         None,
     );
-}
-
-#[cfg(feature = "rich-output")]
-#[allow(dead_code)] // TODO: Integrate into rich output path
-fn render_suggestions_panel(suggestions: &[PatternSuggestion]) -> String {
-    use rich_rust::r#box::ROUNDED;
-    use rich_rust::prelude::*;
-
-    // Build content as a Vec of lines, then join
-    let mut lines = Vec::new();
-    if !crate::output::suggestions_enabled() {
-        return String::new();
-    }
-
-    let filtered: Vec<&PatternSuggestion> = suggestions
-        .iter()
-        .filter(|s| s.platform.matches_current())
-        .take(MAX_SUGGESTIONS)
-        .collect();
-
-    for (i, s) in filtered.iter().enumerate() {
-        lines.push(format!("[bold cyan]{}.[/] {}", i + 1, s.description));
-        lines.push(format!("   [green]$[/] [cyan]{}[/]", s.command));
-    }
-    let content_str = lines.join("\n");
-
-    let width = crate::output::terminal_width() as usize;
-    Panel::from_text(&content_str)
-        .title("[yellow bold] 💡 Suggestions [/]")
-        .box_style(&ROUNDED)
-        .border_style(Style::new().color(Color::parse("yellow").unwrap_or_default()))
-        .render_plain(width)
 }
 
 /// Truncate a string for display, appending "..." if truncated.
@@ -1758,6 +1723,63 @@ mod tests {
         assert_eq!(specific["packId"], "core.git");
         assert_eq!(specific["allowOnceCode"], "abc123");
         assert!(!stderr.is_empty(), "stderr must contain colorful warning");
+    }
+
+    #[test]
+    fn test_pattern_suggestion_alternatives_formats_platform_matches() {
+        let suggestions = [
+            PatternSuggestion::new("git stash", "Save uncommitted changes"),
+            PatternSuggestion::new("git clean -n", "Preview untracked file cleanup"),
+        ];
+
+        let alternatives = pattern_suggestion_alternatives("git reset --hard", true, &suggestions);
+
+        assert_eq!(
+            alternatives,
+            vec![
+                "Save uncommitted changes: git stash",
+                "Preview untracked file cleanup: git clean -n"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_pattern_suggestion_alternatives_respects_disable_flag() {
+        let suggestions = [PatternSuggestion::new(
+            "git stash",
+            "Save uncommitted changes",
+        )];
+
+        let alternatives = pattern_suggestion_alternatives("git reset --hard", false, &suggestions);
+
+        assert!(alternatives.is_empty());
+    }
+
+    #[test]
+    fn test_pattern_suggestion_alternatives_falls_back_to_contextual() {
+        let alternatives = pattern_suggestion_alternatives("git clean -fd", true, &[]);
+
+        assert_eq!(
+            alternatives,
+            vec!["Use 'git clean -n' first to preview what would be deleted."]
+        );
+    }
+
+    #[test]
+    fn test_pattern_suggestion_alternatives_limits_display_count() {
+        let suggestions = [
+            PatternSuggestion::new("cmd1", "one"),
+            PatternSuggestion::new("cmd2", "two"),
+            PatternSuggestion::new("cmd3", "three"),
+            PatternSuggestion::new("cmd4", "four"),
+            PatternSuggestion::new("cmd5", "five"),
+        ];
+
+        let alternatives = pattern_suggestion_alternatives("rm -rf /tmp/x", true, &suggestions);
+
+        assert_eq!(alternatives.len(), MAX_SUGGESTIONS);
+        assert!(alternatives.iter().any(|item| item == "one: cmd1"));
+        assert!(!alternatives.iter().any(|item| item == "five: cmd5"));
     }
 
     #[test]
