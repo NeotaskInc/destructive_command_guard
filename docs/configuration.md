@@ -35,7 +35,75 @@ disabled = [
 - `DCG_DISABLE="kubernetes.helm"`
 - `DCG_VERBOSE=1`
 - `DCG_COLOR=auto|always|never`
+- `DCG_NO_RICH=1`
 - `DCG_BYPASS=1` (escape hatch; use sparingly)
+
+## Output Configuration
+
+dcg separates machine-readable output from human-facing terminal output. Hook and
+robot-mode integrations must read protocol responses from stdout and treat stderr
+as advisory human output only. Human warnings, rich formatting, and progress
+output are never required for automation.
+
+### Rich Terminal Output
+
+Rich output is enabled only when the current output mode is human-facing, stdout
+is a TTY, and no plain-output control is active. These controls force plain,
+automation-friendly output:
+
+| Control | Default | Effect |
+|---------|---------|--------|
+| `--legacy-output` or `DCG_LEGACY_OUTPUT=1` | unset | Use the legacy/plain renderer. |
+| `DCG_NO_RICH=1` | unset | Disable rich formatting while keeping normal command output. |
+| `--no-color`, `DCG_NO_COLOR=1`, or `NO_COLOR=1` | unset | Disable colors and rich terminal styling. |
+| `DCG_COLOR=never` | `auto` | Disable colors through the general configuration override. |
+| `TERM=dumb` | terminal-defined | Use a plain fallback for minimal terminals. |
+| `CI=1` | unset | Use a plain fallback in CI and other non-interactive runners. |
+| Piped stdout or non-TTY stdout | TTY-detected | Disable rich output automatically. |
+
+Examples:
+
+```bash
+DCG_NO_RICH=1 dcg scan .
+NO_COLOR=1 dcg doctor
+dcg scan . | head
+```
+
+### Theme Configuration
+
+High-contrast output can be enabled with `DCG_HIGH_CONTRAST=1` or config:
+
+```toml
+[output]
+high_contrast = true
+
+[theme]
+palette = "high-contrast"
+use_unicode = false
+```
+
+### Robot and Hook Modes
+
+Use robot mode for agent and script integrations:
+
+```bash
+DCG_ROBOT=1 dcg test --format json "git reset --hard HEAD~1"
+dcg --robot packs
+```
+
+Robot mode forces JSON output on stdout, suppresses stderr, disables rich output,
+and uses standardized machine-readable exit codes.
+
+In hook mode, keep stdout reserved for the hook protocol. Human-facing denial or
+warning text is written to stderr so agents can parse stdout without terminal
+decorations. Codex hook protocol denials use the stricter Codex-compatible path:
+exit code `2` with the denial reason on stderr instead of stdout JSON.
+
+Related references:
+
+- [README.md](../README.md) for the user-facing overview.
+- [AGENTS.md](../AGENTS.md) for the hook protocol contract.
+- [docs/agents.md](agents.md) for agent detection and profile configuration.
 
 ## External Packs (YAML)
 
