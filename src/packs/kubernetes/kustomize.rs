@@ -108,8 +108,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packs::test_helpers::*;
     use crate::packs::Severity;
+    use crate::packs::test_helpers::*;
 
     #[test]
     fn kustomize_blocks_piped_delete() {
@@ -129,11 +129,7 @@ mod tests {
     #[test]
     fn kustomize_blocks_kubectl_delete_k() {
         let pack = create_pack();
-        assert_blocks(
-            &pack,
-            "kubectl delete -k ./overlays/prod",
-            "delete -k",
-        );
+        assert_blocks(&pack, "kubectl delete -k ./overlays/prod", "delete -k");
     }
 
     #[test]
@@ -149,11 +145,7 @@ mod tests {
             "kubectl kustomize ./prod | kubectl delete -f -",
             Severity::Critical,
         );
-        assert_blocks_with_severity(
-            &pack,
-            "kubectl delete -k ./prod",
-            Severity::Critical,
-        );
+        assert_blocks_with_severity(&pack, "kubectl delete -k ./prod", Severity::Critical);
     }
 
     #[test]
@@ -166,10 +158,7 @@ mod tests {
     #[test]
     fn kustomize_safe_with_diff() {
         let pack = create_pack();
-        assert_allows(
-            &pack,
-            "kustomize build ./overlays/prod | kubectl diff -f -",
-        );
+        assert_allows(&pack, "kustomize build ./overlays/prod | kubectl diff -f -");
     }
 
     #[test]
@@ -179,10 +168,7 @@ mod tests {
             &pack,
             "kustomize build ./overlays/prod | kubectl apply --dry-run=client -f -",
         );
-        assert_allows(
-            &pack,
-            "kubectl delete -k ./prod --dry-run=client",
-        );
+        assert_allows(&pack, "kubectl delete -k ./prod --dry-run=client");
     }
 
     #[test]
