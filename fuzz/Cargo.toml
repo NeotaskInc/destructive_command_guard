@@ -78,3 +78,19 @@ path = "fuzz_targets/fuzz_shell_extract.rs"
 test = false
 doc = false
 bench = false
+
+# Fuzz target: integrated heredoc extraction + AST fail-open behavior
+[[bin]]
+name = "heredoc_fuzz"
+path = "fuzz_targets/heredoc_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+# Fuzz target: AST matcher parser and pattern matching fail-open behavior
+[[bin]]
+name = "ast_matcher_fuzz"
+path = "fuzz_targets/ast_matcher_fuzz.rs"
+test = false
+doc = false
+bench = false

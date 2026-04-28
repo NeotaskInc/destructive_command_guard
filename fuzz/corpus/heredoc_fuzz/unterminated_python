@@ -1,0 +1,2 @@
+up
+print('unterminated heredoc should fail open')

@@ -1,0 +1,3 @@
+hp
+import shutil
+shutil.rmtree('/tmp/dcg-fuzz', ignore_errors=True)

@@ -155,6 +155,33 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Cache cargo registry and fuzz target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fuzz/target
+          key: ${{ runner.os }}-fuzz-smoke-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'fuzz/**') }}
+          restore-keys: |
+            ${{ runner.os }}-fuzz-smoke-
+
+      - name: Run heredoc fuzz smoke
+        run: |
+          cd fuzz
+          cargo fuzz run heredoc_fuzz -- -max_total_time=30
+
   coverage:
     runs-on: ubuntu-latest
     needs: check
@@ -820,7 +847,7 @@ jobs:
           components: llvm-tools-preview
 
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
 
       - name: Cache cargo registry and fuzz corpus
         uses: actions/cache@v5
@@ -838,7 +865,7 @@ jobs:
         run: |
           cd fuzz
           echo "## Fuzzing Results" >> $GITHUB_STEP_SUMMARY
-          for target in fuzz_context fuzz_evaluate fuzz_hook_input fuzz_normalize fuzz_heredoc_trigger fuzz_heredoc_extract fuzz_heredoc_language fuzz_shell_extract; do
+          for target in fuzz_context fuzz_evaluate fuzz_hook_input fuzz_normalize fuzz_heredoc_trigger fuzz_heredoc_extract fuzz_heredoc_language fuzz_shell_extract heredoc_fuzz ast_matcher_fuzz; do
             echo "Fuzzing $target (~60s runtime + build)..."
             timeout 10m cargo fuzz run "$target" -- -max_total_time=60 || true
             echo "- $target: completed" >> $GITHUB_STEP_SUMMARY

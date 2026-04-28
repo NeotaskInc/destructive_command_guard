@@ -1,0 +1,3 @@
+b
+rm -rf /tmp/dcg-fuzz
+# git reset --hard HEAD in a comment

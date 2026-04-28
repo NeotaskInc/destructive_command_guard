@@ -10,8 +10,8 @@
 use libfuzzer_sys::fuzz_target;
 
 use destructive_command_guard::LayeredAllowlist;
-use destructive_command_guard::config::Config;
 use destructive_command_guard::config::CompiledOverrides;
+use destructive_command_guard::config::Config;
 use destructive_command_guard::evaluator::evaluate_command;
 use std::sync::LazyLock;
 

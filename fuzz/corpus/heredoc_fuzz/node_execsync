@@ -1,0 +1,3 @@
+ij
+const { execSync } = require('child_process');
+execSync('rm -rf /tmp/dcg-fuzz');
