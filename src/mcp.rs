@@ -7,7 +7,7 @@ use crate::config::Config;
 use crate::evaluator::{EvaluationDecision, evaluate_command};
 use crate::packs::REGISTRY;
 use crate::scan::{
-    ScanEvalContext, ScanFailOn, ScanFormat, ScanOptions, ScanRedactMode, scan_paths,
+    ScanEvalContext, ScanFailOn, ScanFormat, ScanOptions, ScanRedactMode, ScanReport, scan_paths,
 };
 use async_trait::async_trait;
 use rust_mcp_sdk::mcp_server::{
@@ -28,8 +28,8 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub struct DcgMcpServer {
     server_info: InitializeResult,
-    config: Config,
-    scan_ctx: ScanEvalContext,
+    config: Arc<Config>,
+    scan_ctx: Arc<ScanEvalContext>,
 }
 
 #[derive(Serialize)]
@@ -101,8 +101,8 @@ impl DcgMcpServer {
 
         Self {
             server_info,
-            config,
-            scan_ctx,
+            config: Arc::new(config),
+            scan_ctx: Arc::new(scan_ctx),
         }
     }
 
@@ -273,6 +273,44 @@ impl DcgMcpServer {
             explanation,
         })
     }
+
+    async fn scan_file_report(&self, path: String) -> Result<ScanReport, CallToolError> {
+        let config = Arc::clone(&self.config);
+        let scan_ctx = Arc::clone(&self.scan_ctx);
+
+        Self::run_blocking_scan(move || {
+            let path_buf = PathBuf::from(path);
+            let options = Self::default_scan_options();
+            let include: Vec<String> = Vec::new();
+            let exclude: Vec<String> = Vec::new();
+
+            scan_paths(
+                &[path_buf],
+                &options,
+                config.as_ref(),
+                scan_ctx.as_ref(),
+                &include,
+                &exclude,
+                None,
+            )
+        })
+        .await
+    }
+
+    async fn scan_file_tool(&self, path: String) -> Result<CallToolResult, CallToolError> {
+        let report = self.scan_file_report(path).await?;
+        Self::tool_result_json(&report)
+    }
+
+    async fn run_blocking_scan<F>(scan: F) -> Result<ScanReport, CallToolError>
+    where
+        F: FnOnce() -> Result<ScanReport, String> + Send + 'static,
+    {
+        tokio::task::spawn_blocking(scan)
+            .await
+            .map_err(|err| Self::call_tool_error(format!("scan_file worker failed: {err}")))?
+            .map_err(Self::call_tool_error)
+    }
 }
 
 impl Default for DcgMcpServer {
@@ -341,21 +379,7 @@ impl ServerHandler for DcgMcpServer {
             }
             "scan_file" => {
                 let path = Self::string_arg(params.arguments.as_ref(), "path")?;
-                let path_buf = PathBuf::from(path);
-                let options = Self::default_scan_options();
-                let include: Vec<String> = Vec::new();
-                let exclude: Vec<String> = Vec::new();
-                let report = scan_paths(
-                    &[path_buf],
-                    &options,
-                    &self.config,
-                    &self.scan_ctx,
-                    &include,
-                    &exclude,
-                    None,
-                )
-                .map_err(Self::call_tool_error)?;
-                Self::tool_result_json(&report)
+                self.scan_file_tool(path).await
             }
             "explain_pattern" => {
                 let rule_id = Self::string_arg(params.arguments.as_ref(), "rule_id")?;
@@ -394,4 +418,81 @@ pub fn run_mcp_server() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
     runtime.block_on(run_mcp_server_async())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scan::{SCAN_SCHEMA_VERSION, ScanDecisionCounts, ScanSeverityCounts, ScanSummary};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    fn empty_scan_report() -> ScanReport {
+        ScanReport {
+            schema_version: SCAN_SCHEMA_VERSION,
+            summary: ScanSummary {
+                files_scanned: 0,
+                files_skipped: 0,
+                commands_extracted: 0,
+                findings_total: 0,
+                decisions: ScanDecisionCounts::default(),
+                severities: ScanSeverityCounts::default(),
+                max_findings_reached: false,
+                elapsed_ms: Some(0),
+            },
+            findings: Vec::new(),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_scan_worker_does_not_starve_lightweight_checks() {
+        let server = DcgMcpServer::new();
+        let scan_started = Arc::new(AtomicBool::new(false));
+        let scan_started_in_worker = Arc::clone(&scan_started);
+
+        let scan_future = DcgMcpServer::run_blocking_scan(move || {
+            scan_started_in_worker.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(150));
+            Ok(empty_scan_report())
+        });
+        let quick_future = async {
+            let quick_check = tokio::time::timeout(Duration::from_millis(50), async {
+                while !scan_started.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+                server.check_command("git status")
+            })
+            .await
+            .expect("blocking scan should not starve the async runtime");
+
+            assert!(quick_check.allowed);
+        };
+
+        let (scan_result, ()) = tokio::join!(scan_future, quick_future);
+        let report = scan_result.expect("blocking scan should succeed");
+        assert_eq!(report.schema_version, SCAN_SCHEMA_VERSION);
+    }
+
+    #[tokio::test]
+    async fn scan_file_report_scans_path_on_blocking_worker() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let script = temp_dir.path().join("danger.sh");
+        std::fs::write(&script, "#!/bin/sh\nrm -rf /\n").unwrap();
+
+        let server = DcgMcpServer::new();
+        let report = server
+            .scan_file_report(script.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+
+        assert_eq!(report.summary.files_scanned, 1);
+        assert!(report.summary.commands_extracted >= 1);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.extracted_command.contains("rm -rf /"))
+        );
+    }
 }
