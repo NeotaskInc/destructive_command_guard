@@ -96,6 +96,28 @@ const RM_RECURSIVE_FORCE_SUGGESTIONS: &[PatternSuggestion] = &[
         "Safe temp directory deletion (allowed without confirmation)",
     ),
 ];
+
+/// Suggestions for `find ... -delete` patterns. `find -delete` is
+/// bytewise-equivalent to `rm -rf` on the matching tree, so the suggestions
+/// mirror the rm-rf ones.
+const FIND_DELETE_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "find {path} -type f | head -20",
+        "Preview which files `-delete` would remove (drop the -delete flag)",
+    ),
+    PatternSuggestion::new(
+        "find {path} -type f | wc -l",
+        "Count files that would be deleted before proceeding",
+    ),
+    PatternSuggestion::new(
+        "find /tmp/{subdir} -delete",
+        "Safe temp directory deletion (allowed without confirmation)",
+    ),
+    PatternSuggestion::new(
+        "find {path} -print -delete",
+        "If you must proceed: use -print to log every deletion",
+    ),
+];
 use crate::{normalize::NormalizeTokenKind, normalize::tokenize_for_normalization};
 use std::ops::Range;
 
@@ -455,8 +477,12 @@ pub fn create_pack() -> Pack {
     Pack {
         id: "core.filesystem".to_string(),
         name: "Core Filesystem",
-        description: "Protects against dangerous rm -rf commands outside temp directories",
-        keywords: &["rm"],
+        description: "Protects against dangerous rm -rf commands and equivalent destruction (find -delete) outside temp directories",
+        // `find` is included so the quick-reject filter doesn't drop
+        // commands like `find / -delete` — which is bytewise-equivalent
+        // to `rm -rf /` and used to bypass dcg entirely (the agent learns
+        // to swap `rm -rf` → `find -delete` when blocked).
+        keywords: &["rm", "find"],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
         keyword_matcher: None,
@@ -594,6 +620,41 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "rm-force-recursive-tmpdir-brace",
             r"^rm\s+.*--force.*--recursive\s+(?:\$\{TMPDIR\}/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
         ),
+        // -----------------------------------------------------------------
+        // `find ... -delete` safe whitelist for temp directories.
+        //
+        // The destructive pattern `find-delete-general` (below) blocks any
+        // `find ... -delete` invocation, mirroring the `rm -rf` policy.
+        // These safe patterns short-circuit when EVERY path argument is
+        // rooted under the corresponding temp directory.
+        //
+        // STRICT shape: after `find <tmp-path>`, only allow more `<tmp-path>`
+        // tokens or `-flag [value]` pairs whose value is NOT path-like
+        // (i.e. doesn't start with `/`, `~`, or `$HOME`). This prevents
+        //   find /tmp/foo /etc -delete
+        // (the previous loose pattern matched this and silently allowed
+        // the /etc deletion).
+        //
+        // The `-delete` action must appear and the rest of the line must
+        // contain only flags. Trailing flags after `-delete` are also
+        // permitted (`-print -delete -prune` etc.).
+        // -----------------------------------------------------------------
+        safe_pattern!(
+            "find-delete-tmp",
+            r"^find\s+/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
+        ),
+        safe_pattern!(
+            "find-delete-var-tmp",
+            r"^find\s+/var/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:/var/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
+        ),
+        safe_pattern!(
+            "find-delete-tmpdir",
+            r"^find\s+\$TMPDIR(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:\$TMPDIR(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
+        ),
+        safe_pattern!(
+            "find-delete-tmpdir-brace",
+            r"^find\s+\$\{TMPDIR\}(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:\$\{TMPDIR\}(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
+        ),
     ]
 }
 
@@ -718,6 +779,70 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              find /path --maxdepth 2 -ls | head -30",
             RM_RECURSIVE_FORCE_SUGGESTIONS
         ),
+        // ----- `find ... -delete` (Critical: root/home target) -----
+        //
+        // `find <sensitive-path> -delete` recursively removes everything
+        // under the path — bytewise-equivalent to `rm -rf <sensitive-path>`.
+        // This rule exists to close the most common dcg-bypass pattern in
+        // the wild: agents that learn `rm -rf` is blocked simply swap it
+        // for `find -delete`. Without this rule, dcg's protection against
+        // catastrophic root/home deletion is one Google search away from
+        // useless.
+        //
+        // The regex requires `find` at the start of the segment, then
+        // somewhere later a sensitive path token (root, common system
+        // dirs, or home-like prefixes) preceded by whitespace or `=`,
+        // then a `-delete` action flag terminated by whitespace or
+        // end-of-string (so `-delete-this-not-a-flag` does NOT match).
+        destructive_pattern!(
+            "find-delete-root-home",
+            r#"^\s*find\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)[^|;&]*?\s-delete(?:\s|$)"#,
+            "find <sensitive-path> -delete is bytewise-equivalent to rm -rf on root/home and is EXTREMELY DANGEROUS. This command will NOT be executed.",
+            Critical,
+            "`find <path> -delete` is the bytewise-equivalent of `rm -rf <path>`: \
+             it recursively removes every file and (when -depth is implied) every \
+             directory matched by the predicate. Targeting `/`, `~`, `$HOME`, or any \
+             top-level system directory (`/etc`, `/usr`, `/var`, `/home`, `/boot`, \
+             `/dev`, `/proc`, `/sys`, `/lib`, `/lib64`, `/opt`, `/root`) destroys \
+             the operating system or user data the same way `rm -rf` would.\n\n\
+             There is NO recovery without backups.\n\n\
+             If you only need to delete files matching a pattern, use a much more \
+             specific path:\n  \
+             find /path/to/specific/subdir -name '*.tmp' -delete\n\n\
+             Always preview first:\n  \
+             find /path -type f | head -20",
+            FIND_DELETE_SUGGESTIONS
+        ),
+        // ----- `find ... -delete` (High: any other target) -----
+        //
+        // The general rule fires after the safe-pattern whitelist (which
+        // allows `find /tmp/...`, `/var/tmp/...`, `$TMPDIR/...`, and
+        // `${TMPDIR}/...`). Any other `find ... -delete` is an
+        // unscoped destructive operation that should require human
+        // approval, exactly like the parallel `rm-rf-general` rule.
+        destructive_pattern!(
+            "find-delete-general",
+            // `-delete(?:\s|$)` (not `\b`) so that `-delete-this-not-a-flag`
+            // — where -delete is followed by another word character via `-`
+            // (which `\b` happily allows since `-` is non-word) — does NOT
+            // false-positive.
+            r"^\s*find\b[^|;&]*\s-delete(?:\s|$)",
+            "find ... -delete is destructive (bytewise-equivalent to rm -rf on the matched tree) and requires human approval.",
+            High,
+            "`find ... -delete` recursively deletes every path matched by the find \
+             expression. The action flag `-delete` implies `-depth` (so directories \
+             are deleted after their contents). With no path predicate it deletes \
+             the entire starting tree. Common pitfalls:\n\n\
+             - `find . -delete` deletes the current working directory's contents.\n\
+             - `find <path> -delete` with a wide -name glob matches more than expected.\n\
+             - `-delete` errors are silent by default — failures don't stop the walk.\n\n\
+             Safer alternatives:\n\
+             - Drop -delete to preview: `find <path> ...` (just lists matches)\n\
+             - Add -print -delete to log each deletion as it happens\n\
+             - Use `find /tmp/<subdir> ... -delete` (allowed under temp dirs)\n\
+             - For a few files: `find ... | xargs -t -p rm -i` for confirmation",
+            FIND_DELETE_SUGGESTIONS
+        ),
     ]
 }
 
@@ -733,6 +858,126 @@ mod tests {
         assert_eq!(pack.id, "core.filesystem");
         assert_eq!(pack.name, "Core Filesystem");
         assert!(pack.keywords.contains(&"rm"));
+        // Required for the find -delete bypass family — see
+        // `find-delete-root-home` / `find-delete-general` patterns.
+        assert!(pack.keywords.contains(&"find"));
+    }
+
+    // ---------- find -delete: closes the rm -rf bypass ----------
+
+    #[test]
+    fn find_delete_blocks_root_critical() {
+        let pack = create_pack();
+        // The historical bypass: agent learns rm -rf is blocked, swaps
+        // for the bytewise-equivalent `find -delete`.
+        for cmd in [
+            "find / -delete",
+            "find /etc -delete",
+            "find /usr -delete",
+            "find /home -delete",
+            "find /var -delete",
+            "find /boot -delete",
+            "find /lib -delete",
+            "find /lib64 -delete",
+            "find /root -delete",
+            "find /sys -delete",
+            "find /proc -delete",
+            "find /dev -delete",
+            "find /opt -delete",
+            "find ~ -delete",
+            "find $HOME -delete",
+            "find ${HOME} -delete",
+            // With predicates / extra flags before -delete:
+            "find / -depth -delete",
+            "find / -type f -delete",
+            "find /etc -name '*.conf' -delete",
+            "find /home -mindepth 1 -delete",
+            // Quoted paths
+            "find \"/\" -delete",
+            "find '/etc' -delete",
+        ] {
+            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
+        }
+    }
+
+    #[test]
+    fn find_delete_blocks_general_high() {
+        let pack = create_pack();
+        // Anything that's not under a temp dir and not root/home should
+        // still be blocked (High severity, mirrors rm-rf-general).
+        for cmd in [
+            "find . -delete",
+            "find ./node_modules -delete",
+            "find . -name '*.pyc' -delete",
+            "find /data -delete",
+            "find /workspace/build -delete",
+            "find ./target -type f -delete",
+        ] {
+            assert_blocks_with_severity(&pack, cmd, Severity::High);
+        }
+    }
+
+    #[test]
+    fn find_delete_under_tmp_is_allowed() {
+        let pack = create_pack();
+        // Mirrors the rm -rf temp whitelist. Critical: only the FIRST
+        // path argument matters; safe pattern must NOT short-circuit if
+        // a second argument is sensitive (test below).
+        for cmd in [
+            "find /tmp -delete",
+            "find /tmp/foo -delete",
+            "find /tmp/foo -name '*.log' -delete",
+            "find /var/tmp -delete",
+            "find /var/tmp/dir -type f -delete",
+            "find $TMPDIR -delete",
+            "find $TMPDIR/work -name '*.tmp' -delete",
+            "find ${TMPDIR} -delete",
+            "find ${TMPDIR}/work -delete",
+        ] {
+            assert_safe_pattern_matches(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn find_delete_with_secondary_sensitive_path_still_blocks() {
+        let pack = create_pack();
+        // Important: the safe-temp pattern must require EVERY path to be
+        // temp-rooted. Without that, an attacker could write
+        //   find /tmp/foo /etc -delete
+        // and short-circuit through the safe pattern even though /etc
+        // would also be deleted. The current safe regex tightly restricts
+        // post-find tokens to more temp paths or `-flag [non-path-value]`
+        // pairs, so the secondary `/etc` argument fails the safe match
+        // and the destructive root-home rule fires. We assert Critical
+        // because /etc is in the sensitive-path list.
+        let cases = [
+            "find /tmp/foo /etc -delete",
+            "find /tmp /usr -delete",
+            "find /var/tmp/foo /home/user -delete",
+            "find $TMPDIR / -delete",
+        ];
+        for cmd in cases {
+            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
+        }
+    }
+
+    #[test]
+    fn find_without_delete_is_not_blocked() {
+        let pack = create_pack();
+        // Plain find without the -delete action is read-only.
+        for cmd in [
+            "find . -name '*.rs'",
+            "find / -type f -name passwd",
+            "find /etc -ls",
+            "find . -print",
+            // -exec without rm is not destructive
+            "find . -exec cat {} +",
+            // -delete is a SUBSTRING of -delete-this-arg; word boundary
+            // prevents false positive
+            "find . -name -delete-this-not-a-flag",
+        ] {
+            assert_no_match(&pack, cmd);
+        }
     }
 
     #[test]

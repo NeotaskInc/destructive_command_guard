@@ -885,7 +885,13 @@ static PACK_ENTRIES: [PackEntry; 83] = [
     PackEntry::new("core.git", &["git"], core::git::create_pack),
     PackEntry::new(
         "core.filesystem",
-        &["rm", "/rm"],
+        // `find` and `/find` are required so the quick-reject filter does
+        // NOT drop `find ... -delete` invocations. Without them the pack
+        // never runs and the find-delete-root-home / find-delete-general
+        // rules can't fire — the historical bypass that motivated those
+        // rules. See `core::filesystem::create_pack` for the matching
+        // keyword list inside the pack.
+        &["rm", "/rm", "find", "/find"],
         core::filesystem::create_pack,
     ),
     PackEntry::new("storage.s3", &["s3", "s3api"], storage::s3::create_pack),

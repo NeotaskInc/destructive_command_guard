@@ -457,7 +457,19 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
     );
     m.insert("core.filesystem:rm-rf-general", rm_rf_suggestions.clone());
     m.insert("core.filesystem:rm-r-f-separate", rm_rf_suggestions.clone());
-    m.insert("core.filesystem:rm-recursive-force-long", rm_rf_suggestions);
+    m.insert(
+        "core.filesystem:rm-recursive-force-long",
+        rm_rf_suggestions.clone(),
+    );
+    // `find ... -delete` mirrors `rm -rf` (bytewise-equivalent destruction
+    // on the matched tree). Reuse the same suggestion set — the safer
+    // alternatives (preview with -ls, scope to /tmp, use trash-cli) all
+    // apply identically.
+    m.insert(
+        "core.filesystem:find-delete-root-home",
+        rm_rf_suggestions.clone(),
+    );
+    m.insert("core.filesystem:find-delete-general", rm_rf_suggestions);
 }
 
 /// Register suggestions for heredoc pattern rules.
@@ -1529,6 +1541,8 @@ mod tests {
             "core.filesystem:rm-rf-general",
             "core.filesystem:rm-r-f-separate",
             "core.filesystem:rm-recursive-force-long",
+            "core.filesystem:find-delete-root-home",
+            "core.filesystem:find-delete-general",
         ];
 
         for rule in expected_rules {
