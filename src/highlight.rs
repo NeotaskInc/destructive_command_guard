@@ -268,6 +268,25 @@ pub fn format_regex_pattern(pattern: &str, use_color: bool) -> String {
     format_regex_pattern_manual(pattern)
 }
 
+/// Find the raw regex for a built-in pack pattern.
+#[must_use]
+pub fn find_pattern_regex(pack_id: &str, pattern_name: &str) -> Option<String> {
+    let pack = crate::packs::REGISTRY.get(pack_id)?;
+
+    if let Some(pattern) = pack
+        .safe_patterns
+        .iter()
+        .find(|pattern| pattern.name == pattern_name)
+    {
+        return Some(pattern.regex.as_str().to_string());
+    }
+
+    pack.destructive_patterns
+        .iter()
+        .find(|pattern| pattern.name == Some(pattern_name))
+        .map(|pattern| pattern.regex.as_str().to_string())
+}
+
 #[cfg(feature = "rich-output")]
 fn render_regex_pattern_rich(pattern: &str) -> Option<String> {
     use rich_rust::prelude::{Console, Syntax};
@@ -860,6 +879,29 @@ mod tests {
         let pattern = r"^git\s+reset\s+--hard(?:\s|$)";
 
         assert_eq!(format_regex_pattern(pattern, false), pattern);
+    }
+
+    #[test]
+    fn test_find_pattern_regex_finds_builtin_safe_pattern() {
+        let regex = find_pattern_regex("core.git", "restore-staged-long")
+            .expect("core.git restore-staged-long regex should be present");
+
+        assert!(regex.contains("restore"));
+        assert!(regex.contains("--staged"));
+    }
+
+    #[test]
+    fn test_find_pattern_regex_finds_builtin_destructive_pattern() {
+        let regex = find_pattern_regex("core.git", "reset-hard")
+            .expect("core.git reset-hard regex should be present");
+
+        assert!(regex.contains("reset"));
+        assert!(regex.contains("--hard"));
+    }
+
+    #[test]
+    fn test_find_pattern_regex_returns_none_for_unknown_pattern() {
+        assert!(find_pattern_regex("core.git", "not-a-real-pattern").is_none());
     }
 
     #[test]

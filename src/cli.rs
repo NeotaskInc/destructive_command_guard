@@ -2541,6 +2541,7 @@ fn list_packs(
                         info.safe_pattern_count,
                         info.destructive_pattern_count
                     );
+                    print_pack_patterns_plain(info);
                 } else {
                     println!("    {} {} - {}", status, info.id, info.name);
                 }
@@ -2554,13 +2555,39 @@ fn list_packs(
     }
 }
 
+#[cfg(not(feature = "rich-output"))]
+fn print_pack_patterns_plain(info: &PackInfo) {
+    let Some(pack) = REGISTRY.get(&info.id) else {
+        return;
+    };
+    let use_color = crate::output::auto_theme().colors_enabled;
+
+    if !pack.safe_patterns.is_empty() {
+        println!("      Safe patterns:");
+        for pattern in &pack.safe_patterns {
+            let regex = crate::highlight::format_regex_pattern(pattern.regex.as_str(), use_color);
+            println!("        - {}: {}", pattern.name, regex);
+        }
+    }
+
+    if !pack.destructive_patterns.is_empty() {
+        println!("      Destructive patterns:");
+        for pattern in &pack.destructive_patterns {
+            let name = pattern.name.unwrap_or("unnamed");
+            let severity_label = pattern.severity.label();
+            let regex = crate::highlight::format_regex_pattern(pattern.regex.as_str(), use_color);
+            println!("        - {name} [{severity_label}]: {regex}");
+        }
+    }
+}
+
 /// Rich terminal packs output using DcgConsole and markup.
 #[cfg(feature = "rich-output")]
 fn list_packs_rich(pack_list: &[PackInfo], verbose: bool) {
     let tree_items: Vec<_> = pack_list
         .iter()
         .map(|info| {
-            crate::output::PackTreeItem::new(
+            let item = crate::output::PackTreeItem::new(
                 &info.id,
                 &info.name,
                 &info.category,
@@ -2568,7 +2595,36 @@ fn list_packs_rich(pack_list: &[PackInfo], verbose: bool) {
                 info.enabled,
                 info.safe_pattern_count,
                 info.destructive_pattern_count,
-            )
+            );
+
+            if !verbose {
+                return item;
+            }
+
+            let Some(pack) = REGISTRY.get(&info.id) else {
+                return item;
+            };
+
+            let safe_patterns = pack
+                .safe_patterns
+                .iter()
+                .map(|pattern| {
+                    crate::output::PackTreePattern::safe(pattern.name, pattern.regex.as_str())
+                })
+                .collect();
+            let destructive_patterns = pack
+                .destructive_patterns
+                .iter()
+                .map(|pattern| {
+                    crate::output::PackTreePattern::destructive(
+                        pattern.name.unwrap_or("unnamed"),
+                        pattern.regex.as_str(),
+                        pattern.severity.label(),
+                    )
+                })
+                .collect();
+
+            item.with_patterns(safe_patterns, destructive_patterns)
         })
         .collect();
 
@@ -2690,10 +2746,13 @@ fn pack_info(
     );
 
     if show_patterns {
+        let use_color = crate::output::auto_theme().colors_enabled;
+
         println!();
         println!("Safe patterns:");
         for pattern in &pack.safe_patterns {
-            println!("  - {} : {}", pattern.name, pattern.regex.as_str());
+            let regex = crate::highlight::format_regex_pattern(pattern.regex.as_str(), use_color);
+            println!("  - {} : {}", pattern.name, regex);
         }
 
         println!();
@@ -2701,7 +2760,8 @@ fn pack_info(
         for pattern in &pack.destructive_patterns {
             let name = pattern.name.unwrap_or("unnamed");
             let severity_label = pattern.severity.label().to_uppercase();
-            println!("  - {name} [{severity_label}] : {}", pattern.regex.as_str());
+            let regex = crate::highlight::format_regex_pattern(pattern.regex.as_str(), use_color);
+            println!("  - {name} [{severity_label}] : {regex}");
             println!("    Reason: {}", pattern.reason);
             if let Some(explanation) = pattern.explanation {
                 println!("    Explanation: {explanation}");
@@ -6252,6 +6312,7 @@ fn handle_explain(
                 let output =
                     trace.format_pretty(colored::control::SHOULD_COLORIZE.should_colorize());
                 println!("{output}");
+                print_explain_regex_line(&trace);
             }
         }
         ExplainFormat::Compact => {
@@ -6264,6 +6325,27 @@ fn handle_explain(
             println!("{json}");
         }
     }
+}
+
+#[cfg(not(feature = "rich-output"))]
+fn print_explain_regex_line(trace: &crate::trace::ExplainTrace) {
+    let Some(match_info) = trace.match_info.as_ref() else {
+        return;
+    };
+    let Some((pack_id, pattern_name)) = match_info
+        .pack_id
+        .as_deref()
+        .zip(match_info.pattern_name.as_deref())
+    else {
+        return;
+    };
+    let Some(regex) = crate::highlight::find_pattern_regex(pack_id, pattern_name) else {
+        return;
+    };
+
+    let regex =
+        crate::highlight::format_regex_pattern(&regex, crate::output::auto_theme().colors_enabled);
+    println!("Regex: {regex}");
 }
 
 /// Rich output for explain command with tree visualization.

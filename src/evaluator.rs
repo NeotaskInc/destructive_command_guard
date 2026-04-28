@@ -769,6 +769,13 @@ impl EvaluationResult {
         self.pattern_info.as_ref().map(|p| p.reason.as_str())
     }
 
+    /// Get the session occurrence count for this command, if tracked.
+    #[inline]
+    #[must_use]
+    pub fn session_count(&self) -> Option<u32> {
+        self.session_occurrence.as_ref().map(|s| s.session_count)
+    }
+
     /// Get the pack ID that blocked (if denied by a pack).
     #[must_use]
     pub fn pack_id(&self) -> Option<&str> {
@@ -3823,6 +3830,7 @@ mod tests {
                 effective_mode: Some(crate::packs::DecisionMode::Deny),
                 skipped_due_to_budget: false,
                 branch_context: None,
+                session_occurrence: None,
             }
         }
 
@@ -3994,6 +4002,7 @@ mod tests {
                 branch_context: None,
                 effective_mode: None,
                 skipped_due_to_budget: false,
+                session_occurrence: None,
             };
 
             // Applying branch strictness at a non-git path should return unchanged result

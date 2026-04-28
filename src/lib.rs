@@ -86,6 +86,7 @@ pub mod perf;
 pub mod rebase_recovery;
 pub mod sarif;
 pub mod scan;
+pub mod session;
 pub mod simulate;
 pub mod stats;
 pub mod suggest;
@@ -244,3 +245,6 @@ pub use update::{
     CACHE_DURATION, VersionCheckError, VersionCheckResult, check_for_update, clear_cache,
     current_version, format_check_result, format_check_result_json,
 };
+
+// Re-export session occurrence tracking types for graduated response system
+pub use session::{OccurrenceSnapshot, hash_command as session_hash_command};

@@ -965,6 +965,7 @@ mod tests {
             effective_mode: Some(crate::packs::DecisionMode::Deny),
             skipped_due_to_budget: false,
             branch_context: None,
+            session_occurrence: None,
         };
 
         let result = TestResultBox::from_evaluation("git reset --hard HEAD", &eval);

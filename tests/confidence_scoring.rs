@@ -32,6 +32,7 @@ fn mock_deny_result(
         effective_mode: Some(DecisionMode::Deny),
         skipped_due_to_budget: false,
         branch_context: None,
+        session_occurrence: None,
     }
 }
 

@@ -18,6 +18,43 @@ use crate::evaluator::EvaluationDecision;
 use crate::trace::{ExplainTrace, MatchInfo, PackSummary, TraceDetails, TraceStep};
 use std::collections::BTreeMap;
 
+/// Pattern details rendered under a pack in verbose tree output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackTreePattern {
+    /// Pattern name used in rule IDs and allowlists.
+    pub name: String,
+    /// Raw regex pattern.
+    pub regex: String,
+    /// Optional severity label for destructive patterns.
+    pub severity: Option<String>,
+}
+
+impl PackTreePattern {
+    /// Create a safe pattern entry.
+    #[must_use]
+    pub fn safe(name: impl Into<String>, regex: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            regex: regex.into(),
+            severity: None,
+        }
+    }
+
+    /// Create a destructive pattern entry.
+    #[must_use]
+    pub fn destructive(
+        name: impl Into<String>,
+        regex: impl Into<String>,
+        severity: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            regex: regex.into(),
+            severity: Some(severity.into()),
+        }
+    }
+}
+
 /// Guide style for tree rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DcgTreeGuides {
@@ -49,6 +86,10 @@ pub struct PackTreeItem {
     pub safe_pattern_count: usize,
     /// Destructive pattern count.
     pub destructive_pattern_count: usize,
+    /// Safe patterns to render in verbose mode.
+    pub safe_patterns: Vec<PackTreePattern>,
+    /// Destructive patterns to render in verbose mode.
+    pub destructive_patterns: Vec<PackTreePattern>,
 }
 
 impl PackTreeItem {
@@ -71,7 +112,21 @@ impl PackTreeItem {
             enabled,
             safe_pattern_count,
             destructive_pattern_count,
+            safe_patterns: Vec::new(),
+            destructive_patterns: Vec::new(),
         }
+    }
+
+    /// Attach pattern details for verbose rendering.
+    #[must_use]
+    pub fn with_patterns(
+        mut self,
+        safe_patterns: Vec<PackTreePattern>,
+        destructive_patterns: Vec<PackTreePattern>,
+    ) -> Self {
+        self.safe_patterns = safe_patterns;
+        self.destructive_patterns = destructive_patterns;
+        self
     }
 }
 
@@ -601,6 +656,17 @@ fn match_node(info: &MatchInfo) -> TreeNode {
     if let Some(pattern) = info.pattern_name.as_ref() {
         children.push(TreeNode::new(format!("Pattern: {pattern}")));
     }
+    if let (Some(pack_id), Some(pattern_name)) =
+        (info.pack_id.as_deref(), info.pattern_name.as_deref())
+    {
+        if let Some(regex) = crate::highlight::find_pattern_regex(pack_id, pattern_name) {
+            let regex = crate::highlight::format_regex_pattern(
+                &regex,
+                crate::output::auto_theme().colors_enabled,
+            );
+            children.push(TreeNode::new(format!("Regex: {regex}")));
+        }
+    }
     if let Some(severity) = info.severity {
         children.push(TreeNode::new(format!("Severity: {severity:?}")));
     }
@@ -877,7 +943,37 @@ fn pack_tree_node(pack: &PackTreeItem, verbose: bool) -> TreeNode {
         format!("{} - {}", pack.id, pack.name)
     };
 
-    TreeNode::with_icon(status, label).styled(style)
+    let mut node = TreeNode::with_icon(status, label).styled(style);
+
+    if verbose {
+        if !pack.safe_patterns.is_empty() {
+            node = node.child(pattern_group_node("Safe patterns", &pack.safe_patterns));
+        }
+        if !pack.destructive_patterns.is_empty() {
+            node = node.child(pattern_group_node(
+                "Destructive patterns",
+                &pack.destructive_patterns,
+            ));
+        }
+    }
+
+    node
+}
+
+fn pattern_group_node(title: &str, patterns: &[PackTreePattern]) -> TreeNode {
+    let use_color = crate::output::auto_theme().colors_enabled;
+
+    TreeNode::new(title)
+        .styled("[dim]")
+        .children(patterns.iter().map(|pattern| {
+            let regex = crate::highlight::format_regex_pattern(&pattern.regex, use_color);
+            let label = if let Some(severity) = &pattern.severity {
+                format!("{} [{}]: {}", pattern.name, severity, regex)
+            } else {
+                format!("{}: {}", pattern.name, regex)
+            };
+            TreeNode::new(label)
+        }))
 }
 
 #[cfg(test)]
@@ -1240,6 +1336,43 @@ mod tests {
 
         assert!(output.contains("core.filesystem - Protects filesystem operations"));
         assert!(output.contains("(4 safe, 7 destructive)"));
+    }
+
+    #[test]
+    fn test_pack_list_tree_verbose_includes_pattern_regexes() {
+        let items = vec![
+            PackTreeItem::new(
+                "core.git",
+                "Git",
+                "core",
+                "Protects Git operations",
+                true,
+                1,
+                1,
+            )
+            .with_patterns(
+                vec![PackTreePattern::safe(
+                    "git-clean-dry-run",
+                    r"^git\s+clean\s+-n",
+                )],
+                vec![PackTreePattern::destructive(
+                    "reset-hard",
+                    r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*reset\s+--hard",
+                    "critical",
+                )],
+            ),
+        ];
+
+        let lines = pack_list_tree(&items, true)
+            .guides(DcgTreeGuides::Ascii)
+            .render_plain();
+        let output = lines.join("\n");
+
+        assert!(output.contains("Safe patterns"));
+        assert!(output.contains(r"git-clean-dry-run: ^git\s+clean\s+-n"));
+        assert!(output.contains("Destructive patterns"));
+        assert!(output.contains("reset-hard [critical]:"));
+        assert!(output.contains(r"git\s+(?:\S+\s+)*reset\s+--hard"));
     }
 
     #[test]

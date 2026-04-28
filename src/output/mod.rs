@@ -43,8 +43,8 @@ pub use tables::{ScanResultRow, ScanResultsTable, TableStyle};
 pub use test::{AllowedReason, TestOutcome, TestResultBox};
 pub use theme::{BorderStyle, Severity, SeverityColors, Theme, ThemePalette};
 pub use tree::{
-    DcgTree, DcgTreeGuides, ExplainTreeBuilder, PackTreeItem, TreeNode, explain_trace_tree,
-    pack_list_tree,
+    DcgTree, DcgTreeGuides, ExplainTreeBuilder, PackTreeItem, PackTreePattern, TreeNode,
+    explain_trace_tree, pack_list_tree,
 };
 
 use crate::config::Config;

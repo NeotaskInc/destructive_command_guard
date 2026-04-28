@@ -676,6 +676,12 @@ pub(crate) fn print_colorful_warning_to(
     let mut denial = DenialBox::new(command, span, pattern_display, theme_severity)
         .with_alternatives(alternatives);
 
+    if let (Some(pack_id), Some(pattern_name)) = (pack, pattern) {
+        if let Some(regex) = crate::highlight::find_pattern_regex(pack_id, pattern_name) {
+            denial = denial.with_pattern_regex(regex);
+        }
+    }
+
     if let Some(text) = explanation_text {
         denial = denial.with_explanation(text);
     }
