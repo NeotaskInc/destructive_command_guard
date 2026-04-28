@@ -487,7 +487,7 @@ fn test_audit_backtracking_requirements() {
         ),
         (
             "loadbalancer.traefik",
-            HashSet::from(["traefik-healthcheck", "traefik-version"]),
+            HashSet::from(["traefik-api-read", "traefik-healthcheck", "traefik-version"]),
         ),
         (
             "messaging.nats",

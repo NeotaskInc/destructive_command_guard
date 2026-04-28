@@ -121,6 +121,12 @@ Generated: 2026-01-10T17:39:52.939979
 | safe | `kubectl-kustomize` | Found '!' | `kubectl\s+kustomize(?!\s*\\|)` |
 | destructive | `kubectl-delete-k` | Found '!' | `kubectl\s+delete\s+-k\b(?!.*--dry-run)` |
 
+## `src/packs/loadbalancer/traefik.rs`
+
+| Kind | Name | Reason | Regex Preview |
+|------|------|--------|---------------|
+| safe | `traefik-api-read` | Found '!' | `curl\b(?!.*\s(?:-X\|--request)\s*(?:DELETE\|PUT\|POST\|PA...` |
+
 ## `src/packs/package_managers/mod.rs`
 
 | Kind | Name | Reason | Regex Preview |

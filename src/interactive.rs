@@ -20,6 +20,7 @@
 use colored::Colorize;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
@@ -44,6 +45,9 @@ pub const MIN_TIMEOUT_SECONDS: u64 = 1;
 /// Character set for verification codes (lowercase, unambiguous).
 /// Excludes visually confusing characters: i, l, o, 0, 1.
 const CODE_CHARSET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
+
+static SESSION_CODES: std::sync::OnceLock<std::sync::Mutex<VerificationCodeGenerator>> =
+    std::sync::OnceLock::new();
 
 /// Verification method for interactive prompts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +144,56 @@ impl std::fmt::Display for AllowlistScope {
     }
 }
 
+/// Stateful verification-code generator for one interactive session.
+///
+/// The stateless [`generate_verification_code`] helper is useful for direct
+/// callers and tests. Interactive prompts use this generator so a code that
+/// has already been displayed in the current process is not reused.
+#[derive(Debug, Default)]
+pub struct VerificationCodeGenerator {
+    used_codes: HashSet<String>,
+}
+
+impl VerificationCodeGenerator {
+    /// Create an empty session generator.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Generate a single-use verification code for this generator.
+    ///
+    /// If the code space for the requested length is exhausted, previously
+    /// issued codes at that length are forgotten so the prompt remains usable.
+    #[must_use]
+    pub fn generate(&mut self, length: usize) -> String {
+        let length = length.clamp(MIN_CODE_LENGTH, MAX_CODE_LENGTH);
+        self.clear_length_if_exhausted(length);
+
+        loop {
+            let code = generate_verification_code(length);
+            if self.used_codes.insert(code.clone()) {
+                return code;
+            }
+        }
+    }
+
+    fn clear_length_if_exhausted(&mut self, length: usize) {
+        let space_size = CODE_CHARSET
+            .len()
+            .saturating_pow(u32::try_from(length).unwrap_or(u32::MAX));
+        let used_at_length = self
+            .used_codes
+            .iter()
+            .filter(|code| code.len() == length)
+            .count();
+
+        if used_at_length >= space_size {
+            self.used_codes.retain(|code| code.len() != length);
+        }
+    }
+}
+
 /// Configuration for interactive mode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InteractiveConfig {
@@ -226,6 +280,15 @@ pub fn generate_verification_code(length: usize) -> String {
             CODE_CHARSET[idx] as char
         })
         .collect()
+}
+
+fn generate_session_verification_code(length: usize) -> String {
+    let generator =
+        SESSION_CODES.get_or_init(|| std::sync::Mutex::new(VerificationCodeGenerator::new()));
+    let mut guard = generator
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.generate(length)
 }
 
 /// Validate a user-provided verification code.
@@ -330,7 +393,7 @@ pub fn run_interactive_prompt(
 
     match config.verification {
         VerificationMethod::Code => {
-            let code = generate_verification_code(config.effective_code_length());
+            let code = generate_session_verification_code(config.effective_code_length());
             display_prompt(
                 command,
                 reason,
@@ -885,6 +948,32 @@ mod tests {
             unique_count > 5,
             "Generated codes should be mostly unique, got {unique_count} unique out of 10"
         );
+    }
+
+    #[test]
+    fn test_verification_code_generator_avoids_reuse() {
+        let mut generator = VerificationCodeGenerator::new();
+        let mut seen = HashSet::new();
+
+        for _ in 0..256 {
+            let code = generator.generate(DEFAULT_CODE_LENGTH);
+            assert_eq!(code.len(), DEFAULT_CODE_LENGTH);
+            assert!(seen.insert(code.clone()), "code reused: {code}");
+        }
+
+        assert_eq!(generator.used_codes.len(), seen.len());
+    }
+
+    #[test]
+    fn test_verification_code_generator_tracks_lengths_independently() {
+        let mut generator = VerificationCodeGenerator::new();
+        let short_code = generator.generate(MIN_CODE_LENGTH);
+        let long_code = generator.generate(MAX_CODE_LENGTH);
+
+        assert_eq!(short_code.len(), MIN_CODE_LENGTH);
+        assert_eq!(long_code.len(), MAX_CODE_LENGTH);
+        assert!(generator.used_codes.contains(&short_code));
+        assert!(generator.used_codes.contains(&long_code));
     }
 
     #[test]
