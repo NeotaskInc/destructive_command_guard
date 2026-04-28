@@ -531,15 +531,15 @@ pub fn generate_enhanced_suggestions(
     }
 
     // Group by command with frequency and working dirs
-    let mut command_data: HashMap<String, (usize, Vec<String>, usize)> = HashMap::new();
+    let mut command_data: HashMap<String, (usize, Vec<String>, bool)> = HashMap::new();
     for entry in entries {
         let data = command_data
             .entry(entry.command.clone())
-            .or_insert((0, Vec::new(), 0));
+            .or_insert((0, Vec::new(), false));
         data.0 += 1; // frequency
         data.1.push(entry.working_dir.clone()); // working dirs
         if entry.was_bypassed {
-            data.2 += 1; // bypass count
+            data.2 = true; // bypass signal for this command
         }
     }
 
@@ -574,8 +574,8 @@ pub fn generate_enhanced_suggestions(
                 .commands
                 .iter()
                 .filter_map(|cmd| command_data.get(cmd))
-                .map(|(_, _, bypasses)| *bypasses)
-                .sum();
+                .filter(|(_, _, was_bypassed)| *was_bypassed)
+                .count();
 
             AllowlistSuggestion::from_cluster(cluster)
                 .with_path_analysis(&working_dirs)
@@ -1617,6 +1617,34 @@ mod tests {
 
         // Specificity should be lower due to broader pattern
         assert!(pattern.specificity_score < 1.0);
+    }
+
+    #[test]
+    fn enhanced_suggestions_count_bypass_signal_once_per_command() {
+        let entries = vec![
+            CommandEntryInfo {
+                command: "npm run build".to_string(),
+                working_dir: "/repo".to_string(),
+                was_bypassed: true,
+            },
+            CommandEntryInfo {
+                command: "npm run build".to_string(),
+                working_dir: "/repo".to_string(),
+                was_bypassed: true,
+            },
+            CommandEntryInfo {
+                command: "npm run build".to_string(),
+                working_dir: "/repo".to_string(),
+                was_bypassed: true,
+            },
+        ];
+
+        let suggestions = generate_enhanced_suggestions(&entries, 3);
+
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].cluster.frequency, 3);
+        assert_eq!(suggestions[0].bypass_count, 1);
+        assert_eq!(suggestions[0].reason, SuggestionReason::ManuallyBypassed);
     }
 
     #[test]
