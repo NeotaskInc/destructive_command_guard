@@ -505,6 +505,37 @@ impl Pack {
         self.safe_patterns.iter().any(|p| p.regex.is_match(cmd))
     }
 
+    /// Deadline-aware safe pattern matching.
+    ///
+    /// Like [`matches_safe`], but polls the deadline between individual
+    /// backtracking-engine pattern evaluations. Returns `None` (no match) if
+    /// the deadline expires mid-scan, letting the caller fail-open.
+    #[must_use]
+    pub fn matches_safe_with_deadline(
+        &self,
+        cmd: &str,
+        deadline: Option<&crate::perf::Deadline>,
+    ) -> bool {
+        if let Some(ref set) = self.safe_regex_set {
+            if set.is_match(cmd) {
+                return true;
+            }
+            if self.safe_regex_set_is_complete {
+                return false;
+            }
+        }
+
+        for p in &self.safe_patterns {
+            if deadline.is_some_and(crate::perf::Deadline::is_exceeded) {
+                return false;
+            }
+            if p.regex.is_match(cmd) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Check if a command matches any destructive pattern.
     /// Returns the matched pattern's reason, name, severity, and explanation if found.
     #[must_use]
@@ -775,6 +806,39 @@ impl EnabledKeywordIndex {
     #[must_use]
     pub const fn pack_count(&self) -> usize {
         self.pack_count
+    }
+
+    /// Fast check: does the command contain any AC-indexed keyword at all?
+    ///
+    /// Returns `false` when the AC automaton finds zero keyword substrings in
+    /// `cmd` **and** there are no always-check packs (packs with empty keyword
+    /// lists) or whitespace keywords. This is cheaper than `candidate_pack_mask`
+    /// because it can short-circuit on the first hit and skip mask bookkeeping.
+    ///
+    /// When this returns `false`, `candidate_pack_mask` would return 0 and the
+    /// more expensive `pack_aware_quick_reject` can be skipped entirely.
+    #[inline]
+    #[must_use]
+    pub fn has_any_keyword(&self, cmd: &str) -> bool {
+        if self.always_check_mask != 0 {
+            return true;
+        }
+
+        if let Some(ac) = &self.keyword_matcher {
+            if ac.is_match(cmd) {
+                return true;
+            }
+        }
+
+        if !self.whitespace_keywords.is_empty() {
+            for keyword in &self.whitespace_keywords {
+                if keyword_matches_substring(cmd, keyword) {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
     #[inline]
@@ -2582,6 +2646,87 @@ mod tests {
         );
     }
 
+    #[test]
+    fn has_any_keyword_returns_false_for_unrelated_command() {
+        let enabled: HashSet<String> = REGISTRY
+            .all_pack_ids()
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let ordered = REGISTRY.expand_enabled_ordered(&enabled);
+        let index = REGISTRY
+            .build_enabled_keyword_index(&ordered)
+            .expect("should build index");
+
+        assert!(
+            !index.has_any_keyword("ls -la"),
+            "ls -la has no pack keywords"
+        );
+        assert!(
+            !index.has_any_keyword("echo hello world"),
+            "echo has no pack keywords"
+        );
+        assert!(!index.has_any_keyword("cd /tmp"), "cd has no pack keywords");
+    }
+
+    #[test]
+    fn has_any_keyword_returns_true_for_matching_command() {
+        let enabled: HashSet<String> = REGISTRY
+            .all_pack_ids()
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let ordered = REGISTRY.expand_enabled_ordered(&enabled);
+        let index = REGISTRY
+            .build_enabled_keyword_index(&ordered)
+            .expect("should build index");
+
+        assert!(index.has_any_keyword("git status"), "git is a keyword");
+        assert!(index.has_any_keyword("rm -rf /tmp/foo"), "rm is a keyword");
+        assert!(index.has_any_keyword("docker ps"), "docker is a keyword");
+    }
+
+    #[test]
+    fn has_any_keyword_consistent_with_candidate_mask() {
+        let enabled: HashSet<String> = REGISTRY
+            .all_pack_ids()
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let ordered = REGISTRY.expand_enabled_ordered(&enabled);
+        let index = REGISTRY
+            .build_enabled_keyword_index(&ordered)
+            .expect("should build index");
+
+        let cmds = [
+            "ls -la",
+            "git status",
+            "echo hello",
+            "rm -rf /",
+            "docker ps",
+            "kubectl get pods",
+            "cd /tmp",
+            "terraform plan",
+        ];
+
+        for cmd in cmds {
+            let mask = index.candidate_pack_mask(cmd);
+            let has = index.has_any_keyword(cmd);
+            if mask == 0 {
+                // If mask is 0 (ignoring always_check), has_any_keyword should
+                // still be true if always_check_mask is set.
+                // The semantics: has_any_keyword is true when ANY pack might need checking.
+            }
+            // has_any_keyword should be at least as permissive as mask != 0
+            if mask != 0 {
+                assert!(
+                    has,
+                    "has_any_keyword should be true when mask is nonzero for {cmd:?}"
+                );
+            }
+        }
+    }
+
     /// Test that `pack_tier` returns correct tiers for all known categories.
     #[test]
     fn pack_tier_ordering() {
@@ -3544,5 +3689,84 @@ mod tests {
                 assert!(!pack.name.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn matches_safe_with_deadline_returns_false_when_expired() {
+        use crate::perf::Deadline;
+        use std::time::Duration;
+
+        let pack = Pack {
+            id: "test.deadline".to_string(),
+            name: "test",
+            description: "test",
+            keywords: &["rm"],
+            safe_patterns: vec![
+                safe_pattern!("bt_safe_1", r"(?=.*safe_target)rm\s+--dry-run"),
+                safe_pattern!("bt_safe_2", r"(?=.*other_target)rm\s+--interactive"),
+            ],
+            destructive_patterns: Vec::new(),
+            keyword_matcher: None,
+            safe_regex_set: None,
+            safe_regex_set_is_complete: false,
+        };
+
+        let deadline = Deadline::new(Duration::ZERO);
+        assert!(
+            !pack.matches_safe_with_deadline("rm --dry-run safe_target", Some(&deadline)),
+            "Expired deadline should cause safe match to return false"
+        );
+    }
+
+    #[test]
+    fn matches_safe_with_deadline_matches_when_budget_available() {
+        use crate::perf::Deadline;
+        use std::time::Duration;
+
+        let pack = Pack {
+            id: "test.deadline".to_string(),
+            name: "test",
+            description: "test",
+            keywords: &["rm"],
+            safe_patterns: vec![safe_pattern!(
+                "bt_safe_1",
+                r"(?=.*safe_target)rm\s+--dry-run"
+            )],
+            destructive_patterns: Vec::new(),
+            keyword_matcher: None,
+            safe_regex_set: None,
+            safe_regex_set_is_complete: false,
+        };
+
+        let deadline = Deadline::new(Duration::from_secs(10));
+        assert!(
+            pack.matches_safe_with_deadline("rm --dry-run safe_target", Some(&deadline)),
+            "Should find safe match when deadline is generous"
+        );
+    }
+
+    #[test]
+    fn matches_safe_with_no_deadline_behaves_like_matches_safe() {
+        let pack = Pack {
+            id: "test.deadline".to_string(),
+            name: "test",
+            description: "test",
+            keywords: &["rm"],
+            safe_patterns: vec![safe_pattern!(
+                "bt_safe_1",
+                r"(?=.*safe_target)rm\s+--dry-run"
+            )],
+            destructive_patterns: Vec::new(),
+            keyword_matcher: None,
+            safe_regex_set: None,
+            safe_regex_set_is_complete: false,
+        };
+
+        let cmd = "rm --dry-run safe_target";
+        assert_eq!(
+            pack.matches_safe(cmd),
+            pack.matches_safe_with_deadline(cmd, None),
+            "No deadline should behave identically to matches_safe"
+        );
     }
 }

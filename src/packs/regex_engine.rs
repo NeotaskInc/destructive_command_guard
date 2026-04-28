@@ -14,6 +14,16 @@
 use std::borrow::Cow;
 use std::sync::OnceLock;
 
+/// Maximum backtracking steps allowed per fancy_regex match.
+///
+/// The default `fancy_regex` limit is 1,000,000. We lower it to 100,000 to
+/// bound worst-case evaluation time for pathological patterns (especially from
+/// external packs). At ~10ns per step on modern hardware, 100K steps ≈ 1ms
+/// which fits within the PATTERN_MATCH panic budget (1ms). When exceeded,
+/// `fancy_regex` returns `BacktrackLimitExceeded` and our match methods
+/// return `false`/`None` (fail-open).
+pub const BACKTRACK_LIMIT: usize = 100_000;
+
 /// A compiled regex that auto-selects between linear-time and backtracking engines.
 ///
 /// Use this instead of `fancy_regex::Regex` directly when the pattern may not
@@ -53,8 +63,18 @@ impl CompiledRegex {
     /// # Errors
     /// Returns an error if the pattern fails to compile.
     pub fn new(pattern: &str) -> Result<Self, String> {
+        Self::new_with_backtrack_limit(pattern, BACKTRACK_LIMIT)
+    }
+
+    /// Compile a pattern with a specific backtrack limit for the fancy_regex engine.
+    ///
+    /// # Errors
+    /// Returns an error if the pattern fails to compile.
+    pub fn new_with_backtrack_limit(pattern: &str, limit: usize) -> Result<Self, String> {
         if needs_backtracking_engine(pattern) {
-            fancy_regex::Regex::new(pattern)
+            fancy_regex::RegexBuilder::new(pattern)
+                .backtrack_limit(limit)
+                .build()
                 .map(Self::Backtracking)
                 .map_err(|e| format!("fancy_regex compile error: {e}"))
         } else {
@@ -63,7 +83,9 @@ impl CompiledRegex {
                 Err(e) => {
                     // Fall back to backtracking engine if linear engine fails
                     // This handles any advanced features that needs_backtracking_engine() missed
-                    fancy_regex::Regex::new(pattern)
+                    fancy_regex::RegexBuilder::new(pattern)
+                        .backtrack_limit(limit)
+                        .build()
                         .map(Self::Backtracking)
                         .map_err(|fancy_err| {
                             format!(
@@ -91,7 +113,9 @@ impl CompiledRegex {
     /// # Errors
     /// Returns an error if the pattern fails to compile.
     pub fn new_backtracking(pattern: &str) -> Result<Self, String> {
-        fancy_regex::Regex::new(pattern)
+        fancy_regex::RegexBuilder::new(pattern)
+            .backtrack_limit(BACKTRACK_LIMIT)
+            .build()
             .map(Self::Backtracking)
             .map_err(|e| format!("fancy_regex compile error: {e}"))
     }
@@ -691,5 +715,108 @@ mod tests {
 
         // All calls after first should still show as compiled
         assert!(lazy.is_compiled());
+    }
+
+    // =========================================================================
+    // Backtrack Limit Tests (git_safety_guard-wopb)
+    // =========================================================================
+
+    #[test]
+    fn test_default_backtrack_limit_applied() {
+        assert_eq!(BACKTRACK_LIMIT, 100_000);
+    }
+
+    #[test]
+    fn test_pathological_backtracking_fails_open() {
+        // Pattern with catastrophic backtracking: (a+)+$ on "aaa...!" input.
+        // With fancy_regex this requires the backtracking engine due to the
+        // backreference-style nested quantifiers. We force it via lookahead.
+        let re = CompiledRegex::new(r"(?=(a+)+$)").unwrap();
+        assert!(re.uses_backtracking());
+
+        // Input designed to trigger exponential backtracking: many 'a's followed
+        // by a non-matching character. With limit=100K this should fail-open
+        // (return false) instead of running for seconds.
+        let mut input = "a".repeat(200);
+        input.push('!');
+
+        let start = std::time::Instant::now();
+        let result = re.is_match(&input);
+        let elapsed = start.elapsed();
+
+        assert!(
+            !result,
+            "pathological pattern should fail-open (return false)"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "backtrack limit should cap execution to <50ms, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn test_pathological_find_fails_open() {
+        let re = CompiledRegex::new(r"(?=(a+)+$)").unwrap();
+        assert!(re.uses_backtracking());
+
+        let mut input = "a".repeat(200);
+        input.push('!');
+
+        let start = std::time::Instant::now();
+        let result = re.find(&input);
+        let elapsed = start.elapsed();
+
+        assert!(result.is_none(), "pathological find should return None");
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "backtrack limit should cap find to <50ms, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn test_custom_backtrack_limit() {
+        // Very tight limit: even simple backtracking patterns may exceed it
+        let re = CompiledRegex::new_with_backtrack_limit(r"(?=(a+)+$)", 100).unwrap();
+        assert!(re.uses_backtracking());
+
+        let input = "a".repeat(50);
+        // With limit=100, even matching input may fail due to limit
+        // The key assertion: it doesn't hang
+        let start = std::time::Instant::now();
+        let _ = re.is_match(&input);
+        let elapsed = start.elapsed();
+        assert!(elapsed < std::time::Duration::from_millis(10));
+    }
+
+    #[test]
+    fn test_normal_backtracking_still_works() {
+        // Normal lookahead patterns should still work within the 100K limit
+        let re = CompiledRegex::new(r"git\s+push(?=.*--force)").unwrap();
+        assert!(re.uses_backtracking());
+
+        assert!(re.is_match("git push --force"));
+        assert!(re.is_match("git push origin main --force"));
+        assert!(!re.is_match("git push origin main"));
+
+        // Reasonable size input — should not hit the limit
+        let cmd = format!("git push {} --force", "branch ".repeat(100));
+        assert!(re.is_match(&cmd));
+    }
+
+    #[test]
+    fn test_replacen_respects_backtrack_limit() {
+        let re = CompiledRegex::new(r"(?=(a+)+$)").unwrap();
+        assert!(re.uses_backtracking());
+
+        let mut input = "a".repeat(200);
+        input.push('!');
+
+        let start = std::time::Instant::now();
+        let result = re.replacen(&input, 1, "X");
+        let elapsed = start.elapsed();
+
+        // Should fail-open: return original text unchanged
+        assert_eq!(result.as_ref(), input.as_str());
+        assert!(elapsed < std::time::Duration::from_millis(50));
     }
 }
