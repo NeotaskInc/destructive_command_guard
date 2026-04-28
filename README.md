@@ -2268,7 +2268,24 @@ authenticated `codex exec` session against hermetic temporary repositories:
 
 The Codex harness exits successfully with an explicit skipped status when Codex
 is unavailable or unauthenticated, so CI and developer machines without Codex
-access can run it without producing false failures.
+access can run it without producing false failures. A full local run requires
+`codex` 0.125.0 or newer on `PATH` plus an authenticated `codex login status`;
+when Codex is responsive, expect roughly five minutes, with longer runtimes
+possible under rate limiting.
+
+Useful debugging flags:
+
+- `--verbose` mirrors the per-scenario logging style from `scripts/e2e_test.sh`.
+- `--artifacts DIR` writes `trace.jsonl` plus per-failure stdout, stderr,
+  prompts, repository state, manifests, and diffs.
+- `--keep-tempdirs` preserves temporary repositories and isolated Codex homes for
+  manual inspection after a failed run.
+
+CI runs `./scripts/e2e_codex.sh --verbose --json --artifacts
+/tmp/codex_e2e_artifacts` in a dedicated `codex-e2e` job on pushes to `main`
+only. The job installs Codex with npm, authenticates from the `CODEX_API_KEY`
+secret, and still goes green with a clear notice when Codex is unavailable,
+unauthenticated, quota-limited, or temporarily unable to reach the API.
 
 The E2E suite covers:
 - All destructive git commands (reset, checkout, restore, clean, push, branch, stash)

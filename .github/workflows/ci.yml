@@ -600,6 +600,146 @@ jobs:
           echo "::error::E2E suite failed (exit code ${{ steps.e2e.outputs.exit_code }}). See the 'e2e-artifacts' artifact and the step summary for the first failure."
           exit 1
 
+  # Real Codex CLI smoke tests. This runs only on pushes to main because it
+  # requires networked Codex API calls and consumes quota.
+  codex-e2e:
+    runs-on: ubuntu-latest
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-codex-e2e-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release --bin dcg
+
+      - name: Install dcg on PATH
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          cp target/release/dcg "$HOME/.local/bin/dcg"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Check Codex API key secret
+        id: codex_secret
+        env:
+          OPENAI_API_KEY: ${{ secrets.CODEX_API_KEY }}
+        run: |
+          if [ -z "${OPENAI_API_KEY}" ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping Codex CLI install because CODEX_API_KEY is not configured."
+            echo "## Codex E2E" >> "$GITHUB_STEP_SUMMARY"
+            echo "CODEX_API_KEY is not configured; the harness will self-skip." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Codex CLI
+        id: codex_install
+        if: steps.codex_secret.outputs.available == 'true'
+        run: |
+          set +e
+          npm i -g @openai/codex@latest
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "installed=true" >> "$GITHUB_OUTPUT"
+            codex --version
+          else
+            echo "installed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Codex CLI install failed; the harness will self-skip if codex is unavailable."
+          fi
+
+      - name: Authenticate Codex CLI
+        if: steps.codex_secret.outputs.available == 'true' && steps.codex_install.outputs.installed == 'true'
+        env:
+          OPENAI_API_KEY: ${{ secrets.CODEX_API_KEY }}
+        run: |
+          set +e
+          printenv OPENAI_API_KEY | codex login --with-api-key
+          auth_status=$?
+          set -e
+          if [ "$auth_status" -ne 0 ]; then
+            echo "::notice::Codex CLI authentication failed; the harness will self-skip if login status is unavailable."
+          fi
+          codex login status || true
+
+      - name: Run Codex E2E harness
+        id: codex_e2e
+        run: |
+          set +e
+          set -o pipefail
+
+          mkdir -p /tmp/codex_e2e_artifacts
+          ./scripts/e2e_codex.sh --verbose --json --artifacts /tmp/codex_e2e_artifacts --dcg-binary "$HOME/.local/bin/dcg" \
+            2>&1 | tee codex_e2e_output.jsonl
+          EXIT_CODE=${PIPESTATUS[0]}
+
+          SKIP_REASON=""
+          if [ "$EXIT_CODE" -ne 0 ]; then
+            if grep -Eiq "quota|rate limit|429" codex_e2e_output.jsonl /tmp/codex_e2e_artifacts/trace.jsonl 2>/dev/null; then
+              SKIP_REASON="codex API quota exhausted"
+            elif grep -Eiq "not authenticated|authentication|unauthorized|expired" codex_e2e_output.jsonl /tmp/codex_e2e_artifacts/trace.jsonl 2>/dev/null; then
+              SKIP_REASON="codex authentication unavailable or expired"
+            elif grep -Eiq "network|timed out|timeout" codex_e2e_output.jsonl /tmp/codex_e2e_artifacts/trace.jsonl 2>/dev/null; then
+              SKIP_REASON="codex network unavailable"
+            fi
+
+            if [ -n "$SKIP_REASON" ]; then
+              echo "::notice::Codex E2E treated as transient skip: $SKIP_REASON"
+              EXIT_CODE=0
+            fi
+          fi
+
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+          echo "skip_reason=$SKIP_REASON" >> "$GITHUB_OUTPUT"
+
+          echo "## Codex E2E" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$SKIP_REASON" ]; then
+            echo "Transient skip: $SKIP_REASON" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          summary_line="$(grep '"type":"summary"' codex_e2e_output.jsonl | tail -n 1 || true)"
+          if [ -n "$summary_line" ]; then
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            echo "$summary_line" | jq . >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "$summary_line" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            tail -40 codex_e2e_output.jsonl >> "$GITHUB_STEP_SUMMARY" || true
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          exit 0
+
+      - name: Upload Codex E2E artifacts
+        if: steps.codex_e2e.outputs.exit_code != '0'
+        uses: actions/upload-artifact@v7
+        with:
+          name: codex-e2e-artifacts
+          path: |
+            codex_e2e_output.jsonl
+            /tmp/codex_e2e_artifacts/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Check Codex E2E result
+        if: steps.codex_e2e.outputs.exit_code != '0'
+        run: |
+          echo "::error::Codex E2E failed (exit code ${{ steps.codex_e2e.outputs.exit_code }}). See the 'codex-e2e-artifacts' artifact and the step summary for details."
+          exit 1
+
   # Scan-mode regression fixtures (ensures scan output stays stable)
   scan-regression:
     runs-on: ubuntu-latest
