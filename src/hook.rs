@@ -820,11 +820,14 @@ fn get_contextual_suggestion(command: &str) -> Option<&'static str> {
     }
 }
 
-/// Write a denial response to arbitrary stdout/stderr writers (test seam).
+/// Write a denial response to arbitrary stdout/stderr writers.
+///
+/// This is public so integration tests and Criterion benchmarks can exercise
+/// protocol formatting without touching process stdout/stderr.
 #[cold]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn write_denial_to(
+pub fn write_denial_to(
     stdout: &mut impl Write,
     stderr: &mut impl Write,
     protocol: HookProtocol,

@@ -421,7 +421,7 @@ jobs:
             memory-metrics.log
           retention-days: 14
 
-  # Performance benchmark enforcement (push to master only)
+  # Performance benchmark enforcement (push to main only)
   # Runs benchmarks and checks against performance budgets defined in src/perf.rs
   benchmarks:
     runs-on: ubuntu-latest
@@ -448,9 +448,10 @@ jobs:
         run: |
           # Run benchmarks and capture output
           cargo bench --bench heredoc_perf -- --noplot 2>&1 | tee benchmark_output.txt
+          cargo bench --bench codex_deny -- --noplot 2>&1 | tee -a benchmark_output.txt
           echo "## Benchmark Results" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          grep -E "^(tier|pack|core|shell|language|full)" benchmark_output.txt | head -50 >> $GITHUB_STEP_SUMMARY || true
+          grep -E "^(tier|pack|core|shell|language|full|hook)" benchmark_output.txt | head -50 >> $GITHUB_STEP_SUMMARY || true
           echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Check performance budgets

@@ -114,6 +114,10 @@ harness = false
 name = "regex_automata_comparison"
 harness = false
 
+[[bench]]
+name = "codex_deny"
+harness = false
+
 [profile.release]
 opt-level = "z"     # Optimize for size (lean binary for distribution)
 lto = true          # Link-time optimization across crates

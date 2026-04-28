@@ -60,6 +60,9 @@ declare -A BUDGETS=(
 
     # Full pipeline - budget 15ms/50ms
     ["full_pipeline"]=15000000:50000000
+
+    # Protocol deny path - budget 5ms/50ms
+    ["hook_deny_path"]=5000000:50000000
 )
 
 echo -e "${BLUE}=== Performance Budget Check ===${NC}"
@@ -72,7 +75,10 @@ trap 'rm -rf "$BENCH_DIR"' EXIT
 echo -e "${BLUE}Running benchmarks...${NC}"
 
 # Run benchmarks and save output
-if ! cargo bench --bench heredoc_perf -- --noplot --save-baseline budget_check 2>&1 | tee "$BENCH_DIR/bench_output.txt"; then
+if ! {
+    cargo bench --bench heredoc_perf -- --noplot --save-baseline budget_check
+    cargo bench --bench codex_deny -- --noplot --save-baseline budget_check
+} 2>&1 | tee "$BENCH_DIR/bench_output.txt"; then
     echo -e "${RED}Benchmark run failed${NC}"
     exit 1
 fi
