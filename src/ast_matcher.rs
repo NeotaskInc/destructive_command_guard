@@ -37,7 +37,8 @@ use ast_grep_language::SupportLang;
 use memchr::memchr_iter;
 use regex::Regex;
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 /// Hard timeout for AST operations (20ms as per ADR).
@@ -48,6 +49,13 @@ use std::time::{Duration, Instant};
 const AST_TIMEOUT_MS: u64 = 20;
 #[cfg(test)]
 const AST_TIMEOUT_MS: u64 = 500;
+
+/// Maximum body size the AST matcher will parse directly.
+///
+/// Heredoc extraction already defaults to a 1 MiB body cap; keeping the direct
+/// matcher aligned prevents library callers and fuzz targets from bypassing the
+/// same fail-open budget by invoking AST parsing on much larger inputs.
+const MAX_AST_INPUT_BYTES: usize = 1024 * 1024;
 
 /// Severity level for pattern matches.
 ///
@@ -180,7 +188,7 @@ impl CompiledPattern {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PrecompiledPattern {
     pattern: Pattern,
     meta: CompiledPattern,
@@ -240,7 +248,6 @@ impl AstMatcher {
     /// - Timeout
     ///
     /// All errors are non-fatal; callers should fail-open (allow the command).
-    #[allow(clippy::cast_possible_truncation)] // Timeout values are always small
     pub fn find_matches(
         &self,
         code: &str,
@@ -248,12 +255,6 @@ impl AstMatcher {
     ) -> Result<Vec<PatternMatch>, MatchError> {
         let start_time = Instant::now();
         let budget_ms = self.timeout.as_millis() as u64;
-
-        // Helper to create timeout error
-        let timeout_err = |start: Instant| MatchError::Timeout {
-            elapsed_ms: start.elapsed().as_millis() as u64,
-            budget_ms,
-        };
 
         // Perl is not supported by ast-grep-language; use a conservative regex fallback.
         if language == ScriptLanguage::Perl {
@@ -271,61 +272,18 @@ impl AstMatcher {
             _ => return Ok(Vec::new()), // No patterns = no matches
         };
 
-        let newline_positions: Vec<usize> = memchr_iter(b'\n', code.as_bytes()).collect();
-
-        // Parse the code
-        let ast = AstGrep::new(code, ast_lang);
-        let root = ast.root();
-
-        // Check timeout after parsing
-        if start_time.elapsed() > self.timeout {
-            return Err(timeout_err(start_time));
+        if self.timeout.is_zero() || code.len() > MAX_AST_INPUT_BYTES {
+            return Err(timeout_error(start_time, budget_ms));
         }
 
-        let mut matches = Vec::new();
-
-        // Match each pattern
-        for compiled in patterns {
-            // Check timeout before each pattern
-            if start_time.elapsed() > self.timeout {
-                return Err(timeout_err(start_time));
-            }
-
-            // Find all matches for this pattern
-            for node in root.find_all(&compiled.pattern) {
-                // Check timeout during matching (a single pattern can match many nodes)
-                if start_time.elapsed() > self.timeout {
-                    return Err(timeout_err(start_time));
-                }
-
-                let matched_text = node.text();
-                let range = node.range();
-
-                // Calculate line number (1-based)
-                let line_number = newline_positions.partition_point(|&idx| idx < range.start) + 1;
-
-                // Create preview (truncate if too long, UTF-8 safe)
-                let preview = truncate_preview(&matched_text, 60);
-
-                let Some(refined) = refine_match_meta(language, &compiled.meta, &matched_text)
-                else {
-                    continue;
-                };
-
-                matches.push(PatternMatch {
-                    rule_id: refined.rule_id,
-                    reason: refined.reason,
-                    matched_text_preview: preview,
-                    start: range.start,
-                    end: range.end,
-                    line_number,
-                    severity: refined.severity,
-                    suggestion: refined.suggestion,
-                });
-            }
-        }
-
-        Ok(matches)
+        run_ast_match_with_timeout(
+            code.to_string(),
+            language,
+            ast_lang,
+            patterns.clone(),
+            self.timeout,
+            budget_ms,
+        )
     }
 
     /// Check if any blocking patterns match (convenience method).
@@ -337,6 +295,124 @@ impl AstMatcher {
             .ok()
             .and_then(|matches| matches.into_iter().find(|m| m.severity.blocks_by_default()))
     }
+}
+
+#[allow(clippy::cast_possible_truncation)] // Timeout values are always small
+fn timeout_error(start_time: Instant, budget_ms: u64) -> MatchError {
+    MatchError::Timeout {
+        elapsed_ms: start_time.elapsed().as_millis() as u64,
+        budget_ms,
+    }
+}
+
+fn check_ast_timeout(
+    start_time: Instant,
+    timeout: Duration,
+    budget_ms: u64,
+) -> Result<(), MatchError> {
+    if start_time.elapsed() > timeout {
+        return Err(timeout_error(start_time, budget_ms));
+    }
+    Ok(())
+}
+
+fn run_ast_match_with_timeout(
+    code: String,
+    language: ScriptLanguage,
+    ast_lang: SupportLang,
+    patterns: Vec<PrecompiledPattern>,
+    timeout: Duration,
+    budget_ms: u64,
+) -> Result<Vec<PatternMatch>, MatchError> {
+    let start_time = Instant::now();
+    let (tx, rx) = mpsc::sync_channel(1);
+
+    let _worker = thread::Builder::new()
+        .name("dcg-ast-match".to_string())
+        .spawn(move || {
+            let result = find_matches_ast(
+                &code,
+                language,
+                ast_lang,
+                &patterns,
+                Instant::now(),
+                timeout,
+                budget_ms,
+            );
+            let _ = tx.send(result);
+        })
+        .map_err(|err| MatchError::ParseError {
+            language,
+            detail: format!("failed to start AST parser worker: {err}"),
+        })?;
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(timeout_error(start_time, budget_ms)),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(MatchError::ParseError {
+            language,
+            detail: "AST parser worker exited without a result".to_string(),
+        }),
+    }
+}
+
+fn find_matches_ast(
+    code: &str,
+    language: ScriptLanguage,
+    ast_lang: SupportLang,
+    patterns: &[PrecompiledPattern],
+    start_time: Instant,
+    timeout: Duration,
+    budget_ms: u64,
+) -> Result<Vec<PatternMatch>, MatchError> {
+    let newline_positions: Vec<usize> = memchr_iter(b'\n', code.as_bytes()).collect();
+
+    // Parse the code
+    let ast = AstGrep::new(code, ast_lang);
+    let root = ast.root();
+
+    // Check timeout after parsing
+    check_ast_timeout(start_time, timeout, budget_ms)?;
+
+    let mut matches = Vec::new();
+
+    // Match each pattern
+    for compiled in patterns {
+        // Check timeout before each pattern
+        check_ast_timeout(start_time, timeout, budget_ms)?;
+
+        // Find all matches for this pattern
+        for node in root.find_all(&compiled.pattern) {
+            // Check timeout during matching (a single pattern can match many nodes)
+            check_ast_timeout(start_time, timeout, budget_ms)?;
+
+            let matched_text = node.text();
+            let range = node.range();
+
+            // Calculate line number (1-based)
+            let line_number = newline_positions.partition_point(|&idx| idx < range.start) + 1;
+
+            // Create preview (truncate if too long, UTF-8 safe)
+            let preview = truncate_preview(&matched_text, 60);
+
+            let Some(refined) = refine_match_meta(language, &compiled.meta, &matched_text) else {
+                continue;
+            };
+
+            matches.push(PatternMatch {
+                rule_id: refined.rule_id,
+                reason: refined.reason,
+                matched_text_preview: preview,
+                start: range.start,
+                end: range.end,
+                line_number,
+                severity: refined.severity,
+                suggestion: refined.suggestion,
+            });
+        }
+    }
+
+    Ok(matches)
 }
 
 /// Truncate a string to at most `max_chars` characters, UTF-8 safe.
@@ -2377,6 +2453,61 @@ mod tests {
 
         let result = ast_matcher.find_matches(code, ScriptLanguage::Unknown);
         assert!(matches!(result, Err(MatchError::UnsupportedLanguage(_))));
+    }
+
+    #[test]
+    fn zero_timeout_fails_open_before_parsing_malformed_input() {
+        let ast_matcher = AstMatcher::new().with_timeout(Duration::ZERO);
+        let mut code = "function f() {".to_string();
+        code.push_str(&"(".repeat(256 * 1024));
+
+        let start = Instant::now();
+        let result = ast_matcher.find_matches(&code, ScriptLanguage::JavaScript);
+
+        assert!(
+            matches!(result, Err(MatchError::Timeout { .. })),
+            "zero timeout should fail open before AST parsing starts"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "zero-timeout malformed input should return immediately"
+        );
+    }
+
+    #[test]
+    fn oversized_input_fails_open_without_ast_parse() {
+        let ast_matcher = AstMatcher::new().with_timeout(Duration::from_secs(10));
+        let code = "x = 1\n".repeat((MAX_AST_INPUT_BYTES / 6) + 2);
+        assert!(code.len() > MAX_AST_INPUT_BYTES);
+
+        let start = Instant::now();
+        let result = ast_matcher.find_matches(&code, ScriptLanguage::Python);
+
+        assert!(
+            matches!(result, Err(MatchError::Timeout { .. })),
+            "oversized direct matcher input should fail open on the budget guard"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(50),
+            "oversized input should not enter ast-grep parsing"
+        );
+    }
+
+    #[test]
+    fn happy_path_still_matches_with_bounded_worker() {
+        let ast_matcher = AstMatcher::new().with_timeout(Duration::from_millis(250));
+        let code = "import shutil\nshutil.rmtree('/tmp/test')";
+
+        let matches = ast_matcher
+            .find_matches(code, ScriptLanguage::Python)
+            .expect("small valid input should parse within the worker budget");
+
+        assert!(
+            matches
+                .iter()
+                .any(|m| m.rule_id == "heredoc.python.shutil_rmtree"),
+            "bounded worker should preserve normal AST matches"
+        );
     }
 
     #[test]
