@@ -237,6 +237,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packs::Severity;
     use crate::packs::test_helpers::*;
 
     #[test]
@@ -320,5 +321,72 @@ mod tests {
             "aws opensearch delete-package --package-id pkg-123",
             "aws-opensearch-delete-package",
         );
+    }
+
+    #[test]
+    fn opensearch_blocks_with_correct_severity() {
+        let pack = create_pack();
+        // Critical - index deletion (curl, httpie), domain deletion
+        assert_blocks_with_severity(
+            &pack,
+            "curl -X DELETE http://localhost:9200/my-index",
+            Severity::Critical,
+        );
+        assert_blocks_with_severity(&pack, "http DELETE :9200/my-index", Severity::Critical);
+        assert_blocks_with_severity(
+            &pack,
+            "aws opensearch delete-domain --domain-name prod",
+            Severity::Critical,
+        );
+        // High - delete-by-query, close index, connections
+        assert_blocks_with_severity(
+            &pack,
+            "curl -X POST http://localhost:9200/my-index/_delete_by_query",
+            Severity::High,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "curl -X POST http://localhost:9200/my-index/_close",
+            Severity::High,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "http POST :9200/my-index/_delete_by_query",
+            Severity::High,
+        );
+        assert_blocks_with_severity(&pack, "http POST :9200/my-index/_close", Severity::High);
+        assert_blocks_with_severity(
+            &pack,
+            "aws opensearch delete-inbound-connection --connection-id abc",
+            Severity::High,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "aws opensearch delete-outbound-connection --connection-id def",
+            Severity::High,
+        );
+        // Medium - single doc deletion, package deletion
+        assert_blocks_with_severity(
+            &pack,
+            "curl -X DELETE http://localhost:9200/my-index/_doc/123",
+            Severity::Medium,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "http DELETE :9200/my-index/_doc/123",
+            Severity::Medium,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "aws opensearch delete-package --package-id pkg-123",
+            Severity::Medium,
+        );
+    }
+
+    #[test]
+    fn opensearch_unrelated_commands_no_match() {
+        let pack = create_pack();
+        assert_no_match(&pack, "git status");
+        assert_no_match(&pack, "echo hello");
     }
 }

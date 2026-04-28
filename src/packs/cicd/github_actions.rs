@@ -148,6 +148,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packs::Severity;
+    use crate::packs::test_helpers::*;
 
     #[test]
     fn allows_safe_list_variants() {
@@ -206,5 +208,76 @@ mod tests {
             .check("gh api --method DELETE /repos/o/r/actions/variables/FOO")
             .expect("gh api DELETE variables should be detected");
         assert_eq!(matched.name, Some("gh-actions-api-delete-variables"));
+    }
+
+    #[test]
+    fn github_actions_blocks_each_destructive_pattern() {
+        let pack = create_pack();
+        assert_blocks_with_pattern(&pack, "gh secret delete FOO", "gh-actions-secret-remove");
+        assert_blocks_with_pattern(&pack, "gh secret remove FOO", "gh-actions-secret-remove");
+        assert_blocks_with_pattern(
+            &pack,
+            "gh variable delete FOO",
+            "gh-actions-variable-remove",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "gh variable remove FOO",
+            "gh-actions-variable-remove",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "gh workflow disable 123",
+            "gh-actions-workflow-disable",
+        );
+        assert_blocks_with_pattern(&pack, "gh run cancel 456", "gh-actions-run-cancel");
+        assert_blocks_with_pattern(
+            &pack,
+            "gh api -X DELETE repos/o/r/actions/secrets/FOO",
+            "gh-actions-api-delete-secrets",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "gh api --method DELETE /repos/o/r/actions/variables/FOO",
+            "gh-actions-api-delete-variables",
+        );
+    }
+
+    #[test]
+    fn github_actions_blocks_with_correct_severity() {
+        let pack = create_pack();
+        assert_blocks_with_severity(&pack, "gh secret delete FOO", Severity::High);
+        assert_blocks_with_severity(&pack, "gh variable delete FOO", Severity::Medium);
+        assert_blocks_with_severity(&pack, "gh workflow disable 123", Severity::Low);
+        assert_blocks_with_severity(&pack, "gh run cancel 456", Severity::Low);
+        assert_blocks_with_severity(
+            &pack,
+            "gh api -X DELETE repos/o/r/actions/secrets/FOO",
+            Severity::High,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "gh api --method DELETE /repos/o/r/actions/variables/FOO",
+            Severity::Medium,
+        );
+    }
+
+    #[test]
+    fn github_actions_all_safe_patterns_match() {
+        let pack = create_pack();
+        assert_safe_pattern_matches(&pack, "gh secret list");
+        assert_safe_pattern_matches(&pack, "gh variable list");
+        assert_safe_pattern_matches(&pack, "gh workflow list");
+        assert_safe_pattern_matches(&pack, "gh workflow view 123");
+        assert_safe_pattern_matches(&pack, "gh run list");
+        assert_safe_pattern_matches(&pack, "gh run view 456");
+        assert_safe_pattern_matches(&pack, "gh api -X GET repos/o/r/actions/secrets");
+    }
+
+    #[test]
+    fn github_actions_unrelated_commands_no_match() {
+        let pack = create_pack();
+        assert_no_match(&pack, "git status");
+        assert_no_match(&pack, "echo hello");
     }
 }

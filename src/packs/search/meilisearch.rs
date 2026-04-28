@@ -205,6 +205,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packs::Severity;
     use crate::packs::test_helpers::*;
 
     #[test]
@@ -272,5 +273,139 @@ mod tests {
             "http POST :7700/indexes/products/documents/delete-batch",
             "meili-http-delete-batch",
         );
+    }
+
+    #[test]
+    fn meilisearch_blocks_each_destructive_pattern() {
+        let pack = create_pack();
+        // curl patterns
+        assert_blocks_with_pattern(
+            &pack,
+            "curl -X DELETE http://localhost:7700/indexes/movies/documents/42",
+            "meili-curl-delete-document",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "curl -X DELETE http://localhost:7700/indexes/movies/documents",
+            "meili-curl-delete-documents",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "curl -X POST http://localhost:7700/indexes/movies/documents/delete-batch",
+            "meili-curl-delete-batch",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "curl -X DELETE http://localhost:7700/keys/mykey123",
+            "meili-curl-delete-key",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "curl -X DELETE http://localhost:7700/indexes/movies",
+            "meili-curl-delete-index",
+        );
+        // HTTPie patterns
+        assert_blocks_with_pattern(
+            &pack,
+            "http DELETE :7700/indexes/movies/documents/42",
+            "meili-http-delete-document",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "http DELETE :7700/indexes/movies/documents",
+            "meili-http-delete-documents",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "http POST :7700/indexes/movies/documents/delete-batch",
+            "meili-http-delete-batch",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "http DELETE :7700/keys/mykey123",
+            "meili-http-delete-key",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "http DELETE :7700/indexes/movies",
+            "meili-http-delete-index",
+        );
+    }
+
+    #[test]
+    fn meilisearch_blocks_with_correct_severity() {
+        let pack = create_pack();
+        // Critical - index deletion
+        assert_blocks_with_severity(
+            &pack,
+            "curl -X DELETE http://localhost:7700/indexes/products",
+            Severity::Critical,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "http DELETE :7700/indexes/products",
+            Severity::Critical,
+        );
+        // High - documents deletion, delete-batch, key deletion
+        assert_blocks_with_severity(
+            &pack,
+            "curl -X DELETE http://localhost:7700/indexes/products/documents",
+            Severity::High,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "curl -X POST http://localhost:7700/indexes/products/documents/delete-batch",
+            Severity::High,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "curl -X DELETE http://localhost:7700/keys/abc",
+            Severity::High,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "http DELETE :7700/indexes/products/documents",
+            Severity::High,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "http POST :7700/indexes/products/documents/delete-batch",
+            Severity::High,
+        );
+        assert_blocks_with_severity(&pack, "http DELETE :7700/keys/abc", Severity::High);
+        // Medium - single document deletion
+        assert_blocks_with_severity(
+            &pack,
+            "curl -X DELETE http://localhost:7700/indexes/products/documents/123",
+            Severity::Medium,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "http DELETE :7700/indexes/products/documents/123",
+            Severity::Medium,
+        );
+    }
+
+    #[test]
+    fn meilisearch_all_safe_patterns_match() {
+        let pack = create_pack();
+        assert_safe_pattern_matches(&pack, "curl -X GET http://localhost:7700/stats");
+        assert_safe_pattern_matches(&pack, "curl -X GET http://localhost:7700/health");
+        assert_safe_pattern_matches(&pack, "curl -X GET http://localhost:7700/version");
+        assert_safe_pattern_matches(
+            &pack,
+            "curl -X POST http://localhost:7700/indexes/products/search",
+        );
+        assert_safe_pattern_matches(&pack, "http GET :7700/stats");
+        assert_safe_pattern_matches(&pack, "http GET :7700/health");
+        assert_safe_pattern_matches(&pack, "http GET :7700/version");
+        assert_safe_pattern_matches(&pack, "http POST :7700/indexes/products/search");
+    }
+
+    #[test]
+    fn meilisearch_unrelated_commands_no_match() {
+        let pack = create_pack();
+        assert_no_match(&pack, "git status");
+        assert_no_match(&pack, "echo hello");
     }
 }

@@ -364,6 +364,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packs::Severity;
     use crate::packs::test_helpers::*;
 
     #[test]
@@ -509,5 +510,211 @@ mod tests {
             "az acr repository untag --name myregistry --image repo:tag",
             "repository untag",
         );
+    }
+
+    #[test]
+    fn azure_blocks_each_destructive_pattern() {
+        let pack = create_pack();
+        assert_blocks_with_pattern(&pack, "az vm delete --name my-vm -g rg", "vm-delete");
+        assert_blocks_with_pattern(
+            &pack,
+            "az storage account delete --name mystorage",
+            "storage-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "az storage blob delete --container c --name b",
+            "blob-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "az sql server delete --name myserver -g rg",
+            "sql-delete",
+        );
+        assert_blocks_with_pattern(&pack, "az group delete --name my-rg --yes", "group-delete");
+        assert_blocks_with_pattern(&pack, "az aks delete --name mycluster -g rg", "aks-delete");
+        assert_blocks_with_pattern(
+            &pack,
+            "az webapp delete --name myapp -g rg",
+            "webapp-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "az functionapp delete --name myfunc -g rg",
+            "functionapp-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "az cosmosdb delete --name myaccount -g rg",
+            "cosmosdb-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "az keyvault delete --name myvault",
+            "keyvault-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "az network vnet delete --name myvnet -g rg",
+            "vnet-delete",
+        );
+        assert_blocks_with_pattern(&pack, "az acr delete --name myregistry", "acr-delete");
+        assert_blocks_with_pattern(
+            &pack,
+            "az acr repository delete --name myreg --image repo:tag",
+            "acr-repository-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "az acr repository untag --name myreg --image repo:tag",
+            "acr-repository-untag",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "az keyvault secret delete --name mysecret --vault-name v",
+            "keyvault-item-delete-or-purge",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "az keyvault key purge --name mykey --vault-name v",
+            "keyvault-item-delete-or-purge",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "az role assignment delete --assignee user@corp.com",
+            "role-assignment-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "az ad sp delete --id 00000000-0000-0000-0000-000000000000",
+            "ad-sp-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "az ad app delete --id 00000000-0000-0000-0000-000000000000",
+            "ad-app-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "az network dns zone delete --name example.com -g rg",
+            "network-dns-zone-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "az monitor log-profiles delete --name myprofile",
+            "monitor-log-profiles-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "az cosmosdb sql container delete --account-name a --database-name d --name c -g rg",
+            "cosmosdb-sql-container-delete",
+        );
+    }
+
+    #[test]
+    fn azure_blocks_with_correct_severity() {
+        let pack = create_pack();
+        assert_blocks_with_severity(&pack, "az vm delete --name vm -g rg", Severity::Critical);
+        assert_blocks_with_severity(
+            &pack,
+            "az storage account delete --name s",
+            Severity::Critical,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "az storage blob delete --container c --name b",
+            Severity::High,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "az sql server delete --name srv -g rg",
+            Severity::Critical,
+        );
+        assert_blocks_with_severity(&pack, "az group delete --name rg --yes", Severity::Critical);
+        assert_blocks_with_severity(&pack, "az aks delete --name aks -g rg", Severity::Critical);
+        assert_blocks_with_severity(&pack, "az webapp delete --name app -g rg", Severity::High);
+        assert_blocks_with_severity(
+            &pack,
+            "az functionapp delete --name fn -g rg",
+            Severity::High,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "az cosmosdb delete --name acct -g rg",
+            Severity::Critical,
+        );
+        assert_blocks_with_severity(&pack, "az keyvault delete --name vault", Severity::Critical);
+        assert_blocks_with_severity(
+            &pack,
+            "az network vnet delete --name vnet -g rg",
+            Severity::High,
+        );
+        assert_blocks_with_severity(&pack, "az acr delete --name reg", Severity::Critical);
+        assert_blocks_with_severity(
+            &pack,
+            "az acr repository delete --name reg --image i:t",
+            Severity::High,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "az acr repository untag --name reg --image i:t",
+            Severity::Medium,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "az keyvault secret delete --name s --vault-name v",
+            Severity::Critical,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "az role assignment delete --assignee u",
+            Severity::High,
+        );
+        assert_blocks_with_severity(&pack, "az ad sp delete --id x", Severity::Critical);
+        assert_blocks_with_severity(&pack, "az ad app delete --id x", Severity::Critical);
+        assert_blocks_with_severity(
+            &pack,
+            "az network dns zone delete --name z -g rg",
+            Severity::Critical,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "az monitor log-profiles delete --name p",
+            Severity::High,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "az cosmosdb sql container delete --account-name a --database-name d --name c -g rg",
+            Severity::Critical,
+        );
+    }
+
+    #[test]
+    fn azure_all_safe_patterns_match() {
+        let pack = create_pack();
+        // az-show: az <svc> show
+        assert_safe_pattern_matches(&pack, "az vm show --name my-vm -g rg");
+        // az-list: az <svc> list
+        assert_safe_pattern_matches(&pack, "az vm list");
+        // az-account
+        assert_safe_pattern_matches(&pack, "az account list");
+        assert_safe_pattern_matches(&pack, "az account show");
+        // az-configure
+        assert_safe_pattern_matches(&pack, "az configure --defaults group=mygroup");
+        // az-login
+        assert_safe_pattern_matches(&pack, "az login");
+        // az-version
+        assert_safe_pattern_matches(&pack, "az version");
+        // az-help
+        assert_safe_pattern_matches(&pack, "az vm delete --help");
+        // az-what-if
+        assert_safe_pattern_matches(&pack, "az group delete --what-if");
+    }
+
+    #[test]
+    fn azure_unrelated_commands_no_match() {
+        let pack = create_pack();
+        assert_no_match(&pack, "git status");
+        assert_no_match(&pack, "echo hello");
     }
 }

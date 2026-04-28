@@ -391,6 +391,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packs::Severity;
     use crate::packs::test_helpers::*;
 
     #[test]
@@ -537,5 +538,208 @@ mod tests {
             "gcloud artifacts repositories delete my-repo --location=us-central1",
             "repositories delete",
         );
+    }
+
+    #[test]
+    fn gcp_blocks_each_destructive_pattern() {
+        let pack = create_pack();
+        assert_blocks_with_pattern(
+            &pack,
+            "gcloud compute instances delete my-vm",
+            "compute-delete",
+        );
+        assert_blocks_with_pattern(&pack, "gcloud compute disks delete my-disk", "disk-delete");
+        assert_blocks_with_pattern(&pack, "gcloud sql instances delete my-db", "sql-delete");
+        assert_blocks_with_pattern(
+            &pack,
+            "gsutil rm -r gs://my-bucket/path/",
+            "gsutil-rm-recursive",
+        );
+        assert_blocks_with_pattern(&pack, "gsutil rb gs://my-bucket", "gsutil-rb");
+        assert_blocks_with_pattern(
+            &pack,
+            "gcloud container clusters delete my-gke",
+            "gke-delete",
+        );
+        assert_blocks_with_pattern(&pack, "gcloud projects delete my-project", "project-delete");
+        assert_blocks_with_pattern(
+            &pack,
+            "gcloud functions delete my-function",
+            "functions-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "gcloud pubsub topics delete my-topic",
+            "pubsub-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "gcloud firestore indexes delete idx123",
+            "firestore-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "gcloud container images delete gcr.io/proj/img:tag",
+            "container-images-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "gcloud artifacts docker images delete us-docker.pkg.dev/p/r/i:t",
+            "artifacts-docker-images-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "gcloud artifacts repositories delete my-repo --location=us",
+            "artifacts-repositories-delete",
+        );
+        assert_blocks_with_pattern(&pack, "gcloud secrets delete my-secret", "secrets-delete");
+        assert_blocks_with_pattern(
+            &pack,
+            "gcloud kms keys versions destroy 1 --key=k --keyring=r --location=l",
+            "kms-keys-destroy",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "gcloud iam service-accounts delete sa@proj.iam.gserviceaccount.com",
+            "iam-service-accounts-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "gcloud iam roles delete CustomRole --project=proj",
+            "iam-roles-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "gcloud dns managed-zones delete my-zone",
+            "dns-managed-zones-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "gcloud logging sinks delete my-sink",
+            "logging-sinks-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "gcloud spanner instances delete my-spanner",
+            "spanner-instances-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "gcloud bigtable instances delete my-bt",
+            "bigtable-instances-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "gcloud dataproc clusters delete my-cluster --region=us-central1",
+            "dataproc-clusters-delete",
+        );
+        assert_blocks_with_pattern(&pack, "bq rm -r my_dataset", "bq-rm-recursive");
+    }
+
+    #[test]
+    fn gcp_blocks_with_correct_severity() {
+        let pack = create_pack();
+        assert_blocks_with_severity(
+            &pack,
+            "gcloud compute instances delete my-vm",
+            Severity::Critical,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "gcloud compute disks delete my-disk",
+            Severity::Critical,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "gcloud sql instances delete my-db",
+            Severity::Critical,
+        );
+        assert_blocks_with_severity(&pack, "gsutil rm -r gs://bucket/path/", Severity::Critical);
+        assert_blocks_with_severity(&pack, "gsutil rb gs://bucket", Severity::Critical);
+        assert_blocks_with_severity(
+            &pack,
+            "gcloud container clusters delete gke",
+            Severity::Critical,
+        );
+        assert_blocks_with_severity(&pack, "gcloud projects delete proj", Severity::Critical);
+        assert_blocks_with_severity(&pack, "gcloud functions delete fn", Severity::High);
+        assert_blocks_with_severity(&pack, "gcloud pubsub topics delete t", Severity::High);
+        assert_blocks_with_severity(
+            &pack,
+            "gcloud firestore indexes delete idx",
+            Severity::Critical,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "gcloud container images delete gcr.io/p/i:t",
+            Severity::High,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "gcloud artifacts docker images delete us-docker.pkg.dev/p/r/i:t",
+            Severity::High,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "gcloud artifacts repositories delete repo --location=us",
+            Severity::Critical,
+        );
+        assert_blocks_with_severity(&pack, "gcloud secrets delete s", Severity::Critical);
+        assert_blocks_with_severity(
+            &pack,
+            "gcloud kms keys versions destroy 1 --key=k --keyring=r --location=l",
+            Severity::Critical,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "gcloud iam service-accounts delete sa@p.iam.gserviceaccount.com",
+            Severity::Critical,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "gcloud iam roles delete CustomRole --project=p",
+            Severity::High,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "gcloud dns managed-zones delete zone",
+            Severity::Critical,
+        );
+        assert_blocks_with_severity(&pack, "gcloud logging sinks delete sink", Severity::High);
+        assert_blocks_with_severity(
+            &pack,
+            "gcloud spanner instances delete spanner",
+            Severity::Critical,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "gcloud bigtable instances delete bt",
+            Severity::Critical,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "gcloud dataproc clusters delete cluster --region=us",
+            Severity::High,
+        );
+        assert_blocks_with_severity(&pack, "bq rm -r dataset", Severity::Critical);
+    }
+
+    #[test]
+    fn gcp_all_safe_patterns_match() {
+        let pack = create_pack();
+        assert_safe_pattern_matches(&pack, "gcloud compute instances describe my-vm");
+        assert_safe_pattern_matches(&pack, "gcloud compute instances list");
+        assert_safe_pattern_matches(&pack, "gsutil ls gs://bucket/");
+        assert_safe_pattern_matches(&pack, "gsutil cp file.txt gs://bucket/");
+        assert_safe_pattern_matches(&pack, "gcloud config list");
+        assert_safe_pattern_matches(&pack, "gcloud auth login");
+        assert_safe_pattern_matches(&pack, "gcloud info");
+    }
+
+    #[test]
+    fn gcp_unrelated_commands_no_match() {
+        let pack = create_pack();
+        assert_no_match(&pack, "git status");
+        assert_no_match(&pack, "echo hello");
     }
 }

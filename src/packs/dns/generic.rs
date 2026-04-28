@@ -81,8 +81,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packs::test_helpers::*;
     use crate::packs::Severity;
+    use crate::packs::test_helpers::*;
 
     #[test]
     fn test_pack_creation() {
@@ -159,21 +159,9 @@ mod tests {
     #[test]
     fn generic_blocks_with_correct_severity() {
         let pack = create_pack();
-        assert_blocks_with_severity(
-            &pack,
-            "nsupdate delete example.com A",
-            Severity::High,
-        );
-        assert_blocks_with_severity(
-            &pack,
-            "nsupdate -l",
-            Severity::Medium,
-        );
-        assert_blocks_with_severity(
-            &pack,
-            "dig axfr example.com",
-            Severity::Medium,
-        );
+        assert_blocks_with_severity(&pack, "nsupdate delete example.com A", Severity::High);
+        assert_blocks_with_severity(&pack, "nsupdate -l", Severity::Medium);
+        assert_blocks_with_severity(&pack, "dig axfr example.com", Severity::Medium);
     }
 
     #[test]

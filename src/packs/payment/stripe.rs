@@ -225,4 +225,31 @@ mod tests {
         };
         assert_eq!(matched.severity, Severity::Medium);
     }
+
+    #[test]
+    fn stripe_blocks_with_correct_severity() {
+        let pack = create_pack();
+        assert_blocks_with_severity(
+            &pack,
+            "stripe webhook_endpoints delete we_123",
+            Severity::High,
+        );
+        assert_blocks_with_severity(&pack, "stripe customers delete cus_123", Severity::Critical);
+        assert_blocks_with_severity(&pack, "stripe products delete prod_123", Severity::High);
+        assert_blocks_with_severity(&pack, "stripe prices delete price_123", Severity::High);
+        assert_blocks_with_severity(&pack, "stripe coupons delete coupon_123", Severity::High);
+        assert_blocks_with_severity(&pack, "stripe api_keys roll", Severity::Medium);
+        assert_blocks_with_severity(
+            &pack,
+            "curl -X DELETE https://api.stripe.com/v1/customers/cus_123",
+            Severity::High,
+        );
+    }
+
+    #[test]
+    fn stripe_unrelated_commands_no_match() {
+        let pack = create_pack();
+        assert_no_match(&pack, "git status");
+        assert_no_match(&pack, "echo hello");
+    }
 }

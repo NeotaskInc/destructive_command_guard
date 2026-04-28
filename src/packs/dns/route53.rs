@@ -135,8 +135,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packs::test_helpers::*;
     use crate::packs::Severity;
+    use crate::packs::test_helpers::*;
 
     #[test]
     fn test_pack_creation() {
@@ -306,10 +306,7 @@ mod tests {
             &pack,
             "aws route53 test-dns-answer --hosted-zone-id Z123 --record-name example.com",
         );
-        assert_safe_pattern_matches(
-            &pack,
-            "aws --profile prod route53 list-hosted-zones",
-        );
+        assert_safe_pattern_matches(&pack, "aws --profile prod route53 list-hosted-zones");
         assert_safe_pattern_matches(
             &pack,
             "aws --region us-east-1 route53 get-hosted-zone --id Z123",

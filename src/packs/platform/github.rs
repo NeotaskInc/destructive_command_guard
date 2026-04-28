@@ -174,6 +174,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packs::Severity;
+    use crate::packs::test_helpers::*;
 
     #[test]
     fn allows_safe_variants() {
@@ -243,5 +245,102 @@ mod tests {
                 .unwrap_or_else(|| panic!("Should block: {cmd}"));
             assert_eq!(matched.name, Some(expected_rule), "Command: {cmd}");
         }
+    }
+
+    #[test]
+    fn github_blocks_each_destructive_pattern() {
+        let pack = create_pack();
+        assert_blocks_with_pattern(&pack, "gh repo delete owner/repo", "gh-repo-delete");
+        assert_blocks_with_pattern(&pack, "gh repo archive owner/repo", "gh-repo-archive");
+        assert_blocks_with_pattern(&pack, "gh gist delete 123", "gh-gist-delete");
+        assert_blocks_with_pattern(&pack, "gh release delete v1.0", "gh-release-delete");
+        assert_blocks_with_pattern(&pack, "gh issue delete 1", "gh-issue-delete");
+        assert_blocks_with_pattern(&pack, "gh ssh-key delete 1", "gh-ssh-key-delete");
+        assert_blocks_with_pattern(&pack, "gh secret delete SECRET_NAME", "gh-secret-delete");
+        assert_blocks_with_pattern(&pack, "gh variable delete VAR_NAME", "gh-variable-delete");
+        assert_blocks_with_pattern(
+            &pack,
+            "gh repo deploy-key delete 123",
+            "gh-repo-deploy-key-delete",
+        );
+        assert_blocks_with_pattern(&pack, "gh run cancel 123456", "gh-run-cancel");
+        assert_blocks_with_pattern(
+            &pack,
+            "gh api -X DELETE /repos/owner/repo/actions/secrets/SECRET",
+            "gh-api-delete-actions-secret",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "gh api -X DELETE /repos/owner/repo/actions/variables/VAR",
+            "gh-api-delete-actions-variable",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "gh api -X DELETE /repos/owner/repo/hooks/123",
+            "gh-api-delete-hook",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "gh api -X DELETE /repos/owner/repo/keys/456",
+            "gh-api-delete-deploy-key",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "gh api -X DELETE /repos/owner/repo/releases/1",
+            "gh-api-delete-release",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "gh api -X DELETE /repos/owner/repo",
+            "gh-api-delete-repo",
+        );
+    }
+
+    #[test]
+    fn github_blocks_with_correct_severity() {
+        let pack = create_pack();
+        // All github destructive patterns use default severity (High)
+        assert_blocks_with_severity(&pack, "gh repo delete owner/repo", Severity::High);
+        assert_blocks_with_severity(&pack, "gh repo archive owner/repo", Severity::High);
+        assert_blocks_with_severity(&pack, "gh gist delete 123", Severity::High);
+        assert_blocks_with_severity(&pack, "gh release delete v1.0", Severity::High);
+        assert_blocks_with_severity(&pack, "gh issue delete 1", Severity::High);
+        assert_blocks_with_severity(&pack, "gh ssh-key delete 1", Severity::High);
+        assert_blocks_with_severity(&pack, "gh secret delete SECRET_NAME", Severity::High);
+        assert_blocks_with_severity(&pack, "gh variable delete VAR_NAME", Severity::High);
+        assert_blocks_with_severity(&pack, "gh repo deploy-key delete 123", Severity::High);
+        assert_blocks_with_severity(&pack, "gh run cancel 123456", Severity::High);
+        assert_blocks_with_severity(
+            &pack,
+            "gh api -X DELETE /repos/owner/repo/actions/secrets/SECRET",
+            Severity::High,
+        );
+        assert_blocks_with_severity(&pack, "gh api -X DELETE /repos/owner/repo", Severity::High);
+    }
+
+    #[test]
+    fn github_all_safe_patterns_match() {
+        let pack = create_pack();
+        assert_safe_pattern_matches(&pack, "gh repo list");
+        assert_safe_pattern_matches(&pack, "gh repo view");
+        assert_safe_pattern_matches(&pack, "gh gist list");
+        assert_safe_pattern_matches(&pack, "gh gist view abc123");
+        assert_safe_pattern_matches(&pack, "gh release list");
+        assert_safe_pattern_matches(&pack, "gh release view v1.0");
+        assert_safe_pattern_matches(&pack, "gh issue list");
+        assert_safe_pattern_matches(&pack, "gh issue view 42");
+        assert_safe_pattern_matches(&pack, "gh ssh-key list");
+        assert_safe_pattern_matches(&pack, "gh secret list");
+        assert_safe_pattern_matches(&pack, "gh variable list");
+        assert_safe_pattern_matches(&pack, "gh auth status");
+        assert_safe_pattern_matches(&pack, "gh status");
+        assert_safe_pattern_matches(&pack, "gh api -X GET /repos/owner/repo");
+    }
+
+    #[test]
+    fn github_unrelated_commands_no_match() {
+        let pack = create_pack();
+        assert_no_match(&pack, "git status");
+        assert_no_match(&pack, "echo hello");
     }
 }

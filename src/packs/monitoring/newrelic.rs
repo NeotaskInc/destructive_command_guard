@@ -201,11 +201,7 @@ mod tests {
     fn newrelic_blocks_with_correct_severity() {
         let pack = create_pack();
         assert_blocks_with_severity(&pack, "newrelic entity delete 123", Severity::High);
-        assert_blocks_with_severity(
-            &pack,
-            "newrelic apm application delete 123",
-            Severity::High,
-        );
+        assert_blocks_with_severity(&pack, "newrelic apm application delete 123", Severity::High);
         assert_blocks_with_severity(&pack, "newrelic workload delete 123", Severity::High);
         assert_blocks_with_severity(&pack, "newrelic synthetics delete 123", Severity::High);
     }

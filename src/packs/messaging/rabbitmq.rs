@@ -225,11 +225,7 @@ mod tests {
             "rabbitmqadmin delete exchange name=events",
             Severity::High,
         );
-        assert_blocks_with_severity(
-            &pack,
-            "rabbitmqadmin purge queue name=jobs",
-            Severity::High,
-        );
+        assert_blocks_with_severity(&pack, "rabbitmqadmin purge queue name=jobs", Severity::High);
         assert_blocks_with_severity(&pack, "rabbitmqctl delete_vhost /prod", Severity::Critical);
         assert_blocks_with_severity(&pack, "rabbitmqctl reset", Severity::Critical);
         assert_blocks_with_severity(&pack, "rabbitmqctl force_reset", Severity::Critical);

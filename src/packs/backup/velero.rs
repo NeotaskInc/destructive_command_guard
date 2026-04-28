@@ -241,21 +241,9 @@ mod tests {
     #[test]
     fn velero_blocks_with_correct_severity() {
         let pack = create_pack();
-        assert_blocks_with_severity(
-            &pack,
-            "velero backup delete nightly",
-            Severity::High,
-        );
-        assert_blocks_with_severity(
-            &pack,
-            "velero schedule delete nightly",
-            Severity::Medium,
-        );
-        assert_blocks_with_severity(
-            &pack,
-            "velero restore delete restore-1",
-            Severity::Low,
-        );
+        assert_blocks_with_severity(&pack, "velero backup delete nightly", Severity::High);
+        assert_blocks_with_severity(&pack, "velero schedule delete nightly", Severity::Medium);
+        assert_blocks_with_severity(&pack, "velero restore delete restore-1", Severity::Low);
         assert_blocks_with_severity(
             &pack,
             "velero backup-location delete default",

@@ -203,6 +203,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packs::Severity;
     use crate::packs::test_helpers::*;
 
     #[test]
@@ -308,5 +309,99 @@ mod tests {
             pack.check("wrangler --env prod whoami").is_none(),
             "safe read with env flag should remain safe"
         );
+    }
+
+    #[test]
+    fn cloudflare_workers_blocks_each_destructive_pattern() {
+        let pack = create_pack();
+        assert_blocks_with_pattern(&pack, "wrangler delete my-worker", "wrangler-delete");
+        assert_blocks_with_pattern(
+            &pack,
+            "wrangler deployments rollback",
+            "wrangler-deployments-rollback",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "wrangler kv:key delete --namespace-id=abc KEY",
+            "wrangler-kv-key-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "wrangler kv:namespace delete --namespace-id=abc",
+            "wrangler-kv-namespace-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "wrangler kv:bulk delete --namespace-id=abc keys.json",
+            "wrangler-kv-bulk-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "wrangler r2 object delete bucket/key",
+            "wrangler-r2-object-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "wrangler r2 bucket delete my-bucket",
+            "wrangler-r2-bucket-delete",
+        );
+        assert_blocks_with_pattern(&pack, "wrangler d1 delete my-db", "wrangler-d1-delete");
+    }
+
+    #[test]
+    fn cloudflare_workers_blocks_with_correct_severity() {
+        let pack = create_pack();
+        assert_blocks_with_severity(&pack, "wrangler delete my-worker", Severity::Critical);
+        assert_blocks_with_severity(&pack, "wrangler deployments rollback", Severity::High);
+        assert_blocks_with_severity(
+            &pack,
+            "wrangler kv:key delete --namespace-id=abc KEY",
+            Severity::Medium,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "wrangler kv:namespace delete --namespace-id=abc",
+            Severity::Critical,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "wrangler kv:bulk delete --namespace-id=abc keys.json",
+            Severity::High,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "wrangler r2 object delete bucket/key",
+            Severity::Medium,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "wrangler r2 bucket delete my-bucket",
+            Severity::Critical,
+        );
+        assert_blocks_with_severity(&pack, "wrangler d1 delete my-db", Severity::Critical);
+    }
+
+    #[test]
+    fn cloudflare_workers_all_safe_patterns_match() {
+        let pack = create_pack();
+        assert_safe_pattern_matches(&pack, "wrangler whoami");
+        assert_safe_pattern_matches(&pack, "wrangler kv:key get --namespace-id=abc KEY");
+        assert_safe_pattern_matches(&pack, "wrangler kv:key list --namespace-id=abc");
+        assert_safe_pattern_matches(&pack, "wrangler kv:namespace list");
+        assert_safe_pattern_matches(&pack, "wrangler r2 object get my-bucket/path/to/obj");
+        assert_safe_pattern_matches(&pack, "wrangler r2 bucket list");
+        assert_safe_pattern_matches(&pack, "wrangler d1 list");
+        assert_safe_pattern_matches(&pack, "wrangler d1 info my-db");
+        assert_safe_pattern_matches(&pack, "wrangler dev");
+        assert_safe_pattern_matches(&pack, "wrangler tail");
+        assert_safe_pattern_matches(&pack, "wrangler --version");
+        assert_safe_pattern_matches(&pack, "wrangler help");
+    }
+
+    #[test]
+    fn cloudflare_workers_unrelated_commands_no_match() {
+        let pack = create_pack();
+        assert_no_match(&pack, "git status");
+        assert_no_match(&pack, "echo hello");
     }
 }

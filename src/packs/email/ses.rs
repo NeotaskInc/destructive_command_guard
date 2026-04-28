@@ -270,6 +270,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packs::Severity;
     use crate::packs::test_helpers::*;
 
     #[test]
@@ -389,6 +390,70 @@ mod tests {
             "aws sesv2 delete-dedicated-ip-pool --pool-name MyPool",
             "sesv2-delete-dedicated-ip-pool",
         );
+    }
+
+    #[test]
+    fn ses_blocks_with_correct_severity() {
+        let pack = create_pack();
+        // SES v1
+        assert_blocks_with_severity(
+            &pack,
+            "aws ses delete-identity --identity example.com",
+            Severity::High,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "aws ses delete-template --template-name MyTemplate",
+            Severity::Medium,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "aws ses delete-configuration-set --configuration-set-name MySet",
+            Severity::High,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "aws ses delete-receipt-rule-set --rule-set-name MyRuleSet",
+            Severity::Critical,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "aws ses delete-receipt-rule --rule-set-name MyRuleSet --rule-name MyRule",
+            Severity::High,
+        );
+        // SES v2
+        assert_blocks_with_severity(
+            &pack,
+            "aws sesv2 delete-email-identity --email-identity example.com",
+            Severity::High,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "aws sesv2 delete-email-template --template-name MyTemplate",
+            Severity::Medium,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "aws sesv2 delete-configuration-set --configuration-set-name MySet",
+            Severity::High,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "aws sesv2 delete-contact-list --contact-list-name MyList",
+            Severity::High,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "aws sesv2 delete-dedicated-ip-pool --pool-name MyPool",
+            Severity::Critical,
+        );
+    }
+
+    #[test]
+    fn ses_unrelated_commands_no_match() {
+        let pack = create_pack();
+        assert_no_match(&pack, "git status");
+        assert_no_match(&pack, "echo hello");
     }
 
     #[test]

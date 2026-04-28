@@ -156,6 +156,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packs::Severity;
     use crate::packs::test_helpers::*;
 
     #[test]
@@ -236,5 +237,52 @@ mod tests {
             "rm -f '/etc/prometheus/prometheus.yml'",
             "prometheus-rules-file-delete",
         );
+    }
+
+    #[test]
+    fn prometheus_blocks_with_correct_severity() {
+        let pack = create_pack();
+        assert_blocks_with_severity(
+            &pack,
+            "rm /etc/prometheus/rules.d/alerts.yml",
+            Severity::Critical,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "curl -X POST http://localhost:9090/api/v1/admin/tsdb/delete_series?match[]=up",
+            Severity::Critical,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "kubectl delete prometheusrule example -n monitoring",
+            Severity::High,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "grafana-cli plugins uninstall grafana-piechart-panel",
+            Severity::High,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "curl -X DELETE http://grafana.local/api/dashboards/uid/abc",
+            Severity::High,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "curl -X DELETE http://grafana.local/api/datasources/1",
+            Severity::High,
+        );
+        assert_blocks_with_severity(
+            &pack,
+            "curl -X DELETE http://grafana.local/api/alert-notifications/1",
+            Severity::High,
+        );
+    }
+
+    #[test]
+    fn prometheus_unrelated_commands_no_match() {
+        let pack = create_pack();
+        assert_no_match(&pack, "echo hello");
+        assert_no_match(&pack, "cargo build");
     }
 }

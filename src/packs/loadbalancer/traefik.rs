@@ -179,8 +179,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packs::test_helpers::*;
     use crate::packs::Severity;
+    use crate::packs::test_helpers::*;
 
     #[test]
     fn test_pack_creation() {
@@ -236,11 +236,7 @@ mod tests {
         assert_blocks_with_severity(&pack, "docker stop traefik", Severity::Critical);
         assert_blocks_with_severity(&pack, "docker kill traefik", Severity::Critical);
         assert_blocks_with_severity(&pack, "docker rm traefik", Severity::Critical);
-        assert_blocks_with_severity(
-            &pack,
-            "docker-compose down traefik",
-            Severity::Critical,
-        );
+        assert_blocks_with_severity(&pack, "docker-compose down traefik", Severity::Critical);
         assert_blocks_with_severity(
             &pack,
             "kubectl delete pod traefik-abc123",
@@ -256,11 +252,7 @@ mod tests {
             "kubectl delete ingressroute my-route",
             Severity::High,
         );
-        assert_blocks_with_severity(
-            &pack,
-            "rm /etc/traefik/traefik.yml",
-            Severity::Critical,
-        );
+        assert_blocks_with_severity(&pack, "rm /etc/traefik/traefik.yml", Severity::Critical);
         assert_blocks_with_severity(
             &pack,
             "curl -X DELETE http://traefik:8080/api/http/routers/my-router@file",

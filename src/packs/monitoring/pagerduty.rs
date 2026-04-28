@@ -197,11 +197,7 @@ mod tests {
         let pack = create_pack();
         assert_blocks_with_severity(&pack, "pd service delete P123", Severity::Critical);
         assert_blocks_with_severity(&pack, "pd schedule delete P234", Severity::High);
-        assert_blocks_with_severity(
-            &pack,
-            "pd escalation-policy delete P345",
-            Severity::High,
-        );
+        assert_blocks_with_severity(&pack, "pd escalation-policy delete P345", Severity::High);
         assert_blocks_with_severity(&pack, "pd user delete P456", Severity::High);
         assert_blocks_with_severity(&pack, "pd team delete P567", Severity::High);
         assert_blocks_with_severity(

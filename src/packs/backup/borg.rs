@@ -174,7 +174,11 @@ mod tests {
     #[test]
     fn borg_blocks_each_destructive_pattern() {
         let pack = create_pack();
-        assert_blocks(&pack, "borg delete repo::old", "borg delete removes archives");
+        assert_blocks(
+            &pack,
+            "borg delete repo::old",
+            "borg delete removes archives",
+        );
         assert_blocks(&pack, "borg prune repo", "borg prune removes archives");
         assert_blocks(&pack, "borg compact repo", "borg compact reclaims space");
         assert_blocks(

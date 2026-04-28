@@ -64,6 +64,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packs::Severity;
     use crate::packs::test_helpers::*;
 
     #[test]
@@ -96,5 +97,30 @@ mod tests {
         assert_blocks_with_pattern(&pack, "rsync --delete-excluded src/ dest/", "rsync-delete");
         assert_blocks_with_pattern(&pack, "rsync --del src/ dest/", "rsync-del-short");
         assert_safe_pattern_matches(&pack, "rsync --delete --dry-run src/ dest/");
+    }
+
+    #[test]
+    fn rsync_blocks_each_destructive_pattern() {
+        let pack = create_pack();
+        assert_blocks_with_pattern(&pack, "rsync --delete src/ dest/", "rsync-delete");
+        assert_blocks_with_pattern(&pack, "rsync --delete-after src/ dest/", "rsync-delete");
+        assert_blocks_with_pattern(&pack, "rsync --delete-before src/ dest/", "rsync-delete");
+        assert_blocks_with_pattern(&pack, "rsync --delete-during src/ dest/", "rsync-delete");
+        assert_blocks_with_pattern(&pack, "rsync --delete-excluded src/ dest/", "rsync-delete");
+        assert_blocks_with_pattern(&pack, "rsync --del src/ dest/", "rsync-del-short");
+    }
+
+    #[test]
+    fn rsync_blocks_with_correct_severity() {
+        let pack = create_pack();
+        assert_blocks_with_severity(&pack, "rsync --delete src/ dest/", Severity::High);
+        assert_blocks_with_severity(&pack, "rsync --del src/ dest/", Severity::High);
+    }
+
+    #[test]
+    fn rsync_unrelated_commands_no_match() {
+        let pack = create_pack();
+        assert_no_match(&pack, "git status");
+        assert_no_match(&pack, "echo hello");
     }
 }

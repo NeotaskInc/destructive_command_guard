@@ -162,8 +162,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packs::test_helpers::*;
     use crate::packs::Severity;
+    use crate::packs::test_helpers::*;
 
     #[test]
     fn test_pack_creation() {
@@ -277,7 +277,11 @@ mod tests {
     #[test]
     fn minio_blocks_each_destructive_pattern() {
         let pack = create_pack();
-        assert_blocks(&pack, "mc rb myminio/bucket", "mc rb removes a MinIO bucket");
+        assert_blocks(
+            &pack,
+            "mc rb myminio/bucket",
+            "mc rb removes a MinIO bucket",
+        );
         assert_blocks(
             &pack,
             "mc rb --force myminio/bucket",
@@ -334,11 +338,7 @@ mod tests {
     fn minio_blocks_with_correct_severity() {
         let pack = create_pack();
         assert_blocks_with_severity(&pack, "mc rb myminio/bucket", Severity::Critical);
-        assert_blocks_with_severity(
-            &pack,
-            "mc rm myminio/bucket/file.txt",
-            Severity::High,
-        );
+        assert_blocks_with_severity(&pack, "mc rm myminio/bucket/file.txt", Severity::High);
         assert_blocks_with_severity(
             &pack,
             "mc admin bucket delete myminio bucket",

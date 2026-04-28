@@ -146,6 +146,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packs::Severity;
     use crate::packs::test_helpers::*;
 
     #[test]
@@ -213,5 +214,35 @@ mod tests {
             "node -e \"algolia.clearObjects('products')\"",
             "algolia-sdk-clear-objects",
         );
+    }
+
+    #[test]
+    fn algolia_blocks_with_correct_severity() {
+        let pack = create_pack();
+        // Critical - index deletion (CLI and SDK)
+        assert_blocks_with_severity(&pack, "algolia indices delete products", Severity::Critical);
+        assert_blocks_with_severity(
+            &pack,
+            "node -e \"const client = algoliasearch('app','key'); client.deleteIndex('prod');\"",
+            Severity::Critical,
+        );
+        // High - index clear, apikeys delete, SDK clearObjects
+        assert_blocks_with_severity(&pack, "algolia indices clear products", Severity::High);
+        assert_blocks_with_severity(&pack, "algolia apikeys delete key_123", Severity::High);
+        assert_blocks_with_severity(
+            &pack,
+            "node -e \"algolia.clearObjects('products')\"",
+            Severity::High,
+        );
+        // Medium - rules delete, synonyms delete
+        assert_blocks_with_severity(&pack, "algolia rules delete products", Severity::Medium);
+        assert_blocks_with_severity(&pack, "algolia synonyms delete products", Severity::Medium);
+    }
+
+    #[test]
+    fn algolia_unrelated_commands_no_match() {
+        let pack = create_pack();
+        assert_no_match(&pack, "git status");
+        assert_no_match(&pack, "echo hello");
     }
 }

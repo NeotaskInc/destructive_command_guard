@@ -409,6 +409,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packs::Severity;
+    use crate::packs::test_helpers::*;
 
     #[test]
     fn wipefs_is_reachable_via_keywords() {
@@ -479,5 +481,28 @@ mod tests {
             .check("dmsetup --noudevsync remove my-dev")
             .expect("dmsetup with noudevsync should still block");
         assert_eq!(matched.name, Some("dmsetup-remove"));
+    }
+
+    #[test]
+    fn disk_blocks_with_correct_severity() {
+        let pack = create_pack();
+        assert_blocks_with_severity(&pack, "dd if=/dev/zero of=/dev/sda bs=1M", Severity::High);
+        assert_blocks_with_severity(&pack, "fdisk /dev/sda", Severity::High);
+        assert_blocks_with_severity(&pack, "mkfs.ext4 /dev/sdb1", Severity::High);
+        assert_blocks_with_severity(&pack, "wipefs --all /dev/sdb", Severity::High);
+        assert_blocks_with_severity(&pack, "mdadm --stop /dev/md0", Severity::High);
+        assert_blocks_with_severity(&pack, "btrfs subvolume delete /mnt/foo", Severity::High);
+        assert_blocks_with_severity(&pack, "dmsetup remove my-dev", Severity::High);
+        assert_blocks_with_severity(&pack, "pvremove /dev/sda1", Severity::High);
+        assert_blocks_with_severity(&pack, "vgremove my-vg", Severity::High);
+        assert_blocks_with_severity(&pack, "lvremove my-vg/my-lv", Severity::High);
+    }
+
+    #[test]
+    fn disk_unrelated_commands_no_match() {
+        let pack = create_pack();
+        assert_no_match(&pack, "git status");
+        assert_no_match(&pack, "echo hello");
+        assert_no_match(&pack, "cargo build");
     }
 }

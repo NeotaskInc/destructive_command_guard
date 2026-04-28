@@ -211,11 +211,7 @@ mod tests {
         assert_blocks_with_severity(&pack, "restic forget latest", Severity::Critical);
         assert_blocks_with_severity(&pack, "restic prune", Severity::Critical);
         assert_blocks_with_severity(&pack, "restic key remove 1", Severity::Critical);
-        assert_blocks_with_severity(
-            &pack,
-            "restic unlock --remove-all",
-            Severity::High,
-        );
+        assert_blocks_with_severity(&pack, "restic unlock --remove-all", Severity::High);
         assert_blocks_with_severity(&pack, "restic cache --cleanup", Severity::Low);
     }
 

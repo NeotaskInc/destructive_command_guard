@@ -202,6 +202,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::packs::Severity;
+    use crate::packs::test_helpers::*;
 
     #[test]
     fn shutdown_is_reachable_via_keywords() {
@@ -276,5 +278,28 @@ mod tests {
             pack.check("systemctl --user list-units").is_none(),
             "list-units with --user should be treated as safe"
         );
+    }
+
+    #[test]
+    fn services_blocks_with_correct_severity() {
+        let pack = create_pack();
+        assert_blocks_with_severity(&pack, "systemctl stop sshd", Severity::High);
+        assert_blocks_with_severity(&pack, "systemctl disable docker", Severity::High);
+        assert_blocks_with_severity(&pack, "systemctl mask networking", Severity::High);
+        assert_blocks_with_severity(&pack, "service ssh stop", Severity::High);
+        assert_blocks_with_severity(&pack, "systemctl isolate rescue.target", Severity::High);
+        assert_blocks_with_severity(&pack, "systemctl poweroff", Severity::Critical);
+        assert_blocks_with_severity(&pack, "systemctl reboot", Severity::Critical);
+        assert_blocks_with_severity(&pack, "shutdown -h now", Severity::Critical);
+        assert_blocks_with_severity(&pack, "reboot", Severity::Critical);
+        assert_blocks_with_severity(&pack, "init 0", Severity::Critical);
+        assert_blocks_with_severity(&pack, "init 6", Severity::Critical);
+    }
+
+    #[test]
+    fn services_unrelated_commands_no_match() {
+        let pack = create_pack();
+        assert_no_match(&pack, "git status");
+        assert_no_match(&pack, "echo hello");
     }
 }

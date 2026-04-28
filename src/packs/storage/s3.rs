@@ -151,8 +151,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packs::test_helpers::*;
     use crate::packs::Severity;
+    use crate::packs::test_helpers::*;
 
     #[test]
     fn test_pack_creation() {
@@ -212,13 +212,21 @@ mod tests {
     #[test]
     fn s3_blocks_each_destructive_pattern() {
         let pack = create_pack();
-        assert_blocks(&pack, "aws s3 rb s3://my-bucket", "aws s3 rb removes an S3 bucket");
+        assert_blocks(
+            &pack,
+            "aws s3 rb s3://my-bucket",
+            "aws s3 rb removes an S3 bucket",
+        );
         assert_blocks(
             &pack,
             "aws s3 rb s3://my-bucket --force",
             "aws s3 rb removes an S3 bucket",
         );
-        assert_blocks(&pack, "aws s3 rm s3://bucket/key", "aws s3 rm deletes S3 objects");
+        assert_blocks(
+            &pack,
+            "aws s3 rm s3://bucket/key",
+            "aws s3 rm deletes S3 objects",
+        );
         assert_blocks(
             &pack,
             "aws s3 rm s3://bucket --recursive",

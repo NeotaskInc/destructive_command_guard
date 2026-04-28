@@ -102,8 +102,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packs::test_helpers::*;
     use crate::packs::Severity;
+    use crate::packs::test_helpers::*;
 
     #[test]
     fn test_pack_creation() {
@@ -171,16 +171,8 @@ mod tests {
     #[test]
     fn haproxy_blocks_with_correct_severity() {
         let pack = create_pack();
-        assert_blocks_with_severity(
-            &pack,
-            "haproxy -sf $(cat /run/haproxy.pid)",
-            Severity::High,
-        );
-        assert_blocks_with_severity(
-            &pack,
-            "haproxy -st $(cat /run/haproxy.pid)",
-            Severity::High,
-        );
+        assert_blocks_with_severity(&pack, "haproxy -sf $(cat /run/haproxy.pid)", Severity::High);
+        assert_blocks_with_severity(&pack, "haproxy -st $(cat /run/haproxy.pid)", Severity::High);
         assert_blocks_with_severity(&pack, "systemctl stop haproxy", Severity::High);
         assert_blocks_with_severity(&pack, "service haproxy stop", Severity::High);
         assert_blocks_with_severity(
@@ -203,11 +195,7 @@ mod tests {
             "echo 'shutdown frontend http' | socat stdio /var/run/haproxy.sock",
             Severity::High,
         );
-        assert_blocks_with_severity(
-            &pack,
-            "rm /etc/haproxy/haproxy.cfg",
-            Severity::High,
-        );
+        assert_blocks_with_severity(&pack, "rm /etc/haproxy/haproxy.cfg", Severity::High);
     }
 
     #[test]

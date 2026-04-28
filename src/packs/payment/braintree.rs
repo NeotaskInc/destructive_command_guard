@@ -205,21 +205,9 @@ mod tests {
             "curl -X DELETE https://api.braintreegateway.com/merchants/abc/customers/c",
             Severity::High,
         );
-        assert_blocks_with_severity(
-            &pack,
-            "braintree.Customer.delete('c')",
-            Severity::Critical,
-        );
-        assert_blocks_with_severity(
-            &pack,
-            "gateway.payment_method.delete('pm')",
-            Severity::High,
-        );
-        assert_blocks_with_severity(
-            &pack,
-            "gateway.subscription.cancel('s')",
-            Severity::High,
-        );
+        assert_blocks_with_severity(&pack, "braintree.Customer.delete('c')", Severity::Critical);
+        assert_blocks_with_severity(&pack, "gateway.payment_method.delete('pm')", Severity::High);
+        assert_blocks_with_severity(&pack, "gateway.subscription.cancel('s')", Severity::High);
     }
 
     #[test]

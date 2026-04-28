@@ -170,8 +170,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packs::test_helpers::*;
     use crate::packs::Severity;
+    use crate::packs::test_helpers::*;
 
     #[test]
     fn test_pack_creation() {
@@ -254,7 +254,11 @@ mod tests {
     #[test]
     fn gcs_blocks_each_destructive_pattern() {
         let pack = create_pack();
-        assert_blocks(&pack, "gsutil rb gs://bucket", "gsutil rb removes a GCS bucket");
+        assert_blocks(
+            &pack,
+            "gsutil rb gs://bucket",
+            "gsutil rb removes a GCS bucket",
+        );
         assert_blocks(
             &pack,
             "gsutil -f rb gs://bucket",
@@ -297,11 +301,7 @@ mod tests {
         let pack = create_pack();
         assert_blocks_with_severity(&pack, "gsutil rb gs://bucket", Severity::Critical);
         assert_blocks_with_severity(&pack, "gsutil rm gs://bucket/file", Severity::High);
-        assert_blocks_with_severity(
-            &pack,
-            "gsutil rsync -d gs://src gs://dst",
-            Severity::High,
-        );
+        assert_blocks_with_severity(&pack, "gsutil rsync -d gs://src gs://dst", Severity::High);
         assert_blocks_with_severity(
             &pack,
             "gcloud storage buckets delete gs://bucket",
@@ -312,11 +312,7 @@ mod tests {
             "gcloud storage objects delete gs://bucket/file",
             Severity::High,
         );
-        assert_blocks_with_severity(
-            &pack,
-            "gcloud storage rm gs://bucket/file",
-            Severity::High,
-        );
+        assert_blocks_with_severity(&pack, "gcloud storage rm gs://bucket/file", Severity::High);
     }
 
     #[test]
