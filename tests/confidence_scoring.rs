@@ -33,6 +33,8 @@ fn mock_deny_result(
         skipped_due_to_budget: false,
         branch_context: None,
         session_occurrence: None,
+        graduated_response: None,
+        bypass_method: None,
     }
 }
 

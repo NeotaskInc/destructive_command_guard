@@ -84,6 +84,10 @@ pub struct Config {
     #[serde(default)]
     pub agents: AgentsConfig,
 
+    /// Graduated response system configuration.
+    #[serde(default)]
+    pub response: ResponseConfig,
+
     /// Project-specific configurations (keyed by absolute path).
     #[serde(default)]
     pub projects: std::collections::HashMap<String, ProjectConfig>,
@@ -121,6 +125,7 @@ struct ConfigLayer {
     interactive: Option<InteractiveConfigLayer>,
     git_awareness: Option<GitAwarenessConfigLayer>,
     agents: Option<AgentsConfig>,
+    response: Option<ResponseConfigLayer>,
     projects: Option<std::collections::HashMap<String, ProjectConfig>>,
 }
 
@@ -485,6 +490,145 @@ impl Default for ConfidenceConfig {
             protect_critical: true,
         }
     }
+}
+
+/// Graduation mode controlling how responses escalate with repeated occurrences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraduationMode {
+    Paranoid,
+    Strict,
+    Standard,
+    Lenient,
+    WarningOnly,
+    Disabled,
+}
+
+impl Default for GraduationMode {
+    fn default() -> Self {
+        Self::Standard
+    }
+}
+
+impl std::fmt::Display for GraduationMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Paranoid => write!(f, "paranoid"),
+            Self::Strict => write!(f, "strict"),
+            Self::Standard => write!(f, "standard"),
+            Self::Lenient => write!(f, "lenient"),
+            Self::WarningOnly => write!(f, "warning_only"),
+            Self::Disabled => write!(f, "disabled"),
+        }
+    }
+}
+
+/// Per-severity graduation mode override.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SeverityOverrides {
+    pub critical: Option<GraduationMode>,
+    pub high: Option<GraduationMode>,
+    pub medium: Option<GraduationMode>,
+    pub low: Option<GraduationMode>,
+}
+
+impl SeverityOverrides {
+    #[must_use]
+    pub fn mode_for(&self, severity: crate::packs::Severity) -> Option<GraduationMode> {
+        match severity {
+            crate::packs::Severity::Critical => self.critical,
+            crate::packs::Severity::High => self.high,
+            crate::packs::Severity::Medium => self.medium,
+            crate::packs::Severity::Low => self.low,
+        }
+    }
+}
+
+/// Configuration for the graduated response system.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub mode: GraduationMode,
+    #[serde(default = "ResponseConfig::default_session_warning_count")]
+    pub session_warning_count: u32,
+    #[serde(default = "ResponseConfig::default_session_soft_block")]
+    pub session_soft_block: u32,
+    #[serde(default = "ResponseConfig::default_history_soft_block")]
+    pub history_soft_block: u32,
+    #[serde(default = "ResponseConfig::default_history_hard_block")]
+    pub history_hard_block: u32,
+    #[serde(default = "ResponseConfig::default_history_window")]
+    pub history_window: String,
+    #[serde(default)]
+    pub severity_overrides: SeverityOverrides,
+}
+
+impl ResponseConfig {
+    const fn default_session_warning_count() -> u32 {
+        1
+    }
+    const fn default_session_soft_block() -> u32 {
+        2
+    }
+    const fn default_history_soft_block() -> u32 {
+        3
+    }
+    const fn default_history_hard_block() -> u32 {
+        5
+    }
+    fn default_history_window() -> String {
+        "24h".to_string()
+    }
+
+    /// Effective graduation mode for a severity.
+    /// Precedence: explicit override -> severity default -> global mode.
+    /// Critical defaults to Paranoid, Low defaults to WarningOnly.
+    #[must_use]
+    pub fn effective_mode(&self, severity: crate::packs::Severity) -> GraduationMode {
+        if let Some(explicit) = self.severity_overrides.mode_for(severity) {
+            return explicit;
+        }
+        match severity {
+            crate::packs::Severity::Critical => GraduationMode::Paranoid,
+            crate::packs::Severity::Low => GraduationMode::WarningOnly,
+            _ => self.mode,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+impl Default for ResponseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: GraduationMode::default(),
+            session_warning_count: Self::default_session_warning_count(),
+            session_soft_block: Self::default_session_soft_block(),
+            history_soft_block: Self::default_history_soft_block(),
+            history_hard_block: Self::default_history_hard_block(),
+            history_window: Self::default_history_window(),
+            severity_overrides: SeverityOverrides::default(),
+        }
+    }
+}
+
+/// Layered config for graduated response (all fields optional for merge).
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ResponseConfigLayer {
+    enabled: Option<bool>,
+    mode: Option<GraduationMode>,
+    session_warning_count: Option<u32>,
+    session_soft_block: Option<u32>,
+    history_soft_block: Option<u32>,
+    history_hard_block: Option<u32>,
+    history_window: Option<String>,
+    severity_overrides: Option<SeverityOverrides>,
 }
 
 impl HeredocConfig {
@@ -2732,6 +2876,10 @@ impl Config {
             self.merge_agents_layer(agents);
         }
 
+        if let Some(response) = other.response {
+            self.merge_response_layer(response);
+        }
+
         // Merge project configs
         if let Some(projects) = other.projects {
             self.projects.extend(projects);
@@ -2983,6 +3131,33 @@ impl Config {
         self.agents.default = agents.default;
         // Merge agent-specific profiles
         self.agents.profiles.extend(agents.profiles);
+    }
+
+    fn merge_response_layer(&mut self, response: ResponseConfigLayer) {
+        if let Some(enabled) = response.enabled {
+            self.response.enabled = enabled;
+        }
+        if let Some(mode) = response.mode {
+            self.response.mode = mode;
+        }
+        if let Some(session_warning_count) = response.session_warning_count {
+            self.response.session_warning_count = session_warning_count;
+        }
+        if let Some(session_soft_block) = response.session_soft_block {
+            self.response.session_soft_block = session_soft_block;
+        }
+        if let Some(history_soft_block) = response.history_soft_block {
+            self.response.history_soft_block = history_soft_block;
+        }
+        if let Some(history_hard_block) = response.history_hard_block {
+            self.response.history_hard_block = history_hard_block;
+        }
+        if let Some(history_window) = response.history_window {
+            self.response.history_window = history_window;
+        }
+        if let Some(severity_overrides) = response.severity_overrides {
+            self.response.severity_overrides = severity_overrides;
+        }
     }
 
     /// Apply environment variable overrides.
@@ -3449,6 +3624,7 @@ impl Config {
             history: HistoryConfig::default(),
             git_awareness: GitAwarenessConfig::default(),
             agents: AgentsConfig::default(),
+            response: ResponseConfig::default(),
             projects: std::collections::HashMap::new(),
             interactive: crate::interactive::InteractiveConfig::default(),
         }
@@ -3728,6 +3904,35 @@ max_size_mb = 500
 
 # Optional database path override.
 # database_path = "~/.config/dcg/history.db"
+
+#─────────────────────────────────────────────────────────────
+# GRADUATED RESPONSE SYSTEM
+#─────────────────────────────────────────────────────────────
+
+[response]
+# Enable the graduated response system.
+# When enabled, repeated occurrences of the same command escalate
+# from warning → soft block → hard block.
+enabled = false
+
+# Global graduation mode: "paranoid" | "strict" | "standard" | "lenient" | "warning_only" | "disabled"
+mode = "standard"
+
+# Session thresholds (within current process).
+session_warning_count = 1
+session_soft_block = 2
+
+# History thresholds (across sessions within history_window).
+history_soft_block = 3
+history_hard_block = 5
+history_window = "24h"
+
+# Per-severity overrides (uncomment to customize).
+# [response.severity_overrides]
+# critical = "paranoid"
+# high = "strict"
+# medium = "standard"
+# low = "warning_only"
 
 #─────────────────────────────────────────────────────────────
 # PROJECT-SPECIFIC OVERRIDES
@@ -6964,5 +7169,160 @@ trust_level = "high"
             config.agents.profile_for("claude-code").trust_level,
             TrustLevel::High
         );
+    }
+
+    // =========================================================================
+    // Graduated Response Config Tests
+    // =========================================================================
+
+    #[test]
+    fn test_response_config_defaults() {
+        let config = ResponseConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.mode, GraduationMode::Standard);
+        assert_eq!(config.session_warning_count, 1);
+        assert_eq!(config.session_soft_block, 2);
+        assert_eq!(config.history_soft_block, 3);
+        assert_eq!(config.history_hard_block, 5);
+        assert_eq!(config.history_window, "24h");
+    }
+
+    #[test]
+    fn test_response_config_is_enabled() {
+        let mut config = ResponseConfig::default();
+        assert!(!config.is_enabled());
+        config.enabled = true;
+        assert!(config.is_enabled());
+    }
+
+    #[test]
+    fn test_graduation_mode_display() {
+        assert_eq!(GraduationMode::Paranoid.to_string(), "paranoid");
+        assert_eq!(GraduationMode::Strict.to_string(), "strict");
+        assert_eq!(GraduationMode::Standard.to_string(), "standard");
+        assert_eq!(GraduationMode::Lenient.to_string(), "lenient");
+        assert_eq!(GraduationMode::WarningOnly.to_string(), "warning_only");
+        assert_eq!(GraduationMode::Disabled.to_string(), "disabled");
+    }
+
+    #[test]
+    fn test_graduation_mode_serde_roundtrip() {
+        for mode in [
+            GraduationMode::Paranoid,
+            GraduationMode::Strict,
+            GraduationMode::Standard,
+            GraduationMode::Lenient,
+            GraduationMode::WarningOnly,
+            GraduationMode::Disabled,
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let back: GraduationMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(mode, back, "roundtrip failed for {mode}");
+        }
+    }
+
+    #[test]
+    fn test_effective_mode_severity_defaults() {
+        let config = ResponseConfig::default();
+        // Critical defaults to Paranoid
+        assert_eq!(
+            config.effective_mode(crate::packs::Severity::Critical),
+            GraduationMode::Paranoid
+        );
+        // Low defaults to WarningOnly
+        assert_eq!(
+            config.effective_mode(crate::packs::Severity::Low),
+            GraduationMode::WarningOnly
+        );
+        // High/Medium default to global mode (Standard)
+        assert_eq!(
+            config.effective_mode(crate::packs::Severity::High),
+            GraduationMode::Standard
+        );
+        assert_eq!(
+            config.effective_mode(crate::packs::Severity::Medium),
+            GraduationMode::Standard
+        );
+    }
+
+    #[test]
+    fn test_effective_mode_explicit_override_wins() {
+        let mut config = ResponseConfig::default();
+        config.severity_overrides.critical = Some(GraduationMode::Lenient);
+        assert_eq!(
+            config.effective_mode(crate::packs::Severity::Critical),
+            GraduationMode::Lenient
+        );
+    }
+
+    #[test]
+    fn test_response_config_from_toml() {
+        let input = r#"
+[response]
+enabled = true
+mode = "strict"
+session_warning_count = 2
+session_soft_block = 4
+history_soft_block = 6
+history_hard_block = 10
+history_window = "48h"
+
+[response.severity_overrides]
+critical = "paranoid"
+low = "disabled"
+"#;
+        let config: Config = toml::from_str(input).unwrap();
+        assert!(config.response.enabled);
+        assert_eq!(config.response.mode, GraduationMode::Strict);
+        assert_eq!(config.response.session_warning_count, 2);
+        assert_eq!(config.response.session_soft_block, 4);
+        assert_eq!(config.response.history_soft_block, 6);
+        assert_eq!(config.response.history_hard_block, 10);
+        assert_eq!(config.response.history_window, "48h");
+        assert_eq!(
+            config.response.severity_overrides.critical,
+            Some(GraduationMode::Paranoid)
+        );
+        assert_eq!(
+            config.response.severity_overrides.low,
+            Some(GraduationMode::Disabled)
+        );
+        assert_eq!(config.response.severity_overrides.high, None);
+    }
+
+    #[test]
+    fn test_response_config_layer_merge() {
+        let mut config = Config::default();
+        assert!(!config.response.enabled);
+        assert_eq!(config.response.mode, GraduationMode::Standard);
+
+        let layer = ConfigLayer {
+            response: Some(ResponseConfigLayer {
+                enabled: Some(true),
+                mode: Some(GraduationMode::Strict),
+                session_warning_count: None,
+                session_soft_block: Some(5),
+                history_soft_block: None,
+                history_hard_block: None,
+                history_window: None,
+                severity_overrides: None,
+            }),
+            ..ConfigLayer::default()
+        };
+        config.merge_layer(layer);
+        assert!(config.response.enabled);
+        assert_eq!(config.response.mode, GraduationMode::Strict);
+        // Unset fields retain defaults
+        assert_eq!(config.response.session_warning_count, 1);
+        assert_eq!(config.response.session_soft_block, 5);
+    }
+
+    #[test]
+    fn test_sample_config_includes_response_section() {
+        let sample = Config::generate_sample_config();
+        assert!(sample.contains("[response]"));
+        assert!(sample.contains("mode = \"standard\""));
+        // Ensure it still parses
+        toml::from_str::<Config>(&sample).expect("sample config with [response] parses");
     }
 }

@@ -402,6 +402,10 @@ pub enum Command {
             value_name = "LANGS"
         )]
         heredoc_languages: Option<Vec<String>>,
+
+        /// Bypass a soft block from the graduated response system
+        #[arg(long)]
+        force: bool,
     },
 
     /// Generate a sample configuration file
@@ -949,6 +953,11 @@ pub struct SuggestAllowlistCommand {
     /// Undo recently added auto-suggested patterns (removes patterns added in the last N minutes)
     #[arg(long)]
     pub undo: Option<u32>,
+
+    /// Apply suggestions by index (comma-separated, 1-based). Skips interactive prompts.
+    /// Example: --apply 1,3,5
+    #[arg(long, value_delimiter = ',')]
+    pub apply: Option<Vec<usize>>,
 }
 
 /// Output format for suggest-allowlist command.
@@ -1976,6 +1985,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             no_heredoc_scan,
             heredoc_timeout_ms,
             heredoc_languages,
+            force,
         }) => {
             // Robot mode forces JSON output
             let robot_mode = robot_mode_enabled(cli.robot);
@@ -2012,6 +2022,7 @@ pub fn run_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     no_heredoc_scan,
                     heredoc_timeout_ms,
                     heredoc_languages,
+                    force,
                 );
                 // Exit with code 1 if command would be blocked (for CI/robot mode scripting)
                 if was_blocked {
@@ -3770,6 +3781,7 @@ fn test_command(
     no_heredoc_scan: bool,
     heredoc_timeout_ms: Option<u64>,
     heredoc_languages: Option<Vec<String>>,
+    force: bool,
 ) -> bool {
     use std::time::Instant;
 
@@ -3858,7 +3870,7 @@ fn test_command(
 
     // Use shared evaluator for consistent behavior with hook mode
     let start = Instant::now();
-    let result = evaluate_command_with_pack_order_deadline_at_path(
+    let mut result = evaluate_command_with_pack_order_deadline_at_path(
         command,
         &enabled_keywords,
         &ordered_packs,
@@ -3873,6 +3885,19 @@ fn test_command(
 
     // NOTE: External packs from custom_paths are now checked in evaluate_command()
     // alongside built-in packs, so no separate fallback check is needed here.
+
+    // Apply graduated response system
+    result.record_and_graduate(command, &effective_config.response);
+
+    // If --force and we have a SoftBlock, bypass it
+    if force {
+        if let Some(crate::evaluator::GraduatedResponse::SoftBlock { .. }) =
+            &result.graduated_response
+        {
+            result.decision = EvaluationDecision::Allow;
+            result.bypass_method = Some(crate::evaluator::BypassMethod::Force);
+        }
+    }
 
     let elapsed = start.elapsed();
 
@@ -7596,6 +7621,12 @@ fn handle_suggest_allowlist_command(
         return Ok(());
     }
 
+    // --apply mode: apply specific suggestions by 1-based index, non-interactively
+    if let Some(ref indices) = cmd.apply {
+        apply_suggestions_by_index(&suggestions, indices, &db);
+        return Ok(());
+    }
+
     // Output based on format
     match effective_format {
         SuggestFormat::Json => {
@@ -7943,6 +7974,92 @@ fn output_suggestions_interactive(
     }
 
     Ok(())
+}
+
+/// Apply suggestions by 1-based index without interactive prompts.
+fn apply_suggestions_by_index(
+    suggestions: &[AllowlistSuggestion],
+    indices: &[usize],
+    db: &HistoryDb,
+) {
+    let working_dir = std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().to_string());
+
+    let mut applied = 0usize;
+    let mut skipped = 0usize;
+
+    for &idx in indices {
+        if idx == 0 || idx > suggestions.len() {
+            eprintln!(
+                "Index {idx} out of range (1-{}), skipping",
+                suggestions.len()
+            );
+            skipped += 1;
+            continue;
+        }
+
+        let suggestion = &suggestions[idx - 1];
+        let cluster = &suggestion.cluster;
+
+        let reason = format!(
+            "Auto-suggested ({} confidence, {} risk): {}",
+            suggestion.confidence.as_str(),
+            suggestion.risk.as_str(),
+            suggestion.reason.description()
+        );
+
+        match allowlist_add_pattern(
+            &cluster.proposed_pattern,
+            &reason,
+            suggestion.risk.as_str(),
+            suggestion.confidence.as_str(),
+            cluster.frequency,
+            cluster.unique_count,
+        ) {
+            Ok(path) => {
+                println!(
+                    "[{idx}] Applied: {} → {}",
+                    cluster.proposed_pattern,
+                    path.display()
+                );
+                applied += 1;
+
+                let audit_entry = SuggestionAuditEntry {
+                    timestamp: Utc::now(),
+                    action: SuggestionAction::Accepted,
+                    pattern: cluster.proposed_pattern.clone(),
+                    final_pattern: None,
+                    risk_level: suggestion.risk.as_str().to_string(),
+                    risk_score: suggestion.risk.score(),
+                    confidence_tier: suggestion.confidence.as_str().to_string(),
+                    confidence_points: match suggestion.confidence {
+                        ConfidenceTier::High => 3,
+                        ConfidenceTier::Medium => 2,
+                        ConfidenceTier::Low => 1,
+                    },
+                    cluster_frequency: cluster.frequency,
+                    unique_variants: cluster.unique_count,
+                    sample_commands: serde_json::to_string(&cluster.commands).unwrap_or_default(),
+                    rule_id: None,
+                    session_id: None,
+                    working_dir: working_dir.clone(),
+                };
+                let _ = db.log_suggestion_audit(&audit_entry);
+            }
+            Err(e) => {
+                if e.to_string().contains("already exists") {
+                    println!("[{idx}] Already in allowlist: {}", cluster.proposed_pattern);
+                } else {
+                    eprintln!("[{idx}] Failed: {e}");
+                }
+                skipped += 1;
+            }
+        }
+    }
+
+    println!();
+    println!("{applied} applied, {skipped} skipped");
 }
 
 /// Handle the `dcg history` command.
@@ -13500,6 +13617,22 @@ mod tests {
     }
 
     #[test]
+    fn test_cli_parse_packs_pattern_tree_controls() {
+        let cli = Cli::parse_from(["dcg", "packs", "--expand", "--max-patterns", "6"]);
+        if let Some(Command::ListPacks {
+            expand,
+            max_patterns,
+            ..
+        }) = cli.command
+        {
+            assert!(expand);
+            assert_eq!(max_patterns, 6);
+        } else {
+            unreachable!("Expected ListPacks");
+        }
+    }
+
+    #[test]
     fn test_cli_parse_pack_info() {
         let cli = Cli::parse_from(["dcg", "pack", "info", "core.git"]);
         if let Some(Command::Pack {
@@ -13519,22 +13652,6 @@ mod tests {
             assert_eq!(command, "git reset --hard");
         } else {
             unreachable!("Expected TestCommand command");
-        }
-    }
-
-    #[test]
-    fn test_cli_parse_packs_pattern_tree_controls() {
-        let cli = Cli::parse_from(["dcg", "packs", "--expand", "--max-patterns", "6"]);
-        if let Some(Command::ListPacks {
-            expand,
-            max_patterns,
-            ..
-        }) = cli.command
-        {
-            assert!(expand);
-            assert_eq!(max_patterns, 6);
-        } else {
-            unreachable!("Expected ListPacks");
         }
     }
 
@@ -15244,6 +15361,28 @@ exclude = ["target/**"]
         {
             assert_eq!(command, "rm -rf /tmp");
             assert_eq!(format, TestFormat::Toon);
+        } else {
+            unreachable!("Expected TestCommand");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_test_with_force_flag() {
+        let cli =
+            Cli::try_parse_from(["dcg", "test", "--force", "git reset --hard"]).expect("parse");
+        if let Some(Command::TestCommand { command, force, .. }) = cli.command {
+            assert_eq!(command, "git reset --hard");
+            assert!(force);
+        } else {
+            unreachable!("Expected TestCommand");
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_test_without_force_flag() {
+        let cli = Cli::try_parse_from(["dcg", "test", "git status"]).expect("parse");
+        if let Some(Command::TestCommand { force, .. }) = cli.command {
+            assert!(!force);
         } else {
             unreachable!("Expected TestCommand");
         }

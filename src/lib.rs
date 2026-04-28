@@ -102,12 +102,13 @@ pub use allowlist::{
 pub use config::Config;
 pub use error_codes::{DcgError, ErrorCategory, ErrorCode, ErrorResponse};
 pub use evaluator::{
-    ConfidenceResult, DetailedEvaluationResult, EvaluationDecision, EvaluationResult,
-    LegacyDestructivePattern, LegacySafePattern, MatchSource, MatchSpan, PatternMatch,
-    apply_confidence_scoring, evaluate_command, evaluate_command_with_deadline,
-    evaluate_command_with_pack_order, evaluate_command_with_pack_order_at_path,
-    evaluate_command_with_pack_order_deadline, evaluate_command_with_pack_order_deadline_at_path,
-    evaluate_detailed, evaluate_detailed_with_allowlists,
+    BypassMethod, ConfidenceResult, DetailedEvaluationResult, EvaluationDecision, EvaluationResult,
+    GraduatedResponse, LegacyDestructivePattern, LegacySafePattern, MatchSource, MatchSpan,
+    PatternMatch, apply_confidence_scoring, determine_graduated_response, evaluate_command,
+    evaluate_command_with_deadline, evaluate_command_with_pack_order,
+    evaluate_command_with_pack_order_at_path, evaluate_command_with_pack_order_deadline,
+    evaluate_command_with_pack_order_deadline_at_path, evaluate_detailed,
+    evaluate_detailed_with_allowlists,
 };
 pub use exit_codes::{
     EXIT_CONFIG_ERROR, EXIT_DENIED, EXIT_IO_ERROR, EXIT_PARSE_ERROR, EXIT_SUCCESS, EXIT_WARNING,
@@ -122,7 +123,7 @@ pub use pending_exceptions::{
 };
 
 // Re-export dual regex engine abstraction (from regex safety audit)
-pub use packs::regex_engine::{CompiledRegex, needs_backtracking_engine};
+pub use packs::regex_engine::{BACKTRACK_LIMIT, CompiledRegex, needs_backtracking_engine};
 
 // Re-export context types
 pub use context::{
@@ -235,9 +236,10 @@ pub use agent::{
 
 // Re-export output types for TUI/CLI visual formatting
 pub use output::{
-    BorderStyle, DenialBox, Severity as OutputSeverity, SeverityColors, Theme, ThemePalette,
-    auto_theme, auto_theme_with_config, init as init_output, should_use_rich_output,
-    supports_256_colors, terminal_height, terminal_width,
+    BorderStyle, DenialBox, EscalationContext, Severity as OutputSeverity, SeverityColors, Theme,
+    ThemePalette, auto_theme, auto_theme_with_config, format_escalation_message,
+    init as init_output, should_use_rich_output, supports_256_colors, terminal_height,
+    terminal_width,
 };
 
 // Re-export update types for self-update version check

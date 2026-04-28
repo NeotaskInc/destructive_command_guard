@@ -1137,3 +1137,60 @@ fn test_suggest_allowlist_output_diagnostics() {
 
     eprintln!("=== Output diagnostics test PASSED ===");
 }
+
+/// Test that `--apply` writes patterns to the allowlist non-interactively.
+#[test]
+fn apply_flag_writes_to_allowlist() {
+    let env = TestEnv::new().with_history(&suggest_test_fixtures());
+
+    // First, run with --non-interactive to see what suggestions exist
+    let output = env.run_suggest_allowlist(&["--non-interactive", "--min-frequency", "3"]);
+    assert!(output.status.success(), "non-interactive should succeed");
+
+    // Now apply suggestion #1
+    let output = env.run_suggest_allowlist(&["--apply", "1", "--min-frequency", "3"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    eprintln!("╔════════════════════════════════════════════════════════════════════╗");
+    eprintln!("║ --apply test");
+    eprintln!("║ STDOUT: {stdout}");
+    eprintln!("║ STDERR: {stderr}");
+    eprintln!("╚════════════════════════════════════════════════════════════════════╝");
+
+    assert!(
+        output.status.success(),
+        "--apply should succeed (stderr: {stderr})"
+    );
+    assert!(
+        stdout.contains("Applied") || stdout.contains("applied"),
+        "Should report applied patterns"
+    );
+    // Allowlist is written to the project-level .dcg/ dir (since .git exists)
+    let project_allowlist = env.temp_dir.path().join(".dcg").join("allowlist.toml");
+    assert!(
+        env.allowlist_exists() || project_allowlist.exists(),
+        "Allowlist file should be created (user or project level)"
+    );
+}
+
+/// Test that `--apply` with out-of-range index is handled gracefully.
+#[test]
+fn apply_flag_out_of_range_index() {
+    let env = TestEnv::new().with_history(&suggest_test_fixtures());
+
+    let output = env.run_suggest_allowlist(&["--apply", "999", "--min-frequency", "3"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    eprintln!("apply out-of-range: stdout={stdout}, stderr={stderr}");
+
+    assert!(
+        output.status.success(),
+        "Out-of-range --apply should still succeed (not crash)"
+    );
+    assert!(
+        stdout.contains("0 applied") || stderr.contains("out of range"),
+        "Should report no patterns applied or warn about range"
+    );
+}

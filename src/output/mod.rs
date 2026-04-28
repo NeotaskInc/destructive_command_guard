@@ -23,6 +23,7 @@
 
 pub mod console;
 pub mod denial;
+pub mod escalation;
 pub mod progress;
 pub mod rich_theme;
 pub mod suggestions;
@@ -33,6 +34,7 @@ pub mod tree;
 
 pub use console::{DcgConsole, console, init_console};
 pub use denial::DenialBox;
+pub use escalation::{EscalationContext, format_escalation_message};
 pub use progress::{
     MaybeProgress, NoopProgress, SCAN_PROGRESS_THRESHOLD, ScanProgress, ScanProgressStyle, spinner,
     spinner_if_tty,
