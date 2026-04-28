@@ -205,3 +205,25 @@ Write-Host @"
   }
 }
 "@
+
+Write-Host ""
+Write-Warn "Codex CLI auto-configuration is not implemented by the Windows installer yet."
+Write-Info "To protect Codex CLI on Windows, create or merge this into $HOME\.codex\hooks.json:"
+Write-Host @"
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$jsonPath"
+          }
+        ]
+      }
+    ]
+  }
+}
+"@
+Write-Info "To uninstall the Codex hook later, remove only this dcg entry from $HOME\.codex\hooks.json."
