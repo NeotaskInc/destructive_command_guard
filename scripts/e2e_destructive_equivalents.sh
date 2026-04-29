@@ -741,9 +741,59 @@ scenario_mv_sensitive_bypass_var() {
 }
 
 # ---------------------------------------------------------------------------
+# system.disk default-on (git_safety_guard-nqhi.8)
+# ---------------------------------------------------------------------------
+# Verifies that on a default-config invocation (no DCG_PACKS, no
+# ~/.config/dcg/config.toml), the system.disk pack is active and blocks
+# catastrophic disk operations. Per nqhi.8 acceptance: "Block (default
+# config, no env vars, no custom config)".
+#
+# IMPORTANT: must NOT set DCG_PACKS — that env var override is what the
+# disk_tests.rs already exercises. This scenario specifically asserts
+# default-config behavior.
+scenario_system_disk_default() {
+    # mkfs variants (mkfs / mkfs.ext4 / mkfs.xfs).
+    assert_blocked 'mkfs.ext4 /dev/sda1'           'system.disk:mkfs'        'high'
+    assert_blocked 'mkfs.xfs /dev/sdb'             'system.disk:mkfs'        'high'
+    # NOTE: `mkswap` is NOT yet covered by the system.disk pack — see
+    # follow-up bead. Keeping the assertion out for now so this scenario
+    # accurately reflects current-default coverage.
+    # fdisk / parted (partition editing).
+    assert_blocked 'fdisk /dev/sda'                'system.disk:fdisk-edit'  'high'
+    assert_blocked 'parted /dev/sda mklabel gpt'   'system.disk:parted-modify' 'high'
+    # dd to block devices (system.disk's scope, not core.filesystem's).
+    assert_blocked 'dd if=/dev/zero of=/dev/sda bs=1M' 'system.disk:dd-device' 'high'
+    # mdadm zero-superblock (RAID destruction).
+    assert_blocked 'mdadm --zero-superblock /dev/sda' 'system.disk:mdadm-zero-superblock' 'high'
+    # LVM removal.
+    assert_blocked 'lvremove vg0/lv0'              'system.disk:lvremove'    'high'
+    assert_blocked 'pvremove /dev/sda'             'system.disk:pvremove'    'high'
+    # wipefs (filesystem signature wipe).
+    assert_blocked 'wipefs -a /dev/sda'            'system.disk:wipefs'      'high'
+    # Note: these rules are currently High-tier in the system.disk pack.
+    # Bumping them to Critical (per the bead's parenthetical) is a
+    # separate severity change tracked in the system.disk pack — out
+    # of scope for nqhi.8 which is purely about default-enablement.
+
+    # Read-only operations from the same toolchain must remain allowed.
+    assert_allowed 'lsblk'
+    assert_allowed 'df -h'
+    assert_allowed 'parted -l'
+    assert_allowed 'cat /proc/partitions'
+    assert_allowed 'lvs'
+    assert_allowed 'vgs'
+    assert_allowed 'pvs'
+    assert_allowed 'fdisk -l'
+
+    # Critical-tier rules must NOT be relaxed by DCG_BYPASS=1 — these
+    # are catastrophic and bypass-var must hold the line.
+    assert_blocked_under_falsy_bypass  'mkfs.ext4 /dev/sda1'              'system.disk:mkfs'
+    assert_blocked_under_falsy_bypass  'dd if=/dev/zero of=/dev/sda bs=1M' 'system.disk:dd-device'
+}
+
+# ---------------------------------------------------------------------------
 # (placeholders — implementers replace with concrete assertions)
 # scenario_redirect_*() { :; }
-# scenario_system_disk_default() { :; }
 
 # ---------------------------------------------------------------------------
 # Driver

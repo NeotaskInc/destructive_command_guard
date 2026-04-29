@@ -1120,8 +1120,25 @@ impl PacksConfig {
             enabled.retain(|p| !p.starts_with(&format!("{disabled}.")));
         }
 
-        // Core is always enabled.
+        // Core is always enabled (cannot be disabled).
         enabled.insert("core".to_string());
+
+        // `system.disk` is default-on but opt-out-able. It guards
+        // catastrophic, unrecoverable disk operations (`mkfs /dev/sda`,
+        // `dd of=/dev/sdb`, `fdisk`, `parted`, `mdadm --zero-superblock`,
+        // `lvm` removal, `wipefs`). For a tool whose sole purpose is
+        // preventing destructive commands, leaving these one config-edit
+        // away from being unprotected is the wrong default. Users who
+        // genuinely need to run mkfs/dd-to-device unblocked can opt out
+        // via `disabled = ["system.disk"]` (or `disabled = ["system"]`
+        // to drop all system.* packs).
+        let system_disk_explicitly_disabled = self
+            .disabled
+            .iter()
+            .any(|d| d == "system.disk" || d == "system");
+        if !system_disk_explicitly_disabled {
+            enabled.insert("system.disk".to_string());
+        }
 
         enabled
     }
@@ -3740,10 +3757,14 @@ verbose = false
 
 [packs]
 # Enable entire categories or specific sub-packs.
-# Core pack is always enabled implicitly.
+# `core` is always enabled implicitly (cannot be disabled).
+# `system.disk` is also enabled by default (catastrophic disk ops);
+# opt out with `disabled = ["system.disk"]` if you genuinely need
+# `mkfs`/`dd`-to-device unblocked.
 #
 # Available packs:
 #   core                  - Git and filesystem protections (always on)
+#   system.disk           - Disk operations: mkfs, dd-to-device, fdisk, parted, mdadm, lvm, wipefs (default-on, opt-out-able)
 #   database.postgresql   - PostgreSQL destructive commands
 #   database.mysql        - MySQL destructive commands
 #   database.mongodb      - MongoDB destructive commands
@@ -3761,7 +3782,6 @@ verbose = false
 #   infrastructure.terraform - Terraform destroy commands
 #   infrastructure.ansible   - Ansible state=absent patterns
 #   infrastructure.pulumi    - Pulumi destroy commands
-#   system.disk           - Disk operations (dd, mkfs, fdisk)
 #   system.permissions    - Dangerous permission changes
 #   system.services       - Service management commands
 #   strict_git            - Extra paranoid git protections
@@ -4209,6 +4229,56 @@ auto_prune_expired = true
         let config = Config::default();
         let enabled = config.enabled_pack_ids();
         assert!(enabled.contains("core"));
+    }
+
+    #[test]
+    fn test_enabled_pack_ids_includes_system_disk_by_default() {
+        // git_safety_guard-nqhi.8: system.disk is default-on so a
+        // first-time user with empty config has protection against
+        // mkfs/dd-to-/dev/fdisk catastrophes.
+        let config = Config::default();
+        let enabled = config.enabled_pack_ids();
+        assert!(
+            enabled.contains("system.disk"),
+            "system.disk must be enabled by default — catastrophic disk \
+             ops are not safe to leave one config-edit away from \
+             unprotected. Got enabled set: {enabled:?}"
+        );
+    }
+
+    #[test]
+    fn test_system_disk_can_be_explicitly_disabled() {
+        // Opt-out path for users who genuinely need mkfs/dd-to-device
+        // unblocked. Both forms must work: pack-specific
+        // (`disabled = ["system.disk"]`) and category-wide
+        // (`disabled = ["system"]`).
+        let pack_specific = Config {
+            packs: PacksConfig {
+                enabled: vec![],
+                disabled: vec!["system.disk".to_string()],
+                custom_paths: vec![],
+            },
+            ..Default::default()
+        };
+        let enabled = pack_specific.enabled_pack_ids();
+        assert!(
+            !enabled.contains("system.disk"),
+            "explicit `disabled = [\"system.disk\"]` must opt out — got: {enabled:?}"
+        );
+
+        let category_wide = Config {
+            packs: PacksConfig {
+                enabled: vec![],
+                disabled: vec!["system".to_string()],
+                custom_paths: vec![],
+            },
+            ..Default::default()
+        };
+        let enabled = category_wide.enabled_pack_ids();
+        assert!(
+            !enabled.contains("system.disk"),
+            "explicit `disabled = [\"system\"]` must opt out — got: {enabled:?}"
+        );
     }
 
     #[test]
