@@ -1183,20 +1183,28 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
         if segment_cmd_is_all_args_data {
             // For commands like echo/printf, treat all args as data, but never strip inline code.
             //
-            // Exception: shell redirect operators (`>`, `>>`, `>|`, `&>`,
-            // `1>`, `2>`, etc.) end the data scope at the shell-syntax
-            // layer — bash processes redirects BEFORE echo runs, so
-            // the redirect target is NOT echo's data. Masking past it
-            // would hide the destructive target (e.g. `/etc/passwd` in
-            // `echo > /etc/passwd`) from
-            // `core.filesystem:redirect-truncate-root-home`.
-            //
-            // We expose only the redirect operator itself AND the very
-            // next token (the target), then resume args-data masking.
-            // This narrow window prevents a regression where a command
-            // like `echo "x" > /var/log/app.log "rm -rf /"` would expose
-            // the trailing string-literal `"rm -rf /"` to the
+            // Exception 1: standalone shell redirect operators (`>`,
+            // `>>`, `>|`, `&>`, `1>`, `2>`, ...) end the data scope at
+            // the shell-syntax layer — bash processes redirects BEFORE
+            // echo runs, so the redirect TARGET is not echo's data.
+            // We expose the operator and exactly one following token
+            // (the target), then resume args-data masking. The narrow
+            // single-token window prevents a regression where
+            // `echo "x" > /var/log/app.log "rm -rf /"` would expose the
+            // trailing string-literal `"rm -rf /"` to the
             // `rm-rf-root-home` rule and falsely block.
+            //
+            // Exception 2: tokens that contain a GLUED redirect
+            // operator with attached target (e.g. `data>/etc/passwd`,
+            // `2>/etc/passwd`, `"x">/etc/passwd`). The dcg tokenizer
+            // doesn't break on `>`, so bash-level boundary `data` `>`
+            // `/etc/passwd` arrives at sanitize as a single token. Mask
+            // only the prefix BEFORE the operator (echo's data part);
+            // leave the operator and target visible so the destructive
+            // regex can match. The split heuristic requires the byte
+            // after `>` to be a path-start (`/`, `~`, `$`) or a quote
+            // (`"`, `'`), so plain-data arrows like `echo "user>admin"`
+            // remain fully masked (the `>` is followed by `a`, no split).
             if is_shell_redirect_operator(token_text) {
                 next_token_is_redirect_target = true;
                 continue;
@@ -1204,6 +1212,14 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
             if next_token_is_redirect_target {
                 // Visible — let destructive-redirect rules see this path.
                 next_token_is_redirect_target = false;
+                continue;
+            }
+            if let Some(split_pos) = glued_redirect_split_position(token_text) {
+                // Mask only the prefix; preserve the operator+target suffix.
+                if split_pos > 0 && !token.has_inline_code {
+                    let start = token.byte_range.start;
+                    mask_ranges.push(start..start + split_pos);
+                }
                 continue;
             }
             if !token.has_inline_code {
@@ -1735,6 +1751,33 @@ enum SanitizeTokenKind {
     Word,
     Separator,
     Comment,
+}
+
+/// Returns the byte position of a glued shell-redirect operator inside
+/// `token` whose immediate next byte looks like a path-target start.
+/// Matches `>` followed by `/`, `~`, `$`, `"`, or `'` — exactly the set
+/// of characters that begin the redirect-truncate-root-home regex's
+/// sensitive-path arms (incl. the optional ANSI-C `$'...'` and locale
+/// `$"..."` quoting forms). Returns `None` when no glued redirect is
+/// found, so plain-data arrows like `"user>admin"` stay fully masked.
+///
+/// Used by `sanitize_for_pattern_matching` to handle `echo`/`printf`
+/// args of the form `data>/etc/passwd` where the dcg tokenizer keeps
+/// the operator and target in a single word — without this split, the
+/// whole token gets masked and the destructive regex never sees the
+/// target.
+#[inline]
+fn glued_redirect_split_position(token: &str) -> Option<usize> {
+    let bytes = token.as_bytes();
+    if bytes.len() < 2 {
+        return None;
+    }
+    for i in 0..bytes.len() - 1 {
+        if bytes[i] == b'>' && matches!(bytes[i + 1], b'/' | b'~' | b'$' | b'"' | b'\'') {
+            return Some(i);
+        }
+    }
+    None
 }
 
 /// Returns true if `token` is a Bash redirection operator that belongs

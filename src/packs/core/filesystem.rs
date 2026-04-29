@@ -1574,9 +1574,15 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // regex. The `mv-var-tmp` safe pattern rescues. Same defense
         // applies to /tmp / $TMPDIR moves (those don't even trip the
         // destructive regex but are whitelisted for symmetry).
+        // The optional-quote group `(?:['"\\]|\$['"])?` extends the
+        // historical single-char quote prefix to accept Bash's
+        // ANSI-C-quoted (`$'...'`) and locale-translated (`$"..."`)
+        // path forms. Without these, `mv $'/etc' /tmp/x` slipped
+        // through as a HIGH-impact bypass since mv has no general
+        // tier to fall back on.
         destructive_pattern!(
             "mv-sensitive-source-root-home",
-            r#"\bmv\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
+            r#"\bmv\b[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
             "mv touching a sensitive system or home path is the cross-segment recursive-force-delete bypass. EXTREMELY DANGEROUS.",
             Critical,
             "`mv /etc /tmp/x && rm -rf /tmp/x` is the canonical cross-segment bypass: \
@@ -1631,9 +1637,23 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // `: > /tmp/cache`) — those naturally fall through. /var/tmp
         // redirects ARE caught by the regex; if that becomes a real
         // pain we can add a safe pattern later.
+        // Two carve-outs in the regex below worth understanding:
+        //
+        //   1. `(?!/dev/(?:null|zero|full)\b)` — never fire on the
+        //      universal "discard output" sinks. `cmd > /dev/null` and
+        //      `cmd 2>&1 > /dev/null` are the most common shell idioms
+        //      in existence; without this carve-out the `dev` element
+        //      of the sensitive set would block essentially every
+        //      script that suppresses output.
+        //
+        //   2. `(?:['"\\]|\$['"])?` — extends the historical optional
+        //      single-char quote prefix to also accept the two-byte
+        //      Bash quoting introducers `$'` (ANSI-C) and `$"`
+        //      (locale-translated). Without this, an attacker could
+        //      bypass with `> $'/etc/passwd'` or `> $"/etc/passwd"`.
         destructive_pattern!(
             "redirect-truncate-root-home",
-            r#"(?<![<>])(?:[12]?>\|?|&>)\s*['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
+            r#"(?<![<>])(?:[12]?>\|?|&>)\s*(?:['"\\]|\$['"])?(?!/dev/(?:null|zero|full)\b)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
             "shell redirect (>, >|, &>, 1>, 2>) to a sensitive system or home path truncates the file to zero bytes. EXTREMELY DANGEROUS.",
             Critical,
             "`> /etc/passwd` (or `: > /etc/passwd`, `echo > /etc/passwd`, etc.) opens \
@@ -2820,6 +2840,140 @@ mod tests {
             // Not a `>` redirect (heredoc indicator, not output redirect).
             "cat <<EOF",
             "cat <<<\"input\"",
+        ] {
+            assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn redirect_to_dev_null_zero_full_is_allowed_universally() {
+        // Regression guard for the most common shell idiom: discarding
+        // output to /dev/null. The `(?!/dev/(?:null|zero|full)\b)`
+        // lookahead in `redirect-truncate-root-home` exempts these
+        // sinks; without it, every script that suppresses output (which
+        // is essentially every script) would be blocked.
+        let pack = create_pack();
+        for cmd in [
+            "command > /dev/null",
+            "command >/dev/null",
+            "command 2>&1 > /dev/null",
+            "command > /dev/null 2>&1",
+            "command 2> /dev/null",
+            "command &> /dev/null",
+            "cat /etc/passwd > /dev/null",
+            "find . > /dev/null 2>&1",
+            "make > /dev/zero",
+            "echo test > /dev/full",
+        ] {
+            assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn redirect_to_dev_devices_still_blocks() {
+        // The /dev/{null,zero,full} carve-out must NOT relax actual
+        // device destruction (`> /dev/sda` etc.) — only the safe sinks.
+        let pack = create_pack();
+        for cmd in [
+            "> /dev/sda",
+            "echo zero > /dev/sda1",
+            "command > /dev/sdb",
+            "echo > /dev/nvme0n1",
+        ] {
+            assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
+        }
+    }
+
+    #[test]
+    fn redirect_glued_operator_blocks_destructive() {
+        // Bypass attempt: glue the operator to the path with no space.
+        // The dcg tokenizer keeps `data>/etc/passwd` as a single token,
+        // and previously the args-data masking would erase the whole
+        // thing. The `glued_redirect_split_position` helper now masks
+        // only the prefix and leaves operator+target visible.
+        let pack = create_pack();
+        for cmd in [
+            "echo data>/etc/passwd",
+            "printf data>/etc/passwd",
+            "echo data>~/.ssh/id_rsa",
+            "echo data>$HOME/.aws/credentials",
+            "echo \"data\">/etc/passwd",
+            "echo data>'/etc/passwd'",
+            "echo data>\"/etc/passwd\"",
+            "echo x 2>/etc/passwd",
+            "echo x 1>/etc/passwd",
+            "echo x &>/etc/passwd",
+            "echo x >|/etc/passwd",
+        ] {
+            assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
+        }
+    }
+
+    #[test]
+    fn redirect_glued_operator_to_non_sensitive_is_allowed() {
+        // The glued-redirect-split heuristic must NOT cause new false
+        // positives on tokens where `>` is followed by a path-like char
+        // but the path itself isn't sensitive.
+        let pack = create_pack();
+        for cmd in [
+            "echo data>./local.txt",
+            "echo data>build.log",
+            "echo data>/tmp/scratch",
+            "echo data>/dev/null",
+            "echo data>$LOG_FILE",
+        ] {
+            assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn redirect_ansi_c_and_locale_quoted_paths_block() {
+        // Bash ANSI-C (`$'...'`) and locale (`$"..."`) quoting forms
+        // must not bypass. The optional-quote group in the regex now
+        // accepts both `\$'` and `\$"` as quote prefixes.
+        let pack = create_pack();
+        for cmd in [
+            "> $'/etc/passwd'",
+            "> $\"/etc/passwd\"",
+            ": > $'/etc/shadow'",
+            "echo > $'/etc/passwd'",
+            "echo > $\"/etc/passwd\"",
+        ] {
+            assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
+        }
+    }
+
+    #[test]
+    fn mv_ansi_c_and_locale_quoted_sources_block() {
+        // Same ANSI-C / locale quoting bypass for the mv rule. Without
+        // the fix, `mv $'/etc' /tmp/x` slipped past as a HIGH-impact
+        // gap (mv has no general tier to fall back on).
+        let pack = create_pack();
+        for cmd in [
+            "mv $'/etc' /tmp/x",
+            "mv $\"/etc\" /tmp/x",
+            "mv $'/etc/passwd' /tmp/passwd",
+            "mv $\"/home/user\" /tmp/relocated",
+        ] {
+            assert_blocks_with_pattern(&pack, cmd, "mv-sensitive-source-root-home");
+        }
+    }
+
+    #[test]
+    fn echo_quoted_data_args_with_arrow_no_path_dont_falsely_match() {
+        // Plain-data quoted args where `>` is followed by a non-path
+        // character must NOT trigger the
+        // `glued_redirect_split_position` heuristic, so they stay
+        // masked through the full sanitize. (Tokens whose `>` is
+        // followed by `/`, `~`, `$`, or a quote DO get split — that's
+        // the bypass-fix path tested separately via the e2e harness
+        // since `assert_no_match` operates on the raw command and
+        // can't observe sanitize behavior.)
+        let pack = create_pack();
+        for cmd in [
+            "echo \"5 > 3\"",
+            "echo \"user>admin\"",
+            "echo \"<html><body>\"",
         ] {
             assert_no_match(&pack, cmd);
         }

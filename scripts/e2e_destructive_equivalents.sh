@@ -887,6 +887,57 @@ scenario_redirect_temp_safe() {
     assert_allowed 'echo x 1>&2'
     assert_allowed 'echo x 2>&1'
     assert_allowed 'command 2>&1 | tee log.txt'
+    # CRITICAL regression guard: `> /dev/null` (and zero/full) is the
+    # most common shell idiom in existence. The
+    # `(?!/dev/(?:null|zero|full)\b)` carve-out in the destructive
+    # regex must keep these allowed even though /dev is in the
+    # sensitive set.
+    assert_allowed 'cmd > /dev/null'
+    assert_allowed 'cmd >/dev/null'
+    assert_allowed 'cat /etc/passwd > /dev/null'
+    assert_allowed 'curl https://example.com > /dev/null'
+    assert_allowed 'find . > /dev/null 2>&1'
+    assert_allowed 'cmd > /dev/null 2>&1'
+    assert_allowed 'cmd 2> /dev/null'
+    assert_allowed 'cmd &> /dev/null'
+    assert_allowed 'make > /dev/zero'
+    assert_allowed 'echo test > /dev/full'
+}
+
+scenario_redirect_bypass_attempts() {
+    # Bypass-attempt regression guards. These previously slipped past
+    # the destructive regex due to (a) the dcg tokenizer not splitting
+    # glued operator+target words, and (b) the optional-quote prefix
+    # not accepting Bash ANSI-C (`$'...'`) or locale (`$"..."`) forms.
+    #
+    # Glued operator+target (no space between `>` and path).
+    assert_blocked 'echo data>/etc/passwd'              'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked 'printf data>/etc/passwd'            'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked 'echo data>~/.ssh/id_rsa'            'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked 'echo data>$HOME/.aws/credentials'   'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked 'echo "data">/etc/passwd'            'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked "echo data>'/etc/passwd'"            'core.filesystem:redirect-truncate-root-home' 'critical'
+    # Numbered FD glued (`2>/path`).
+    assert_blocked 'echo x 1>/etc/passwd'               'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked 'echo x 2>/etc/passwd'               'core.filesystem:redirect-truncate-root-home' 'critical'
+    # Bash ANSI-C and locale quoting.
+    assert_blocked "> \$'/etc/passwd'"                  'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked '> $"/etc/passwd"'                   'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked "echo > \$'/etc/passwd'"             'core.filesystem:redirect-truncate-root-home' 'critical'
+    # Device-target redirects (the carve-out is null/zero/full only;
+    # `> /dev/sda` etc. must still block).
+    assert_blocked '> /dev/sda'                         'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked 'echo zero > /dev/sda1'              'core.filesystem:redirect-truncate-root-home' 'critical'
+}
+
+scenario_mv_bypass_attempts() {
+    # ANSI-C / locale quoting bypass for the mv rule. mv has no
+    # general tier, so without the optional-quote-prefix extension
+    # these slipped through entirely.
+    assert_blocked "mv \$'/etc' /tmp/x"                 'core.filesystem:mv-sensitive-source-root-home' 'critical'
+    assert_blocked 'mv $"/etc" /tmp/x'                  'core.filesystem:mv-sensitive-source-root-home' 'critical'
+    assert_blocked "mv \$'/etc/passwd' /tmp/passwd"     'core.filesystem:mv-sensitive-source-root-home' 'critical'
+    assert_blocked 'mv $"/home/user" /tmp/relocated'    'core.filesystem:mv-sensitive-source-root-home' 'critical'
 }
 
 scenario_redirect_bypass_var() {
@@ -937,9 +988,11 @@ run_all() {
         scenario_redirect_root_home \
         scenario_redirect_append_safe \
         scenario_redirect_temp_safe \
+        scenario_redirect_bypass_attempts \
         scenario_redirect_bypass_var \
         scenario_mv_sensitive_root_home \
         scenario_mv_no_false_positive \
+        scenario_mv_bypass_attempts \
         scenario_mv_sensitive_bypass_var \
         scenario_system_disk_default; do
         if declare -F "$scenario" >/dev/null 2>&1; then
