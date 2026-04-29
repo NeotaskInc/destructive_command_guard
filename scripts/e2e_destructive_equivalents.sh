@@ -656,9 +656,11 @@ scenario_dd_no_false_positive() {
     # dd alone (no of=).
     assert_allowed 'dd if=/dev/zero'
     assert_allowed 'dd if=/etc/passwd'
-    # Device-level dd (out of scope: system.disk's territory).
-    assert_allowed 'dd if=/dev/zero of=/dev/sda'
-    assert_allowed 'dd if=/dev/urandom of=/dev/sdb1'
+    # Device-level dd is OUT OF SCOPE for core.filesystem (its regex
+    # excludes /dev/ entirely — see scenario_dd_root_home commentary).
+    # Now that system.disk is default-enabled (nqhi.8), `dd of=/dev/sda`
+    # IS blocked — but by system.disk:dd-device, not by core.filesystem.
+    # Asserted in scenario_system_disk_default.
 }
 
 scenario_dd_bypass_var() {
