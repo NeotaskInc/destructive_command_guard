@@ -1175,6 +1175,21 @@ pub fn sanitize_for_pattern_matching(command: &str) -> Cow<'_, str> {
 
         if segment_cmd_is_all_args_data {
             // For commands like echo/printf, treat all args as data, but never strip inline code.
+            //
+            // Exception: shell redirect operators (`>`, `>>`, `>|`, `&>`,
+            // `1>`, `2>`, etc.) end the command's argument scope at the
+            // shell-syntax layer — bash processes them BEFORE echo runs,
+            // so they're not echo's data. Masking past them hides the
+            // redirect target (e.g. `/etc/passwd` in `echo > /etc/passwd`)
+            // from rules that key on it (notably
+            // `core.filesystem:redirect-truncate-root-home`). Drop out of
+            // all-args-data mode and leave both the operator and the
+            // remaining tokens visible so subsequent passes can see the
+            // unredacted command.
+            if is_shell_redirect_operator(token_text) {
+                segment_cmd_is_all_args_data = false;
+                continue;
+            }
             if !token.has_inline_code {
                 mask_ranges.push(token.byte_range.clone());
             }
@@ -1704,6 +1719,31 @@ enum SanitizeTokenKind {
     Word,
     Separator,
     Comment,
+}
+
+/// Returns true if `token` is a Bash output redirection operator that
+/// belongs to shell-syntax processing (not the command's argument
+/// stream). Used by `sanitize_for_pattern_matching` to stop masking
+/// past `echo > <path>` etc., where the path is the shell's redirect
+/// target rather than echo's data argument.
+#[inline]
+fn is_shell_redirect_operator(token: &str) -> bool {
+    matches!(
+        token,
+        ">" | ">>"
+            | ">|"
+            | "&>"
+            | "&>>"
+            | ">&"
+            | "1>"
+            | "2>"
+            | "1>>"
+            | "2>>"
+            | "1>|"
+            | "2>|"
+            | "1>&"
+            | "2>&"
+    )
 }
 
 #[derive(Debug, Clone)]

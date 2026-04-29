@@ -249,6 +249,26 @@ const MV_SENSITIVE_SUGGESTIONS: &[PatternSuggestion] = &[
         "Safe temp-directory rename (allowed without confirmation)",
     ),
 ];
+
+/// Suggestions for `redirect-truncate-*` patterns. Bash output redirects
+/// (`>`, `>|`, `&>`, `1>`, `2>`) truncate the target file to zero bytes
+/// before writing — the truncate-equivalent at the shell-syntax layer.
+/// Append (`>>`) is non-destructive and not blocked.
+const REDIRECT_TRUNCATE_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new("ls -la {path}", "Verify the path before any redirect"),
+    PatternSuggestion::new(
+        "cp {path} {path}.bak && echo data > {path}",
+        "Make a backup first if you might need the previous content",
+    ),
+    PatternSuggestion::new(
+        "echo data >> {path}",
+        "Use append (>>) instead of truncate (>) to preserve existing content",
+    ),
+    PatternSuggestion::new(
+        "echo data > /tmp/{subdir}/scratch",
+        "Safe temp-directory redirect (allowed without confirmation)",
+    ),
+];
 use crate::{normalize::NormalizeTokenKind, normalize::tokenize_for_normalization};
 use std::ops::Range;
 
@@ -626,7 +646,8 @@ pub fn create_pack() -> Pack {
         // Mirror entries MUST also exist in src/packs/mod.rs::PACK_ENTRIES
         // (the duplicate-source-of-truth that gates execution).
         keywords: &[
-            "rm", "find", "unlink", "truncate", "shred", "tar", "dd", "mv",
+            "rm", "find", "unlink", "truncate", "shred", "tar", "dd", "mv", ">/", "> /", ">~",
+            "> ~", ">$", "> $", ">\"", "> \"", ">'", "> '", "&>", ">|", "1>", "2>",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
@@ -1572,6 +1593,61 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                (use `dcg allow-once` for the rename, then a follow-up `rm` after a soak period).\n\
              - Pure tmp-to-tmp moves: `mv /tmp/<a> /tmp/<b>` is allowed.",
             MV_SENSITIVE_SUGGESTIONS
+        ),
+        // ----- `> <sensitive>` (Critical: shell redirect truncate) -----
+        //
+        // Bash output redirection truncates the target file to zero
+        // bytes before writing. `> /etc/passwd` (with no command) opens
+        // /etc/passwd for write, immediately closes — net effect: file
+        // contents destroyed. Same shape:
+        //
+        //   `> /etc/passwd`                — bare redirect
+        //   `: > /etc/passwd`              — null builtin + redirect
+        //   `echo > /etc/passwd`           — any command's stdout > path
+        //   `cat /dev/null > /etc/passwd`  — pipe /dev/null
+        //   `>| /etc/passwd`               — force-overwrite (ignores noclobber)
+        //   `&> /etc/passwd`               — stdout+stderr to file
+        //   `1>| /etc/passwd`              — fd1 force-overwrite
+        //   `2> /etc/passwd`               — fd2 to file
+        //
+        // None of these touch any binary keyword the rest of dcg
+        // recognises, so they bypass dcg entirely without this rule.
+        // The negative lookbehind `(?<![<>])` excludes append-mode
+        // (`>>`) which is non-destructive (only adds content) — the
+        // bead's explicit allow-list. The lookbehind is fixed-width 1,
+        // safe under fancy-regex.
+        //
+        // Per the bead's design recommendation (option a): only ship
+        // the Critical root-home tier. A `-general` rule would block
+        // legitimate workflows like `make > build.log` and `cargo test
+        // > test.log`; that tension is not worth the false-positive
+        // pain. File-level redirects to non-sensitive paths fall
+        // through to default-allow.
+        //
+        // /tmp / /var/tmp / $TMPDIR redirects: /tmp isn't in the
+        // sensitive set so they don't fire the regex at all; /var/tmp
+        // would match /var but we don't bother with a safe rescue
+        // because the bead's allow-list is explicit (`> /tmp/scratch`,
+        // `: > /tmp/cache`) — those naturally fall through. /var/tmp
+        // redirects ARE caught by the regex; if that becomes a real
+        // pain we can add a safe pattern later.
+        destructive_pattern!(
+            "redirect-truncate-root-home",
+            r#"(?<![<>])(?:[12]?>\|?|&>)\s*['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
+            "shell redirect (>, >|, &>, 1>, 2>) to a sensitive system or home path truncates the file to zero bytes. EXTREMELY DANGEROUS.",
+            Critical,
+            "`> /etc/passwd` (or `: > /etc/passwd`, `echo > /etc/passwd`, etc.) opens \
+             the target file with O_WRONLY|O_CREAT|O_TRUNC — the contents are destroyed \
+             before any write happens. This applies equally to `>|` (force-overwrite), \
+             `&>` (stdout+stderr to file), and numbered FD forms (`1>`, `2>`, `1>|`, \
+             `2>|`). All of these are silent, immediate, irrecoverable.\n\n\
+             There is NO recovery without backups.\n\n\
+             Safer alternatives:\n\
+             - Use append (`>>`) to preserve existing content: `echo line >> <file>`.\n\
+             - Make a backup: `cp <file> <file>.bak && echo data > <file>`.\n\
+             - For temp scratch: `> /tmp/<subdir>/scratch` is allowed.\n\
+             - Read redirects (`< <file>`) are not affected — they don't truncate.",
+            REDIRECT_TRUNCATE_SUGGESTIONS
         ),
     ]
 }
@@ -2602,6 +2678,147 @@ mod tests {
                 normalized.contains(expected),
                 "PATH_NORMALIZER did not strip `{input}` to `{expected}` (got `{normalized}`)"
             );
+        }
+    }
+
+    // ---------- redirect-truncate: shell-syntax truncate-equivalent ----------
+
+    #[test]
+    fn redirect_truncate_blocks_critical() {
+        let pack = create_pack();
+        for cmd in [
+            // Bare redirect (no command).
+            "> /etc/passwd",
+            ">/etc/passwd",
+            // Null builtin + redirect (common idiom).
+            ": > /etc/passwd",
+            ": >/etc/shadow",
+            // Any command stdout > sensitive.
+            "echo > /etc/passwd",
+            "echo \"x\" > /etc/passwd",
+            "cat /dev/null > /etc/passwd",
+            "printf foo > /etc/sudoers",
+            // Force-overwrite (>|).
+            ">| /etc/passwd",
+            "echo x >| /etc/passwd",
+            // stdout+stderr (&>).
+            "&> /etc/passwd",
+            "make &> /etc/log",
+            // Numbered FDs.
+            "echo x 1> /etc/passwd",
+            "echo x 2> /etc/passwd",
+            "echo x 1>| /etc/passwd",
+            "echo x 2>| /etc/passwd",
+            // Home variants.
+            "echo x > ~/.ssh/id_ed25519",
+            "echo x > $HOME/.aws/credentials",
+            "echo x > ${HOME}/.gnupg/secring.gpg",
+            // Other system roots.
+            "echo x > /usr/bin/sudo",
+            "echo x > /boot/vmlinuz",
+            // Quoted sensitive paths.
+            "echo x > \"/etc/passwd\"",
+            "echo x > '/etc/shadow'",
+            // Compound forms.
+            "echo done; > /etc/passwd",
+            "true && > /etc/passwd",
+            "(> /etc/passwd)",
+            // Wrappers.
+            "sudo bash -c '> /etc/passwd'",
+        ] {
+            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
+            assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
+        }
+    }
+
+    #[test]
+    fn redirect_append_is_allowed() {
+        // `>>` is append (non-destructive); the destructive regex's
+        // negative lookbehind `(?<![<>])` excludes it. Even on
+        // sensitive paths, append must NOT block.
+        let pack = create_pack();
+        for cmd in [
+            "echo line >> /etc/syslog",
+            "echo line >> ~/.bashrc",
+            "make >> build.log",
+            "echo line >> /etc/passwd",
+            "echo line >> /etc/shadow",
+            "command >> /usr/local/log",
+            "echo x &>> /etc/log",
+            "echo x 1>> /etc/passwd",
+            "echo x 2>> /etc/passwd",
+        ] {
+            assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn redirect_truncate_to_non_sensitive_is_allowed() {
+        // No `-general` tier (per bead's option-a recommendation):
+        // these legitimate workflows must NOT block.
+        let pack = create_pack();
+        for cmd in [
+            "make > build.log",
+            "cargo test > test.log",
+            "echo x > ./output.txt",
+            "echo x > foo.log",
+            "ls > files.txt",
+            "command > /tmp/scratch",
+            "command > $TMPDIR/scratch",
+            "command > ${TMPDIR}/scratch",
+            "echo x >| build.log",
+            "echo x &> build.log",
+            "echo x 2> err.log",
+        ] {
+            assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn redirect_read_is_allowed() {
+        // Read redirects (`<`, `<<`, `<<<`) don't truncate anything.
+        let pack = create_pack();
+        for cmd in [
+            "cat < /etc/passwd",
+            "wc -l < /etc/hosts",
+            "sort < /etc/passwd > /tmp/sorted",
+            "while read line; do echo $line; done < /etc/hosts",
+        ] {
+            assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn redirect_to_fd_is_allowed() {
+        // `1>&2` and `2>&1` redirect FD-to-FD, not file truncation.
+        // The regex's `\s*['"]?<sensitive>` clause requires `/`/`~`/
+        // `$HOME` next, which `&` doesn't satisfy.
+        let pack = create_pack();
+        for cmd in [
+            "echo x 1>&2",
+            "echo x 2>&1",
+            "command 2>&1 | tee log.txt",
+            "echo x >&2",
+        ] {
+            assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn redirect_no_false_positive_substring_traps() {
+        let pack = create_pack();
+        for cmd in [
+            // Comparison operators in unrelated commands.
+            "test 5 > 3",
+            "[ \"a\" \\> \"b\" ]",
+            // No redirect at all.
+            "ls /etc",
+            "cat /etc/passwd",
+            // Not a `>` redirect (heredoc indicator, not output redirect).
+            "cat <<EOF",
+            "cat <<<\"input\"",
+        ] {
+            assert_no_match(&pack, cmd);
         }
     }
 

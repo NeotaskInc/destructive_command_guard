@@ -794,8 +794,94 @@ scenario_system_disk_default() {
 }
 
 # ---------------------------------------------------------------------------
-# (placeholders — implementers replace with concrete assertions)
-# scenario_redirect_*() { :; }
+# redirect-truncate (git_safety_guard-nqhi.4)
+# ---------------------------------------------------------------------------
+# Bash output redirects (`>`, `>|`, `&>`, `1>`, `2>`) truncate the target
+# file before any write — the truncate-equivalent at the shell-syntax
+# layer. Per bead's option-a recommendation, only the Critical root-home
+# tier ships; a `-general` rule would block legitimate
+# `make > build.log` workflows.
+scenario_redirect_root_home() {
+    # Bare redirect.
+    assert_blocked '> /etc/passwd'                'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked '>/etc/passwd'                 'core.filesystem:redirect-truncate-root-home' 'critical'
+    # Null builtin + redirect (common idiom).
+    assert_blocked ': > /etc/passwd'              'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked ': >/etc/shadow'               'core.filesystem:redirect-truncate-root-home' 'critical'
+    # Any command stdout > sensitive.
+    assert_blocked 'echo > /etc/passwd'           'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked 'echo "x" > /etc/passwd'       'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked 'cat /dev/null > /etc/passwd'  'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked 'printf foo > /etc/sudoers'    'core.filesystem:redirect-truncate-root-home' 'critical'
+    # Force-overwrite (>|).
+    assert_blocked '>| /etc/passwd'               'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked 'echo x >| /etc/passwd'        'core.filesystem:redirect-truncate-root-home' 'critical'
+    # stdout+stderr (&>).
+    assert_blocked '&> /etc/passwd'               'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked 'make &> /etc/log'             'core.filesystem:redirect-truncate-root-home' 'critical'
+    # Numbered FDs.
+    assert_blocked 'echo x 1> /etc/passwd'        'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked 'echo x 2> /etc/passwd'        'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked 'echo x 1>| /etc/passwd'       'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked 'echo x 2>| /etc/passwd'       'core.filesystem:redirect-truncate-root-home' 'critical'
+    # Home variants.
+    assert_blocked 'echo x > ~/.ssh/id_ed25519'   'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked 'echo x > $HOME/.aws/credentials'      'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked 'echo x > ${HOME}/.gnupg/secring.gpg'  'core.filesystem:redirect-truncate-root-home' 'critical'
+    # Other system roots.
+    assert_blocked 'echo x > /usr/bin/sudo'       'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked 'echo x > /boot/vmlinuz'       'core.filesystem:redirect-truncate-root-home' 'critical'
+    # Quoted sensitive paths.
+    assert_blocked 'echo x > "/etc/passwd"'       'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked "echo x > '/etc/shadow'"       'core.filesystem:redirect-truncate-root-home' 'critical'
+    # Compound forms.
+    assert_blocked 'echo done; > /etc/passwd'     'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked 'true && > /etc/passwd'        'core.filesystem:redirect-truncate-root-home' 'critical'
+    assert_blocked '(> /etc/passwd)'              'core.filesystem:redirect-truncate-root-home' 'critical'
+}
+
+scenario_redirect_append_safe() {
+    # `>>` is append (non-destructive); negative lookbehind in the
+    # destructive regex must exclude it. Even on sensitive paths.
+    assert_allowed 'echo line >> /etc/syslog'
+    assert_allowed 'echo line >> ~/.bashrc'
+    assert_allowed 'make >> build.log'
+    assert_allowed 'echo line >> /etc/passwd'
+    assert_allowed 'echo line >> /etc/shadow'
+    assert_allowed 'command >> /usr/local/log'
+    assert_allowed 'echo x &>> /etc/log'
+    assert_allowed 'echo x 1>> /etc/passwd'
+    assert_allowed 'echo x 2>> /etc/passwd'
+}
+
+scenario_redirect_temp_safe() {
+    # No `-general` tier — non-sensitive paths fall through to default-allow.
+    # Includes legitimate workflows (build logs, temp scratch).
+    assert_allowed 'make > build.log'
+    assert_allowed 'cargo test > test.log'
+    assert_allowed 'echo x > ./output.txt'
+    assert_allowed 'echo x > foo.log'
+    assert_allowed 'ls > files.txt'
+    assert_allowed 'command > /tmp/scratch'
+    assert_allowed 'command > $TMPDIR/scratch'
+    assert_allowed 'command > ${TMPDIR}/scratch'
+    assert_allowed 'echo x >| build.log'
+    assert_allowed 'echo x &> build.log'
+    assert_allowed 'echo x 2> err.log'
+    # Read redirects (`<`) don't truncate — must NOT match.
+    assert_allowed 'cat < /etc/passwd'
+    assert_allowed 'wc -l < /etc/hosts'
+    # FD-to-FD redirects (`1>&2`, `2>&1`).
+    assert_allowed 'echo x 1>&2'
+    assert_allowed 'echo x 2>&1'
+    assert_allowed 'command 2>&1 | tee log.txt'
+}
+
+scenario_redirect_bypass_var() {
+    assert_blocked_under_falsy_bypass  '> /etc/passwd'              'core.filesystem:redirect-truncate-root-home'
+    assert_blocked_under_falsy_bypass  'echo x > ~/.ssh/id_ed25519' 'core.filesystem:redirect-truncate-root-home'
+    assert_allowed_under_truthy_bypass '> /etc/passwd'
+}
 
 # ---------------------------------------------------------------------------
 # Driver

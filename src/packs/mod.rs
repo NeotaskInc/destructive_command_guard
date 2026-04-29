@@ -923,6 +923,17 @@ static PACK_ENTRIES: [PackEntry; 83] = [
         // `mv /etc /tmp/x && rm -rf /tmp/x` — each segment is allowed
         // individually but the pair destroys /etc. The mv rule blocks
         // any mv whose source (or destination) is a sensitive path.
+        //
+        // `>/`, `> /`, `>~`, `> ~`, `>$`, `> $`, `&>`, `>|`, `1>`, `2>`
+        // are the Bash output-redirect quick-reject keywords for the
+        // `redirect-truncate-root-home` rule — `> /etc/passwd` and its
+        // variants (numbered FDs, `>|` force-overwrite, `&>` combined
+        // stdout+stderr) truncate the target file to zero bytes, the
+        // same destructive primitive as `truncate -s 0`. Append (`>>`)
+        // is intentionally excluded by negative lookbehind in the
+        // destructive regex; the keyword `>>` would still trigger the
+        // pack — quick-reject is by design overly broad and the regex
+        // does the disambiguation.
         &[
             "rm",
             "/rm",
@@ -940,6 +951,20 @@ static PACK_ENTRIES: [PackEntry; 83] = [
             "/dd",
             "mv",
             "/mv",
+            ">/",
+            "> /",
+            ">~",
+            "> ~",
+            ">$",
+            "> $",
+            ">\"",
+            "> \"",
+            ">'",
+            "> '",
+            "&>",
+            ">|",
+            "1>",
+            "2>",
         ],
         core::filesystem::create_pack,
     ),
@@ -2202,7 +2227,26 @@ fn span_matches_any_keyword(span_text: &str, enabled_keywords: &[&str]) -> bool 
 
 #[inline]
 fn should_fallback_to_full_normalized_keyword_scan(original: &str, normalized: &str) -> bool {
-    original != normalized && normalized.bytes().any(|byte| matches!(byte, b'>' | b'<'))
+    // Two cases trigger the fallback to a full-command keyword scan
+    // instead of the span-aware (executable-span-only) check:
+    //
+    //   1. Path-prefixed binary normalisation glued a redirect to the
+    //      command word (e.g. `/usr/bin/cat>file` → `cat>file`); the
+    //      executable span doesn't include the keyword. (Existing case.)
+    //
+    //   2. The command IS or CONTAINS a Bash output redirect
+    //      (`>`, `>|`, `&>`, `1>`, `2>`). Even with no normalization,
+    //      keywords like `> /` (used by `redirect-truncate-root-home`)
+    //      live OUTSIDE the executable span — so span-only matching
+    //      misses them and the destructive rule never gets a chance to
+    //      fire. The append form `>>` is also caught here but the
+    //      destructive regex's negative lookbehind correctly rejects it.
+    //
+    // Read redirects (`<`) trigger the fallback for symmetry; no current
+    // pattern uses them but cost is negligible and future read-side
+    // rules become easier to add.
+    let _ = original;
+    normalized.bytes().any(|byte| matches!(byte, b'>' | b'<'))
 }
 
 /// Pack-aware quick-reject filter.
