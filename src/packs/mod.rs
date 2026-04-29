@@ -891,7 +891,33 @@ static PACK_ENTRIES: [PackEntry; 83] = [
         // rules can't fire — the historical bypass that motivated those
         // rules. See `core::filesystem::create_pack` for the matching
         // keyword list inside the pack.
-        &["rm", "/rm", "find", "/find"],
+        //
+        // `unlink` and `/unlink` enable single-file destruction coverage
+        // via the POSIX unlink(2) primitive (rule unlink-root-home /
+        // unlink-general). Without these, `unlink /etc/passwd` quietly
+        // bypasses dcg.
+        //
+        // `truncate` and `/truncate` enable in-place file-content
+        // destruction via `truncate -s 0` (zero) and `-s -N` (shrink).
+        // Without these, `truncate -s 0 /etc/passwd` silently empties
+        // the file.
+        //
+        // `shred` and `/shred` enable overwrite-and-unlink coverage
+        // (rule shred-unlink-root-home / shred-unlink-general). Without
+        // these, `shred -fzu /etc/passwd` silently destroys the file
+        // beyond forensic recovery.
+        &[
+            "rm",
+            "/rm",
+            "find",
+            "/find",
+            "unlink",
+            "/unlink",
+            "truncate",
+            "/truncate",
+            "shred",
+            "/shred",
+        ],
         core::filesystem::create_pack,
     ),
     PackEntry::new("storage.s3", &["s3", "s3api"], storage::s3::create_pack),

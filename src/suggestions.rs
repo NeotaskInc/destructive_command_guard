@@ -469,7 +469,32 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
         "core.filesystem:find-delete-root-home",
         rm_rf_suggestions.clone(),
     );
-    m.insert("core.filesystem:find-delete-general", rm_rf_suggestions);
+    m.insert(
+        "core.filesystem:find-delete-general",
+        rm_rf_suggestions.clone(),
+    );
+    // unlink-root-home / unlink-general: same shape as rm/find-delete.
+    // Reuse the same suggestion set — the safer alternatives (preview
+    // with ls, scope to /tmp, use trash-cli) all apply identically.
+    m.insert(
+        "core.filesystem:unlink-root-home",
+        rm_rf_suggestions.clone(),
+    );
+    m.insert("core.filesystem:unlink-general", rm_rf_suggestions.clone());
+    // truncate-zero-* (zero/shrink in place): same shape as unlink — single-
+    // file content destruction. Reuse the same suggestion set.
+    m.insert(
+        "core.filesystem:truncate-zero-root-home",
+        rm_rf_suggestions.clone(),
+    );
+    m.insert(
+        "core.filesystem:truncate-zero-general",
+        rm_rf_suggestions.clone(),
+    );
+    // shred-* (overwrite + optional unlink): same single-file destruction
+    // shape. Reuse the rm_rf suggestion set.
+    m.insert("core.filesystem:shred-root-home", rm_rf_suggestions.clone());
+    m.insert("core.filesystem:shred-general", rm_rf_suggestions);
 }
 
 /// Register suggestions for heredoc pattern rules.
@@ -1543,6 +1568,12 @@ mod tests {
             "core.filesystem:rm-recursive-force-long",
             "core.filesystem:find-delete-root-home",
             "core.filesystem:find-delete-general",
+            "core.filesystem:unlink-root-home",
+            "core.filesystem:unlink-general",
+            "core.filesystem:truncate-zero-root-home",
+            "core.filesystem:truncate-zero-general",
+            "core.filesystem:shred-root-home",
+            "core.filesystem:shred-general",
         ];
 
         for rule in expected_rules {

@@ -804,15 +804,17 @@ pub fn consume_word_token(bytes: &[u8], mut i: usize, len: usize) -> usize {
     i
 }
 
-/// Regex to strip absolute paths from git/rm/find binaries.
+/// Regex to strip absolute paths from git/rm/find/unlink/truncate binaries.
 ///
 /// Handles both Unix paths (`/path/to/bin/git`) and Windows paths (`C:/path/to/git.exe`).
 /// For Windows, matches drive letters (C:) followed by either forward or back slashes.
 ///
-/// `find` is included so the `find -delete` family of destructive patterns
-/// catches path-prefixed invocations (`/usr/bin/find / -delete`). Without
-/// this, an agent could bypass the rule simply by writing the absolute
-/// path to find.
+/// `find`, `unlink`, `truncate`, and `shred` are included so the
+/// corresponding destructive patterns catch path-prefixed invocations
+/// (`/usr/bin/find / -delete`, `/usr/bin/unlink /etc/passwd`,
+/// `/usr/bin/truncate -s 0 /etc/passwd`, `/usr/bin/shred -fzu
+/// /etc/passwd`). Without this, an agent could bypass the rules by
+/// writing the absolute path.
 pub static PATH_NORMALIZER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
         r"^(?:",
@@ -825,7 +827,7 @@ pub static PATH_NORMALIZER: LazyLock<Regex> = LazyLock::new(|| {
         r"[A-Za-z]:[/\\](?:[^\s/\\]*[/\\])*",
         r")",
         // Capture the binary name
-        r"(rm|git|find)",
+        r"(rm|git|find|unlink|truncate|shred)",
         // Optional .exe extension for Windows
         r"(?:\.exe)?",
         // Must be followed by whitespace or end
@@ -849,7 +851,8 @@ pub static PATH_NORMALIZER: LazyLock<Regex> = LazyLock::new(|| {
 pub static QUOTED_PATH_NORMALIZER: LazyLock<Regex> = LazyLock::new(|| {
     // Matches quoted paths like "C:/Program Files/Git/bin/git.exe" or "/usr/bin/git"
     // Note: Uses [^"]+ to match path content (may include spaces)
-    Regex::new(r#"^"(?:[^"]+/|[A-Za-z]:[^"]+[/\\])(rm|git|find)(?:\.exe)?""#).unwrap()
+    Regex::new(r#"^"(?:[^"]+/|[A-Za-z]:[^"]+[/\\])(rm|git|find|unlink|truncate|shred)(?:\.exe)?""#)
+        .unwrap()
 });
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

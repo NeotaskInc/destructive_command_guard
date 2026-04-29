@@ -118,6 +118,70 @@ const FIND_DELETE_SUGGESTIONS: &[PatternSuggestion] = &[
         "If you must proceed: use -print to log every deletion",
     ),
 ];
+
+/// Suggestions for `unlink` patterns. `unlink <file>` is the raw POSIX
+/// unlink(2) — semantically equivalent to `rm <file>` on a single file.
+/// On sensitive targets (`/etc/passwd`, `~/.ssh/...`) it is one-shot
+/// destruction with no recovery.
+const UNLINK_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new("ls -la {path}", "Verify the path before unlinking"),
+    PatternSuggestion::new(
+        "cp {path} {path}.bak && unlink {path}",
+        "Make a backup first if you really must remove the original",
+    ),
+    PatternSuggestion::new(
+        "unlink /tmp/{subdir}/scratch",
+        "Safe temp-directory unlink (allowed without confirmation)",
+    ),
+    PatternSuggestion::with_platform(
+        "trash-put {path}",
+        "Move to trash instead of permanent unlink (requires trash-cli)",
+        Platform::Linux,
+    ),
+];
+
+/// Suggestions for `truncate` patterns. `truncate -s 0 <file>` zeros the
+/// file in place — equivalent to deleting all content. `truncate -s -<N>`
+/// shrinks the file by N bytes (data loss). Both are recoverable only
+/// from backups.
+const TRUNCATE_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "cp {path} {path}.bak && truncate -s 0 {path}",
+        "Make a backup before zeroing the file",
+    ),
+    PatternSuggestion::new("wc -c {path}", "Check current size before shrinking"),
+    PatternSuggestion::new(
+        "truncate -s 0 /tmp/{subdir}/scratch",
+        "Safe temp-directory truncate (allowed without confirmation)",
+    ),
+    PatternSuggestion::new(
+        "head -c <N> {path} > {path}.head && mv {path}.head {path}",
+        "Keep the first N bytes instead of dropping data blindly",
+    ),
+];
+
+/// Suggestions for `shred` patterns. `shred -u <file>` overwrites then
+/// unlinks; `shred -fzu` is the most aggressive form (force, zero-pass,
+/// remove). Without `-u`/`--remove` the file is overwritten in place —
+/// data is destroyed but the file persists.
+const SHRED_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "ls -la {path}",
+        "Verify the path before shredding (no recovery)",
+    ),
+    PatternSuggestion::new(
+        "cp {path} {path}.bak && shred -u {path}",
+        "Make a backup first if you might need the data",
+    ),
+    PatternSuggestion::new(
+        "shred -u /tmp/{subdir}/scratch",
+        "Safe temp-directory shred (allowed without confirmation)",
+    ),
+    PatternSuggestion::new(
+        "shred -n 1 -u {path}",
+        "Single-pass shred is faster (and on SSDs, multi-pass adds little)",
+    ),
+];
 use crate::{normalize::NormalizeTokenKind, normalize::tokenize_for_normalization};
 use std::ops::Range;
 
@@ -477,12 +541,21 @@ pub fn create_pack() -> Pack {
     Pack {
         id: "core.filesystem".to_string(),
         name: "Core Filesystem",
-        description: "Protects against dangerous rm -rf commands and equivalent destruction (find -delete) outside temp directories",
+        description: "Protects against dangerous rm -rf commands and equivalent destruction (find -delete, unlink) outside temp directories",
         // `find` is included so the quick-reject filter doesn't drop
         // commands like `find / -delete` — which is bytewise-equivalent
         // to `rm -rf /` and used to bypass dcg entirely (the agent learns
         // to swap `rm -rf` → `find -delete` when blocked).
-        keywords: &["rm", "find"],
+        //
+        // `unlink` is included so the quick-reject filter doesn't drop
+        // single-file destruction via the POSIX unlink primitive.
+        // `truncate` covers the in-place zero/shrink primitive that
+        // destroys file content without removing the inode.
+        // `shred` covers overwrite-and-unlink (or just overwrite) — DoD-
+        // style data destruction with no recovery.
+        // Mirror entries MUST also exist in src/packs/mod.rs::PACK_ENTRIES
+        // (the duplicate-source-of-truth that gates execution).
+        keywords: &["rm", "find", "unlink", "truncate", "shred"],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
         keyword_matcher: None,
@@ -671,6 +744,109 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         safe_pattern!(
             "find-delete-tmpdir-brace",
             r"^find\s+\$\{TMPDIR\}(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:\$\{TMPDIR\}(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
+        ),
+        // -----------------------------------------------------------------
+        // `unlink <file>` safe whitelist for temp directories.
+        //
+        // WHOLE-COMMAND ANCHOR: `^...$`. Same rationale as the find-delete
+        // safe patterns — segment-aware safes shadow the destructive rule
+        // across compound segments and re-open the bypass class.
+        //
+        // Trade-off accepted: `echo done; unlink /tmp/scratch` blocks (false
+        // positive). Resolve via `dcg allow-once` for one-offs.
+        // -----------------------------------------------------------------
+        safe_pattern!(
+            "unlink-tmp",
+            r"^unlink\s+/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
+        ),
+        safe_pattern!(
+            "unlink-var-tmp",
+            r"^unlink\s+/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
+        ),
+        safe_pattern!(
+            "unlink-tmpdir",
+            r"^unlink\s+\$TMPDIR/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
+        ),
+        safe_pattern!(
+            "unlink-tmpdir-brace",
+            r"^unlink\s+\$\{TMPDIR\}/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
+        ),
+        // unlink invoked with --help / --version is read-only.
+        safe_pattern!("unlink-help", r"^unlink\s+(?:--help|--version)\s*$"),
+        // -----------------------------------------------------------------
+        // `truncate` safe whitelist.
+        //
+        // truncate has many flag forms:
+        //   -s 0 <file>       --size=0 <file>      (zero out)
+        //   -s -<N> <file>    --size=-N <file>     (shrink by N bytes — destructive)
+        //   -s <N> <file>     --size=N <file>      (set absolute — could grow OR shrink)
+        //   -s +<N> <file>    --size=+N <file>     (grow — non-destructive)
+        //   -s <fmt><N> <file>                     (>, <, %, etc. — destructive variants exist)
+        //
+        // Approach: only allow truncate when the FIRST positional argument
+        // looks like a +<N> grow operation OR the path is under /tmp etc.
+        // Whole-command anchored. --help / --version are read-only.
+        // -----------------------------------------------------------------
+        safe_pattern!("truncate-help", r"^truncate\s+(?:--help|--version)\s*$"),
+        // Growing operations: -s +<N>, --size=+<N> (pure growth — no
+        // data destroyed). We only whitelist the explicit `+` form because
+        // absolute sizes can shrink existing files. The `-s` short form
+        // takes its value as a separate token (`-s +1G`); `--size=` packs
+        // value into the same token (`--size=+1G`).
+        safe_pattern!(
+            "truncate-grow",
+            r"^truncate\s+(?:-s\s+\+\S+|--size=\+\S+)\s+\S+\s*$"
+        ),
+        // Temp-directory truncate (any size).
+        safe_pattern!(
+            "truncate-tmp",
+            r"^truncate\s+(?:-s\s+\S+|--size=\S+)\s+/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
+        ),
+        safe_pattern!(
+            "truncate-var-tmp",
+            r"^truncate\s+(?:-s\s+\S+|--size=\S+)\s+/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
+        ),
+        safe_pattern!(
+            "truncate-tmpdir",
+            r"^truncate\s+(?:-s\s+\S+|--size=\S+)\s+\$TMPDIR/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
+        ),
+        safe_pattern!(
+            "truncate-tmpdir-brace",
+            r"^truncate\s+(?:-s\s+\S+|--size=\S+)\s+\$\{TMPDIR\}/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
+        ),
+        // -r/--reference <ref-file> <file> uses the size of ref-file.
+        // This is a copy-size, not a destruction primitive — allowed when
+        // both args are paths. We don't whitelist explicitly because the
+        // destructive pattern only fires on `-s 0` / `-s -N` / `--size=0`
+        // / `--size=-N`, leaving --reference invocations to the
+        // default-allow path.
+        // -----------------------------------------------------------------
+        // `shred` safe whitelist.
+        //
+        // shred forms (all destructive when path is sensitive):
+        //   shred <file>          — overwrite (file persists, content gone)
+        //   shred -u <file>       — overwrite + unlink
+        //   shred -fzu <file>     — force + zero-pass + unlink (most aggressive)
+        //   shred --remove <file> — long form for -u
+        //
+        // Whole-command anchored. Allow temp dirs and --help/--version.
+        // -----------------------------------------------------------------
+        safe_pattern!("shred-help", r"^shred\s+(?:--help|--version)\s*$"),
+        safe_pattern!(
+            "shred-tmp",
+            r"^shred(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
+        ),
+        safe_pattern!(
+            "shred-var-tmp",
+            r"^shred(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
+        ),
+        safe_pattern!(
+            "shred-tmpdir",
+            r"^shred(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+\$TMPDIR/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
+        ),
+        safe_pattern!(
+            "shred-tmpdir-brace",
+            r"^shred(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+\$\{TMPDIR\}/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
         ),
     ]
 }
@@ -872,6 +1048,155 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Use `find /tmp/<subdir> ... -delete` (allowed under temp dirs)\n\
              - For a few files: `find ... | xargs -t -p rm -i` for confirmation",
             FIND_DELETE_SUGGESTIONS
+        ),
+        // ----- `unlink <file>` (Critical: root/home/system target) -----
+        //
+        // `unlink <file>` is the raw POSIX unlink(2) primitive — semantic
+        // equivalent of `rm <file>` (single file, no recursion). On a
+        // sensitive target (`/etc/passwd`, `~/.ssh/id_*`, `$HOME/...`) it
+        // is one-shot data destruction with no recovery and no recursion
+        // budget to slow it down.
+        //
+        // The regex matches `unlink` at any word boundary (so it fires in
+        // compound forms and after `sudo`/`env` wrappers, and on
+        // path-prefixed binaries via PATH_NORMALIZER), then a sensitive
+        // path token. Single argument only — multi-arg unlink isn't
+        // standard.
+        destructive_pattern!(
+            "unlink-root-home",
+            r#"\bunlink\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
+            "unlink on a sensitive system or home path is one-shot data destruction with no recovery. EXTREMELY DANGEROUS.",
+            Critical,
+            "`unlink <file>` is the raw POSIX unlink(2) primitive: it removes a single \
+             directory entry without prompting, without trash, without backup. On a \
+             sensitive system file (`/etc/passwd`, `/etc/shadow`, `/etc/sudoers`) or \
+             a home-directory key (`~/.ssh/id_ed25519`, `$HOME/.gnupg/...`) the result \
+             is irrecoverable.\n\n\
+             There is NO recovery without backups.\n\n\
+             Safer alternatives:\n\
+             - `mv <file> <file>.deleted-YYYYMMDD` then verify nothing breaks, then\n\
+               `unlink <file>.deleted-...` after a few days.\n\
+             - `cp <file> <file>.bak && unlink <file>` to keep an explicit backup.\n\
+             - `unlink /tmp/<subdir>/scratch` is allowed (temp dirs).",
+            UNLINK_SUGGESTIONS
+        ),
+        // ----- `unlink <file>` (High: any other target) -----
+        //
+        // The general rule fires after the `unlink-tmp` safe whitelist.
+        // Any unlink not under a temp dir requires human approval.
+        destructive_pattern!(
+            "unlink-general",
+            r"\bunlink\s+\S",
+            "unlink is destructive (POSIX equivalent of rm on a single file) and requires human approval.",
+            High,
+            "`unlink <file>` removes a single directory entry without confirmation, \
+             without trash, without backup. While not as broad as `rm -rf`, a typo in \
+             the target path destroys an unintended file.\n\n\
+             Safer alternatives:\n\
+             - Verify the path with `ls -la <file>` first.\n\
+             - Make a backup: `cp <file> <file>.bak`.\n\
+             - For temp scratch: `unlink /tmp/<subdir>/scratch` is allowed.\n\
+             - Use `mv <file> /tmp/quarantine-<file>` if you want a delayed delete.",
+            UNLINK_SUGGESTIONS
+        ),
+        // ----- `truncate -s 0|--size=0|-s -N` (Critical: root/home/system) -----
+        //
+        // `truncate -s 0 <file>` zeros the file in place — equivalent to
+        // deleting all content. With a sensitive target (`/etc/passwd`,
+        // `/etc/shadow`, `/etc/sudoers`, `~/.ssh/...`, `$HOME/.aws/...`)
+        // this is irrecoverable data destruction.
+        //
+        // Variants caught by the regex (size operand may have leading `=`):
+        //   -s 0
+        //   -s -<N>      (shrink by N bytes — destructive)
+        //   --size=0
+        //   --size=-<N>
+        //
+        // Variants NOT caught (intentionally — non-destructive):
+        //   -s +<N>      (grow — pure append of zeros, no data loss)
+        //   -s <N>       (absolute size; could shrink, but the safe path
+        //                  is to whitelist via temp dir or restructure)
+        //
+        // The destructive size operand is `0`, `-<digits>...` (with unit
+        // suffix), or `--size=0`/`--size=-...`.
+        destructive_pattern!(
+            "truncate-zero-root-home",
+            r#"\btruncate\b[^|;&]*?(?:\s-s\s+(?:0\b|-\d+)|\s--size=(?:0\b|-\d+))[^|;&]*?\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
+            "truncate -s 0|-N on a sensitive system or home path destroys data. EXTREMELY DANGEROUS.",
+            Critical,
+            "`truncate -s 0 <file>` zeros a file in place. `truncate -s -<N> <file>` \
+             shrinks a file by N bytes (destroying the trailing data). On a sensitive \
+             system file (`/etc/passwd`, `/etc/shadow`, `/etc/sudoers`) or a home-\
+             directory key/credential the result is irrecoverable.\n\n\
+             There is NO recovery without backups.\n\n\
+             Safer alternatives:\n\
+             - Make a backup first: `cp <file> <file>.bak && truncate -s 0 <file>`.\n\
+             - For growth (NOT shrink): `truncate -s +<N>` is allowed (no data loss).\n\
+             - For temp scratch: `truncate -s 0 /tmp/<subdir>/scratch` is allowed.",
+            TRUNCATE_SUGGESTIONS
+        ),
+        // ----- `truncate -s 0|--size=0|-s -N` (High: any other target) -----
+        destructive_pattern!(
+            "truncate-zero-general",
+            r"\btruncate\b[^|;&]*?(?:\s-s\s+(?:0\b|-\d+)|\s--size=(?:0\b|-\d+))",
+            "truncate -s 0|-N is destructive (zeroes or shrinks file content) and requires human approval.",
+            High,
+            "`truncate -s 0 <file>` zeros a file in place; `truncate -s -<N> <file>` \
+             shrinks it by N bytes. Both destroy data without confirmation, without \
+             trash, without backup. While not as broad as `rm`, a typo in the target \
+             path destroys an unintended file.\n\n\
+             Safer alternatives:\n\
+             - Verify the size first: `wc -c <file>`.\n\
+             - Make a backup: `cp <file> <file>.bak && truncate -s 0 <file>`.\n\
+             - For growth: `truncate -s +<N>` (allowed; non-destructive).\n\
+             - For temp scratch: `truncate -s 0 /tmp/<subdir>/scratch` is allowed.",
+            TRUNCATE_SUGGESTIONS
+        ),
+        // ----- `shred ...` (Critical: root/home/system) -----
+        //
+        // `shred` overwrites file content; `shred -u`/`--remove`/`-fzu`
+        // additionally unlinks the file. On a sensitive target this is
+        // beyond-recovery destruction (the very design intent of shred).
+        //
+        // Whether or not `-u` is present, a sensitive-path shred is
+        // Critical: the file content is destroyed even if the inode
+        // remains. The general (High-tier) rule below handles non-
+        // sensitive paths.
+        destructive_pattern!(
+            "shred-root-home",
+            r#"\bshred\b[^|;&]*?\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
+            "shred on a sensitive system or home path destroys data beyond forensic recovery. EXTREMELY DANGEROUS.",
+            Critical,
+            "`shred` overwrites file content with random data (DoD-style multi-pass by \
+             default). With `-u`/`--remove`/`-fzu` the file is also unlinked. On a \
+             sensitive system file (`/etc/passwd`, `/etc/shadow`, `/etc/sudoers`) or a \
+             home-directory key/credential the result is unrecoverable even with \
+             specialised forensics — that is shred's entire design intent.\n\n\
+             There is NO recovery without backups.\n\n\
+             Safer alternatives:\n\
+             - Verify the path with `ls -la <file>` first.\n\
+             - Make a backup: `cp <file> <file>.bak && shred -u <file>`.\n\
+             - For temp scratch: `shred -u /tmp/<subdir>/scratch` is allowed.\n\
+             - For modern SSDs, single-pass is sufficient: `shred -n 1 -u <file>`.",
+            SHRED_SUGGESTIONS
+        ),
+        // ----- `shred ...` (High: any other target) -----
+        destructive_pattern!(
+            "shred-general",
+            r"\bshred\s+(?:-[a-zA-Z]+\s+|--[a-z\-]+\s+|--[a-z\-]+=\S+\s+)*\S",
+            "shred destroys file content beyond recovery and requires human approval.",
+            High,
+            "`shred` overwrites file content with random data; `-u`/`--remove` adds an \
+             unlink step. The whole point is that the data cannot be recovered. While \
+             not as broad as `rm -rf`, a typo in the target path destroys an unintended \
+             file with no possibility of undo.\n\n\
+             Safer alternatives:\n\
+             - Verify the path with `ls -la <file>` first.\n\
+             - Make a backup: `cp <file> <file>.bak`.\n\
+             - For temp scratch: `shred -u /tmp/<subdir>/scratch` is allowed.\n\
+             - On modern SSDs `shred` may not actually overwrite the underlying flash \
+               cells; use `cryptsetup erase` or vendor secure-erase utilities instead.",
+            SHRED_SUGGESTIONS
         ),
     ]
 }
@@ -1111,6 +1436,361 @@ mod tests {
             "find ${TMPDIR} -delete",
         ] {
             assert_safe_pattern_matches(&pack, cmd);
+        }
+    }
+
+    // ---------- unlink (nqhi.3) ----------
+
+    #[test]
+    fn unlink_blocks_root_critical() {
+        let pack = create_pack();
+        for cmd in [
+            "unlink /etc/passwd",
+            "unlink /etc/shadow",
+            "unlink /etc/sudoers",
+            "unlink /usr/bin/sudo",
+            "unlink /boot/vmlinuz",
+            "unlink ~/.bashrc",
+            "unlink ~/.ssh/id_ed25519",
+            "unlink $HOME/.gnupg/secring.gpg",
+            "unlink ${HOME}/.aws/credentials",
+            "unlink \"/etc/passwd\"",
+            "unlink '/etc/shadow'",
+            // Compound forms.
+            "echo done; unlink /etc/passwd",
+            "true && unlink /etc/passwd",
+            "(unlink /etc/passwd)",
+            // Wrappers.
+            "sudo unlink /etc/passwd",
+            "env FOO=bar unlink /etc/passwd",
+            // Path-prefixed (PATH_NORMALIZER strips it).
+            "/usr/bin/unlink /etc/passwd",
+            "/bin/unlink /etc/shadow",
+        ] {
+            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
+        }
+    }
+
+    #[test]
+    fn unlink_blocks_general_high() {
+        let pack = create_pack();
+        // Anything outside temp dirs — High severity, mirrors rm-rf-general.
+        for cmd in [
+            "unlink ./important.db",
+            "unlink ./build/output.bin",
+            "unlink secrets.txt",
+            "unlink /data/important",
+            "unlink /workspace/build/critical.bin",
+        ] {
+            assert_blocks_with_severity(&pack, cmd, Severity::High);
+        }
+    }
+
+    #[test]
+    fn unlink_under_tmp_is_allowed() {
+        let pack = create_pack();
+        // Whole-command anchor — single invocation only.
+        for cmd in [
+            "unlink /tmp/scratch",
+            "unlink /tmp/foo/bar",
+            "unlink /var/tmp/cache",
+            "unlink $TMPDIR/file",
+            "unlink ${TMPDIR}/file",
+        ] {
+            assert_safe_pattern_matches(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn unlink_help_is_allowed() {
+        let pack = create_pack();
+        // unlink --help / --version are read-only.
+        for cmd in ["unlink --help", "unlink --version"] {
+            assert_safe_pattern_matches(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn unlink_path_traversal_in_tmp_is_blocked() {
+        let pack = create_pack();
+        // The safe regex's negative lookahead rejects `..` traversal.
+        for cmd in [
+            "unlink /tmp/../etc/passwd",
+            "unlink /tmp/foo/../../etc/shadow",
+            "unlink $TMPDIR/../etc/passwd",
+        ] {
+            // Path-traversal should NOT match the safe pattern. The
+            // command falls through to destructive evaluation. Whether
+            // it lands on root-home or general depends on the literal
+            // sensitive substring; we only assert it blocks SOMEHOW.
+            assert_blocks(&pack, cmd, "unlink");
+        }
+    }
+
+    #[test]
+    fn unlink_compound_with_temp_blocks_conservatively() {
+        let pack = create_pack();
+        // Same trade-off as find-delete: compound forms block even when
+        // the unlink target is /tmp. Users `dcg allow-once` for the
+        // legitimate cases.
+        for cmd in [
+            "echo done; unlink /tmp/scratch",
+            "true && unlink /tmp/scratch",
+        ] {
+            assert_blocks(&pack, cmd, "unlink");
+        }
+    }
+
+    #[test]
+    fn unlink_no_false_positive_substring_traps() {
+        let pack = create_pack();
+        // `unlink` substring inside other paths/commands must NOT trip.
+        for cmd in [
+            "cat /etc/unlink-script.sh",
+            "ls unlink-foo.txt",
+            "echo unlink",
+            // unlink without an argument doesn't match (regex requires \S).
+            "unlink",
+            "unlink ",
+        ] {
+            assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn unlink_path_prefixed_normalizes_to_bare() {
+        // PATH_NORMALIZER strips `/usr/bin/unlink` to bare `unlink`.
+        // Pin the contract — if `unlink` is dropped from the capture,
+        // path-prefixed bypasses re-open.
+        use crate::normalize::normalize_command;
+        for (input, expected) in [
+            ("/usr/bin/unlink /etc/passwd", "unlink /etc/passwd"),
+            ("/bin/unlink /etc/shadow", "unlink /etc/shadow"),
+            ("/usr/local/bin/unlink /etc/sudoers", "unlink /etc/sudoers"),
+        ] {
+            let normalized = normalize_command(input);
+            assert!(
+                normalized.contains(expected),
+                "PATH_NORMALIZER did not strip `{input}` to `{expected}` (got `{normalized}`)"
+            );
+        }
+    }
+
+    // ---------- truncate (nqhi.1) ----------
+
+    #[test]
+    fn truncate_blocks_zero_root_critical() {
+        let pack = create_pack();
+        for cmd in [
+            "truncate -s 0 /etc/passwd",
+            "truncate -s 0 /etc/shadow",
+            "truncate -s 0 /etc/sudoers",
+            "truncate -s 0 /usr/bin/sudo",
+            "truncate -s 0 /boot/vmlinuz",
+            "truncate -s 0 ~/.bashrc",
+            "truncate -s 0 $HOME/.aws/credentials",
+            "truncate -s 0 ${HOME}/.gnupg/secring.gpg",
+            "truncate --size=0 /etc/passwd",
+            // shrink form
+            "truncate -s -100 /etc/passwd",
+            "truncate -s -1024 /etc/hosts",
+            "truncate --size=-100 /etc/passwd",
+            // compound forms
+            "echo done; truncate -s 0 /etc/passwd",
+            "true && truncate -s 0 /etc/passwd",
+            "(truncate -s 0 /etc/passwd)",
+            // wrappers
+            "sudo truncate -s 0 /etc/passwd",
+            "env FOO=bar truncate -s 0 /etc/passwd",
+            // path-prefixed
+            "/usr/bin/truncate -s 0 /etc/passwd",
+            "/bin/truncate --size=0 /etc/shadow",
+        ] {
+            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
+        }
+    }
+
+    #[test]
+    fn truncate_blocks_zero_general_high() {
+        let pack = create_pack();
+        for cmd in [
+            "truncate -s 0 ./important.db",
+            "truncate -s 0 build/output.bin",
+            "truncate --size=0 secrets.txt",
+            "truncate -s -100 ./large.log",
+            "truncate -s 0 /data/important",
+        ] {
+            assert_blocks_with_severity(&pack, cmd, Severity::High);
+        }
+    }
+
+    #[test]
+    fn truncate_under_tmp_is_allowed() {
+        let pack = create_pack();
+        for cmd in [
+            "truncate -s 0 /tmp/scratch.bin",
+            "truncate -s 1G /tmp/sparse-file.bin",
+            "truncate -s 0 /var/tmp/cache.bin",
+            "truncate -s 100M /var/tmp/test.img",
+            "truncate -s 0 $TMPDIR/cache.bin",
+            "truncate --size=0 ${TMPDIR}/scratch",
+            "truncate -s -100 /tmp/log.txt",
+        ] {
+            assert_safe_pattern_matches(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn truncate_grow_is_allowed_anywhere() {
+        let pack = create_pack();
+        // Pure-growth `+N` does not destroy data — allowed everywhere.
+        for cmd in [
+            "truncate -s +1024 ./output.bin",
+            "truncate -s +1G /var/log/sparse",
+            "truncate --size=+100M ./preallocated",
+        ] {
+            assert_safe_pattern_matches(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn truncate_help_is_allowed() {
+        let pack = create_pack();
+        for cmd in ["truncate --help", "truncate --version"] {
+            assert_safe_pattern_matches(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn truncate_no_false_positive_substring_traps() {
+        let pack = create_pack();
+        for cmd in [
+            "cat /etc/truncate-readme.txt",
+            "ls truncate-script.sh",
+            "echo truncate",
+            // no -s 0 / shrink → no destructive match. truncate WITHOUT
+            // a destructive size operand falls through to default-allow.
+            "truncate -r ref.bin out.bin",
+            "truncate --reference=ref.bin out.bin",
+        ] {
+            assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn truncate_path_prefixed_normalizes_to_bare() {
+        use crate::normalize::normalize_command;
+        for (input, expected) in [
+            (
+                "/usr/bin/truncate -s 0 /etc/passwd",
+                "truncate -s 0 /etc/passwd",
+            ),
+            (
+                "/bin/truncate --size=0 /etc/shadow",
+                "truncate --size=0 /etc/shadow",
+            ),
+        ] {
+            let normalized = normalize_command(input);
+            assert!(
+                normalized.contains(expected),
+                "PATH_NORMALIZER did not strip `{input}` to `{expected}` (got `{normalized}`)"
+            );
+        }
+    }
+
+    // ---------- shred (nqhi.2) ----------
+
+    #[test]
+    fn shred_blocks_root_critical() {
+        let pack = create_pack();
+        for cmd in [
+            "shred /etc/passwd",
+            "shred -u /etc/passwd",
+            "shred -fzu /etc/shadow",
+            "shred --remove /etc/hosts",
+            "shred -n 3 -u /etc/passwd",
+            "shred -u ~/.ssh/id_ed25519",
+            "shred -u $HOME/.aws/credentials",
+            "shred -u ${HOME}/.gnupg/secring.gpg",
+            "shred -fzu /usr/bin/sudo",
+            "shred -u /boot/vmlinuz",
+            // compound forms
+            "echo done; shred -u /etc/passwd",
+            "true && shred -u /etc/passwd",
+            "(shred -u /etc/passwd)",
+            // wrappers
+            "sudo shred -u /etc/passwd",
+            "env FOO=bar shred -u /etc/passwd",
+            // path-prefixed
+            "/usr/bin/shred -fzu /etc/passwd",
+            "/bin/shred -u /etc/shadow",
+        ] {
+            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
+        }
+    }
+
+    #[test]
+    fn shred_blocks_general_high() {
+        let pack = create_pack();
+        for cmd in [
+            "shred ./important.db",
+            "shred -u ./secrets.txt",
+            "shred -fzu build/output.bin",
+            "shred -u /data/private",
+            "shred --remove /workspace/build/critical.bin",
+        ] {
+            assert_blocks_with_severity(&pack, cmd, Severity::High);
+        }
+    }
+
+    #[test]
+    fn shred_under_tmp_is_allowed() {
+        let pack = create_pack();
+        for cmd in [
+            "shred -u /tmp/scratch.bin",
+            "shred -fzu /tmp/foo/cache",
+            "shred -u /var/tmp/cache.bin",
+            "shred -u $TMPDIR/file",
+            "shred -u ${TMPDIR}/file",
+            "shred -n 1 -u /tmp/scratch",
+            "shred /tmp/foo/output",
+        ] {
+            assert_safe_pattern_matches(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn shred_help_is_allowed() {
+        let pack = create_pack();
+        for cmd in ["shred --help", "shred --version"] {
+            assert_safe_pattern_matches(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn shred_no_false_positive_substring_traps() {
+        let pack = create_pack();
+        for cmd in [
+            "cat /etc/shred-readme.txt",
+            "ls shred-script.sh",
+            "echo shred",
+        ] {
+            assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn shred_path_prefixed_normalizes_to_bare() {
+        use crate::normalize::normalize_command;
+        for (input, expected) in [
+            ("/usr/bin/shred -u /etc/passwd", "shred -u /etc/passwd"),
+            ("/bin/shred -fzu /etc/shadow", "shred -fzu /etc/shadow"),
+        ] {
+            let normalized = normalize_command(input);
+            assert!(
+                normalized.contains(expected),
+                "PATH_NORMALIZER did not strip `{input}` to `{expected}` (got `{normalized}`)"
+            );
         }
     }
 
