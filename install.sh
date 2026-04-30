@@ -1581,10 +1581,26 @@ configure_codex() {
       local codex_hook_state
       codex_hook_state=$(python3 - "$settings_file" "$DEST/dcg" <<'PYEOF'
 import json
+import os
+import shlex
 import sys
 
 hooks_file = sys.argv[1]
 dcg_path = sys.argv[2]
+
+def is_dcg_command(cmd):
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    name = os.path.basename(tokens[0])
+    if name.endswith('.exe'):
+        name = name[:-4]
+    return name == 'dcg'
 
 try:
     with open(hooks_file, 'r') as f:
@@ -1598,6 +1614,7 @@ if not isinstance(pre_tool_use, list):
     print("merge")
     raise SystemExit(0)
 
+dcg_commands = []
 for entry in pre_tool_use:
     if not isinstance(entry, dict) or entry.get("matcher") != "Bash":
         continue
@@ -1605,11 +1622,13 @@ for entry in pre_tool_use:
     if not isinstance(hooks, list):
         continue
     for hook in hooks:
-        if isinstance(hook, dict) and hook.get("command") == dcg_path:
-            print("already")
-            raise SystemExit(0)
+        if isinstance(hook, dict) and is_dcg_command(hook.get("command")):
+            dcg_commands.append(hook.get("command"))
 
-print("merge")
+if dcg_commands == [dcg_path]:
+    print("already")
+else:
+    print("merge")
 PYEOF
 )
       if [ "$codex_hook_state" = "already" ]; then
@@ -1655,39 +1674,44 @@ except (IOError, ValueError, json.JSONDecodeError):
     config = {}
 
 # Ensure hooks structure exists
-if 'hooks' not in config:
+if not isinstance(config, dict):
+    config = {}
+if not isinstance(config.get('hooks'), dict):
     config['hooks'] = {}
-if 'PreToolUse' not in config['hooks']:
+if not isinstance(config['hooks'].get('PreToolUse'), list):
     config['hooks']['PreToolUse'] = []
 
 # Look for existing Bash matcher
 bash_hooks = []
 new_pre_tool_use = []
+dcg_seen = False
 
 for entry in config['hooks']['PreToolUse']:
-    if entry.get('matcher') == 'Bash':
-        if 'hooks' in entry:
-            for hook in entry['hooks']:
+    if not isinstance(entry, dict):
+        new_pre_tool_use.append(entry)
+    elif entry.get('matcher') == 'Bash':
+        hooks = entry.get('hooks', [])
+        if isinstance(hooks, list):
+            for hook in hooks:
                 if isinstance(hook, dict) and 'command' in hook:
                     cmd = str(hook.get('command', ''))
                     if not is_dcg_command(cmd):  # Don't duplicate dcg
                         bash_hooks.append(hook)
                     else:
-                        # Keep existing dcg hook but ensure path is updated
-                        bash_hooks.append({"type": "command", "command": dcg_path})
+                        dcg_seen = True
                 else:
                     bash_hooks.append(hook)
     else:
         new_pre_tool_use.append(entry)
 
-# Add dcg hook at the beginning if not already present
+# Add exactly one dcg hook at the beginning. Existing dcg hooks, including stale
+# paths or duplicates, are intentionally collapsed here.
 dcg_hook = {"type": "command", "command": dcg_path}
-dcg_exists = any(
+if dcg_seen or not any(
     is_dcg_command(h.get('command', ''))
     for h in bash_hooks
     if isinstance(h, dict)
-)
-if not dcg_exists:
+):
     bash_hooks.insert(0, dcg_hook)
 
 # Create consolidated Bash matcher with dcg first

@@ -624,6 +624,47 @@ raise SystemExit("no Bash PreToolUse matcher found")
 PYEOF
 }
 
+assert_codex_dcg_hook_count() {
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    python3 - "$CODEX_SETTINGS" "$1" <<'PYEOF'
+import json
+import os
+import shlex
+import sys
+
+hooks_file = sys.argv[1]
+expected = int(sys.argv[2])
+
+with open(hooks_file, "r") as f:
+    config = json.load(f)
+
+count = 0
+for entry in config.get("hooks", {}).get("PreToolUse", []):
+    if not isinstance(entry, dict):
+        continue
+    for hook in entry.get("hooks", []):
+        if not isinstance(hook, dict):
+            continue
+        command = hook.get("command")
+        if not isinstance(command, str):
+            continue
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            continue
+        if parts:
+            name = os.path.basename(parts[0])
+            if name.endswith(".exe"):
+                name = name[:-4]
+            if name == "dcg":
+                count += 1
+
+if count != expected:
+    raise SystemExit(f"dcg hook count was {count}, expected {expected}")
+PYEOF
+}
+
 create_no_python_path() {
     local no_python_path="$TEST_TMPDIR/no-python-path"
     mkdir -p "$no_python_path"
@@ -725,10 +766,7 @@ EOF
 
     [ "$CODEX_STATUS" = "already" ]
     assert_codex_hooks_has_current_dcg
-
-    local dcg_count
-    dcg_count=$(grep -oF "$DEST/dcg" "$CODEX_SETTINGS" | wc -l)
-    [ "$dcg_count" -eq 1 ]
+    assert_codex_dcg_hook_count 1
 }
 
 @test "configure_codex: merges existing hooks and keeps dcg first" {
@@ -815,6 +853,82 @@ EOF
     if grep -q "/old/bin/dcg" "$CODEX_SETTINGS"; then
         return 1
     fi
+    assert_codex_dcg_hook_count 1
+}
+
+@test "configure_codex: collapses duplicate and stale dcg hooks" {
+    log_test "Testing Codex duplicate dcg hook cleanup..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_codex
+    cat > "$CODEX_SETTINGS" <<EOF
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {"type": "command", "command": "$DEST/dcg"},
+          {"type": "command", "command": "/old/bin/dcg"},
+          {"type": "command", "command": "atuin history start"}
+        ]
+      }
+    ]
+  }
+}
+EOF
+
+    log_test "Before hooks.json: $(cat "$CODEX_SETTINGS")"
+
+    configure_codex
+
+    log_test "CODEX_STATUS: $CODEX_STATUS"
+    log_test "After hooks.json: $(cat "$CODEX_SETTINGS")"
+
+    [ "$CODEX_STATUS" = "merged" ]
+    assert_codex_hooks_has_current_dcg
+    assert_codex_first_bash_hook_command "$DEST/dcg"
+    assert_codex_dcg_hook_count 1
+    grep -q "atuin history start" "$CODEX_SETTINGS"
+    if grep -q "/old/bin/dcg" "$CODEX_SETTINGS"; then
+        return 1
+    fi
+}
+
+@test "configure_codex: repairs malformed Bash hooks shape" {
+    log_test "Testing Codex malformed Bash hooks repair..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_codex
+    cat > "$CODEX_SETTINGS" <<'EOF'
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": {"bad": "shape"}
+      },
+      {
+        "matcher": "Read",
+        "hooks": [
+          {"type": "command", "command": "echo read-hook"}
+        ]
+      }
+    ]
+  }
+}
+EOF
+
+    configure_codex
+
+    log_test "CODEX_STATUS: $CODEX_STATUS"
+    log_test "After hooks.json: $(cat "$CODEX_SETTINGS")"
+
+    [ "$CODEX_STATUS" = "merged" ]
+    assert_codex_hooks_has_current_dcg
+    assert_codex_first_bash_hook_command "$DEST/dcg"
+    assert_codex_dcg_hook_count 1
+    grep -q "echo read-hook" "$CODEX_SETTINGS"
 }
 
 @test "configure_codex: fails without python3 and preserves existing hooks.json" {
