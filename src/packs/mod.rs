@@ -571,12 +571,10 @@ impl Pack {
     /// Check a command against this pack.
     /// Returns Some(DestructiveMatch) if blocked, None if allowed.
     ///
-    /// Compound commands (joined by `;`, `&&`, `||`, `\n`) are split into
-    /// segments and each segment is evaluated independently. This prevents
-    /// a safe pattern matching one segment (e.g. `docker ps`) from
-    /// shielding a destructive pattern in another (`docker system prune`).
-    /// Pipelines (`|`) are intentionally kept whole because some pack
-    /// patterns span them.
+    /// Compound commands and pipelines are split into segments and each
+    /// segment is evaluated independently. This prevents a safe pattern
+    /// matching one segment (e.g. `docker ps`) from shielding a destructive
+    /// pattern in another (`docker system prune`).
     #[must_use]
     pub fn check(&self, cmd: &str) -> Option<DestructiveMatch> {
         let segments = crate::packs::split_command_segments(cmd);
@@ -1685,10 +1683,9 @@ impl PackRegistry {
         // Expand category IDs to include all sub-packs in deterministic order
         let ordered_packs = self.expand_enabled_ordered(enabled_packs);
 
-        // Segment the command on shell sequence separators (`;`, `&&`, `||`,
-        // `\n`) so a safe pattern matching one segment cannot shield a
-        // destructive pattern in another. Pipelines (`|`) are intentionally
-        // kept whole because some pack patterns span them.
+        // Segment the command on shell sequence and pipeline separators so a
+        // safe pattern matching one segment cannot shield a destructive pattern
+        // in another.
         //
         // We run the existing per-command logic on each segment. If any
         // segment blocks, the whole command blocks. If all segments are
@@ -2346,11 +2343,11 @@ pub fn pack_aware_quick_reject(cmd: &str, enabled_keywords: &[&str]) -> bool {
     pack_aware_quick_reject_with_normalized(cmd, enabled_keywords).0
 }
 
-/// Split a command into segments on shell sequence separators.
+/// Split a command into segments on shell sequence/pipeline separators.
 ///
-/// Splits on `;`, `&&`, `||`, and `\n`. Does NOT split on `|` (pipeline) or
-/// bare `&` (background) because some pack patterns legitimately span those
-/// (e.g. `kustomize build | kubectl diff`).
+/// Splits on `;`, `&&`, `||`, `|`, `|&`, bare `&`, and `\n`.
+/// Callers that need patterns spanning a pipeline should evaluate the full
+/// command after evaluating the returned segments.
 ///
 /// Respects single and double quotes — separators inside quotes don't split.
 /// Skips backslash-escaped separators outside single quotes.
@@ -2397,10 +2394,13 @@ pub fn split_command_segments(cmd: &str) -> Vec<&str> {
 
         let split_width: Option<usize> = if b == b';' || b == b'\n' {
             Some(1)
-        } else if (b == b'&' && bytes.get(i + 1) == Some(&b'&'))
-            || (b == b'|' && bytes.get(i + 1) == Some(&b'|'))
-        {
-            Some(2)
+        } else if b == b'&' {
+            Some(usize::from(bytes.get(i + 1) == Some(&b'&')) + 1)
+        } else if b == b'|' {
+            Some(
+                usize::from(matches!(bytes.get(i + 1), Some(&b'|') | Some(&b'&')))
+                    + 1,
+            )
         } else {
             None
         };
@@ -2696,15 +2696,21 @@ mod tests {
             vec!["docker ps", "docker logs x"]
         );
         assert_eq!(split_command_segments("a || b"), vec!["a", "b"]);
-        // Pipeline `|` is NOT a split point.
         assert_eq!(
             split_command_segments("docker ps | grep nginx"),
-            vec!["docker ps | grep nginx"]
+            vec!["docker ps", "grep nginx"]
         );
-        // Single `&` is background, also not split.
+        assert_eq!(
+            split_command_segments("docker ps |& grep nginx"),
+            vec!["docker ps", "grep nginx"]
+        );
+        assert_eq!(
+            split_command_segments("docker ps & docker logs foo"),
+            vec!["docker ps", "docker logs foo"]
+        );
         assert_eq!(
             split_command_segments("docker logs foo &"),
-            vec!["docker logs foo &"]
+            vec!["docker logs foo"]
         );
     }
 
@@ -2721,6 +2727,8 @@ mod tests {
         );
         // Escaped separators outside single quotes are literal.
         assert_eq!(split_command_segments(r"echo a\; b"), vec![r"echo a\; b"]);
+        assert_eq!(split_command_segments(r"echo a\| b"), vec![r"echo a\| b"]);
+        assert_eq!(split_command_segments(r"echo a\& b"), vec![r"echo a\& b"]);
     }
 
     #[test]

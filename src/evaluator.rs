@@ -3325,6 +3325,42 @@ mod tests {
     }
 
     #[test]
+    fn non_core_safe_pipeline_stage_does_not_mask_later_destructive_stage() {
+        let result = evaluate_with_pack_ids(
+            "railway service list | railway volume delete --volume prod-db --yes",
+            &["platform.railway"],
+        );
+
+        assert!(
+            result.is_denied(),
+            "Railway volume delete must be blocked after a safe pipeline stage"
+        );
+        let info = result
+            .pattern_info
+            .expect("denial should include pattern info");
+        assert_eq!(info.pack_id.as_deref(), Some("platform.railway"));
+        assert_eq!(info.pattern_name.as_deref(), Some("railway-volume-delete"));
+    }
+
+    #[test]
+    fn non_core_safe_background_command_does_not_mask_later_destructive_command() {
+        let result = evaluate_with_pack_ids(
+            "railway service list & railway volume delete --volume prod-db --yes",
+            &["platform.railway"],
+        );
+
+        assert!(
+            result.is_denied(),
+            "Railway volume delete must be blocked after a safe background command"
+        );
+        let info = result
+            .pattern_info
+            .expect("denial should include pattern info");
+        assert_eq!(info.pack_id.as_deref(), Some("platform.railway"));
+        assert_eq!(info.pattern_name.as_deref(), Some("railway-volume-delete"));
+    }
+
+    #[test]
     fn non_core_safe_segment_does_not_mask_earlier_destructive_segment() {
         let result = evaluate_with_pack_ids(
             "railway volume delete --volume prod-db --yes && railway service list",

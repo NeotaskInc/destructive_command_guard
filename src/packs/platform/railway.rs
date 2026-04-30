@@ -509,6 +509,16 @@ mod tests {
             "railway service list && railway volume delete --volume prod-db --yes",
             "railway-volume-delete",
         );
+        assert_blocks_with_pattern(
+            &pack,
+            "railway service list | railway volume delete --volume prod-db --yes",
+            "railway-volume-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "railway service list & railway volume delete --volume prod-db --yes",
+            "railway-volume-delete",
+        );
     }
 
     #[test]
