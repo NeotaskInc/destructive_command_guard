@@ -18,9 +18,7 @@
 //! console().print("[bold red]Error:[/] Something went wrong");
 //! ```
 
-use std::io;
-#[cfg(not(feature = "rich-output"))]
-use std::io::Write;
+use std::io::{self, Write};
 use std::sync::OnceLock;
 
 /// Global flag indicating whether rich output should be used.
@@ -59,7 +57,8 @@ impl DcgConsole {
     pub fn print(&self, text: &str) {
         let console = self.create_inner_console();
         if self.force_plain {
-            console.print_plain(text);
+            let plain_text = strip_markup(text);
+            console.print_plain(&plain_text);
         } else {
             console.print(text);
         }
@@ -86,6 +85,19 @@ impl DcgConsole {
     /// Print a horizontal rule.
     #[cfg(feature = "rich-output")]
     pub fn rule(&self, title: Option<&str>) {
+        if self.force_plain {
+            let width = self.width();
+            let plain_title = title.map(strip_markup);
+            let line = if let Some(t) = plain_title {
+                let padding = width.saturating_sub(t.len() + 4) / 2;
+                format!("{} {} {}", "-".repeat(padding), t, "-".repeat(padding))
+            } else {
+                "-".repeat(width)
+            };
+            let _ = writeln!(io::stderr(), "{line}");
+            return;
+        }
+
         let console = self.create_inner_console();
         console.rule(title);
     }
@@ -173,13 +185,13 @@ pub fn console() -> DcgConsole {
 ///
 /// If the console settings were already initialized, this function does nothing.
 pub fn init_console(force_plain: bool) {
-    let _ = USE_RICH.set(!force_plain);
+    let use_rich = !force_plain && crate::output::should_use_rich_output();
+    let _ = USE_RICH.set(use_rich);
 }
 
 /// Strip markup tags from text for plain output.
 ///
 /// Removes patterns like `[bold red]` and `[/]` from the text.
-#[cfg(not(feature = "rich-output"))]
 fn strip_markup(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut in_bracket = false;

@@ -559,6 +559,8 @@ mod tests {
             summary: ScanSummary {
                 files_scanned: 5,
                 files_skipped: 0,
+                skipped: Vec::new(),
+                paths_skipped: Vec::new(),
                 commands_extracted: 2,
                 findings_total: 2,
                 decisions: crate::scan::ScanDecisionCounts::default(),

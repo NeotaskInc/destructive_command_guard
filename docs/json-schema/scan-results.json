@@ -24,7 +24,45 @@
         "files_skipped": {
           "type": "integer",
           "minimum": 0,
-          "description": "Number of files skipped (binary, too large, permission denied)"
+          "description": "Number of files skipped (binary, too large, permission denied). Authoritative total — see 'skipped' for per-file detail."
+        },
+        "skipped": {
+          "type": "array",
+          "description": "Per-file skip detail. Lets operators distinguish 'max-file-size too low' from 'not a script' from 'read error'. Omitted when empty.",
+          "items": {
+            "type": "object",
+            "required": ["path", "reason"],
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Path to the skipped file"
+              },
+              "reason": {
+                "type": "string",
+                "enum": ["path_not_found", "metadata_error", "not_a_regular_file", "too_large", "no_extractor", "read_error"],
+                "description": "Why the file was skipped"
+              }
+            }
+          }
+        },
+        "paths_skipped": {
+          "type": "array",
+          "description": "Top-level scan target paths that did not exist or were unreadable. CI integrations should fail loudly when this is non-empty rather than silently passing on misconfigured paths. Omitted when empty.",
+          "items": {
+            "type": "object",
+            "required": ["path", "reason"],
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "The user-supplied target path"
+              },
+              "reason": {
+                "type": "string",
+                "enum": ["path_not_found", "metadata_error"],
+                "description": "Why the target path was unreadable"
+              }
+            }
+          }
         },
         "commands_extracted": {
           "type": "integer",

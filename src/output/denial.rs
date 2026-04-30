@@ -135,8 +135,11 @@ impl DenialBox {
     pub fn render(&self, theme: &Theme) -> String {
         #[cfg(feature = "rich-output")]
         {
-            // If using rich output, delegate to render_rich
-            self.render_rich(theme)
+            if crate::output::should_use_rich_output() {
+                self.render_rich(theme)
+            } else {
+                self.render_ascii(theme)
+            }
         }
         #[cfg(not(feature = "rich-output"))]
         match theme.border_style {
@@ -540,7 +543,6 @@ impl DenialBox {
     }
 
     /// Render with ASCII box-drawing characters.
-    #[cfg(not(feature = "rich-output"))]
     fn render_ascii(&self, theme: &Theme) -> String {
         let width = terminal_width().saturating_sub(4).max(40) as usize;
         let mut output = String::new();
@@ -772,7 +774,6 @@ fn severity_color_code(theme: &Theme, severity: Severity) -> String {
 }
 
 /// Calculate padding needed to fill width, accounting for ANSI codes.
-#[cfg(not(feature = "rich-output"))]
 fn padding_for(text: &str, width: usize) -> String {
     let visible_len = strip_ansi_codes(text).chars().count();
     let padding = width.saturating_sub(visible_len);
@@ -794,7 +795,6 @@ fn padding_for(text: &str, width: usize) -> String {
 ///   ST sequence `ESC \\`. Used by hyperlink escapes (`\x1b]8;...\x1b\\text\x1b]8;;\x1b\\`).
 /// - **Two-byte ESC sequences** (`ESC <X>` where X is `0x40..=0x5F`):
 ///   single-character terminator. Conservative fallback: drop the byte.
-#[cfg(not(feature = "rich-output"))]
 fn strip_ansi_codes(s: &str) -> String {
     #[derive(Copy, Clone)]
     enum State {

@@ -521,37 +521,48 @@ fn first_non_empty_line(value: &str) -> Option<&str> {
     value.lines().map(str::trim).find(|line| !line.is_empty())
 }
 
+/// Map a parent-process name to a known agent.
+///
+/// Tokenizes the input on whitespace and matches each token's basename (after
+/// `\` → `/` normalization, last path segment, `.exe` strip, lower-case)
+/// against an explicit name/alias table. This rejects false positives like
+/// `claude-explorer`, `myproject-continue`, or `cursor-ext` whose basename
+/// merely *contains* an agent name without *being* one.
+///
+/// The whitespace tokenization handles wrapper-style invocations like
+/// `node /usr/local/bin/codex`: each argv entry is checked independently and
+/// the first exact basename match wins.
 fn agent_from_process_name(process_name: &str) -> Option<Agent> {
-    let normalized = process_name.to_lowercase().replace('\\', "/");
-    let executable = normalized.rsplit('/').next().unwrap_or(&normalized);
-    let executable = executable.strip_suffix(".exe").unwrap_or(executable);
-
-    if executable.contains("claude") || normalized.contains("/claude") {
-        return Some(Agent::ClaudeCode);
+    for token in process_name.split_whitespace() {
+        if let Some(agent) = agent_for_basename(executable_basename(token).as_str()) {
+            return Some(agent);
+        }
     }
-    if executable.contains("augment") || executable.contains("auggie") {
-        return Some(Agent::AugmentCode);
-    }
-    if executable.contains("aider") {
-        return Some(Agent::Aider);
-    }
-    if executable.contains("continue") {
-        return Some(Agent::Continue);
-    }
-    if executable.contains("codex") || normalized.contains("/codex") {
-        return Some(Agent::CodexCli);
-    }
-    if executable.contains("gemini") {
-        return Some(Agent::GeminiCli);
-    }
-    if executable.contains("copilot") {
-        return Some(Agent::CopilotCli);
-    }
-    if executable.contains("cursor") {
-        return Some(Agent::CursorIde);
-    }
-
     None
+}
+
+fn executable_basename(token: &str) -> String {
+    let normalized = token.to_lowercase().replace('\\', "/");
+    let last = normalized.rsplit('/').next().unwrap_or(&normalized);
+    last.strip_suffix(".exe").unwrap_or(last).to_string()
+}
+
+fn agent_for_basename(basename: &str) -> Option<Agent> {
+    // Exact-match table. New aliases for the same agent go in the same arm.
+    // Substring matching is intentionally NOT used: a tool whose name merely
+    // contains "claude" / "aider" / "continue" / "cursor" would otherwise be
+    // misclassified.
+    match basename {
+        "claude" | "claude-code" | "claude_code" => Some(Agent::ClaudeCode),
+        "augment" | "augment-code" | "auggie" => Some(Agent::AugmentCode),
+        "aider" => Some(Agent::Aider),
+        "continue" | "continue-cli" => Some(Agent::Continue),
+        "codex" | "codex-cli" => Some(Agent::CodexCli),
+        "gemini" | "gemini-cli" => Some(Agent::GeminiCli),
+        "copilot" | "copilot-cli" | "gh-copilot" => Some(Agent::CopilotCli),
+        "cursor" | "cursor-ide" => Some(Agent::CursorIde),
+        _ => None,
+    }
 }
 
 /// Create a detection result from an explicit agent name.
@@ -708,6 +719,68 @@ mod tests {
         assert_eq!(agent_from_process_name("zsh"), None);
         assert_eq!(agent_from_process_name("cargo test agent"), None);
         assert_eq!(agent_from_process_name("node"), None);
+    }
+
+    #[test]
+    fn test_agent_from_process_name_rejects_substring_false_positives() {
+        // Previously these all returned a (wrong) Agent because the
+        // implementation matched on substring. They must now return None.
+        assert_eq!(agent_from_process_name("claude-explorer"), None);
+        assert_eq!(agent_from_process_name("myclaude"), None);
+        assert_eq!(agent_from_process_name("anti-claude"), None);
+        assert_eq!(agent_from_process_name("aider-helper"), None);
+        assert_eq!(agent_from_process_name("myproject-continue"), None);
+        assert_eq!(agent_from_process_name("continue-on-error"), None);
+        assert_eq!(agent_from_process_name("cursor-ext"), None);
+        assert_eq!(agent_from_process_name("xcursor"), None);
+        assert_eq!(agent_from_process_name("codex-runner"), None);
+        assert_eq!(agent_from_process_name("gemini-tools"), None);
+        assert_eq!(agent_from_process_name("copilot-stub"), None);
+        assert_eq!(agent_from_process_name("augment-helpers"), None);
+    }
+
+    #[test]
+    fn test_agent_from_process_name_accepts_known_aliases() {
+        // Hyphenated and underscored aliases for the same agent.
+        assert_eq!(
+            agent_from_process_name("claude_code"),
+            Some(Agent::ClaudeCode)
+        );
+        assert_eq!(
+            agent_from_process_name("claude-code"),
+            Some(Agent::ClaudeCode)
+        );
+        assert_eq!(agent_from_process_name("codex-cli"), Some(Agent::CodexCli));
+        assert_eq!(
+            agent_from_process_name("gemini-cli"),
+            Some(Agent::GeminiCli)
+        );
+        assert_eq!(
+            agent_from_process_name("gh-copilot"),
+            Some(Agent::CopilotCli)
+        );
+        assert_eq!(
+            agent_from_process_name("cursor-ide"),
+            Some(Agent::CursorIde)
+        );
+        assert_eq!(
+            agent_from_process_name("continue-cli"),
+            Some(Agent::Continue)
+        );
+    }
+
+    #[test]
+    fn test_agent_from_process_name_each_argv_token_checked() {
+        // Wrapper invocations: tokenize argv, basename each token, exact match.
+        assert_eq!(
+            agent_from_process_name("node /usr/local/bin/codex --foo"),
+            Some(Agent::CodexCli)
+        );
+        // First-token wins on ties.
+        assert_eq!(
+            agent_from_process_name("/opt/codex /opt/cursor"),
+            Some(Agent::CodexCli)
+        );
     }
 
     #[test]

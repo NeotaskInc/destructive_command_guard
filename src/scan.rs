@@ -256,6 +256,18 @@ pub struct ScanSeverityCounts {
 pub struct ScanSummary {
     pub files_scanned: usize,
     pub files_skipped: usize,
+    /// Per-entry skip detail. Lets operators distinguish "I configured
+    /// max-file-size too low" from "this file isn't a script" from "the
+    /// path I passed doesn't exist". `files_skipped` is the authoritative
+    /// total — `skipped.len()` may be smaller if entries are dropped to
+    /// keep output bounded (currently no truncation is applied).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<SkippedEntry>,
+    /// Top-level scan target paths that did not exist or were unreadable.
+    /// CI integrations should fail loudly when this is non-empty rather
+    /// than silently passing on misconfigured paths.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths_skipped: Vec<SkippedEntry>,
     pub commands_extracted: usize,
     pub findings_total: usize,
     pub decisions: ScanDecisionCounts,
@@ -263,6 +275,38 @@ pub struct ScanSummary {
     pub max_findings_reached: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<u64>,
+}
+
+/// One file or top-level path that was skipped during scanning, with the
+/// reason it was skipped. The `reason` field is a stable lower-snake-case
+/// label so JSON consumers can branch on it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkippedEntry {
+    pub path: String,
+    pub reason: SkipReason,
+}
+
+/// Why a file or path was skipped during scanning. Serialized as
+/// lower-snake-case strings for JSON stability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    /// User-supplied target path could not be read (does not exist,
+    /// permission denied, broken symlink, etc.). Surfaced via
+    /// `ScanSummary::paths_skipped` so misconfigured CI invocations don't
+    /// silently exit zero with `files_scanned=0`.
+    PathNotFound,
+    /// `std::fs::metadata` failed for an enumerated file (race or
+    /// permission change between enumeration and stat).
+    MetadataError,
+    /// Path exists but is not a regular file (directory, fifo, etc.).
+    NotARegularFile,
+    /// File size exceeds `ScanOptions::max_file_size_bytes`.
+    TooLarge,
+    /// File extension / shebang did not match any recognized extractor.
+    NoExtractor,
+    /// `std::fs::read` failed (permission change, disk error).
+    ReadError,
 }
 
 /// Complete scan output (stable JSON schema).
@@ -296,6 +340,16 @@ pub struct ScanEvalContext {
     pub heredoc_settings: HeredocSettings,
 }
 
+/// Minimum heredoc-extraction timeout the scan path enforces (milliseconds).
+///
+/// The hook hot path is a per-Bash-call budget where every microsecond
+/// matters; the scan path is offline (`dcg scan .` runs once, deliberately,
+/// and doesn't gate command execution). Capping the scan timeout at the
+/// hot-path default silently dropped matches whose extraction merely brushed
+/// the budget. Floor it at 200ms so realistic embedded-script extraction
+/// completes; user config values larger than this floor still win.
+pub const SCAN_HEREDOC_MIN_TIMEOUT_MS: u64 = 200;
+
 impl ScanEvalContext {
     #[must_use]
     pub fn from_config(config: &Config) -> Self {
@@ -303,7 +357,11 @@ impl ScanEvalContext {
         let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
         let compiled_overrides = config.overrides.compile();
         let allowlists = crate::load_default_allowlists();
-        let heredoc_settings = config.heredoc_settings();
+        let mut heredoc_settings = config.heredoc_settings();
+        // Scan mode raises the extraction timeout floor — see the constant.
+        if heredoc_settings.limits.timeout_ms < SCAN_HEREDOC_MIN_TIMEOUT_MS {
+            heredoc_settings.limits.timeout_ms = SCAN_HEREDOC_MIN_TIMEOUT_MS;
+        }
 
         // Load external packs from custom_paths (glob + tilde expansion).
         let external_paths = config.packs.expand_custom_paths();
@@ -692,7 +750,20 @@ pub fn scan_paths_with_progress(
 
     let mut files: Vec<PathBuf> = Vec::new();
     let mut visited: HashSet<PathBuf> = HashSet::new();
+    let mut paths_skipped: Vec<SkippedEntry> = Vec::new();
     for path in paths {
+        // Top-level paths are user-controlled. If the user pointed at a
+        // path that doesn't exist or that we can't stat, that's almost
+        // always a misconfigured CI invocation (typo, wrong cwd, bad
+        // glob expansion). Surface it instead of silently returning
+        // `files_scanned=0`.
+        if std::fs::metadata(path).is_err() {
+            paths_skipped.push(SkippedEntry {
+                path: path.to_string_lossy().into_owned(),
+                reason: SkipReason::PathNotFound,
+            });
+            continue;
+        }
         collect_files_recursively(path, &mut files, &mut visited);
     }
 
@@ -713,7 +784,14 @@ pub fn scan_paths_with_progress(
 
     let mut files_scanned = 0usize;
     let mut files_skipped = 0usize;
+    let mut skipped: Vec<SkippedEntry> = Vec::new();
     let mut commands_extracted = 0usize;
+    let record_skip = |list: &mut Vec<SkippedEntry>, file: &Path, reason: SkipReason| {
+        list.push(SkippedEntry {
+            path: file.to_string_lossy().into_owned(),
+            reason,
+        });
+    };
     let mut findings: Vec<ScanFinding> = Vec::new();
     let mut max_findings_reached = false;
 
@@ -729,16 +807,19 @@ pub fn scan_paths_with_progress(
 
         let Ok(meta) = std::fs::metadata(file) else {
             files_skipped += 1;
+            record_skip(&mut skipped, file, SkipReason::MetadataError);
             continue;
         };
 
         if !meta.is_file() {
             files_skipped += 1;
+            record_skip(&mut skipped, file, SkipReason::NotARegularFile);
             continue;
         }
 
         if meta.len() > options.max_file_size_bytes {
             files_skipped += 1;
+            record_skip(&mut skipped, file, SkipReason::TooLarge);
             continue;
         }
 
@@ -766,11 +847,13 @@ pub fn scan_paths_with_progress(
             && !is_compose
         {
             files_skipped += 1;
+            record_skip(&mut skipped, file, SkipReason::NoExtractor);
             continue;
         }
 
         let Ok(bytes) = std::fs::read(file) else {
             files_skipped += 1;
+            record_skip(&mut skipped, file, SkipReason::ReadError);
             continue;
         };
 
@@ -880,14 +963,28 @@ pub fn scan_paths_with_progress(
     }
 
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).ok();
-    Ok(build_report(
+    let mut report = build_report(
         findings,
         files_scanned,
         files_skipped,
         commands_extracted,
         max_findings_reached,
         elapsed_ms,
-    ))
+    );
+    report.summary.skipped = skipped;
+    report.summary.paths_skipped = paths_skipped;
+    if !report.summary.paths_skipped.is_empty() {
+        // Operators (especially CI integrators) need to know if their
+        // target paths were dropped. Tracing-level WARN is appropriate:
+        // these are user-controlled inputs that didn't resolve.
+        for entry in &report.summary.paths_skipped {
+            tracing::warn!(
+                path = %entry.path,
+                "scan target path could not be read"
+            );
+        }
+    }
+    Ok(report)
 }
 fn collect_files_recursively(
     path: &PathBuf,
@@ -3483,6 +3580,12 @@ pub fn build_report(
         summary: ScanSummary {
             files_scanned,
             files_skipped,
+            // Per-file skip detail and top-level path-skip detail are
+            // populated by callers (e.g. `scan_paths_with_progress`)
+            // after `build_report` returns. Tests that build reports
+            // directly use the empty defaults.
+            skipped: Vec::new(),
+            paths_skipped: Vec::new(),
             commands_extracted,
             findings_total: findings.len(),
             decisions,
@@ -6316,5 +6419,136 @@ RUN echo "path\\with\\backslashes" && rm -rf /tmp"#;
         assert_eq!(extracted.len(), 2);
         assert!(extracted.iter().any(|e| e.command.contains("./build")));
         assert!(extracted.iter().any(|e| e.command.contains("./dist")));
+    }
+
+    // ========================================================================
+    // Skip-detail tests (git_safety_guard-jvkm + -eug4)
+    // ========================================================================
+
+    fn scan_options_with_max_size(max_file_size_bytes: u64) -> ScanOptions {
+        ScanOptions {
+            format: ScanFormat::Json,
+            fail_on: ScanFailOn::Error,
+            max_file_size_bytes,
+            max_findings: 1000,
+            redact: ScanRedactMode::None,
+            truncate: 0,
+        }
+    }
+
+    #[test]
+    fn scan_paths_records_path_not_found_for_missing_target() {
+        // CI integrators pointing at a wrong path used to silently get
+        // files_scanned=0 / files_skipped=0 with no signal. Now they
+        // get a populated `paths_skipped[]` entry to gate on.
+        let cfg = default_config();
+        let ctx = ScanEvalContext::from_config(&cfg);
+        let opts = scan_options_with_max_size(1_000_000);
+        let target =
+            std::env::temp_dir().join(format!("dcg-scan-missing-{}-{}", std::process::id(), 42));
+        let report = scan_paths(
+            std::slice::from_ref(&target),
+            &opts,
+            &cfg,
+            &ctx,
+            &[],
+            &[],
+            None,
+        )
+        .expect("scan_paths");
+        assert_eq!(report.summary.files_scanned, 0);
+        assert_eq!(report.summary.files_skipped, 0);
+        assert_eq!(report.summary.paths_skipped.len(), 1);
+        let entry = &report.summary.paths_skipped[0];
+        assert_eq!(entry.reason, SkipReason::PathNotFound);
+        assert_eq!(entry.path, target.to_string_lossy());
+    }
+
+    #[test]
+    fn scan_paths_records_no_extractor_for_unknown_extension() {
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().expect("tempdir");
+        let unknown = temp.path().join("notes.txt");
+        let mut f = std::fs::File::create(&unknown).unwrap();
+        writeln!(f, "rm -rf /etc").unwrap();
+
+        let cfg = default_config();
+        let ctx = ScanEvalContext::from_config(&cfg);
+        let opts = scan_options_with_max_size(1_000_000);
+        let report = scan_paths(
+            std::slice::from_ref(&unknown),
+            &opts,
+            &cfg,
+            &ctx,
+            &[],
+            &[],
+            None,
+        )
+        .expect("scan_paths");
+        assert_eq!(report.summary.files_scanned, 0);
+        assert_eq!(report.summary.files_skipped, 1);
+        assert_eq!(report.summary.skipped.len(), 1);
+        assert_eq!(report.summary.skipped[0].reason, SkipReason::NoExtractor);
+        assert_eq!(report.summary.paths_skipped.len(), 0);
+    }
+
+    #[test]
+    fn scan_eval_context_floors_heredoc_timeout_to_scan_minimum() {
+        // git_safety_guard-s67a — scan mode must not inherit the hot-path
+        // sub-millisecond timeout. ScanEvalContext::from_config raises any
+        // configured timeout below SCAN_HEREDOC_MIN_TIMEOUT_MS.
+        let mut cfg = default_config();
+        cfg.heredoc.timeout_ms = Some(1);
+        let ctx = ScanEvalContext::from_config(&cfg);
+        assert_eq!(
+            ctx.heredoc_settings.limits.timeout_ms, SCAN_HEREDOC_MIN_TIMEOUT_MS,
+            "scan timeout floor must override sub-floor user setting"
+        );
+    }
+
+    #[test]
+    fn scan_eval_context_preserves_user_timeout_above_floor() {
+        let mut cfg = default_config();
+        cfg.heredoc.timeout_ms = Some(SCAN_HEREDOC_MIN_TIMEOUT_MS * 5);
+        let ctx = ScanEvalContext::from_config(&cfg);
+        assert_eq!(
+            ctx.heredoc_settings.limits.timeout_ms,
+            SCAN_HEREDOC_MIN_TIMEOUT_MS * 5,
+            "user-configured timeout above the floor must be honored"
+        );
+    }
+
+    #[test]
+    fn scan_paths_records_too_large_when_file_exceeds_limit() {
+        use std::io::Write;
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().expect("tempdir");
+        let big = temp.path().join("big.sh");
+        let mut f = std::fs::File::create(&big).unwrap();
+        // 4KB of payload — comfortably above the 1KB cap below.
+        for _ in 0..400 {
+            writeln!(f, "echo padding line").unwrap();
+        }
+
+        let cfg = default_config();
+        let ctx = ScanEvalContext::from_config(&cfg);
+        let opts = scan_options_with_max_size(1024);
+        let report = scan_paths(
+            std::slice::from_ref(&big),
+            &opts,
+            &cfg,
+            &ctx,
+            &[],
+            &[],
+            None,
+        )
+        .expect("scan_paths");
+        assert_eq!(report.summary.files_scanned, 0);
+        assert_eq!(report.summary.files_skipped, 1);
+        assert_eq!(report.summary.skipped.len(), 1);
+        assert_eq!(report.summary.skipped[0].reason, SkipReason::TooLarge);
     }
 }

@@ -21,6 +21,7 @@ use colored::Colorize;
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::fmt::Write as FmtWrite;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::sync::mpsc;
 use std::thread;
@@ -479,6 +480,96 @@ pub fn run_interactive_prompt(
     }
 }
 
+/// Sanitize an attacker-controlled string for safe display in the interactive
+/// prompt.
+///
+/// The blocked command and the rule-supplied reason both flow through here
+/// before any styling is applied. A malicious command can contain CSI/OSC/SGR
+/// sequences (which can fake the prompt boundary, change the terminal title,
+/// or recolor the page) or raw C0 control bytes like `\r` and `\x07` (which
+/// can rewrite the visible prompt or beep the terminal). Either could mislead
+/// the human verifier — the entire value of the interactive prompt is that
+/// the human reads exactly what the agent tried to run.
+///
+/// Output rules:
+/// - CSI (`ESC [ ...` final byte `0x40..=0x7E`) sequences are dropped.
+/// - OSC (`ESC ] ...` terminated by `BEL` or `ESC \\`) sequences are dropped.
+/// - Any other 2-byte `ESC <X>` sequence is dropped.
+/// - Remaining C0 control bytes (`0x00..=0x1F`), DEL (`0x7F`), and C1 control
+///   bytes (`0x80..=0x9F`) are rendered as their visible escape form
+///   (`\\n`, `\\r`, `\\t`, `\\xNN`) so the user can still see the original
+///   bytes without the terminal acting on them.
+fn sanitize_for_display(input: &str) -> String {
+    #[derive(Copy, Clone)]
+    enum State {
+        Normal,
+        EscOpen,
+        Csi,
+        Osc,
+        OscWantSt,
+    }
+
+    let mut out = String::with_capacity(input.len());
+    let mut state = State::Normal;
+
+    let push_visible_control = |out: &mut String, c: char| match c {
+        '\n' => out.push_str("\\n"),
+        '\r' => out.push_str("\\r"),
+        '\t' => out.push_str("\\t"),
+        _ => {
+            let cp = c as u32;
+            if cp <= 0xFF {
+                let _ = write!(out, "\\x{cp:02X}");
+            } else {
+                let _ = write!(out, "\\u{{{cp:04X}}}");
+            }
+        }
+    };
+
+    for c in input.chars() {
+        match state {
+            State::Normal => {
+                if c == '\x1b' {
+                    state = State::EscOpen;
+                } else if (c as u32) <= 0x1F || c == '\x7f' || (0x80..=0x9F).contains(&(c as u32)) {
+                    push_visible_control(&mut out, c);
+                } else {
+                    out.push(c);
+                }
+            }
+            State::EscOpen => {
+                state = match c {
+                    '[' => State::Csi,
+                    ']' => State::Osc,
+                    _ => State::Normal,
+                };
+            }
+            State::Csi => {
+                let cp = c as u32;
+                if (0x40..=0x7E).contains(&cp) {
+                    state = State::Normal;
+                }
+            }
+            State::Osc => {
+                if c == '\x07' {
+                    state = State::Normal;
+                } else if c == '\x1b' {
+                    state = State::OscWantSt;
+                }
+            }
+            State::OscWantSt => {
+                state = if c == '\\' {
+                    State::Normal
+                } else {
+                    State::EscOpen
+                };
+            }
+        }
+    }
+
+    out
+}
+
 /// Display the interactive prompt to stderr.
 ///
 /// Shows a formatted box with the blocked command, available options, and
@@ -492,6 +583,8 @@ fn display_prompt(
     code: Option<&str>,
     timeout: Duration,
 ) {
+    let command = sanitize_for_display(command);
+    let reason = sanitize_for_display(reason);
     let stderr = io::stderr();
     let mut handle = stderr.lock();
 
@@ -543,7 +636,7 @@ fn display_prompt(
             command.chars().take(max_cmd_len - 3).collect::<String>()
         )
     } else {
-        command.to_string()
+        command.clone()
     };
     let header = format!("{cmd_prefix}{display_cmd}");
     let header_padding = WIDTH.saturating_sub(header.chars().count());
@@ -1228,6 +1321,62 @@ mod tests {
             start.elapsed() < Duration::from_millis(150),
             "timeout should return before the blocking reader finishes"
         );
+    }
+
+    #[test]
+    fn sanitize_strips_csi_sequences() {
+        // SGR (color), erase-line, cursor position — all CSI variants must
+        // disappear without consuming surrounding text.
+        assert_eq!(sanitize_for_display("rm \x1b[31m-rf /\x1b[0m"), "rm -rf /");
+        assert_eq!(sanitize_for_display("\x1b[Kafter-erase"), "after-erase");
+        assert_eq!(sanitize_for_display("\x1b[2J\x1b[Hclear"), "clear");
+    }
+
+    #[test]
+    fn sanitize_strips_osc_sequences() {
+        // Terminal-title set (OSC 0;...BEL) — the canonical "fake the prompt"
+        // attack — must be stripped entirely.
+        assert_eq!(
+            sanitize_for_display("\x1b]0;Pwned by attacker\x07rm /etc"),
+            "rm /etc"
+        );
+        // OSC 8 hyperlink (ESC \\ terminator).
+        assert_eq!(
+            sanitize_for_display("\x1b]8;;https://evil\x1b\\click\x1b]8;;\x1b\\"),
+            "click"
+        );
+    }
+
+    #[test]
+    fn sanitize_visualizes_remaining_control_chars() {
+        // Newlines and CRs that would break the box / overwrite the prompt
+        // boundary become visible escapes.
+        assert_eq!(
+            sanitize_for_display("line1\nline2\r> fake-prompt"),
+            "line1\\nline2\\r> fake-prompt"
+        );
+        // BEL outside an OSC also gets visualized.
+        assert_eq!(sanitize_for_display("ding\x07"), "ding\\x07");
+        // DEL and other low control bytes.
+        assert_eq!(sanitize_for_display("a\x7fb"), "a\\x7Fb");
+        assert_eq!(sanitize_for_display("\x00null"), "\\x00null");
+    }
+
+    #[test]
+    fn sanitize_passes_through_normal_text_and_unicode() {
+        assert_eq!(sanitize_for_display("rm -rf /tmp/foo"), "rm -rf /tmp/foo");
+        assert_eq!(
+            sanitize_for_display("git commit -m \"naïve façade — done\""),
+            "git commit -m \"naïve façade — done\""
+        );
+    }
+
+    #[test]
+    fn sanitize_drops_two_byte_esc_sequences() {
+        // ESC = (DECPAM) and other 2-byte sequences are conservatively dropped.
+        assert_eq!(sanitize_for_display("foo\x1b=bar"), "foobar");
+        // Truncated escape at end-of-string drops cleanly.
+        assert_eq!(sanitize_for_display("foo\x1b"), "foo");
     }
 
     #[test]
