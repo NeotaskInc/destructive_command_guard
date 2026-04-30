@@ -207,6 +207,89 @@ assert commands.count(dcg_path) == 1, commands
 PY
 }
 
+@test "configure_claude_code: no-python fallback ignores dcg substrings" {
+    log_test "Testing Claude Code no-python fallback exact detection..."
+
+    CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+    mkdir -p "$HOME/.claude"
+
+    cat > "$CLAUDE_SETTINGS" << 'EOF'
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {"type": "command", "command": "/opt/dcgrep/bin/scan"}
+        ]
+      }
+    ]
+  }
+}
+EOF
+
+    local no_python_path="$TEST_TMPDIR/no-python-bin"
+    mkdir -p "$no_python_path"
+    local tool
+    for tool in dirname mkdir cp date grep rm mv cat; do
+        ln -s "$(command -v "$tool")" "$no_python_path/$tool"
+    done
+
+    local old_path="$PATH"
+    PATH="$no_python_path"
+    configure_claude_code "$CLAUDE_SETTINGS" "0"
+    local rc=$?
+    PATH="$old_path"
+
+    log_test "CLAUDE_STATUS: $CLAUDE_STATUS rc=$rc"
+    log_test "After: $(cat "$CLAUDE_SETTINGS")"
+
+    [ "$rc" -eq 1 ]
+    [ "$CLAUDE_STATUS" = "failed" ]
+    grep -qF '/opt/dcgrep/bin/scan' "$CLAUDE_SETTINGS"
+    ! grep -qF "$DEST/dcg" "$CLAUDE_SETTINGS"
+}
+
+@test "configure_claude_code: no-python fallback recognizes exact dcg hook" {
+    log_test "Testing Claude Code no-python fallback exact already-configured state..."
+
+    CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+    mkdir -p "$HOME/.claude"
+
+    cat > "$CLAUDE_SETTINGS" << EOF
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {"type": "command", "command": "$DEST/dcg"}
+        ]
+      }
+    ]
+  }
+}
+EOF
+
+    local no_python_path="$TEST_TMPDIR/no-python-bin"
+    mkdir -p "$no_python_path"
+    local tool
+    for tool in dirname mkdir cp date grep rm mv cat; do
+        ln -s "$(command -v "$tool")" "$no_python_path/$tool"
+    done
+
+    local old_path="$PATH"
+    PATH="$no_python_path"
+    configure_claude_code "$CLAUDE_SETTINGS" "0"
+    local rc=$?
+    PATH="$old_path"
+
+    log_test "CLAUDE_STATUS: $CLAUDE_STATUS rc=$rc"
+
+    [ "$rc" -eq 0 ]
+    [ "$CLAUDE_STATUS" = "already" ]
+}
+
 # ============================================================================
 # Gemini CLI Configuration Tests
 # ============================================================================

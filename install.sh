@@ -1187,9 +1187,11 @@ PYEOF
         AUTO_CONFIGURED=1
         return 0
       fi
-    elif grep -q '"command".*dcg' "$settings_file" 2>/dev/null; then
+    elif grep -qF "\"command\": \"$DEST/dcg\"" "$settings_file" 2>/dev/null; then
       # Fallback for systems without python3; the merge path below is also
-      # python-backed, so keep the historical cheap check in that environment.
+      # python-backed. Only trust the exact hook fragment written by dcg
+      # itself so unrelated commands with "dcg" in their path do not suppress
+      # installation.
       CLAUDE_STATUS="already"
       AUTO_CONFIGURED=1
       return 0
