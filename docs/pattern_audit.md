@@ -1,5 +1,5 @@
 # Pattern Audit Report
-Generated: 2026-04-30T00:25:39.284718
+Generated: 2026-04-30T17:10:51.206113
 
 ## `src/packs/apigateway/apigee.rs`
 
