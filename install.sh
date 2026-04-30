@@ -1187,14 +1187,17 @@ PYEOF
         AUTO_CONFIGURED=1
         return 0
       fi
-    elif grep -qF "\"command\": \"$DEST/dcg\"" "$settings_file" 2>/dev/null; then
+    else
       # Fallback for systems without python3; the merge path below is also
-      # python-backed. Only trust the exact hook fragment written by dcg
-      # itself so unrelated commands with "dcg" in their path do not suppress
-      # installation.
-      CLAUDE_STATUS="already"
-      AUTO_CONFIGURED=1
-      return 0
+      # python-backed. Only trust the exact hook path written by dcg itself so
+      # unrelated commands with "dcg" in their path do not suppress installation.
+      local dcg_hook_regex
+      dcg_hook_regex=$(printf '%s' "$DEST/dcg" | sed 's/[][\\.^$*+?{}()|]/\\&/g')
+      if grep -Eq "\"command\"[[:space:]]*:[[:space:]]*\"$dcg_hook_regex\"" "$settings_file" 2>/dev/null; then
+        CLAUDE_STATUS="already"
+        AUTO_CONFIGURED=1
+        return 0
+      fi
     fi
 
     # Settings file exists, need to merge

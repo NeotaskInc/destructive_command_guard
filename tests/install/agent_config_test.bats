@@ -231,7 +231,7 @@ EOF
     local no_python_path="$TEST_TMPDIR/no-python-bin"
     mkdir -p "$no_python_path"
     local tool
-    for tool in dirname mkdir cp date grep rm mv cat; do
+    for tool in dirname mkdir cp date grep sed rm mv cat; do
         ln -s "$(command -v "$tool")" "$no_python_path/$tool"
     done
 
@@ -274,7 +274,33 @@ EOF
     local no_python_path="$TEST_TMPDIR/no-python-bin"
     mkdir -p "$no_python_path"
     local tool
-    for tool in dirname mkdir cp date grep rm mv cat; do
+    for tool in dirname mkdir cp date grep sed rm mv cat; do
+        ln -s "$(command -v "$tool")" "$no_python_path/$tool"
+    done
+
+    local old_path="$PATH"
+    PATH="$no_python_path"
+    configure_claude_code "$CLAUDE_SETTINGS" "0"
+    local rc=$?
+    PATH="$old_path"
+
+    log_test "CLAUDE_STATUS: $CLAUDE_STATUS rc=$rc"
+
+    [ "$rc" -eq 0 ]
+    [ "$CLAUDE_STATUS" = "already" ]
+}
+
+@test "configure_claude_code: no-python fallback recognizes minified dcg hook" {
+    log_test "Testing Claude Code no-python fallback with minified JSON..."
+
+    CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+    mkdir -p "$HOME/.claude"
+    printf '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"%s"}]}]}}\n' "$DEST/dcg" > "$CLAUDE_SETTINGS"
+
+    local no_python_path="$TEST_TMPDIR/no-python-bin"
+    mkdir -p "$no_python_path"
+    local tool
+    for tool in dirname mkdir cp date grep sed rm mv cat; do
         ln -s "$(command -v "$tool")" "$no_python_path/$tool"
     done
 
