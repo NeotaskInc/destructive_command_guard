@@ -1947,39 +1947,37 @@ fn evaluate_packs_with_allowlists(
                     );
                 }
             }
-        } else {
-            if has_compound_segments {
-                for &(segment_start, segment_end) in &segment_ranges {
-                    if deadline_exceeded(deadline)
-                        || remaining_below(deadline, &crate::perf::PATTERN_MATCH)
-                    {
-                        return EvaluationResult::allowed_due_to_budget();
-                    }
-
-                    let segment = &command_for_packs[segment_start..segment_end];
-                    if pack.matches_safe_with_deadline(segment, deadline) {
-                        continue;
-                    }
-
-                    if let Some(result) = evaluate_pack_destructive_patterns(
-                        pack_id,
-                        pack,
-                        segment,
-                        segment_start,
-                        original_command,
-                        normalized_offset,
-                        original_len,
-                        allowlists,
-                        project_path,
-                        &mut first_allowlist_hit,
-                        deadline,
-                    ) {
-                        return result;
-                    }
+        } else if has_compound_segments {
+            for &(segment_start, segment_end) in &segment_ranges {
+                if deadline_exceeded(deadline)
+                    || remaining_below(deadline, &crate::perf::PATTERN_MATCH)
+                {
+                    return EvaluationResult::allowed_due_to_budget();
                 }
-            } else if pack.matches_safe_with_deadline(command_for_packs, deadline) {
-                continue; // Safe pattern match - skip this pack's destructive patterns
+
+                let segment = &command_for_packs[segment_start..segment_end];
+                if pack.matches_safe_with_deadline(segment, deadline) {
+                    continue;
+                }
+
+                if let Some(result) = evaluate_pack_destructive_patterns(
+                    pack_id,
+                    pack,
+                    segment,
+                    segment_start,
+                    original_command,
+                    normalized_offset,
+                    original_len,
+                    allowlists,
+                    project_path,
+                    &mut first_allowlist_hit,
+                    deadline,
+                ) {
+                    return result;
+                }
             }
+        } else if pack.matches_safe_with_deadline(command_for_packs, deadline) {
+            continue; // Safe pattern match - skip this pack's destructive patterns
         }
 
         for pattern in &pack.destructive_patterns {
@@ -2121,10 +2119,13 @@ fn evaluate_pack_destructive_patterns(
             return Some(EvaluationResult::allowed_due_to_budget());
         }
 
-        let matched_span = pattern.regex.find(command_slice).map(|(start, end)| MatchSpan {
-            start: start + slice_offset,
-            end: end + slice_offset,
-        });
+        let matched_span = pattern
+            .regex
+            .find(command_slice)
+            .map(|(start, end)| MatchSpan {
+                start: start + slice_offset,
+                end: end + slice_offset,
+            });
 
         if deadline_exceeded(deadline) {
             return Some(EvaluationResult::allowed_due_to_budget());
@@ -3223,7 +3224,9 @@ mod tests {
         );
 
         assert!(result.is_denied(), "Railway volume delete must be blocked");
-        let info = result.pattern_info.expect("denial should include pattern info");
+        let info = result
+            .pattern_info
+            .expect("denial should include pattern info");
         assert_eq!(info.pack_id.as_deref(), Some("platform.railway"));
         assert_eq!(info.pattern_name.as_deref(), Some("railway-volume-delete"));
     }
@@ -3239,7 +3242,9 @@ mod tests {
             result.is_denied(),
             "Railway volume delete must be blocked before a safe segment"
         );
-        let info = result.pattern_info.expect("denial should include pattern info");
+        let info = result
+            .pattern_info
+            .expect("denial should include pattern info");
         assert_eq!(info.pack_id.as_deref(), Some("platform.railway"));
         assert_eq!(info.pattern_name.as_deref(), Some("railway-volume-delete"));
     }
@@ -3251,7 +3256,10 @@ mod tests {
             &["platform.railway"],
         );
 
-        assert!(result.is_allowed(), "read-only Railway segments should pass");
+        assert!(
+            result.is_allowed(),
+            "read-only Railway segments should pass"
+        );
     }
 
     #[test]
