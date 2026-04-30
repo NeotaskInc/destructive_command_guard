@@ -50,12 +50,12 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
-| `drop-database` | DROP DATABASE permanently deletes the entire database (even with IF EXISTS). Verify and back up first. | high |
+| `drop-database` | DROP DATABASE permanently deletes the entire database (even with IF EXISTS). Verify and back up first. | critical |
 | `drop-table` | DROP TABLE permanently deletes the table (even with IF EXISTS). Verify and back up first. | high |
-| `drop-schema` | DROP SCHEMA permanently deletes the schema and all its objects (even with IF EXISTS). | high |
+| `drop-schema` | DROP SCHEMA permanently deletes the schema and all its objects (even with IF EXISTS). | critical |
 | `truncate-table` | TRUNCATE permanently deletes all rows without logging individual deletions. | high |
 | `delete-without-where` | DELETE without WHERE clause deletes ALL rows. Add a WHERE clause or use TRUNCATE intentionally. | high |
-| `dropdb-cli` | dropdb permanently deletes the entire database. Verify the database name carefully. | high |
+| `dropdb-cli` | dropdb permanently deletes the entire database. Verify the database name carefully. | critical |
 | `pg-dump-clean` | pg_dump --clean drops objects before creating them. This can be destructive on restore. | high |
 
 ### Allowlist Guidance
@@ -83,14 +83,52 @@ risk_acknowledged = true
 
 **Pack ID:** `database.mysql`
 
-MySQL/MariaDB guard
+Protects against destructive MySQL/MariaDB operations like DROP DATABASE, TRUNCATE, and mysqladmin drop
 
 ### Keywords
 
 Commands containing these keywords are checked against this pack:
 
 - `mysql`
+- `mysqladmin`
+- `mysqldump`
+- `mariadb`
 - `DROP`
+- `TRUNCATE`
+- `DELETE`
+- `delete`
+- `drop`
+- `truncate`
+- `GRANT`
+
+### Safe Patterns (Allowed)
+
+These patterns match safe commands that are always allowed:
+
+| Pattern Name | Pattern |
+|--------------|----------|
+| `select-query` | `(?i)^\s*SELECT\s+` |
+| `show-command` | `(?i)^\s*SHOW\s+` |
+| `describe-query` | `(?i)^\s*(?:DESCRIBE\|DESC\|EXPLAIN)\s+` |
+| `mysqldump-no-drop` | `mysqldump\s+(?!.*--add-drop-database)(?!.*--add-drop-table)` |
+| `mysql-select` | `mysql\s+.*(?:-e\|--execute)\s*['"]?\s*SELECT` |
+
+### Destructive Patterns (Blocked)
+
+These patterns match potentially destructive commands:
+
+| Pattern Name | Reason | Severity |
+|--------------|--------|----------|
+| `drop-database` | DROP DATABASE permanently deletes the entire database. Verify and back up first. | critical |
+| `drop-table` | DROP TABLE permanently deletes the table. Verify and back up first. | high |
+| `truncate-table` | TRUNCATE permanently deletes all rows. Cannot be rolled back in MySQL. | high |
+| `delete-without-where` | DELETE without WHERE clause deletes ALL rows. Add a WHERE clause. | high |
+| `mysqladmin-drop` | mysqladmin drop permanently deletes the database. Verify carefully. | critical |
+| `mysqldump-add-drop-database` | mysqldump --add-drop-database drops the database before restore. | high |
+| `mysqldump-add-drop-table` | mysqldump --add-drop-table drops tables before creating them on restore. | medium |
+| `grant-all` | GRANT ALL ON *.* gives unrestricted access to all databases. | high |
+| `drop-user` | DROP USER permanently removes the user account and all their privileges. | medium |
+| `reset-master` | RESET MASTER deletes all binary logs and resets the binlog position. | critical |
 
 ### Allowlist Guidance
 
@@ -128,6 +166,11 @@ Commands containing these keywords are checked against this pack:
 - `dropDatabase`
 - `dropCollection`
 - `deleteMany`
+- `.drop(`
+- `.remove(`
+- `.deleteMany(`
+- `mongorestore`
+- `mongodump`
 
 ### Safe Patterns (Allowed)
 
@@ -135,11 +178,11 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `mongo-find` | `\.find\s*\(` |
-| `mongo-count` | `\.count(?:Documents)?\s*\(` |
-| `mongo-aggregate` | `\.aggregate\s*\(` |
+| `mongo-find` | `^(?!.*(?:dropDatabase\|dropCollection\|\.drop\s*\(\|\.(?:remove\|deleteMany)\s*\(\s*\{\s*\}\s*\)\|mongorestore\s+.*--drop)).*\.find\s*\(` |
+| `mongo-count` | `^(?!.*(?:dropDatabase\|dropCollection\|\.drop\s*\(\|\.(?:remove\|deleteMany)\s*\(\s*\{\s*\}\s*\)\|mongorestore\s+.*--drop)).*\.count(?:Documents)?\s*\(` |
+| `mongo-aggregate` | `^(?!.*(?:dropDatabase\|dropCollection\|\.drop\s*\(\|\.(?:remove\|deleteMany)\s*\(\s*\{\s*\}\s*\)\|mongorestore\s+.*--drop)).*\.aggregate\s*\(` |
 | `mongodump-no-drop` | `mongodump\s+(?!.*--drop)` |
-| `mongo-explain` | `\.explain\s*\(` |
+| `mongo-explain` | `^(?!.*(?:dropDatabase\|dropCollection\|\.drop\s*\(\|\.(?:remove\|deleteMany)\s*\(\s*\{\s*\}\s*\)\|mongorestore\s+.*--drop)).*\.explain\s*\(` |
 
 ### Destructive Patterns (Blocked)
 
@@ -147,7 +190,7 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
-| `drop-database` | dropDatabase permanently deletes the entire database. | high |
+| `drop-database` | dropDatabase permanently deletes the entire database. | critical |
 | `drop-collection` | drop/dropCollection permanently deletes the collection. | high |
 | `delete-all` | remove({}) or deleteMany({}) deletes ALL documents. Add filter criteria. | high |
 | `mongorestore-drop` | mongorestore --drop deletes existing data before restoring. | high |
@@ -195,11 +238,12 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `redis-get` | `(?i)\b(?:GET\|MGET)\b` |
-| `redis-scan` | `(?i)\bSCAN\b` |
-| `redis-info` | `(?i)\bINFO\b` |
-| `redis-keys` | `(?i)\bKEYS\b` |
-| `redis-dbsize` | `(?i)\bDBSIZE\b` |
+| `redis-get` | `(?i)^(?!.*\b(?:FLUSHALL\|FLUSHDB\|DEBUG\|SHUTDOWN\|CONFIG\s+(?:SET\|REWRITE))\b).*\b(?:GET\|MGET)\b` |
+| `redis-scan` | `(?i)^(?!.*\b(?:FLUSHALL\|FLUSHDB\|DEBUG\|SHUTDOWN\|CONFIG\s+(?:SET\|REWRITE))\b).*\bSCAN\b` |
+| `redis-info` | `(?i)^(?!.*\b(?:FLUSHALL\|FLUSHDB\|DEBUG\|SHUTDOWN\|CONFIG\s+(?:SET\|REWRITE))\b).*\bINFO\b` |
+| `redis-keys` | `(?i)^(?!.*\b(?:FLUSHALL\|FLUSHDB\|DEBUG\|SHUTDOWN\|CONFIG\s+(?:SET\|REWRITE))\b).*\bKEYS\b` |
+| `redis-dbsize` | `(?i)^(?!.*\b(?:FLUSHALL\|FLUSHDB\|DEBUG\|SHUTDOWN\|CONFIG\s+(?:SET\|REWRITE))\b).*\bDBSIZE\b` |
+| `redis-config-get` | `(?i)^(?!.*\b(?:FLUSHALL\|FLUSHDB\|DEBUG\|SHUTDOWN\|CONFIG\s+(?:SET\|REWRITE))\b).*\bCONFIG\s+GET\b` |
 
 ### Destructive Patterns (Blocked)
 
@@ -207,12 +251,17 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
-| `flushall` | FLUSHALL permanently deletes ALL keys in ALL databases. | high |
+| `flushall` | FLUSHALL permanently deletes ALL keys in ALL databases. | critical |
 | `flushdb` | FLUSHDB permanently deletes ALL keys in the current database. | high |
-| `debug-crash` | DEBUG SEGFAULT/CRASH will crash the Redis server. | high |
+| `debug-crash` | DEBUG SEGFAULT/CRASH will crash the Redis server. | critical |
 | `debug-sleep` | DEBUG SLEEP blocks the Redis server and can cause availability issues. | high |
-| `shutdown` | SHUTDOWN stops the Redis server. Use carefully. | high |
-| `config-dangerous` | CONFIG SET for dir/dbfilename/slaveof can be used for security attacks. | high |
+| `shutdown` | SHUTDOWN stops the Redis server. SHUTDOWN NOSAVE risks data loss. | high |
+| `config-dangerous` | CONFIG SET for dir/dbfilename/slaveof can be used for security attacks. | critical |
+| `config-set-maxmemory` | CONFIG SET maxmemory can trigger immediate mass key eviction if new limit is below current usage. | critical |
+| `config-set-maxmemory-policy` | CONFIG SET maxmemory-policy changes how Redis evicts keys, risking silent data loss. | critical |
+| `config-set-save` | CONFIG SET save can disable RDB persistence entirely, risking data loss on restart. | high |
+| `config-set-appendonly` | CONFIG SET appendonly can disable AOF persistence, risking data loss on restart. | high |
+| `config-rewrite` | CONFIG REWRITE persists all runtime CONFIG SET changes to redis.conf permanently. | high |
 
 ### Allowlist Guidance
 
@@ -258,10 +307,8 @@ These patterns match safe commands that are always allowed:
 | Pattern Name | Pattern |
 |--------------|----------|
 | `select-query` | `(?i)^\s*SELECT\s+` |
-| `dot-schema` | `\.schema` |
-| `dot-tables` | `\.tables` |
-| `dot-dump` | `\.dump` |
-| `dot-backup` | `\.backup` |
+| `sqlite3-dot-command` | `sqlite3\b[^\|;&]*['"]\s*\.(?:schema\|tables\|dump\|backup\|help)\b[^'"]*['"]?\s*$` |
+| `dot-command-standalone` | `^\s*\.(?:schema\|tables\|dump\|backup\|help)\b` |
 | `explain` | `(?i)^\s*EXPLAIN\s+` |
 
 ### Destructive Patterns (Blocked)
@@ -270,9 +317,9 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
-| `drop-table` | DROP TABLE permanently deletes the table (even with IF EXISTS). Verify it is intended. | high |
-| `delete-without-where` | DELETE without WHERE deletes ALL rows. Add a WHERE clause. | high |
-| `vacuum-into` | VACUUM INTO overwrites the target file if it exists. | high |
+| `drop-table` | DROP TABLE permanently deletes the table (even with IF EXISTS). Verify it is intended. | critical |
+| `delete-without-where` | DELETE without WHERE deletes ALL rows. Add a WHERE clause. | critical |
+| `vacuum-into` | VACUUM INTO overwrites the target file if it exists. | medium |
 | `sqlite3-stdin` | Running SQL from file could contain destructive commands. Review the file first. | high |
 
 ### Allowlist Guidance
@@ -296,7 +343,7 @@ risk_acknowledged = true
 
 ---
 
-## `database.supabase`
+## Supabase
 
 **Pack ID:** `database.supabase`
 
@@ -319,11 +366,10 @@ Commands containing these keywords are checked against this pack:
 - `orgs delete`
 - `branches delete`
 - `domains delete`
-- `vanity-subdomains`
+- `vanity-subdomains delete`
 - `sso remove`
 - `network-restrictions`
 - `config push`
-- `stop --no-backup`
 
 ### Safe Patterns (Allowed)
 
@@ -331,41 +377,41 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `supabase-db-diff` | `supabase\s+db\s+diff` |
-| `supabase-db-lint` | `supabase\s+db\s+lint` |
-| `supabase-db-dump` | `supabase\s+db\s+dump` |
-| `supabase-db-shell-safe` | `(?i)supabase\s+db\s+shell\s*$` |
-| `supabase-inspect-db` | `supabase\s+inspect\s+db` |
-| `supabase-status` | `supabase\s+status` |
-| `supabase-start` | `supabase\s+start` |
-| `supabase-services` | `supabase\s+services` |
-| `supabase-gen-types` | `supabase\s+gen\s+types` |
-| `supabase-test-db` | `supabase\s+test\s+db` |
-| `supabase-migration-list` | `supabase\s+migration\s+list` |
-| `supabase-migration-new` | `supabase\s+migration\s+new` |
-| `supabase-migration-fetch` | `supabase\s+migration\s+fetch` |
-| `supabase-db-push-dry-run` | `supabase\s+db\s+push\b.*--dry-run` |
-| `supabase-functions-list` | `supabase\s+functions\s+list` |
-| `supabase-functions-serve` | `supabase\s+functions\s+serve` |
-| `supabase-functions-download` | `supabase\s+functions\s+download` |
-| `supabase-functions-new` | `supabase\s+functions\s+new` |
-| `supabase-secrets-list` | `supabase\s+secrets\s+list` |
-| `supabase-storage-ls` | `supabase\s+storage\s+ls` |
-| `supabase-projects-list` | `supabase\s+projects\s+list` |
-| `supabase-orgs-list` | `supabase\s+orgs\s+list` |
-| `supabase-branches-list` | `supabase\s+branches\s+list` |
-| `supabase-branches-get` | `supabase\s+branches\s+get` |
-| `supabase-domains-get` | `supabase\s+domains\s+get` |
-| `supabase-domains-reverify` | `supabase\s+domains\s+reverify` |
-| `supabase-vanity-subdomains-get` | `supabase\s+vanity-subdomains\s+get` |
-| `supabase-vanity-subdomains-check` | `supabase\s+vanity-subdomains\s+check-availability` |
-| `supabase-sso-list` | `supabase\s+sso\s+list` |
-| `supabase-sso-show` | `supabase\s+sso\s+show` |
-| `supabase-sso-info` | `supabase\s+sso\s+info` |
-| `supabase-network-restrictions-get` | `supabase\s+network-restrictions\s+get` |
-| `supabase-network-bans-get` | `supabase\s+network-bans\s+get` |
-| `supabase-ssl-enforcement-get` | `supabase\s+ssl-enforcement\s+get` |
-| `supabase-postgres-config-get` | `supabase\s+postgres-config\s+get` |
+| `supabase-db-diff` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+db\s+diff` |
+| `supabase-db-lint` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+db\s+lint` |
+| `supabase-db-dump` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+db\s+dump` |
+| `supabase-db-shell-safe` | `(?i)supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+db\s+shell\s*$` |
+| `supabase-inspect-db` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+inspect\s+db` |
+| `supabase-status` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+status` |
+| `supabase-start` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+start` |
+| `supabase-services` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+services` |
+| `supabase-gen-types` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+gen\s+types` |
+| `supabase-test-db` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+test\s+db` |
+| `supabase-migration-list` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+migration\s+list` |
+| `supabase-migration-new` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+migration\s+new` |
+| `supabase-migration-fetch` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+migration\s+fetch` |
+| `supabase-db-push-dry-run` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+db\s+push\b.*--dry-run` |
+| `supabase-functions-list` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+functions\s+list` |
+| `supabase-functions-serve` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+functions\s+serve` |
+| `supabase-functions-download` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+functions\s+download` |
+| `supabase-functions-new` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+functions\s+new` |
+| `supabase-secrets-list` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+secrets\s+list` |
+| `supabase-storage-ls` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+storage\s+ls` |
+| `supabase-projects-list` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+projects\s+list` |
+| `supabase-orgs-list` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+orgs\s+list` |
+| `supabase-branches-list` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+branches\s+list` |
+| `supabase-branches-get` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+branches\s+get` |
+| `supabase-domains-get` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+domains\s+get` |
+| `supabase-domains-reverify` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+domains\s+reverify` |
+| `supabase-vanity-subdomains-get` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+vanity-subdomains\s+get` |
+| `supabase-vanity-subdomains-check` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+vanity-subdomains\s+check-availability` |
+| `supabase-sso-list` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+sso\s+list` |
+| `supabase-sso-show` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+sso\s+show` |
+| `supabase-sso-info` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+sso\s+info` |
+| `supabase-network-restrictions-get` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+network-restrictions\s+get` |
+| `supabase-network-bans-get` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+network-bans\s+get` |
+| `supabase-ssl-enforcement-get` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+ssl-enforcement\s+get` |
+| `supabase-postgres-config-get` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+postgres-config\s+get` |
 
 ### Destructive Patterns (Blocked)
 

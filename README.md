@@ -38,7 +38,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/destructive_comm
 | Feature | What It Does |
 |---------|--------------|
 | **Zero-Config Protection** | Blocks dangerous git/filesystem commands out of the box |
-| **49+ Security Packs** | Databases, Kubernetes, Docker, AWS/GCP/Azure, Terraform, and more |
+| **50+ Security Packs** | Databases, Kubernetes, Docker, AWS/GCP/Azure, Terraform, and more |
 | **Sub-Millisecond Latency** | SIMD-accelerated filtering—you won't notice it's there |
 | **Heredoc/Inline Script Scanning** | Catches `python -c "os.remove(...)"` and embedded shell scripts |
 | **Smart Context Detection** | Won't block `grep "rm -rf"` (data) but will block `rm -rf /` (execution) |
@@ -117,7 +117,7 @@ trust levels, and configuration options.
 
 This project began as a Python script by Jeffrey Emanuel, who recognized that AI coding agents, while incredibly useful, occasionally run catastrophic commands that destroy hours of uncommitted work. The original implementation was a simple but effective hook that intercepted dangerous git and filesystem commands before execution.
 
-- **[Jeffrey Emanuel](https://github.com/Dicklesworthstone)** - Original concept and Python implementation ([source](https://github.com/Dicklesworthstone/misc_coding_agent_tips_and_scripts/blob/main/DESTRUCTIVE_GIT_COMMAND_CLAUDE_HOOKS_SETUP.md)); substantially expanded the Rust version with the modular pack system (49+ security packs), heredoc/inline-script scanning, the three-tier architecture, context classification, allowlists, scan mode, and the dual regex engine
+- **[Jeffrey Emanuel](https://github.com/Dicklesworthstone)** - Original concept and Python implementation ([source](https://github.com/Dicklesworthstone/misc_coding_agent_tips_and_scripts/blob/main/DESTRUCTIVE_GIT_COMMAND_CLAUDE_HOOKS_SETUP.md)); substantially expanded the Rust version with the modular pack system (50+ security packs), heredoc/inline-script scanning, the three-tier architecture, context classification, allowlists, scan mode, and the dual regex engine
 - **[Darin Gordon](https://github.com/Dowwie)** - Initial Rust port with performance optimizations
 
 The initial Rust port by Darin maintained pattern compatibility with the original Python implementation while adding sub-millisecond execution through SIMD-accelerated filtering and lazy-compiled regex patterns. Jeffrey subsequently expanded the Rust codebase dramatically to add the features described above.
@@ -219,6 +219,7 @@ dcg uses a modular "pack" system to organize destructive command patterns by cat
 ### Platform Packs
 - `platform.github` - Protects against destructive GitHub CLI operations like deleting repositories, gists, releases, or SSH keys.
 - `platform.gitlab` - Protects against destructive GitLab platform operations like deleting projects, releases, protected branches, and webhooks.
+- `platform.railway` - Protects against destructive Railway CLI and Public API operations that can delete projects, environments, services, volumes, variables, or deployments.
 
 ### DNS Packs
 - `dns.cloudflare` - Protects against destructive Cloudflare DNS operations like record deletion, zone deletion, and targeted Terraform destroy.
@@ -315,6 +316,7 @@ enabled = [
 
     # Platform
     "platform.github",
+    "platform.railway",
 
     # Monitoring
     "monitoring.splunk",
@@ -493,7 +495,7 @@ Environment variables override config files (highest priority):
 - `DCG_COLOR=auto|always|never`: color mode
 - `DCG_NO_RICH=1`: disable rich terminal formatting and use plain rendering
 - `DCG_NO_COLOR=1`: disable colored output (same as NO_COLOR)
-- `DCG_LEGACY_OUTPUT=1`: force legacy/plain output paths (same as `--legacy-output`)
+- `DCG_LEGACY_OUTPUT=1`: force plain output paths (same as `--legacy-output`)
 - `DCG_ROBOT=1`: enable robot mode for JSON stdout and quiet stderr
 - `DCG_HIGH_CONTRAST=1`: enable high-contrast output (ASCII borders + monochrome palette)
 - `DCG_FORMAT=text|json|sarif`: default output format (command-specific; SARIF applies to `dcg scan`)
@@ -963,19 +965,19 @@ Sometimes you need to run a blocked command temporarily without permanently modi
 ```bash
 # When a command is blocked, dcg outputs a short code
 # BLOCKED: git reset --hard HEAD
-# Allow-once code: ab12
-# To allow this: dcg allow-once ab12
+# Allow-once code: 123456
+# To allow this: dcg allow-once 123456
 
 # Use the short code to create a temporary exception
-dcg allow-once ab12
+dcg allow-once 123456
 
 # Or, use --single-use to make the exception one-shot
-dcg allow-once ab12 --single-use
+dcg allow-once 123456 --single-use
 ```
 
 **How Allow-Once Works**:
 
-1. When dcg blocks a command, it generates a short code (currently 4 hex chars; collisions are handled via `--pick` / `--hash`)
+1. When dcg blocks a command, it generates a short code (currently 6 numeric digits; collisions are handled via `--pick` / `--hash`)
 2. The code is tied to the exact command that was blocked
 3. Running `dcg allow-once <code>` creates a temporary exception
 4. The exception is stored in `~/.config/dcg/pending_exceptions.jsonl`
@@ -1756,7 +1758,7 @@ Evaluation Trace:
 
 ### Keyword-Based Pack Pre-filtering
 
-Before expensive regex matching, dcg uses a multi-level keyword filtering system to quickly skip irrelevant packs. This is critical for performance—with 49+ packs available, checking every pattern against every command would be prohibitively slow.
+Before expensive regex matching, dcg uses a multi-level keyword filtering system to quickly skip irrelevant packs. This is critical for performance—with 50+ packs available, checking every pattern against every command would be prohibitively slow.
 
 **How Keyword Filtering Works**:
 
@@ -1975,6 +1977,15 @@ assert exact strings:
 DCG_NO_RICH=1 dcg test "git reset --hard HEAD"
 NO_COLOR=1 dcg explain "rm -rf ./build"
 TERM=dumb dcg scan .
+```
+
+### Build Features
+
+Rich terminal output is enabled by default. For a lean build without the
+`rich_rust` dependency, compile with:
+
+```bash
+cargo build --release --no-default-features
 ```
 
 ### Agent JSON Output
@@ -2359,7 +2370,7 @@ Yes. dcg natively supports Claude Code, Gemini CLI, and GitHub Copilot CLI hook 
 
 **Q: What about database, Docker, Kubernetes, and cloud commands?**
 
-dcg includes 49+ packs covering all of these. See the [Modular Pack System](#modular-pack-system) section for the full list. Enable the packs you need in your config.
+dcg includes 50+ packs covering all of these. See the [Modular Pack System](#modular-pack-system) section for the full list. Enable the packs you need in your config.
 
 ## Contributing
 

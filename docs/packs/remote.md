@@ -98,12 +98,12 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
-| `ssh-remote-rm-rf` | SSH remote execution contains destructive rm -rf command. | high |
+| `ssh-remote-rm-rf` | SSH remote execution contains destructive rm -rf command. | critical |
 | `ssh-remote-git-reset-hard` | SSH remote execution contains destructive git reset --hard command. | high |
 | `ssh-remote-git-clean` | SSH remote execution contains destructive git clean -f command. | high |
-| `ssh-keygen-remove-host` | ssh-keygen -R removes entries from known_hosts file. | high |
-| `ssh-add-delete-all` | ssh-add -d/-D removes identities from the SSH agent. | high |
-| `ssh-remote-sudo-rm` | SSH remote execution with sudo rm is high-risk. | high |
+| `ssh-keygen-remove-host` | ssh-keygen -R removes entries from known_hosts file. | medium |
+| `ssh-add-delete-all` | ssh-add -d/-D removes identities from the SSH agent. | medium |
+| `ssh-remote-sudo-rm` | SSH remote execution with sudo rm is high-risk. | critical |
 
 ### Allowlist Guidance
 
@@ -146,9 +146,9 @@ These patterns match safe commands that are always allowed:
 |--------------|----------|
 | `scp-help` | `scp\b.*\s--?h(elp)?\b` |
 | `scp-download` | `scp\b.*\s(?:\S+@)?\S+:\S+\s+\.\S*\s*$` |
-| `scp-to-home` | `scp\b.*\s(?:(?:\S+@)?\S+:)?~/\S+\s*$` |
-| `scp-to-tmp` | `scp\b.*\s(?:(?:\S+@)?\S+:)?/tmp/\S*\s*$` |
-| `scp-to-var-tmp` | `scp\b.*\s(?:(?:\S+@)?\S+:)?/var/tmp(?:/\S*)?\s*$` |
+| `scp-to-home` | `scp\b.*\s(?:(?:\S+@)?\S+:)?~/(?!\S*\.\./)\S+\s*$` |
+| `scp-to-tmp` | `scp\b.*\s(?:(?:\S+@)?\S+:)?/tmp/(?!\S*\.\./)\S*\s*$` |
+| `scp-to-var-tmp` | `scp\b.*\s(?:(?:\S+@)?\S+:)?/var/tmp(?:/(?!\S*\.\./)\S*)?\s*$` |
 
 ### Destructive Patterns (Blocked)
 
@@ -156,13 +156,13 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
-| `scp-recursive-root` | scp -r to root (/) is extremely dangerous. | high |
+| `scp-recursive-root` | scp -r to root (/) is extremely dangerous. | critical |
 | `scp-to-etc` | scp to /etc/ can overwrite system configuration. | high |
 | `scp-to-var` | scp to /var/ can overwrite system data. | high |
-| `scp-to-boot` | scp to /boot/ can corrupt boot configuration. | high |
+| `scp-to-boot` | scp to /boot/ can corrupt boot configuration. | critical |
 | `scp-to-usr` | scp to /usr/ can overwrite system binaries. | high |
-| `scp-to-bin` | scp to /bin/ or /sbin/ can overwrite system binaries. | high |
-| `scp-to-lib` | scp to /lib/ can overwrite system libraries. | high |
+| `scp-to-bin` | scp to /bin/ or /sbin/ can overwrite system binaries. | critical |
+| `scp-to-lib` | scp to /lib/ can overwrite system libraries. | critical |
 
 ### Allowlist Guidance
 

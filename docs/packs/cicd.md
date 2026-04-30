@@ -44,11 +44,11 @@ These patterns match potentially destructive commands:
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
 | `gh-actions-secret-remove` | gh secret delete/remove deletes GitHub Actions secrets. This can break CI and may be hard to recover. | high |
-| `gh-actions-variable-remove` | gh variable delete/remove deletes GitHub Actions variables. This can break workflows. | high |
-| `gh-actions-workflow-disable` | gh workflow disable disables workflows. This is reversible, but can disrupt CI. | high |
-| `gh-actions-run-cancel` | gh run cancel cancels a running workflow. This is reversible, but may disrupt deployments. | high |
+| `gh-actions-variable-remove` | gh variable delete/remove deletes GitHub Actions variables. This can break workflows. | medium |
+| `gh-actions-workflow-disable` | gh workflow disable disables workflows. This is reversible, but can disrupt CI. | low |
+| `gh-actions-run-cancel` | gh run cancel cancels a running workflow. This is reversible, but may disrupt deployments. | low |
 | `gh-actions-api-delete-secrets` | gh api DELETE against /actions/secrets deletes GitHub Actions secrets. | high |
-| `gh-actions-api-delete-variables` | gh api DELETE against /actions/variables deletes GitHub Actions variables. | high |
+| `gh-actions-api-delete-variables` | gh api DELETE against /actions/variables deletes GitHub Actions variables. | medium |
 
 ### Allowlist Guidance
 
@@ -105,9 +105,9 @@ These patterns match potentially destructive commands:
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
 | `glab-variable-delete` | glab variable delete removes CI variables and can break pipelines. | high |
-| `glab-ci-delete` | glab ci delete removes pipeline artifacts or pipelines. | high |
+| `glab-ci-delete` | glab ci delete removes pipeline artifacts or pipelines. | medium |
 | `glab-api-delete-variables` | glab api DELETE against variables endpoints removes CI variables. | high |
-| `gitlab-runner-unregister` | gitlab-runner unregister removes runners and can halt CI. | high |
+| `gitlab-runner-unregister` | gitlab-runner unregister removes runners and can halt CI. | critical |
 
 ### Allowlist Guidance
 
@@ -166,12 +166,12 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
-| `jenkins-cli-delete-job` | jenkins-cli delete-job deletes Jenkins jobs and can break pipelines. | high |
+| `jenkins-cli-delete-job` | jenkins-cli delete-job deletes Jenkins jobs and can break pipelines. | critical |
 | `jenkins-cli-delete-node` | jenkins-cli delete-node deletes Jenkins nodes and can halt CI. | high |
 | `jenkins-cli-delete-credentials` | jenkins-cli delete-credentials removes stored credentials. | high |
-| `jenkins-cli-delete-builds` | jenkins-cli delete-builds removes build history and artifacts. | high |
-| `jenkins-cli-delete-view` | jenkins-cli delete-view removes Jenkins views. | high |
-| `jenkins-curl-do-delete` | curl POST to Jenkins doDelete endpoints deletes jobs or resources. | high |
+| `jenkins-cli-delete-builds` | jenkins-cli delete-builds removes build history and artifacts. | medium |
+| `jenkins-cli-delete-view` | jenkins-cli delete-view removes Jenkins views. | low |
+| `jenkins-curl-do-delete` | curl POST to Jenkins doDelete endpoints deletes jobs or resources. | critical |
 
 ### Allowlist Guidance
 
@@ -229,11 +229,11 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
-| `circleci-context-delete` | circleci context delete removes contexts and their secrets. | high |
+| `circleci-context-delete` | circleci context delete removes contexts and their secrets. | critical |
 | `circleci-context-remove-secret` | circleci context remove-secret deletes secrets from a context. | high |
 | `circleci-orb-delete` | circleci orb delete removes an orb from the registry. | high |
-| `circleci-namespace-delete` | circleci namespace delete removes an orb namespace. | high |
-| `circleci-pipeline-delete` | circleci pipeline delete removes pipeline history. | high |
+| `circleci-namespace-delete` | circleci namespace delete removes an orb namespace. | critical |
+| `circleci-pipeline-delete` | circleci pipeline delete removes pipeline history. | medium |
 | `circleci-api-delete-envvar` | curl DELETE against CircleCI envvar endpoints removes environment variables. | high |
 
 ### Allowlist Guidance

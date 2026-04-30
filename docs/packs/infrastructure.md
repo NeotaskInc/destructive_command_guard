@@ -31,17 +31,17 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `terraform-plan` | `terraform\s+plan(?!\s+.*-destroy)` |
-| `terraform-init` | `terraform\s+init` |
-| `terraform-validate` | `terraform\s+validate` |
-| `terraform-fmt` | `terraform\s+fmt` |
-| `terraform-show` | `terraform\s+show` |
-| `terraform-output` | `terraform\s+output` |
-| `terraform-state-list` | `terraform\s+state\s+list` |
-| `terraform-state-show` | `terraform\s+state\s+show` |
-| `terraform-graph` | `terraform\s+graph` |
-| `terraform-version` | `terraform\s+version` |
-| `terraform-providers` | `terraform\s+providers` |
+| `terraform-plan` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+plan(?=\s\|$)(?!\s+.*-destroy)` |
+| `terraform-init` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+init(?=\s\|$)` |
+| `terraform-validate` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+validate(?=\s\|$)` |
+| `terraform-fmt` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+fmt(?=\s\|$)` |
+| `terraform-show` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+show(?=\s\|$)` |
+| `terraform-output` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+output(?=\s\|$)` |
+| `terraform-state-list` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+state\s+list(?=\s\|$)` |
+| `terraform-state-show` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+state\s+show(?=\s\|$)` |
+| `terraform-graph` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+graph(?=\s\|$)` |
+| `terraform-version` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+version(?=\s\|$)` |
+| `terraform-providers` | `terraform\b(?:\s+--?\S+(?:\s+\S+)?)*\s+providers(?=\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 
@@ -49,14 +49,14 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
-| `destroy` | terraform destroy removes ALL managed infrastructure. Use 'terraform plan -destroy' first. | high |
-| `plan-destroy` | terraform plan -destroy shows what would be destroyed. Review carefully before applying. | high |
+| `plan-destroy` | terraform plan -destroy shows what would be destroyed. Review carefully before applying. | medium |
+| `destroy` | terraform destroy removes ALL managed infrastructure. Use 'terraform plan -destroy' first. | critical |
 | `apply-auto-approve` | terraform apply -auto-approve skips confirmation. Remove -auto-approve for safety. | high |
 | `taint` | terraform taint marks a resource to be destroyed and recreated on next apply. | high |
 | `state-rm` | terraform state rm removes resource from state without destroying it. Resource becomes unmanaged. | high |
 | `state-mv` | terraform state mv moves resources in state. Incorrect moves can cause resource recreation. | high |
 | `force-unlock` | terraform force-unlock removes state lock. Only use if lock is stale. | high |
-| `workspace-delete` | terraform workspace delete removes a workspace. Ensure it's not in use. | high |
+| `workspace-delete` | terraform workspace delete removes a workspace. Ensure it's not in use. | medium |
 
 ### Allowlist Guidance
 
@@ -113,10 +113,10 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
-| `shell-rm-rf` | Ansible shell/command with 'rm -rf' is destructive. Review carefully. | high |
+| `shell-rm-rf` | Ansible shell/command with 'rm -rf' is destructive. Review carefully. | critical |
 | `shell-reboot` | Ansible shell/command with reboot/shutdown affects system availability. | high |
 | `playbook-all-hosts` | ansible-playbook without --check or --limit may affect all hosts. Use --check first. | high |
-| `extra-vars-delete` | Ansible extra-vars contains potentially destructive keywords. Review carefully. | high |
+| `extra-vars-delete` | Ansible extra-vars contains potentially destructive keywords. Review carefully. | medium |
 
 ### Allowlist Guidance
 
@@ -159,15 +159,15 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `pulumi-preview` | `pulumi\s+preview` |
-| `pulumi-stack-ls` | `pulumi\s+stack\s+ls` |
-| `pulumi-stack-select` | `pulumi\s+stack\s+select` |
-| `pulumi-stack-init` | `pulumi\s+stack\s+init` |
-| `pulumi-config` | `pulumi\s+config` |
-| `pulumi-whoami` | `pulumi\s+whoami` |
-| `pulumi-version` | `pulumi\s+version` |
-| `pulumi-about` | `pulumi\s+about` |
-| `pulumi-logs` | `pulumi\s+logs` |
+| `pulumi-preview` | `pulumi\b(?:\s+--?\S+(?:\s+\S+)?)*\s+preview(?=\s\|$)` |
+| `pulumi-stack-ls` | `pulumi\b(?:\s+--?\S+(?:\s+\S+)?)*\s+stack\s+ls(?=\s\|$)` |
+| `pulumi-stack-select` | `pulumi\b(?:\s+--?\S+(?:\s+\S+)?)*\s+stack\s+select(?=\s\|$)` |
+| `pulumi-stack-init` | `pulumi\b(?:\s+--?\S+(?:\s+\S+)?)*\s+stack\s+init(?=\s\|$)` |
+| `pulumi-config` | `pulumi\b(?:\s+--?\S+(?:\s+\S+)?)*\s+config(?=\s\|$)` |
+| `pulumi-whoami` | `pulumi\b(?:\s+--?\S+(?:\s+\S+)?)*\s+whoami(?=\s\|$)` |
+| `pulumi-version` | `pulumi\b(?:\s+--?\S+(?:\s+\S+)?)*\s+version(?=\s\|$)` |
+| `pulumi-about` | `pulumi\b(?:\s+--?\S+(?:\s+\S+)?)*\s+about(?=\s\|$)` |
+| `pulumi-logs` | `pulumi\b(?:\s+--?\S+(?:\s+\S+)?)*\s+logs(?=\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 
@@ -175,11 +175,11 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
-| `destroy` | pulumi destroy removes ALL managed infrastructure. Use 'pulumi preview --diff' first. | high |
+| `destroy` | pulumi destroy removes ALL managed infrastructure. Use 'pulumi preview --diff' first. | critical |
 | `up-yes` | pulumi up -y skips confirmation. Remove -y flag for safety. | high |
 | `state-delete` | pulumi state delete removes resource from state without destroying it. | high |
 | `stack-rm` | pulumi stack rm removes the stack. Use --force only if stack is empty. | high |
-| `refresh-yes` | pulumi refresh -y auto-approves state changes. Review changes first. | high |
+| `refresh-yes` | pulumi refresh -y auto-approves state changes. Review changes first. | medium |
 | `cancel` | pulumi cancel terminates an in-progress update, which may leave resources in inconsistent state. | high |
 
 ### Allowlist Guidance

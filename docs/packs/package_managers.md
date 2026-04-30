@@ -41,21 +41,21 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `npm-install` | `npm\s+(?:install\|i\|ci)\b` |
-| `yarn-add` | `yarn\s+(?:add\|install)\b` |
-| `pnpm-install` | `pnpm\s+(?:add\|install\|i)\b` |
-| `npm-list` | `npm\s+(?:list\|ls\|info\|view)\b` |
-| `yarn-list` | `yarn\s+(?:list\|info\|why)\b` |
-| `npm-audit` | `npm\s+audit` |
-| `yarn-audit` | `yarn\s+audit` |
-| `pip-list` | `pip\s+(?:list\|show\|freeze)\b` |
-| `poetry-show` | `poetry\s+show\b` |
-| `poetry-env-list` | `poetry\s+env\s+list\b` |
-| `cargo-safe` | `cargo\s+(?:build\|test\|check\|clippy\|fmt\|doc\|bench)\b` |
-| `apt-list` | `apt\s+(?:list\|show\|search)\b` |
-| `apt-get-list` | `apt-get\s+(?:update\|upgrade)(?!\s+.*-y)` |
-| `npm-dry-run` | `npm\s+.*--dry-run` |
-| `cargo-dry-run` | `cargo\s+.*--dry-run` |
+| `npm-install` | `npm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:install\|i\|ci)(?=\s\|$)` |
+| `yarn-add` | `yarn\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:add\|install)(?=\s\|$)` |
+| `pnpm-install` | `pnpm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:add\|install\|i)(?=\s\|$)` |
+| `npm-list` | `npm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list\|ls\|info\|view)(?=\s\|$)` |
+| `yarn-list` | `yarn\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list\|info\|why)(?=\s\|$)` |
+| `npm-audit` | `npm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+audit(?=\s\|$)` |
+| `yarn-audit` | `yarn\b(?:\s+--?\S+(?:\s+\S+)?)*\s+audit(?=\s\|$)` |
+| `pip-list` | `pip\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list\|show\|freeze)(?=\s\|$)` |
+| `poetry-show` | `poetry\b(?:\s+--?\S+(?:\s+\S+)?)*\s+show(?=\s\|$)` |
+| `poetry-env-list` | `poetry\b(?:\s+--?\S+(?:\s+\S+)?)*\s+env\s+list(?=\s\|$)` |
+| `cargo-safe` | `cargo\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:build\|test\|check\|clippy\|fmt\|doc\|bench)\b` |
+| `apt-list` | `apt\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list\|show\|search)(?=\s\|$)` |
+| `apt-get-list` | `apt-get\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:update\|upgrade)(?!\s+.*-y)` |
+| `npm-dry-run` | `npm\b.*--dry-run` |
+| `cargo-dry-run` | `cargo\b.*--dry-run` |
 
 ### Destructive Patterns (Blocked)
 

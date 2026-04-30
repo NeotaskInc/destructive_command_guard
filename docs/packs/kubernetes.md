@@ -32,16 +32,16 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `kubectl-get` | `kubectl\s+get` |
-| `kubectl-describe` | `kubectl\s+describe` |
-| `kubectl-logs` | `kubectl\s+logs` |
-| `kubectl-dry-run` | `kubectl\s+.*--dry-run(?:=(?:client\|server\|none))?` |
-| `kubectl-diff` | `kubectl\s+diff` |
-| `kubectl-explain` | `kubectl\s+explain` |
-| `kubectl-top` | `kubectl\s+top` |
-| `kubectl-config` | `kubectl\s+config` |
-| `kubectl-api` | `kubectl\s+api-(?:resources\|versions)` |
-| `kubectl-version` | `kubectl\s+version` |
+| `kubectl-get` | `kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+get(?=\s\|$)` |
+| `kubectl-describe` | `kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+describe(?=\s\|$)` |
+| `kubectl-logs` | `kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+logs(?=\s\|$)` |
+| `kubectl-dry-run` | `kubectl\b.*--dry-run(?:=(?:client\|server\|none))?` |
+| `kubectl-diff` | `kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+diff(?=\s\|$)` |
+| `kubectl-explain` | `kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+explain(?=\s\|$)` |
+| `kubectl-top` | `kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+top(?=\s\|$)` |
+| `kubectl-config` | `kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+config(?=\s\|$)` |
+| `kubectl-api` | `kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+api-(?:resources\|versions)(?=\s\|$)` |
+| `kubectl-version` | `kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+version(?=\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 
@@ -49,17 +49,19 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
-| `delete-namespace` | kubectl delete namespace removes the entire namespace and ALL resources within it. | high |
+| `delete-namespace` | kubectl delete namespace removes the entire namespace and ALL resources within it. | critical |
 | `delete-all` | kubectl delete --all removes ALL resources of that type. Use --dry-run=client first. | high |
-| `delete-all-namespaces` | kubectl delete with -A/--all-namespaces affects ALL namespaces. Very dangerous! | high |
+| `delete-all-namespaces` | kubectl delete with -A/--all-namespaces affects ALL namespaces. Very dangerous! | critical |
 | `drain-node` | kubectl drain evicts all pods from a node. Ensure proper pod disruption budgets. | high |
-| `cordon-node` | kubectl cordon marks a node unschedulable. Existing pods continue running. | high |
+| `cordon-node` | kubectl cordon marks a node unschedulable. Existing pods continue running. | medium |
 | `taint-noexecute` | kubectl taint with NoExecute evicts existing pods that don't tolerate the taint. | high |
 | `delete-workload` | kubectl delete deployment/statefulset/daemonset removes the workload. Use --dry-run first. | high |
-| `delete-pvc` | kubectl delete pvc may permanently delete data if ReclaimPolicy is Delete. | high |
-| `delete-pv` | kubectl delete pv may permanently delete the underlying storage. | high |
+| `delete-pvc` | kubectl delete pvc may permanently delete data if ReclaimPolicy is Delete. | critical |
+| `delete-pv` | kubectl delete pv may permanently delete the underlying storage. | critical |
 | `scale-to-zero` | kubectl scale --replicas=0 stops all pods for the workload. | high |
-| `delete-force` | kubectl delete --force --grace-period=0 immediately removes resources without graceful shutdown. | high |
+| `delete-force` | kubectl delete --force --grace-period=0 immediately removes resources without graceful shutdown. | critical |
+| `apply-force` | kubectl apply --force deletes and recreates resources, causing downtime. | high |
+| `delete-from-directory` | kubectl delete -f with directories or --recursive deletes many resources at once. | high |
 
 ### Allowlist Guidance
 
@@ -103,18 +105,18 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `helm-list` | `helm\s+list` |
-| `helm-status` | `helm\s+status` |
-| `helm-history` | `helm\s+history` |
-| `helm-show` | `helm\s+show` |
-| `helm-inspect` | `helm\s+inspect` |
-| `helm-get` | `helm\s+get` |
-| `helm-search` | `helm\s+search` |
-| `helm-repo` | `helm\s+repo` |
-| `helm-dry-run` | `helm\s+.*--dry-run` |
-| `helm-template` | `helm\s+template` |
-| `helm-lint` | `helm\s+lint` |
-| `helm-diff` | `helm\s+diff` |
+| `helm-list` | `helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+list(?=\s\|$)` |
+| `helm-status` | `helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+status(?=\s\|$)` |
+| `helm-history` | `helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+history(?=\s\|$)` |
+| `helm-show` | `helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+show(?=\s\|$)` |
+| `helm-inspect` | `helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+inspect(?=\s\|$)` |
+| `helm-get` | `helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+get(?=\s\|$)` |
+| `helm-search` | `helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+search(?=\s\|$)` |
+| `helm-repo` | `helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+repo(?=\s\|$)` |
+| `helm-dry-run` | `helm\b.*--dry-run` |
+| `helm-template` | `helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+template(?=\s\|$)` |
+| `helm-lint` | `helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+lint(?=\s\|$)` |
+| `helm-diff` | `helm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+diff(?=\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 
@@ -122,7 +124,7 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
-| `uninstall` | helm uninstall removes the release and all its resources. Use --dry-run first. | high |
+| `uninstall` | helm uninstall removes the release and all its resources. Use --dry-run first. | critical |
 | `rollback` | helm rollback reverts to a previous release. Use --dry-run to preview changes. | high |
 | `upgrade-force` | helm upgrade --force deletes and recreates resources, causing downtime. | high |
 | `upgrade-reset-values` | helm upgrade --reset-values discards all previously set values. | high |
@@ -167,10 +169,10 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `kustomize-build` | `kustomize\s+build(?!\s*\\|)` |
-| `kubectl-kustomize` | `kubectl\s+kustomize(?!\s*\\|)` |
-| `kustomize-diff` | `kustomize\s+build\s+.*\\|\s*kubectl\s+diff` |
-| `kustomize-dry-run` | `kustomize\s+build\s+.*\\|\s*kubectl\s+.*--dry-run` |
+| `kustomize-build` | `kustomize\b(?:\s+--?\S+(?:\s+\S+)?)*\s+build\b(?!.*\\|)` |
+| `kubectl-kustomize` | `kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+kustomize\b(?!.*\\|)` |
+| `kustomize-diff` | `kustomize\b.*?\bbuild\s+.*\\|\s*kubectl\b.*?\s+diff\b` |
+| `kustomize-dry-run` | `kustomize\b.*?\bbuild\s+.*\\|\s*kubectl\b.*--dry-run` |
 
 ### Destructive Patterns (Blocked)
 
@@ -178,9 +180,9 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
-| `kustomize-delete` | kustomize build \| kubectl delete removes all resources in the kustomization. | high |
-| `kubectl-kustomize-delete` | kubectl kustomize \| kubectl delete removes all resources in the kustomization. | high |
-| `kubectl-delete-k` | kubectl delete -k removes all resources defined in the kustomization. Use --dry-run first. | high |
+| `kustomize-delete` | kustomize build \| kubectl delete removes all resources in the kustomization. | critical |
+| `kubectl-kustomize-delete` | kubectl kustomize \| kubectl delete removes all resources in the kustomization. | critical |
+| `kubectl-delete-k` | kubectl delete -k removes all resources defined in the kustomization. Use --dry-run first. | critical |
 
 ### Allowlist Guidance
 

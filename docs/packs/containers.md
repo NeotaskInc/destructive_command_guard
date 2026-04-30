@@ -31,16 +31,16 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `docker-ps` | `docker\s+ps` |
-| `docker-images` | `docker\s+images` |
-| `docker-logs` | `docker\s+logs` |
-| `docker-inspect` | `docker\s+inspect` |
-| `docker-build` | `docker\s+build` |
-| `docker-pull` | `docker\s+pull` |
-| `docker-run` | `docker\s+run` |
-| `docker-exec` | `docker\s+exec` |
-| `docker-stats` | `docker\s+stats` |
-| `docker-dry-run` | `docker\s+.*--dry-run` |
+| `docker-ps` | `^\s*docker\b(?:\s+--?\S+(?:\s+\S+)?)*\s+ps(?=\s\|$)(?:\s+[^;&\|`$()]*)*$` |
+| `docker-images` | `^\s*docker\b(?:\s+--?\S+(?:\s+\S+)?)*\s+images(?=\s\|$)(?:\s+[^;&\|`$()]*)*$` |
+| `docker-logs` | `^\s*docker\b(?:\s+--?\S+(?:\s+\S+)?)*\s+logs(?=\s\|$)(?:\s+[^;&\|`$()]*)*$` |
+| `docker-inspect` | `^\s*docker\b(?:\s+--?\S+(?:\s+\S+)?)*\s+inspect(?=\s\|$)(?:\s+[^;&\|`$()]*)*$` |
+| `docker-build` | `^\s*docker\b(?:\s+--?\S+(?:\s+\S+)?)*\s+build(?=\s\|$)(?:\s+[^;&\|`$()]*)*$` |
+| `docker-pull` | `^\s*docker\b(?:\s+--?\S+(?:\s+\S+)?)*\s+pull(?=\s\|$)(?:\s+[^;&\|`$()]*)*$` |
+| `docker-run` | `^\s*docker\b(?:\s+--?\S+(?:\s+\S+)?)*\s+run(?=\s\|$)(?:\s+[^;&\|`$()]*)*$` |
+| `docker-exec` | `^\s*docker\b(?:\s+--?\S+(?:\s+\S+)?)*\s+exec(?=\s\|$)(?:\s+[^;&\|`$()]*)*$` |
+| `docker-stats` | `^\s*docker\b(?:\s+--?\S+(?:\s+\S+)?)*\s+stats(?=\s\|$)(?:\s+[^;&\|`$()]*)*$` |
+| `docker-dry-run` | `^\s*docker\b(?:\s+[^;&\|`$()]*)*--dry-run(?:\s+[^;&\|`$()]*)*$` |
 
 ### Destructive Patterns (Blocked)
 
@@ -105,7 +105,7 @@ These patterns match safe commands that are always allowed:
 | `compose-up` | `(?:docker-compose\|docker\s+compose)\s+up` |
 | `compose-build` | `(?:docker-compose\|docker\s+compose)\s+build` |
 | `compose-pull` | `(?:docker-compose\|docker\s+compose)\s+pull` |
-| `compose-down-no-volumes` | `(?:docker-compose\|docker\s+compose)\s+down(?!\s+.*(?:-v\|--volumes))` |
+| `compose-down-no-volumes` | `(?:docker-compose\|docker\s+compose)\s+down(?!\s+.*(?:-v\b\|--volumes\|--rmi))` |
 
 ### Destructive Patterns (Blocked)
 
@@ -113,10 +113,10 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
-| `down-volumes` | docker-compose down -v removes volumes and their data permanently. | high |
+| `down-volumes` | docker-compose down -v removes volumes and their data permanently. | critical |
 | `down-rmi-all` | docker-compose down --rmi all removes all images used by services. | high |
 | `rm-volumes` | docker-compose rm -v removes volumes attached to containers. | high |
-| `rm-force` | docker-compose rm -f forcibly removes containers without confirmation. | high |
+| `rm-force` | docker-compose rm -f forcibly removes containers without confirmation. | medium |
 
 ### Allowlist Guidance
 
@@ -158,14 +158,14 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `podman-ps` | `podman\s+ps` |
-| `podman-images` | `podman\s+images` |
-| `podman-logs` | `podman\s+logs` |
-| `podman-inspect` | `podman\s+inspect` |
-| `podman-build` | `podman\s+build` |
-| `podman-pull` | `podman\s+pull` |
-| `podman-run` | `podman\s+run` |
-| `podman-exec` | `podman\s+exec` |
+| `podman-ps` | `podman\b(?:\s+--?\S+(?:\s+\S+)?)*\s+ps(?=\s\|$)` |
+| `podman-images` | `podman\b(?:\s+--?\S+(?:\s+\S+)?)*\s+images(?=\s\|$)` |
+| `podman-logs` | `podman\b(?:\s+--?\S+(?:\s+\S+)?)*\s+logs(?=\s\|$)` |
+| `podman-inspect` | `podman\b(?:\s+--?\S+(?:\s+\S+)?)*\s+inspect(?=\s\|$)` |
+| `podman-build` | `podman\b(?:\s+--?\S+(?:\s+\S+)?)*\s+build(?=\s\|$)` |
+| `podman-pull` | `podman\b(?:\s+--?\S+(?:\s+\S+)?)*\s+pull(?=\s\|$)` |
+| `podman-run` | `podman\b(?:\s+--?\S+(?:\s+\S+)?)*\s+run(?=\s\|$)` |
+| `podman-exec` | `podman\b(?:\s+--?\S+(?:\s+\S+)?)*\s+exec(?=\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 
@@ -174,8 +174,8 @@ These patterns match potentially destructive commands:
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
 | `system-prune` | podman system prune removes ALL unused containers, pods, images. Use 'podman system df' to preview. | high |
-| `volume-prune` | podman volume prune removes ALL unused volumes and their data permanently. | high |
-| `pod-prune` | podman pod prune removes ALL stopped pods. | high |
+| `volume-prune` | podman volume prune removes ALL unused volumes and their data permanently. | critical |
+| `pod-prune` | podman pod prune removes ALL stopped pods. | medium |
 | `image-prune` | podman image prune removes unused images. Use 'podman images' to review first. | medium |
 | `container-prune` | podman container prune removes ALL stopped containers. | medium |
 | `rm-force` | podman rm -f forcibly removes containers, potentially losing data. | high |
@@ -202,3 +202,4 @@ risk_acknowledged = true
 ```
 
 ---
+

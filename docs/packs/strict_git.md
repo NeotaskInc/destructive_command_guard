@@ -12,27 +12,13 @@ This document describes packs in the `strict_git` category.
 
 **Pack ID:** `strict_git`
 
-Stricter git protections: blocks all force pushes, rebases, and history rewriting operations
+Stricter git protections: blocks force pushes, rebases, history rewriting, blind staging, and direct pushes to default branches
 
 ### Keywords
 
 Commands containing these keywords are checked against this pack:
 
 - `git`
-
-### Safe Patterns (Allowed)
-
-These patterns match safe commands that are always allowed:
-
-| Pattern Name | Pattern |
-|--------------|----------|
-| `git-status` | `git\s+status` |
-| `git-log` | `git\s+log` |
-| `git-diff` | `git\s+diff` |
-| `git-show` | `git\s+show` |
-| `git-branch-list` | `git\s+branch\s*$\\|git\s+branch\s+-[alv]` |
-| `git-remote-v` | `git\s+remote\s+-v` |
-| `git-fetch` | `git\s+fetch` |
 
 ### Destructive Patterns (Blocked)
 
@@ -50,7 +36,10 @@ These patterns match potentially destructive commands:
 | `gc-aggressive` | git gc with aggressive/prune options can remove recoverable objects. | high |
 | `worktree-remove` | git worktree remove deletes a linked working tree. | high |
 | `submodule-deinit` | git submodule deinit removes submodule configuration. | high |
-| `push-master` | Direct push to master is blocked. Use a Pull Request. | high |
+| `add-all-dot` | git add . stages everything including secrets, .env files, and build artifacts. Use 'git add <specific-files>' instead. | high |
+| `add-all-flag` | git add -A/--all stages all changes including secrets, .env files, and build artifacts. Use 'git add <specific-files>' instead. | high |
+| `push-master` | Direct push to master is blocked. Use a feature branch and open a Pull Request. | high |
+| `push-main` | Direct push to main is blocked. Use a feature branch and open a Pull Request. | high |
 
 ### Allowlist Guidance
 

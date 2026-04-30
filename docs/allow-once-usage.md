@@ -6,7 +6,7 @@ This guide explains how to use the allow-once feature to temporarily override dc
 
 ## Overview
 
-When dcg blocks a command, it prints a 5-digit numeric code that can be used to temporarily allow that exact command. This provides an escape hatch for false positives without permanently weakening your security policy.
+When dcg blocks a command, it prints a 6-digit numeric code that can be used to temporarily allow that exact command. This provides an escape hatch for false positives without permanently weakening your security policy.
 
 **Key properties:**
 - Exceptions are scoped to the exact command + directory (project root in git repos, cwd otherwise)
@@ -21,7 +21,7 @@ When dcg blocks a command, it prints a 5-digit numeric code that can be used to 
 When dcg blocks a command, you'll see output like this:
 
 ```
-ALLOW-24H CODE: [12345] | run: dcg allow-once 12345
+ALLOW-24H CODE: [123456] | run: dcg allow-once 123456
 Tip: dcg explain "git reset --hard HEAD"
 
 ╭─────────────────────── COMMAND BLOCKED ────────────────────────╮
@@ -39,7 +39,7 @@ Tip: dcg explain "git reset --hard HEAD"
 ╰─────────────────────────────────────────────────────────────────╯
 ```
 
-The first line contains the allow-once code (`12345` in this example).
+The first line contains the allow-once code (`123456` in this example).
 
 ---
 
@@ -48,7 +48,7 @@ The first line contains the allow-once code (`12345` in this example).
 To allow the blocked command, run:
 
 ```bash
-dcg allow-once 12345
+dcg allow-once 123456
 ```
 
 This creates a temporary exception that:
@@ -62,7 +62,7 @@ This creates a temporary exception that:
 For a one-time exception that's consumed after the first use:
 
 ```bash
-dcg allow-once 12345 --single-use
+dcg allow-once 123456 --single-use
 ```
 
 This is more restrictive and recommended when you only need to run the command once.
@@ -125,7 +125,7 @@ A standard allow-once exception overrides pack-based denials but does **not** ov
 If you've explicitly blocked a command in your config and need to override it, use `--force`:
 
 ```bash
-dcg allow-once 12345 --force
+dcg allow-once 123456 --force
 ```
 
 This requires additional confirmation because:
@@ -156,7 +156,7 @@ dcg allow-once list --show-raw
 To revoke a pending code or active exception:
 
 ```bash
-dcg allow-once revoke 12345
+dcg allow-once revoke 123456
 ```
 
 You can also revoke by full hash (useful when multiple codes collide):
@@ -219,8 +219,8 @@ dcg allow-once clear --all         # Wipe all entries
 When multiple blocked commands share the same short code, you must disambiguate:
 
 ```bash
-dcg allow-once 12345 --pick 1       # Select by index (1-based)
-dcg allow-once 12345 --hash 0123... # Select by full hash
+dcg allow-once 123456 --pick 1       # Select by index (1-based)
+dcg allow-once 123456 --hash 0123... # Select by full hash
 ```
 
 Without disambiguation, the CLI will show a list of matching entries to choose from.
@@ -252,7 +252,7 @@ All allow-once actions are logged:
 Enable verbose logging for detailed audit trails:
 
 ```bash
-DCG_VERBOSE=1 dcg allow-once 12345
+DCG_VERBOSE=1 dcg allow-once 123456
 ```
 
 Log files are stored in `~/.config/dcg/dcg.log` by default (configurable).
@@ -311,7 +311,7 @@ The short code may have expired (24-hour limit) or been revoked. Re-run the bloc
 Use `--pick <N>` or `--hash <HASH>` to disambiguate:
 
 ```bash
-dcg allow-once 12345 --pick 1
+dcg allow-once 123456 --pick 1
 ```
 
 ### "Cannot override config blocklist without --force"
@@ -319,7 +319,7 @@ dcg allow-once 12345 --pick 1
 The blocked command is in your config blocklist. Add `--force` if you're certain:
 
 ```bash
-dcg allow-once 12345 --force
+dcg allow-once 123456 --force
 ```
 
 ### Permissions Error

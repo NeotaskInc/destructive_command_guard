@@ -44,16 +44,16 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `aws-describe` | `aws\s+\S+\s+describe-` |
-| `aws-list` | `aws\s+\S+\s+list-` |
-| `aws-get` | `aws\s+\S+\s+get-` |
-| `s3-ls` | `aws\s+s3\s+ls` |
-| `s3-cp` | `aws\s+s3\s+cp` |
-| `aws-dry-run` | `aws\s+.*--dry-run` |
-| `sts-identity` | `aws\s+sts\s+get-caller-identity` |
-| `cfn-describe` | `aws\s+cloudformation\s+(?:describe\|list)-` |
-| `ecr-login` | `aws\s+ecr\s+get-login` |
-| `athena-delete-with-where` | Athena `DELETE FROM <table> ... WHERE` (targeted deletion, no trailing `;`) — the only Athena safe pattern needed, since it escapes the broad `athena-query-delete-without-where` destructive rule. Pure `SELECT` / `SHOW` / `DESCRIBE` / `EXPLAIN` / `CREATE` / `INSERT` / `UPDATE` queries aren't matched by any destructive rule and are allowed by default. |
+| `aws-describe` | `aws\b(?:\s+--?\S+(?:\s+\S+)?)*\s+\S+\s+describe-` |
+| `aws-list` | `aws\b(?:\s+--?\S+(?:\s+\S+)?)*\s+\S+\s+list-` |
+| `aws-get` | `aws\b(?:\s+--?\S+(?:\s+\S+)?)*\s+\S+\s+get-` |
+| `s3-ls` | `aws\b(?:\s+--?\S+(?:\s+\S+)?)*\s+s3\s+ls(?=\s\|$)` |
+| `s3-cp` | `aws\b(?:\s+--?\S+(?:\s+\S+)?)*\s+s3\s+cp(?=\s\|$)` |
+| `aws-dry-run` | `aws\b.*--dry-run` |
+| `sts-identity` | `aws\b(?:\s+--?\S+(?:\s+\S+)?)*\s+sts\s+get-caller-identity(?=\s\|$)` |
+| `cfn-describe` | `aws\b(?:\s+--?\S+(?:\s+\S+)?)*\s+cloudformation\s+(?:describe\|list)-` |
+| `ecr-login` | `aws\b(?:\s+--?\S+(?:\s+\S+)?)*\s+ecr\s+get-login` |
+| `athena-delete-with-where` | `(?i)aws\b.*?\bathena\s+start-query-execution\b.*?--query-string[=\s]+['"]?\s*DELETE\s+FROM\s+[^\s;]+\s+.*?\bWHERE\b(?!.*;\s*[A-Za-z])` |
 
 ### Destructive Patterns (Blocked)
 
@@ -84,24 +84,24 @@ These patterns match potentially destructive commands:
 | `redshift-delete-cluster` | aws redshift delete-cluster destroys a Redshift cluster and all loaded data. | critical |
 | `kinesis-delete-stream` | aws kinesis delete-stream destroys a data stream — in-flight records are lost. | critical |
 | `efs-delete-file-system` | aws efs delete-file-system destroys an EFS filesystem — all files and mount targets are lost. | critical |
-| `s3api-delete-object` | aws s3api delete-object deletes an S3 object — object is gone unless bucket versioning is enabled. | high |
-| `athena-delete-data-catalog` | aws athena delete-data-catalog removes the catalog and all database/table definitions tied to it. | critical |
+| `s3api-delete-object` | aws s3api delete-object[s]/delete-object-tagging — object(s) or tags are gone unless bucket versioning is enabled. | high |
+| `athena-delete-data-catalog` | aws athena delete-data-catalog removes the data catalog and all database/table definitions tied to it. | critical |
 | `athena-delete-work-group` | aws athena delete-work-group removes the Athena workgroup and its configuration. | high |
 | `athena-delete-named-query` | aws athena delete-named-query permanently removes a saved query. | medium |
-| `athena-query-drop-database` | Athena `DROP DATABASE`/`SCHEMA` removes the database from the Glue catalog. | critical |
-| `athena-query-drop-table` | Athena `DROP TABLE`/`VIEW` removes the table definition from the Glue catalog. | high |
-| `athena-query-truncate` | Athena `TRUNCATE TABLE` deletes all rows from an Iceberg table. | critical |
-| `athena-query-string-from-file` | Athena `--query-string file://…`/`fileb://…` loads the SQL from disk, so DCG can't grep the statement. Use inline `--query-string '…'` instead. | high |
-| `athena-cli-input-file` | Athena `start-query-execution --cli-input-json file://…`/`--cli-input-yaml file://…` loads the full invocation from disk, hiding `QueryString` from inspection. Inline `--cli-input-json '{…}'` is still allowed because the broad `DROP`/`TRUNCATE`/`DELETE` rules can still see its contents. | high |
-| `athena-query-delete-without-where` | Athena `DELETE` without a `WHERE` clause removes all rows from the target table. | critical |
+| `athena-query-drop-database` | Athena DROP DATABASE/SCHEMA removes the database from the Glue catalog. | critical |
+| `athena-query-drop-table` | Athena DROP TABLE/VIEW removes the table definition from the Glue catalog. | high |
+| `athena-query-truncate` | Athena TRUNCATE TABLE deletes all rows from an Iceberg table. | critical |
+| `athena-query-string-from-file` | Athena --query-string loaded from file:// or fileb:// — SQL content is opaque to the guard. | high |
+| `athena-cli-input-file` | Athena --cli-input-json/yaml loaded from file:// or fileb:// — content is opaque to the guard. | high |
+| `athena-query-delete-without-where` | Athena DELETE without a WHERE clause removes all rows from the target table. | critical |
 | `glue-delete-database` | aws glue delete-database removes the database and every table definition inside it. | critical |
 | `glue-delete-table` | aws glue delete-table removes the table definition from the catalog. | high |
 | `glue-batch-delete-table` | aws glue batch-delete-table removes multiple table definitions in one call. | critical |
-| `glue-delete-partition` | aws glue delete-partition removes partition metadata. | high |
+| `glue-delete-partition` | aws glue delete-partition removes partition metadata; the partition is no longer queryable until recreated. | high |
 | `glue-batch-delete-partition` | aws glue batch-delete-partition removes multiple partition definitions in one call. | high |
 | `glue-delete-crawler` | aws glue delete-crawler removes the crawler configuration. | medium |
-| `glue-delete-job` | aws glue delete-job removes the ETL job definition and all run history. | high |
-| `glue-delete-dev-endpoint` | aws glue delete-dev-endpoint tears down the development endpoint. | medium |
+| `glue-delete-job` | aws glue delete-job removes the ETL job definition and all of its run history. | high |
+| `glue-delete-dev-endpoint` | aws glue delete-dev-endpoint tears down the development endpoint and any attached SageMaker notebook configuration. | medium |
 
 ### Allowlist Guidance
 
@@ -152,21 +152,21 @@ Commands containing these keywords are checked against this pack:
 
 ### Safe Patterns (Allowed)
 
-These patterns match safe commands that are always allowed. Every rule allows global flags (`--project`, `--account`, `--impersonate-service-account`, …) to appear between `gcloud`/`gsutil` and the subcommand. Pattern-wise the subcommand literal is preceded by whitespace so flag values like `--config-file` or `--auth-token` cannot false-match a safe rule on a destructive command.
+These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `gcloud-describe` | `gcloud\b.*?\s+\S+\s+\S+\s+describe` |
-| `gcloud-list` | `gcloud\b.*?\s+\S+\s+\S+\s+list` |
-| `gsutil-ls` | `gsutil\b.*?\bls` |
-| `gsutil-cp` | `gsutil\b.*?\bcp` |
-| `gcloud-config` | `gcloud\b.*?\s+config\b` |
-| `gcloud-auth` | `gcloud\b.*?\s+auth\b` |
-| `gcloud-info` | `gcloud\b.*?\s+info\b` |
+| `gcloud-describe` | `gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*\s+\S+\s+\S+\s+describe(?=\s\|$)` |
+| `gcloud-list` | `gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*\s+\S+\s+\S+\s+list(?=\s\|$)` |
+| `gsutil-ls` | `gsutil\b(?:\s+--?\S+(?:\s+\S+)?)*\s+ls(?=\s\|$)` |
+| `gsutil-cp` | `gsutil\b(?:\s+--?\S+(?:\s+\S+)?)*\s+cp(?=\s\|$)` |
+| `gcloud-config` | `gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*\s+config(?=\s\|$)` |
+| `gcloud-auth` | `gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*\s+auth(?=\s\|$)` |
+| `gcloud-info` | `gcloud\b(?:\s+--?\S+(?:\s+\S+)?)*\s+info(?=\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 
-These patterns match potentially destructive commands. Every rule matches through wrapper tools (`gcloud-vault`-like binaries) and with arbitrary global flags (`--project X`, `--quiet`, `--verbosity debug`, …) between `gcloud` and the service name.
+These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
@@ -186,12 +186,12 @@ These patterns match potentially destructive commands. Every rule matches throug
 | `secrets-delete` | gcloud secrets delete destroys a Secret Manager secret — credentials gone. | critical |
 | `kms-keys-destroy` | gcloud kms keys versions destroy schedules a CryptoKeyVersion for destruction — data encrypted with it becomes unrecoverable. | critical |
 | `iam-service-accounts-delete` | gcloud iam service-accounts delete removes a service account — workloads authenticating with it break. | critical |
-| `iam-roles-delete` | gcloud iam roles delete removes a custom IAM role — users/SAs bound to it lose permissions. | high |
+| `iam-roles-delete` | gcloud iam roles delete removes a custom IAM role — all users/SAs bound to it lose the permissions. | high |
 | `dns-managed-zones-delete` | gcloud dns managed-zones delete removes a DNS zone — domains stop resolving. | critical |
 | `logging-sinks-delete` | gcloud logging sinks delete removes an audit-log export — compliance/forensics impact. | high |
 | `spanner-instances-delete` | gcloud spanner instances delete destroys a Spanner instance — all databases and data lost. | critical |
 | `bigtable-instances-delete` | gcloud bigtable instances delete destroys a Bigtable instance — all tables and data lost. | critical |
-| `dataproc-clusters-delete` | gcloud dataproc clusters delete destroys a Dataproc cluster. | high |
+| `dataproc-clusters-delete` | gcloud dataproc clusters delete destroys a Dataproc (Hadoop/Spark) cluster. | high |
 | `bq-rm-recursive` | bq rm -r/-f removes BigQuery datasets, tables, or models — data lost. | critical |
 
 ### Allowlist Guidance
@@ -241,22 +241,22 @@ Commands containing these keywords are checked against this pack:
 
 ### Safe Patterns (Allowed)
 
-These patterns match safe commands that are always allowed. Every rule allows Azure CLI global flags (`--subscription`, `--debug`, `--output`, `--verbose`, `--only-show-errors`) to appear between `az` and the subcommand. The subcommand literal is preceded by whitespace so flag values like `--account-name` or `--configure-files` cannot false-match a safe rule on a destructive command.
+These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `az-show` | `az\b.*?\s+\S+\s+show` |
-| `az-list` | `az\b.*?\s+\S+\s+list` |
-| `az-account` | `az\b.*?\s+account\b` |
-| `az-configure` | `az\b.*?\s+configure\b` |
-| `az-login` | `az\b.*?\s+login\b` |
-| `az-version` | `az\b.*?\s+version\b` |
+| `az-show` | `az\b(?:\s+--?\S+(?:\s+\S+)?)*\s+\S+\s+show(?=\s\|$)` |
+| `az-list` | `az\b(?:\s+--?\S+(?:\s+\S+)?)*\s+\S+\s+list(?=\s\|$)` |
+| `az-account` | `az\b(?:\s+--?\S+(?:\s+\S+)?)*\s+account(?=\s\|$)` |
+| `az-configure` | `az\b(?:\s+--?\S+(?:\s+\S+)?)*\s+configure(?=\s\|$)` |
+| `az-login` | `az\b(?:\s+--?\S+(?:\s+\S+)?)*\s+login(?=\s\|$)` |
+| `az-version` | `az\b(?:\s+--?\S+(?:\s+\S+)?)*\s+version(?=\s\|$)` |
 | `az-help` | `az\b.*--help` |
 | `az-what-if` | `az\b.*--what-if` |
 
 ### Destructive Patterns (Blocked)
 
-These patterns match potentially destructive commands. Every rule matches with arbitrary global flags between `az` and the service name (`az --subscription prod vm delete …`, etc.).
+These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|

@@ -29,13 +29,13 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `borg-list` | `borg(?:\s+--?\S+(?:\s+\S+)?)*\s+list\b` |
-| `borg-info` | `borg(?:\s+--?\S+(?:\s+\S+)?)*\s+info\b` |
-| `borg-diff` | `borg(?:\s+--?\S+(?:\s+\S+)?)*\s+diff\b` |
-| `borg-check` | `borg(?:\s+--?\S+(?:\s+\S+)?)*\s+check\b` |
-| `borg-create` | `borg(?:\s+--?\S+(?:\s+\S+)?)*\s+create\b` |
-| `borg-extract` | `borg(?:\s+--?\S+(?:\s+\S+)?)*\s+extract\b` |
-| `borg-mount` | `borg(?:\s+--?\S+(?:\s+\S+)?)*\s+mount\b` |
+| `borg-list` | `borg(?:\s+--?\S+(?:\s+\S+)?)*\s+list(?=\s\|$)` |
+| `borg-info` | `borg(?:\s+--?\S+(?:\s+\S+)?)*\s+info(?=\s\|$)` |
+| `borg-diff` | `borg(?:\s+--?\S+(?:\s+\S+)?)*\s+diff(?=\s\|$)` |
+| `borg-check` | `borg(?:\s+--?\S+(?:\s+\S+)?)*\s+check(?=\s\|$)` |
+| `borg-create` | `borg(?:\s+--?\S+(?:\s+\S+)?)*\s+create(?=\s\|$)` |
+| `borg-extract` | `borg(?:\s+--?\S+(?:\s+\S+)?)*\s+extract(?=\s\|$)` |
+| `borg-mount` | `borg(?:\s+--?\S+(?:\s+\S+)?)*\s+mount(?=\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 
@@ -43,11 +43,11 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
-| `borg-delete` | borg delete removes archives or entire repositories. | high |
+| `borg-delete` | borg delete removes archives or entire repositories. | critical |
 | `borg-prune` | borg prune removes archives based on retention rules. | high |
-| `borg-compact` | borg compact reclaims space after deletions. | high |
+| `borg-compact` | borg compact reclaims space after deletions. | medium |
 | `borg-recreate` | borg recreate can drop data from archives. | high |
-| `borg-break-lock` | borg break-lock forces removal of repository locks. | high |
+| `borg-break-lock` | borg break-lock forces removal of repository locks. | medium |
 
 ### Allowlist Guidance
 
@@ -88,13 +88,13 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `rclone-copy` | `rclone(?:\s+--?\S+(?:\s+\S+)?)*\s+copy\b` |
-| `rclone-ls` | `rclone(?:\s+--?\S+(?:\s+\S+)?)*\s+ls\b` |
-| `rclone-lsd` | `rclone(?:\s+--?\S+(?:\s+\S+)?)*\s+lsd\b` |
-| `rclone-lsl` | `rclone(?:\s+--?\S+(?:\s+\S+)?)*\s+lsl\b` |
-| `rclone-size` | `rclone(?:\s+--?\S+(?:\s+\S+)?)*\s+size\b` |
-| `rclone-check` | `rclone(?:\s+--?\S+(?:\s+\S+)?)*\s+check\b` |
-| `rclone-config` | `rclone(?:\s+--?\S+(?:\s+\S+)?)*\s+config\b` |
+| `rclone-copy` | `rclone(?:\s+--?\S+(?:\s+\S+)?)*\s+copy(?=\s\|$)` |
+| `rclone-ls` | `rclone(?:\s+--?\S+(?:\s+\S+)?)*\s+ls(?=\s\|$)` |
+| `rclone-lsd` | `rclone(?:\s+--?\S+(?:\s+\S+)?)*\s+lsd(?=\s\|$)` |
+| `rclone-lsl` | `rclone(?:\s+--?\S+(?:\s+\S+)?)*\s+lsl(?=\s\|$)` |
+| `rclone-size` | `rclone(?:\s+--?\S+(?:\s+\S+)?)*\s+size(?=\s\|$)` |
+| `rclone-check` | `rclone(?:\s+--?\S+(?:\s+\S+)?)*\s+check(?=\s\|$)` |
+| `rclone-config` | `rclone(?:\s+--?\S+(?:\s+\S+)?)*\s+config(?=\s\|$)` |
 | `rclone-dry-run` | `rclone\b(?:\s+\S+)*\s+--dry-run\b` |
 
 ### Destructive Patterns (Blocked)
@@ -103,11 +103,11 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
-| `rclone-sync` | rclone sync deletes destination files not present in the source. | high |
-| `rclone-delete` | rclone delete removes files and directories from the target. | high |
+| `rclone-sync` | rclone sync deletes destination files not present in the source. | critical |
+| `rclone-delete` | rclone delete removes files and directories from the target. | critical |
 | `rclone-deletefile` | rclone deletefile removes a single file from the target. | high |
-| `rclone-purge` | rclone purge deletes a path and all its contents. | high |
-| `rclone-cleanup` | rclone cleanup removes old/malformed uploads. | high |
+| `rclone-purge` | rclone purge deletes a path and all its contents. | critical |
+| `rclone-cleanup` | rclone cleanup removes old/malformed uploads. | medium |
 | `rclone-dedupe` | rclone dedupe can delete or rename duplicate files. | high |
 | `rclone-move` | rclone move deletes source files after copying. | high |
 
@@ -150,14 +150,14 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `restic-snapshots` | `restic(?:\s+--?\S+(?:\s+\S+)?)*\s+snapshots\b` |
-| `restic-ls` | `restic(?:\s+--?\S+(?:\s+\S+)?)*\s+ls\b` |
-| `restic-stats` | `restic(?:\s+--?\S+(?:\s+\S+)?)*\s+stats\b` |
-| `restic-check` | `restic(?:\s+--?\S+(?:\s+\S+)?)*\s+check\b` |
-| `restic-diff` | `restic(?:\s+--?\S+(?:\s+\S+)?)*\s+diff\b` |
-| `restic-find` | `restic(?:\s+--?\S+(?:\s+\S+)?)*\s+find\b` |
-| `restic-backup` | `restic(?:\s+--?\S+(?:\s+\S+)?)*\s+backup\b` |
-| `restic-restore` | `restic(?:\s+--?\S+(?:\s+\S+)?)*\s+restore\b` |
+| `restic-snapshots` | `restic(?:\s+--?\S+(?:\s+\S+)?)*\s+snapshots(?=\s\|$)` |
+| `restic-ls` | `restic(?:\s+--?\S+(?:\s+\S+)?)*\s+ls(?=\s\|$)` |
+| `restic-stats` | `restic(?:\s+--?\S+(?:\s+\S+)?)*\s+stats(?=\s\|$)` |
+| `restic-check` | `restic(?:\s+--?\S+(?:\s+\S+)?)*\s+check(?=\s\|$)` |
+| `restic-diff` | `restic(?:\s+--?\S+(?:\s+\S+)?)*\s+diff(?=\s\|$)` |
+| `restic-find` | `restic(?:\s+--?\S+(?:\s+\S+)?)*\s+find(?=\s\|$)` |
+| `restic-backup` | `restic(?:\s+--?\S+(?:\s+\S+)?)*\s+backup(?=\s\|$)` |
+| `restic-restore` | `restic(?:\s+--?\S+(?:\s+\S+)?)*\s+restore(?=\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 
@@ -165,11 +165,11 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
-| `restic-forget` | restic forget removes snapshots and can permanently delete backup data. | high |
-| `restic-prune` | restic prune removes unreferenced data and is irreversible. | high |
-| `restic-key-remove` | restic key remove deletes encryption keys and can make backups unrecoverable. | high |
+| `restic-forget` | restic forget removes snapshots and can permanently delete backup data. | critical |
+| `restic-prune` | restic prune removes unreferenced data and is irreversible. | critical |
+| `restic-key-remove` | restic key remove deletes encryption keys and can make backups unrecoverable. | critical |
 | `restic-unlock-remove-all` | restic unlock --remove-all force-removes repository locks. | high |
-| `restic-cache-cleanup` | restic cache --cleanup removes cached data from disk. | high |
+| `restic-cache-cleanup` | restic cache --cleanup removes cached data from disk. | low |
 
 ### Allowlist Guidance
 
@@ -210,13 +210,13 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `velero-backup-get` | `velero(?:\s+--?\S+(?:\s+\S+)?)*\s+backup\s+get\b` |
-| `velero-backup-describe` | `velero(?:\s+--?\S+(?:\s+\S+)?)*\s+backup\s+describe\b` |
-| `velero-backup-logs` | `velero(?:\s+--?\S+(?:\s+\S+)?)*\s+backup\s+logs\b` |
-| `velero-backup-create` | `velero(?:\s+--?\S+(?:\s+\S+)?)*\s+backup\s+create\b` |
-| `velero-schedule-get` | `velero(?:\s+--?\S+(?:\s+\S+)?)*\s+schedule\s+get\b` |
-| `velero-restore-create` | `velero(?:\s+--?\S+(?:\s+\S+)?)*\s+restore\s+create\b` |
-| `velero-version` | `velero(?:\s+--?\S+(?:\s+\S+)?)*\s+version\b` |
+| `velero-backup-get` | `velero(?:\s+--?\S+(?:\s+\S+)?)*\s+backup\s+get(?=\s\|$)` |
+| `velero-backup-describe` | `velero(?:\s+--?\S+(?:\s+\S+)?)*\s+backup\s+describe(?=\s\|$)` |
+| `velero-backup-logs` | `velero(?:\s+--?\S+(?:\s+\S+)?)*\s+backup\s+logs(?=\s\|$)` |
+| `velero-backup-create` | `velero(?:\s+--?\S+(?:\s+\S+)?)*\s+backup\s+create(?=\s\|$)` |
+| `velero-schedule-get` | `velero(?:\s+--?\S+(?:\s+\S+)?)*\s+schedule\s+get(?=\s\|$)` |
+| `velero-restore-create` | `velero(?:\s+--?\S+(?:\s+\S+)?)*\s+restore\s+create(?=\s\|$)` |
+| `velero-version` | `velero(?:\s+--?\S+(?:\s+\S+)?)*\s+version(?=\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 
@@ -225,11 +225,11 @@ These patterns match potentially destructive commands:
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
 | `velero-backup-delete` | velero backup delete removes a backup and its data. | high |
-| `velero-schedule-delete` | velero schedule delete removes scheduled backups. | high |
-| `velero-restore-delete` | velero restore delete removes restore records. | high |
+| `velero-schedule-delete` | velero schedule delete removes scheduled backups. | medium |
+| `velero-restore-delete` | velero restore delete removes restore records. | low |
 | `velero-backup-location-delete` | velero backup-location delete removes a backup storage location. | high |
 | `velero-snapshot-location-delete` | velero snapshot-location delete removes a snapshot location. | high |
-| `velero-uninstall` | velero uninstall removes the Velero deployment and related resources. | high |
+| `velero-uninstall` | velero uninstall removes the Velero deployment and related resources. | critical |
 
 ### Allowlist Guidance
 

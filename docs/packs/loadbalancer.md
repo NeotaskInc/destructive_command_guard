@@ -32,7 +32,7 @@ These patterns match safe commands that are always allowed:
 |--------------|----------|
 | `haproxy-config-check` | `\bhaproxy\s+-c\b` |
 | `haproxy-version` | `\bhaproxy\s+-v+\b` |
-| `systemctl-status-haproxy` | `systemctl\s+status\s+haproxy(?:\.service)?\b` |
+| `systemctl-status-haproxy` | `systemctl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+status\s+haproxy(?:\.service)?\b` |
 | `service-status-haproxy` | `service\s+haproxy\s+status\b` |
 | `haproxy-socat-show` | `(?:echo\|printf)\s+['"]?show\s+(?:stat\|info\|servers\|backend\|pools\|sess\|errors\|table)['"]?\s*\\|\s*socat\b` |
 
@@ -97,7 +97,7 @@ These patterns match safe commands that are always allowed:
 | `nginx-version` | `nginx\s+-v\b` |
 | `nginx-version-full` | `nginx\s+-V\b` |
 | `nginx-reload` | `nginx\s+-s\s+reload\b` |
-| `systemctl-status-nginx` | `systemctl\s+status\s+nginx(?:\.service)?\b` |
+| `systemctl-status-nginx` | `systemctl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+status\s+nginx(?:\.service)?\b` |
 | `service-status-nginx` | `service\s+nginx\s+status\b` |
 
 ### Destructive Patterns (Blocked)
@@ -110,7 +110,7 @@ These patterns match potentially destructive commands:
 | `nginx-quit` | nginx -s quit gracefully stops nginx and halts traffic handling. | high |
 | `systemctl-stop-nginx` | systemctl stop nginx stops the nginx service and disrupts traffic. | high |
 | `service-stop-nginx` | service nginx stop stops the nginx service and disrupts traffic. | high |
-| `nginx-config-delete` | Removing files from /etc/nginx deletes nginx configuration. | high |
+| `nginx-config-delete` | Removing files from /etc/nginx deletes nginx configuration. | critical |
 
 ### Allowlist Guidance
 
@@ -152,12 +152,12 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `traefik-version` | `\btraefik\s+version\b` |
-| `traefik-healthcheck` | `\btraefik\s+healthcheck\b` |
+| `traefik-version` | `\btraefik\s+version(?=\s\|$)` |
+| `traefik-healthcheck` | `\btraefik\s+healthcheck(?=\s\|$)` |
 | `traefik-api-get` | `curl\b.*\s-X\s*GET\b.*\btraefik\b.*\b/api/` |
-| `traefik-api-read` | `curl\b.*\btraefik\b.*\b/api/(?:overview\|entrypoints\|routers\|services\|middlewares\|version\|rawdata)` |
-| `docker-traefik-inspect` | `docker\s+(?:inspect\|logs)\s+.*\btraefik\b` |
-| `kubectl-traefik-get` | `kubectl\s+(?:get\|describe)\s+.*\bingressroute` |
+| `traefik-api-read` | `curl\b(?!.*\s(?:-X\|--request)\s*(?:DELETE\|PUT\|POST\|PATCH)\b).*\btraefik\b.*\b/api/(?:overview\|entrypoints\|routers\|services\|middlewares\|version\|rawdata)` |
+| `docker-traefik-inspect` | `docker\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:inspect\|logs)\s+.*\btraefik\b` |
+| `kubectl-traefik-get` | `kubectl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:get\|describe)\s+.*\bingressroute` |
 
 ### Destructive Patterns (Blocked)
 
@@ -165,12 +165,12 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
-| `traefik-docker-stop` | Stopping the Traefik container halts all traffic routing. | high |
-| `traefik-docker-rm` | Removing the Traefik container destroys the load balancer. | high |
-| `traefik-compose-down` | docker-compose down on Traefik stops and removes the load balancer. | high |
-| `traefik-kubectl-delete-pod` | Deleting Traefik pods/deployments disrupts traffic routing. | high |
+| `traefik-docker-stop` | Stopping the Traefik container halts all traffic routing. | critical |
+| `traefik-docker-rm` | Removing the Traefik container destroys the load balancer. | critical |
+| `traefik-compose-down` | docker-compose down on Traefik stops and removes the load balancer. | critical |
+| `traefik-kubectl-delete-pod` | Deleting Traefik pods/deployments disrupts traffic routing. | critical |
 | `traefik-kubectl-delete-ingressroute` | Deleting IngressRoute CRDs removes Traefik routing rules. | high |
-| `traefik-config-delete` | Removing Traefik config files disrupts load balancer configuration. | high |
+| `traefik-config-delete` | Removing Traefik config files disrupts load balancer configuration. | critical |
 | `traefik-api-delete` | DELETE operations against Traefik API can remove routing configuration. | high |
 | `traefik-systemctl-stop` | systemctl stop traefik stops the Traefik service. | high |
 | `traefik-service-stop` | service traefik stop stops the Traefik service. | high |

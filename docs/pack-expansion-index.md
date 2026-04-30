@@ -44,9 +44,10 @@ Master Epic (pcq)
 │   ├── rsync (78a) - PROMOTED from remote.*
 │   └── s3 (3a1) - PROMOTED from storage.*
 │
-├── Tier 2: High Value (hhh) [P1] - 18 pack tasks
+├── Tier 2: High Value (hhh) [P1] - 19 pack tasks
 │   ├── platform.github (3w5) - repos, releases, deploy keys, webhooks
 │   ├── platform.gitlab (z2q) - projects, releases, runners
+│   ├── platform.railway - projects, services, environments, volumes, variables, deployments
 │   ├── dns.*: cloudflare, route53, generic (3)
 │   ├── loadbalancer.*: nginx, elb, haproxy, traefik (4)
 │   ├── monitoring.*: datadog, pagerduty, prometheus, newrelic (4)
