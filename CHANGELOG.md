@@ -20,12 +20,17 @@ flag semantics that need to ship in prebuilt binaries.
 
 ### CLI Reliability
 
+- Kept shell redirection ampersands such as `2>&1`, `>&2`, and `&>` inside
+  the current command segment instead of splitting them as command separators,
+  preserving correct downstream pack evaluation for redirected commands
+  ([acf6803](https://github.com/Dicklesworthstone/destructive_command_guard/commit/acf6803)).
 - Honored documented falsey values for `DCG_NO_COLOR` and `DCG_NO_RICH` in
   non-clap output paths, so values such as `0`, `false`, `no`, and `off` no
   longer disable colors or rich output by mere presence
   ([14f1aac](https://github.com/Dicklesworthstone/destructive_command_guard/commit/14f1aac)).
 - Kept Linux-only allowlist process inspection imports behind a Linux cfg so
-  macOS and Windows release builds stay warning-clean.
+  macOS and Windows release builds stay warning-clean
+  ([bdcbb9b](https://github.com/Dicklesworthstone/destructive_command_guard/commit/bdcbb9b)).
 
 ## [v0.4.8](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.4.8) -- 2026-05-01 [Release]
 
