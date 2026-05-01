@@ -98,7 +98,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // API - GET requests
         safe_pattern!(
             "launchdarkly-api-get",
-            r"curl\s+.*(?:-X\s+GET|--request\s+GET)\s+.*app\.launchdarkly\.com/api"
+            r"(?i)^(?!(?=.*(?:-X\s+DELETE|--request\s+DELETE)\b)(?=.*app\.launchdarkly\.com/api/))curl\s+.*(?:-X\s+GET|--request\s+GET)\s+.*app\.launchdarkly\.com/api"
         ),
     ]
 }
@@ -187,7 +187,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // API - DELETE requests (ordered from most specific to least specific)
         destructive_pattern!(
             "launchdarkly-api-delete-environments",
-            r"curl\s+.*(?:-X\s+DELETE|--request\s+DELETE)\s+.*app\.launchdarkly\.com/api/.*/environments/",
+            r"(?i)\bcurl\b(?=.*(?:-X\s+DELETE|--request\s+DELETE)\b)(?=.*app\.launchdarkly\.com/api/.*/environments/).*",
             "DELETE request to LaunchDarkly API removes environments.",
             Critical,
             "API DELETE calls to environments immediately invalidate SDK keys and remove \
@@ -200,7 +200,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "launchdarkly-api-delete-flags",
-            r"curl\s+.*(?:-X\s+DELETE|--request\s+DELETE)\s+.*app\.launchdarkly\.com/api/.*/flags/",
+            r"(?i)\bcurl\b(?=.*(?:-X\s+DELETE|--request\s+DELETE)\b)(?=.*app\.launchdarkly\.com/api/.*/flags/).*",
             "DELETE request to LaunchDarkly API removes feature flags.",
             Critical,
             "API DELETE calls permanently remove flags without archive recovery options. \
@@ -213,7 +213,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "launchdarkly-api-delete-segments",
-            r"curl\s+.*(?:-X\s+DELETE|--request\s+DELETE)\s+.*app\.launchdarkly\.com/api/.*/segments/",
+            r"(?i)\bcurl\b(?=.*(?:-X\s+DELETE|--request\s+DELETE)\b)(?=.*app\.launchdarkly\.com/api/.*/segments/).*",
             "DELETE request to LaunchDarkly API removes segments.",
             High,
             "API DELETE calls to segments remove user groupings immediately. Flags \
@@ -226,7 +226,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "launchdarkly-api-delete-projects",
-            r"curl\s+.*(?:-X\s+DELETE|--request\s+DELETE)\s+.*app\.launchdarkly\.com/api/v2/projects/[^/]+$",
+            r"(?i)\bcurl\b(?=.*(?:-X\s+DELETE|--request\s+DELETE)\b)(?=.*app\.launchdarkly\.com/api/v2/projects/[^/\s]+(?:\s|$)).*",
             "DELETE request to LaunchDarkly API removes projects.",
             Critical,
             "API DELETE calls to projects remove ALL resources: flags, environments, \
@@ -239,7 +239,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "launchdarkly-api-delete-generic",
-            r"curl\s+.*(?:-X\s+DELETE|--request\s+DELETE)\s+.*app\.launchdarkly\.com/api/",
+            r"(?i)\bcurl\b(?=.*(?:-X\s+DELETE|--request\s+DELETE)\b)(?=.*app\.launchdarkly\.com/api/).*",
             "DELETE request to LaunchDarkly API can remove resources.",
             High,
             "Generic DELETE requests to the LaunchDarkly API can remove various \
@@ -412,6 +412,22 @@ mod tests {
             &pack,
             "curl -X DELETE https://app.launchdarkly.com/api/v2/other-resource",
             "launchdarkly-api-delete-generic",
+        );
+    }
+
+    #[test]
+    fn curl_get_safe_pattern_does_not_mask_destructive_api_methods() {
+        let pack = create_pack();
+        let command = "curl -X GET https://app.launchdarkly.com/api/v2/flags/my-project \
+            -X DELETE https://app.launchdarkly.com/api/v2/flags/my-project/my-flag";
+
+        assert_no_safe_match(&pack, command);
+        assert_blocks_with_pattern(&pack, command, "launchdarkly-api-delete-flags");
+
+        assert_blocks_with_pattern(
+            &pack,
+            "curl https://app.launchdarkly.com/api/v2/projects/my-project -X DELETE",
+            "launchdarkly-api-delete-projects",
         );
     }
 

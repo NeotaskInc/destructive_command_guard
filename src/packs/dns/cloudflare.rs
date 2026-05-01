@@ -41,7 +41,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         ),
         safe_pattern!(
             "cloudflare-api-get",
-            r"curl\b.*\s-X\s*GET\b.*\bapi\.cloudflare\.com\b"
+            r"(?i)^(?!(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*\bapi\.cloudflare\.com\b[^\s]*?/(?:dns_records|zones)/[^\s]+))curl\b.*(?:-X\s*|--request(?:=|\s+))GET\b.*\bapi\.cloudflare\.com\b"
         ),
     ]
 }
@@ -63,7 +63,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "cloudflare-api-delete-dns-record",
-            r"curl\b.*-X\s*DELETE\b.*\bapi\.cloudflare\.com\b[^\s]*?/dns_records/[^\s]+",
+            r"(?i)\bcurl\b(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*\bapi\.cloudflare\.com\b[^\s]*?/dns_records/[^\s]+).*",
             "curl -X DELETE against /dns_records/{id} deletes a Cloudflare DNS record.",
             High,
             "API deletion of a DNS record takes effect immediately across Cloudflare's network. \
@@ -75,7 +75,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "cloudflare-api-delete-zone",
-            r"curl\b.*-X\s*DELETE\b.*\bapi\.cloudflare\.com\b[^\s]*?/zones/[^\s]+",
+            r"(?i)\bcurl\b(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*\bapi\.cloudflare\.com\b[^\s]*?/zones/[^\s]+).*",
             "curl -X DELETE against /zones/{id} deletes a Cloudflare zone.",
             Critical,
             "Deleting a zone removes ALL DNS records, page rules, firewall rules, and \
@@ -153,6 +153,22 @@ mod tests {
             &pack,
             "terraform destroy -target=cloudflare_record.main",
             "cloudflare-terraform-destroy-record",
+        );
+    }
+
+    #[test]
+    fn curl_get_safe_pattern_does_not_mask_destructive_api_methods() {
+        let pack = create_pack();
+        let command = "curl -X GET https://api.cloudflare.com/client/v4/zones \
+            -X DELETE https://api.cloudflare.com/client/v4/zones/abc/dns_records/def";
+
+        assert_no_safe_match(&pack, command);
+        assert_blocks_with_pattern(&pack, command, "cloudflare-api-delete-dns-record");
+
+        assert_blocks_with_pattern(
+            &pack,
+            "curl https://api.cloudflare.com/client/v4/zones/abc --request=DELETE",
+            "cloudflare-api-delete-zone",
         );
     }
 

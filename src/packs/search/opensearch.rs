@@ -40,15 +40,15 @@ fn create_safe_patterns() -> Vec<SafePattern> {
     vec![
         safe_pattern!(
             "os-curl-get-search",
-            r#"curl\b.*-X\s*GET\b.*\b(?:https?://)?[^\s'\"]*(?:opensearch|:9200)[^\s'\"]*/(?:[^\s/]+/)?(?:_search|_count|_mapping|_settings)\b"#
+            r#"(?i)^(?!(?=.*-X\s*(?:DELETE|POST)\b)(?=.*(?:opensearch|:9200)))curl\b.*-X\s*GET\b.*\b(?:https?://)?[^\s'\"]*(?:opensearch|:9200)[^\s'\"]*/(?:[^\s/]+/)?(?:_search|_count|_mapping|_settings)\b"#
         ),
         safe_pattern!(
             "os-curl-get-cat",
-            r#"curl\b.*-X\s*GET\b.*\b(?:https?://)?[^\s'\"]*(?:opensearch|:9200)[^\s'\"]*/_cat/\S+"#
+            r#"(?i)^(?!(?=.*-X\s*(?:DELETE|POST)\b)(?=.*(?:opensearch|:9200)))curl\b.*-X\s*GET\b.*\b(?:https?://)?[^\s'\"]*(?:opensearch|:9200)[^\s'\"]*/_cat/\S+"#
         ),
         safe_pattern!(
             "os-curl-get-cluster-health",
-            r#"curl\b.*-X\s*GET\b.*\b(?:https?://)?[^\s'\"]*(?:opensearch|:9200)[^\s'\"]*/_cluster/health\b"#
+            r#"(?i)^(?!(?=.*-X\s*(?:DELETE|POST)\b)(?=.*(?:opensearch|:9200)))curl\b.*-X\s*GET\b.*\b(?:https?://)?[^\s'\"]*(?:opensearch|:9200)[^\s'\"]*/_cluster/health\b"#
         ),
         safe_pattern!(
             "os-http-get-search",
@@ -77,7 +77,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
     vec![
         destructive_pattern!(
             "os-curl-delete-doc",
-            r#"curl\b.*-X\s*DELETE\b.*\b(?:https?://)?[^\s'\"]*?(?:opensearch|:9200)[^\s'\"]*?/[a-z0-9][a-z0-9._-]*/_doc/[^\s/?]+"#,
+            r#"(?i)\bcurl\b(?=.*-X\s*DELETE\b)(?=.*\b(?:https?://)?[^\s'\"]*?(?:opensearch|:9200)[^\s'\"]*?/[a-z0-9][a-z0-9._-]*/_doc/[^\s/?]+).*"#,
             "curl -X DELETE against /_doc deletes a document from OpenSearch.",
             Medium,
             "Deleting individual documents removes them from search results immediately. \
@@ -90,7 +90,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "os-curl-delete-by-query",
-            r#"curl\b.*-X\s*POST\b.*\b(?:https?://)?[^\s'\"]*(?:opensearch|:9200)[^\s'\"]*/[a-z0-9][a-z0-9._-]*/_delete_by_query\b"#,
+            r#"(?i)\bcurl\b(?=.*-X\s*POST\b)(?=.*\b(?:https?://)?[^\s'\"]*(?:opensearch|:9200)[^\s'\"]*/[a-z0-9][a-z0-9._-]*/_delete_by_query\b).*"#,
             "curl -X POST to _delete_by_query deletes documents matching the query.",
             High,
             "The _delete_by_query endpoint can delete large numbers of documents at once. \
@@ -103,7 +103,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "os-curl-close-index",
-            r#"curl\b.*-X\s*POST\b.*\b(?:https?://)?[^\s'\"]*(?:opensearch|:9200)[^\s'\"]*/(?:_all|\*|[a-z0-9][a-z0-9._-]*)/_close\b"#,
+            r#"(?i)\bcurl\b(?=.*-X\s*POST\b)(?=.*\b(?:https?://)?[^\s'\"]*(?:opensearch|:9200)[^\s'\"]*/(?:_all|\*|[a-z0-9][a-z0-9._-]*)/_close\b).*"#,
             "curl -X POST to _close closes an index, making it unavailable for reads/writes.",
             High,
             "Closing an index makes it completely unavailable for search and indexing. \
@@ -116,7 +116,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "os-curl-delete-index",
-            r#"curl\b.*-X\s*DELETE\b.*\b(?:https?://)?[^\s'\"]*(?:opensearch|:9200)[^\s'\"]*/(?:_all|\*|[a-z0-9][a-z0-9._-]*)(?:\b|[/?])"#,
+            r#"(?i)\bcurl\b(?=.*-X\s*DELETE\b)(?=.*\b(?:https?://)?[^\s'\"]*(?:opensearch|:9200)[^\s'\"]*/(?:_all|\*|[a-z0-9][a-z0-9._-]*)(?:\b|[/?])).*"#,
             "curl -X DELETE against an OpenSearch index (or _all/*) deletes data permanently.",
             Critical,
             "Deleting an OpenSearch index permanently removes all documents, mappings, and \
@@ -295,6 +295,22 @@ mod tests {
             &pack,
             "http POST :9200/my-index/_close",
             "os-http-close-index",
+        );
+    }
+
+    #[test]
+    fn curl_get_safe_pattern_does_not_mask_destructive_api_methods() {
+        let pack = create_pack();
+        let command = "curl -X GET http://localhost:9200/_cluster/health \
+            -X DELETE http://localhost:9200/my-index";
+
+        assert_no_safe_match(&pack, command);
+        assert_blocks_with_pattern(&pack, command, "os-curl-delete-index");
+
+        assert_blocks_with_pattern(
+            &pack,
+            "curl http://localhost:9200/my-index/_delete_by_query -X POST",
+            "os-curl-delete-by-query",
         );
     }
 

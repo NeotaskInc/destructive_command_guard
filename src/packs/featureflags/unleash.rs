@@ -90,7 +90,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // API - GET requests
         safe_pattern!(
             "unleash-api-get",
-            r"curl\s+.*(?:-X\s+GET|--request\s+GET)\s+.*/api/admin/"
+            r"(?i)^(?!(?=.*(?:-X\s+DELETE|--request\s+DELETE)\b)(?=.*/api/admin/))curl\s+.*(?:-X\s+GET|--request\s+GET)\s+.*/api/admin/"
         ),
     ]
 }
@@ -179,7 +179,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // API - DELETE requests
         destructive_pattern!(
             "unleash-api-delete-features",
-            r"curl\s+.*(?:-X\s+DELETE|--request\s+DELETE)\s+.*?/api/admin/projects/.*/features/",
+            r"(?i)\bcurl\b(?=.*(?:-X\s+DELETE|--request\s+DELETE)\b)(?=.*?/api/admin/projects/.*/features/).*",
             "DELETE request to Unleash API removes feature toggles.",
             Critical,
             "API DELETE calls to features permanently remove toggles without archive \
@@ -191,7 +191,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "unleash-api-delete-projects",
-            r"curl\s+.*(?:-X\s+DELETE|--request\s+DELETE)\s+.*?/api/admin/projects/[^/]+$",
+            r"(?i)\bcurl\b(?=.*(?:-X\s+DELETE|--request\s+DELETE)\b)(?=.*?/api/admin/projects/[^/\s]+(?:\s|$)).*",
             "DELETE request to Unleash API removes projects.",
             Critical,
             "API DELETE calls to projects remove ALL toggles, strategies, and \
@@ -204,7 +204,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "unleash-api-delete-generic",
-            r"curl\s+.*(?:-X\s+DELETE|--request\s+DELETE)\s+.*?/api/admin/",
+            r"(?i)\bcurl\b(?=.*(?:-X\s+DELETE|--request\s+DELETE)\b)(?=.*?/api/admin/).*",
             "DELETE request to Unleash API can remove resources.",
             High,
             "Generic DELETE requests to the Unleash admin API can remove various \
@@ -333,6 +333,22 @@ mod tests {
         assert_blocks_with_pattern(
             &pack,
             "curl -X DELETE http://unleash.example.com:4242/api/admin/projects/my-project",
+            "unleash-api-delete-projects",
+        );
+    }
+
+    #[test]
+    fn curl_get_safe_pattern_does_not_mask_destructive_api_methods() {
+        let pack = create_pack();
+        let command = "curl -X GET http://unleash.example.com:4242/api/admin/projects/default/features \
+            -X DELETE http://unleash.example.com:4242/api/admin/projects/default/features/my-toggle";
+
+        assert_no_safe_match(&pack, command);
+        assert_blocks_with_pattern(&pack, command, "unleash-api-delete-features");
+
+        assert_blocks_with_pattern(
+            &pack,
+            "curl http://unleash.example.com:4242/api/admin/projects/my-project -X DELETE",
             "unleash-api-delete-projects",
         );
     }

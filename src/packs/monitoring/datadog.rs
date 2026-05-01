@@ -39,7 +39,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         ),
         safe_pattern!(
             "datadog-api-get",
-            r"(?i)curl\s+.*(?:-X|--request)\s+GET\b.*api\.datadoghq\.com"
+            r"(?i)^(?!(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*api\.datadoghq\.com.*\/(?:monitor|dashboard|synthetics)\/))curl\s+.*(?:-X\s*|--request(?:=|\s+))GET\b.*api\.datadoghq\.com"
         ),
     ]
 }
@@ -74,7 +74,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "datadog-api-delete",
-            r"(?i)curl\s+.*(?:-X|--request)\s+DELETE\b.*api\.datadoghq\.com.*\/(monitor|dashboard|synthetics)\/",
+            r"(?i)\bcurl\b(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*api\.datadoghq\.com.*\/(?:monitor|dashboard|synthetics)\/).*",
             "Datadog API DELETE calls remove monitors/dashboards/synthetics.",
             High,
             "Direct API DELETE calls permanently remove Datadog resources without \
@@ -155,6 +155,22 @@ mod tests {
             &pack,
             "terraform destroy -target=datadog_monitor.alerts",
             "terraform-datadog-destroy",
+        );
+    }
+
+    #[test]
+    fn curl_get_safe_pattern_does_not_mask_destructive_api_methods() {
+        let pack = create_pack();
+        let command = "curl -X GET https://api.datadoghq.com/api/v1/monitor \
+            -X DELETE https://api.datadoghq.com/api/v1/dashboard/abc";
+
+        assert_no_safe_match(&pack, command);
+        assert_blocks_with_pattern(&pack, command, "datadog-api-delete");
+
+        assert_blocks_with_pattern(
+            &pack,
+            "curl https://api.datadoghq.com/api/v1/dashboard/abc -XDELETE",
+            "datadog-api-delete",
         );
     }
 

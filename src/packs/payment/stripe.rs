@@ -49,7 +49,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         ),
         safe_pattern!(
             "stripe-api-get",
-            r"(?i)curl\s+.*(?:-X|--request)\s+GET\b.*api\.stripe\.com.*\/v1\/"
+            r"(?i)^(?!(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*api\.stripe\.com.*\/v1\/))curl\s+.*(?:-X\s*|--request(?:=|\s+))GET\b.*api\.stripe\.com.*\/v1\/"
         ),
     ]
 }
@@ -136,7 +136,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "stripe-api-delete",
-            r"(?i)curl\s+.*(?:-X|--request)\s+DELETE\b.*api\.stripe\.com.*\/v1\/",
+            r"(?i)\bcurl\b(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*api\.stripe\.com.*\/v1\/).*",
             "Stripe API DELETE calls remove Stripe resources.",
             High,
             "Direct API DELETE calls permanently remove Stripe resources without CLI \
@@ -213,6 +213,22 @@ mod tests {
         assert_blocks_with_pattern(
             &pack,
             "curl -X DELETE https://api.stripe.com/v1/customers/cus_123",
+            "stripe-api-delete",
+        );
+    }
+
+    #[test]
+    fn curl_get_safe_pattern_does_not_mask_destructive_api_methods() {
+        let pack = create_pack();
+        let command = "curl -X GET https://api.stripe.com/v1/customers \
+            -X DELETE https://api.stripe.com/v1/customers/cus_123";
+
+        assert_no_safe_match(&pack, command);
+        assert_blocks_with_pattern(&pack, command, "stripe-api-delete");
+
+        assert_blocks_with_pattern(
+            &pack,
+            "curl https://api.stripe.com/v1/customers/cus_123 -XDELETE",
             "stripe-api-delete",
         );
     }

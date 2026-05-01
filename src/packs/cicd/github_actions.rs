@@ -57,7 +57,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // Safe only when GET is explicit (default method can vary by flags).
         safe_pattern!(
             "gh-actions-api-explicit-get",
-            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:secret|variable|workflow|run|api)\b)\S+)?)*\s+api\b.*(?:-X|--method)\s+GET\b"
+            r"^(?!(?=.*(?:-X\s*|--method(?:=|\s+))DELETE\b))gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:secret|variable|workflow|run|api)\b)\S+)?)*\s+api\b.*(?:-X\s*|--method(?:=|\s+))GET\b"
         ),
     ]
 }
@@ -118,7 +118,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "gh-actions-api-delete-secrets",
-            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:secret|variable|workflow|run|api)\b)\S+)?)*\s+api\b.*(?:-X|--method)\s+DELETE\b.*\b/?repos/[^\s/]+/[^\s/]+/actions/secrets\b",
+            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:secret|variable|workflow|run|api)\b)\S+)?)*\s+api\b.*(?:-X\s*|--method(?:=|\s+))DELETE\b.*\b/?repos/[^\s/]+/[^\s/]+/actions/secrets\b",
             "gh api DELETE against /actions/secrets deletes GitHub Actions secrets.",
             High,
             "Making DELETE requests to the GitHub Actions secrets API removes secrets from \
@@ -131,7 +131,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "gh-actions-api-delete-variables",
-            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:secret|variable|workflow|run|api)\b)\S+)?)*\s+api\b.*(?:-X|--method)\s+DELETE\b.*\b/?repos/[^\s/]+/[^\s/]+/actions/variables\b",
+            r"gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:secret|variable|workflow|run|api)\b)\S+)?)*\s+api\b.*(?:-X\s*|--method(?:=|\s+))DELETE\b.*\b/?repos/[^\s/]+/[^\s/]+/actions/variables\b",
             "gh api DELETE against /actions/variables deletes GitHub Actions variables.",
             Medium,
             "Making DELETE requests to the GitHub Actions variables API removes variables \
@@ -200,12 +200,12 @@ mod tests {
         let pack = create_pack();
 
         let matched = pack
-            .check("gh api -X DELETE repos/o/r/actions/secrets/FOO")
+            .check("gh api -XDELETE repos/o/r/actions/secrets/FOO")
             .expect("gh api DELETE secrets should be detected");
         assert_eq!(matched.name, Some("gh-actions-api-delete-secrets"));
 
         let matched = pack
-            .check("gh api --method DELETE /repos/o/r/actions/variables/FOO")
+            .check("gh api --method=DELETE /repos/o/r/actions/variables/FOO")
             .expect("gh api DELETE variables should be detected");
         assert_eq!(matched.name, Some("gh-actions-api-delete-variables"));
     }
@@ -272,6 +272,16 @@ mod tests {
         assert_safe_pattern_matches(&pack, "gh run list");
         assert_safe_pattern_matches(&pack, "gh run view 456");
         assert_safe_pattern_matches(&pack, "gh api -X GET repos/o/r/actions/secrets");
+    }
+
+    #[test]
+    fn gh_api_get_safe_pattern_does_not_mask_delete_methods() {
+        let pack = create_pack();
+        let command =
+            "gh api -X GET repos/o/r/actions/secrets -X DELETE repos/o/r/actions/secrets/FOO";
+
+        assert_no_safe_match(&pack, command);
+        assert_blocks_with_pattern(&pack, command, "gh-actions-api-delete-secrets");
     }
 
     #[test]

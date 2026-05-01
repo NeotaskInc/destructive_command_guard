@@ -34,11 +34,11 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // API GET operations (read-only)
         safe_pattern!(
             "traefik-api-get",
-            r"curl\b.*\s-X\s*GET\b.*\btraefik\b.*\b/api/"
+            r"(?i)^(?!(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*\btraefik\b.*\b/api/))curl\b.*(?:-X\s*|--request(?:=|\s+))GET\b.*\btraefik\b.*\b/api/"
         ),
         safe_pattern!(
             "traefik-api-read",
-            r"curl\b(?!.*\s(?:-X|--request)\s*(?:DELETE|PUT|POST|PATCH)\b).*\btraefik\b.*\b/api/(?:overview|entrypoints|routers|services|middlewares|version|rawdata)"
+            r"curl\b(?!.*\s(?:-X\s*|--request(?:=|\s+))(?:DELETE|PUT|POST|PATCH)\b).*\btraefik\b.*\b/api/(?:overview|entrypoints|routers|services|middlewares|version|rawdata)"
         ),
         // Docker inspect/logs (read-only)
         safe_pattern!(
@@ -139,7 +139,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // API DELETE operations
         destructive_pattern!(
             "traefik-api-delete",
-            r"curl\b.*\s-X\s*DELETE\b.*\btraefik\b.*\b/api/",
+            r"(?i)\bcurl\b(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*\btraefik\b.*\b/api/).*",
             "DELETE operations against Traefik API can remove routing configuration.",
             High,
             "Sending DELETE requests to the Traefik API removes routers, services, or \
@@ -228,6 +228,22 @@ mod tests {
             "traefik-config-delete",
         );
         assert_blocks_with_pattern(&pack, "systemctl stop traefik", "traefik-systemctl-stop");
+    }
+
+    #[test]
+    fn curl_get_safe_pattern_does_not_mask_destructive_api_methods() {
+        let pack = create_pack();
+        let command = "curl -X GET http://traefik:8080/api/overview \
+            -X DELETE http://traefik:8080/api/http/routers/foo";
+
+        assert_no_safe_match(&pack, command);
+        assert_blocks_with_pattern(&pack, command, "traefik-api-delete");
+
+        assert_blocks_with_pattern(
+            &pack,
+            "curl http://traefik:8080/api/http/routers/foo -XDELETE",
+            "traefik-api-delete",
+        );
     }
 
     #[test]

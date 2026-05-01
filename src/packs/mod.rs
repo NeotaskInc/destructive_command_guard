@@ -1240,7 +1240,12 @@ static PACK_ENTRIES: [PackEntry; 84] = [
     ),
     PackEntry::new(
         "payment.square",
-        &["square", "api.squareup.com"],
+        &[
+            "square",
+            "api.squareup.com",
+            "connect.squareup.com",
+            "connect.squareupsandbox.com",
+        ],
         payment::square::create_pack,
     ),
     PackEntry::new(

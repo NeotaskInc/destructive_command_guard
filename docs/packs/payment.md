@@ -145,6 +145,8 @@ Commands containing these keywords are checked against this pack:
 
 - `square`
 - `api.squareup.com`
+- `connect.squareup.com`
+- `connect.squareupsandbox.com`
 
 ### Safe Patterns (Allowed)
 
@@ -154,7 +156,7 @@ These patterns match safe commands that are always allowed:
 |--------------|----------|
 | `square-catalog-list` | `\bsquare\b(?:\s+--?\S+(?:\s+\S+)?)*\s+catalog\s+list\b` |
 | `square-customers-list` | `\bsquare\b(?:\s+--?\S+(?:\s+\S+)?)*\s+customers\s+list\b` |
-| `square-api-get` | `(?i)curl\s+.*(?:-X\|--request)\s+GET\b.*api\.squareup\.com` |
+| `square-api-get` | `(?i)^(?!(?=.*(?:-X\s*\|--request(?:=\|\s+))DELETE\b)(?=.*https?://(?:api\.squareup\.com\|connect\.squareup(?:sandbox)?\.com)))(?!(?=.*(?:-X\s*\|--request(?:=\|\s+))POST\b)(?=.*https?://(?:api\.squareup\.com\|connect\.squareup(?:sandbox)?\.com)[^\s'"]*/v2/catalog/batch-delete))\bcurl\b(?:[^\n]*?(?:-X\s*\|--request(?:=\|\s+))GET\b[^\n]*?https?://(?:api\.squareup\.com\|connect\.squareup(?:sandbox)?\.com)\|[^\n]*?https?://(?:api\.squareup\.com\|connect\.squareup(?:sandbox)?\.com)[^\n]*?(?:-X\s*\|--request(?:=\|\s+))GET\b)` |
 
 ### Destructive Patterns (Blocked)
 
@@ -164,7 +166,9 @@ These patterns match potentially destructive commands:
 |--------------|--------|----------|
 | `square-catalog-delete` | square catalog delete removes catalog objects, impacting products and inventory. | high |
 | `square-api-delete-catalog-object` | Square API DELETE /v2/catalog/object/{id} deletes a catalog object. | high |
+| `square-api-batch-delete-catalog-objects` | Square API POST /v2/catalog/batch-delete deletes multiple catalog objects. | critical |
 | `square-api-delete-customer` | Square API DELETE /v2/customers/{id} deletes a customer. | critical |
+| `square-api-delete-payment-link` | Square API DELETE /v2/online-checkout/payment-links/{id} deletes a payment link. | high |
 | `square-api-delete-location` | Square API DELETE /v2/locations/{id} deletes a location. | critical |
 | `square-api-delete-webhook-subscription` | Square API DELETE /v2/webhooks/subscriptions/{id} deletes a webhook subscription. | high |
 
@@ -188,4 +192,3 @@ risk_acknowledged = true
 ```
 
 ---
-

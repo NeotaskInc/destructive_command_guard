@@ -72,7 +72,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // Kong Admin API - explicit GET requests only
         safe_pattern!(
             "kong-admin-explicit-get",
-            r"curl\s+.*(?:-X\s+GET|--request\s+GET)\s+.*(?:localhost|127\.0\.0\.1):8001/"
+            r"(?i)^(?!(?=.*(?:-X\s+DELETE|--request\s+DELETE)\b)(?=.*(?:localhost|127\.0\.0\.1):8001/))curl\s+.*(?:-X\s+GET|--request\s+GET)\s+.*(?:localhost|127\.0\.0\.1):8001/"
         ),
     ]
 }
@@ -428,6 +428,16 @@ mod tests {
             "curl 127.0.0.1:8001/plugins/rate-limit -X DELETE",
             "kong-admin-delete-plugins",
         );
+    }
+
+    #[test]
+    fn curl_get_safe_pattern_does_not_mask_destructive_api_methods() {
+        let pack = create_pack();
+        let command =
+            "curl -X GET localhost:8001/routes -X DELETE localhost:8001/services/my-service";
+
+        assert_no_safe_match(&pack, command);
+        assert_blocks_with_pattern(&pack, command, "kong-admin-delete-services");
     }
 
     #[test]

@@ -44,7 +44,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         ),
         safe_pattern!(
             "braintree-api-get",
-            r"(?i)curl\s+.*(?:-X|--request)\s+GET\b.*braintreegateway\.com"
+            r"(?i)^(?!(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*braintreegateway\.com))curl\s+.*(?:-X\s*|--request(?:=|\s+))GET\b.*braintreegateway\.com"
         ),
     ]
 }
@@ -53,7 +53,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
     vec![
         destructive_pattern!(
             "braintree-api-delete",
-            r"(?i)curl\s+.*(?:-X|--request)\s+DELETE\b.*braintreegateway\.com",
+            r"(?i)\bcurl\b(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*braintreegateway\.com).*",
             "Braintree API DELETE calls remove payment resources (customers, webhooks, etc.).",
             High,
             "Direct API DELETE calls to Braintree permanently remove payment resources \
@@ -194,6 +194,22 @@ mod tests {
             &pack,
             "gateway.subscription.cancel('sub_123')",
             "braintree-subscription-cancel",
+        );
+    }
+
+    #[test]
+    fn curl_get_safe_pattern_does_not_mask_destructive_api_methods() {
+        let pack = create_pack();
+        let command = "curl -X GET https://api.braintreegateway.com/merchants/abc/customers \
+            -X DELETE https://api.braintreegateway.com/merchants/abc/customers/cust_123";
+
+        assert_no_safe_match(&pack, command);
+        assert_blocks_with_pattern(&pack, command, "braintree-api-delete");
+
+        assert_blocks_with_pattern(
+            &pack,
+            "curl https://api.braintreegateway.com/merchants/abc/customers/cust_123 --request=DELETE",
+            "braintree-api-delete",
         );
     }
 

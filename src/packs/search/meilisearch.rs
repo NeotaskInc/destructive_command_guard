@@ -30,19 +30,19 @@ fn create_safe_patterns() -> Vec<SafePattern> {
     vec![
         safe_pattern!(
             "meili-curl-get-stats",
-            r#"curl\b.*-X\s*GET\b.*\b(?:https?://)?[^\s'\"]*(?:meili|:7700)[^\s'\"]*/stats\b"#
+            r#"(?i)^(?!(?=.*-X\s*DELETE\b)(?=.*(?:meili|:7700)))(?!(?=.*-X\s*POST\b)(?=.*documents/delete-batch\b))curl\b.*-X\s*GET\b.*\b(?:https?://)?[^\s'\"]*(?:meili|:7700)[^\s'\"]*/stats\b"#
         ),
         safe_pattern!(
             "meili-curl-get-health",
-            r#"curl\b.*-X\s*GET\b.*\b(?:https?://)?[^\s'\"]*(?:meili|:7700)[^\s'\"]*/health\b"#
+            r#"(?i)^(?!(?=.*-X\s*DELETE\b)(?=.*(?:meili|:7700)))(?!(?=.*-X\s*POST\b)(?=.*documents/delete-batch\b))curl\b.*-X\s*GET\b.*\b(?:https?://)?[^\s'\"]*(?:meili|:7700)[^\s'\"]*/health\b"#
         ),
         safe_pattern!(
             "meili-curl-get-version",
-            r#"curl\b.*-X\s*GET\b.*\b(?:https?://)?[^\s'\"]*(?:meili|:7700)[^\s'\"]*/version\b"#
+            r#"(?i)^(?!(?=.*-X\s*DELETE\b)(?=.*(?:meili|:7700)))(?!(?=.*-X\s*POST\b)(?=.*documents/delete-batch\b))curl\b.*-X\s*GET\b.*\b(?:https?://)?[^\s'\"]*(?:meili|:7700)[^\s'\"]*/version\b"#
         ),
         safe_pattern!(
             "meili-curl-search",
-            r#"curl\b.*-X\s*POST\b.*\b(?:https?://)?[^\s'\"]*(?:meili|:7700)[^\s'\"]*/indexes/[^\s/]+/search\b"#
+            r#"(?i)^(?!(?=.*-X\s*DELETE\b)(?=.*(?:meili|:7700)))(?!(?=.*-X\s*POST\b)(?=.*documents/delete-batch\b))curl\b.*-X\s*POST\b.*\b(?:https?://)?[^\s'\"]*(?:meili|:7700)[^\s'\"]*/indexes/[^\s/]+/search\b"#
         ),
         safe_pattern!(
             "meili-http-get-stats",
@@ -69,7 +69,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // More specific patterns first
         destructive_pattern!(
             "meili-curl-delete-document",
-            r#"curl\b.*-X\s*DELETE\b.*\b(?:https?://)?[^\s'\"]*(?:meili|:7700)[^\s'\"]*/indexes/[^\s/?]+/documents/[^\s/?]+"#,
+            r#"(?i)\bcurl\b(?=.*-X\s*DELETE\b)(?=.*\b(?:https?://)?[^\s'\"]*(?:meili|:7700)[^\s'\"]*/indexes/[^\s/?]+/documents/[^\s/?]+).*"#,
             "curl -X DELETE against /documents/{id} removes a document from Meilisearch.",
             Medium,
             "Deleting a single document removes it from search results immediately. While \
@@ -82,7 +82,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "meili-curl-delete-documents",
-            r#"curl\b.*-X\s*DELETE\b.*\b(?:https?://)?[^\s'\"]*(?:meili|:7700)[^\s'\"]*/indexes/[^\s/?]+/documents(?:[\s?'"]|$)"#,
+            r#"(?i)\bcurl\b(?=.*-X\s*DELETE\b)(?=.*\b(?:https?://)?[^\s'\"]*(?:meili|:7700)[^\s'\"]*/indexes/[^\s/?]+/documents(?:[\s?'"]|$)).*"#,
             "curl -X DELETE against /documents removes documents from Meilisearch.",
             High,
             "Deleting all documents removes every record from the index while preserving \
@@ -95,7 +95,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "meili-curl-delete-batch",
-            r#"curl\b.*-X\s*POST\b.*\b(?:https?://)?[^\s'\"]*(?:meili|:7700)[^\s'\"]*/indexes/[^\s/?]+/documents/delete-batch\b"#,
+            r#"(?i)\bcurl\b(?=.*-X\s*POST\b)(?=.*\b(?:https?://)?[^\s'\"]*(?:meili|:7700)[^\s'\"]*/indexes/[^\s/?]+/documents/delete-batch\b).*"#,
             "curl -X POST to /documents/delete-batch deletes documents in bulk.",
             High,
             "Batch delete removes multiple documents by their IDs in a single operation. \
@@ -108,7 +108,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "meili-curl-delete-key",
-            r#"curl\b.*-X\s*DELETE\b.*\b(?:https?://)?[^\s'\"]*(?:meili|:7700)[^\s'\"]*/keys/[^\s/?]+"#,
+            r#"(?i)\bcurl\b(?=.*-X\s*DELETE\b)(?=.*\b(?:https?://)?[^\s'\"]*(?:meili|:7700)[^\s'\"]*/keys/[^\s/?]+).*"#,
             "curl -X DELETE against /keys removes a Meilisearch API key.",
             High,
             "Deleting an API key immediately revokes access for all applications using it. \
@@ -122,7 +122,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Generic index deletion last
         destructive_pattern!(
             "meili-curl-delete-index",
-            r#"curl\b.*-X\s*DELETE\b.*\b(?:https?://)?[^\s'\"]*(?:meili|:7700)[^\s'\"]*/indexes/[^\s/?]+(?:[\s?'"]|$)"#,
+            r#"(?i)\bcurl\b(?=.*-X\s*DELETE\b)(?=.*\b(?:https?://)?[^\s'\"]*(?:meili|:7700)[^\s'\"]*/indexes/[^\s/?]+(?:[\s?'"]|$)).*"#,
             "curl -X DELETE against /indexes/{uid} deletes a Meilisearch index.",
             Critical,
             "Deleting a Meilisearch index permanently removes all documents, settings, \
@@ -272,6 +272,27 @@ mod tests {
             &pack,
             "http POST :7700/indexes/products/documents/delete-batch",
             "meili-http-delete-batch",
+        );
+    }
+
+    #[test]
+    fn curl_safe_patterns_do_not_mask_destructive_api_methods() {
+        let pack = create_pack();
+        let get_then_delete = "curl -X GET http://localhost:7700/health -X DELETE http://localhost:7700/indexes/products";
+
+        assert_no_safe_match(&pack, get_then_delete);
+        assert_blocks_with_pattern(&pack, get_then_delete, "meili-curl-delete-index");
+
+        let search_then_delete_batch = "curl -X POST http://localhost:7700/indexes/products/search \
+            -X POST http://localhost:7700/indexes/products/documents/delete-batch";
+
+        assert_no_safe_match(&pack, search_then_delete_batch);
+        assert_blocks_with_pattern(&pack, search_then_delete_batch, "meili-curl-delete-batch");
+
+        assert_blocks_with_pattern(
+            &pack,
+            "curl http://localhost:7700/keys/abc -X DELETE",
+            "meili-curl-delete-key",
         );
     }
 

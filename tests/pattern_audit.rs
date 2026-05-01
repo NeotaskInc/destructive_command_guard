@@ -78,6 +78,7 @@ fn test_audit_backtracking_requirements() {
                 "deck-ping",
                 "deck-validate",
                 "deck-version",
+                "kong-admin-explicit-get",
                 "kong-check",
                 "kong-config-parse",
                 "kong-health",
@@ -108,6 +109,10 @@ fn test_audit_backtracking_requirements() {
                 "rclone-lsl",
                 "rclone-size",
             ]),
+        ),
+        (
+            "cicd.jenkins",
+            HashSet::from(["jenkins-curl-do-delete", "jenkins-curl-explicit-get"]),
         ),
         (
             "backup.restic",
@@ -355,6 +360,14 @@ fn test_audit_backtracking_requirements() {
         ),
         ("dns.generic", HashSet::from(["dns-dig-safe"])),
         (
+            "dns.cloudflare",
+            HashSet::from([
+                "cloudflare-api-delete-dns-record",
+                "cloudflare-api-delete-zone",
+                "cloudflare-api-get",
+            ]),
+        ),
+        (
             "email.ses",
             HashSet::from([
                 "ses-get-send-quota",
@@ -390,6 +403,12 @@ fn test_audit_backtracking_requirements() {
         (
             "featureflags.launchdarkly",
             HashSet::from([
+                "launchdarkly-api-delete-environments",
+                "launchdarkly-api-delete-flags",
+                "launchdarkly-api-delete-generic",
+                "launchdarkly-api-delete-projects",
+                "launchdarkly-api-delete-segments",
+                "launchdarkly-api-get",
                 "ldcli-environments-create",
                 "ldcli-environments-get",
                 "ldcli-environments-list",
@@ -412,6 +431,11 @@ fn test_audit_backtracking_requirements() {
         (
             "featureflags.split",
             HashSet::from([
+                "split-api-delete-environments",
+                "split-api-delete-generic",
+                "split-api-delete-segments",
+                "split-api-delete-splits",
+                "split-api-get",
                 "split-environments-create",
                 "split-environments-get",
                 "split-environments-list",
@@ -435,6 +459,10 @@ fn test_audit_backtracking_requirements() {
             HashSet::from([
                 "unleash-environments-get",
                 "unleash-environments-list",
+                "unleash-api-delete-features",
+                "unleash-api-delete-generic",
+                "unleash-api-delete-projects",
+                "unleash-api-get",
                 "unleash-features-create",
                 "unleash-features-enable",
                 "unleash-features-get",
@@ -526,7 +554,13 @@ fn test_audit_backtracking_requirements() {
         ),
         (
             "loadbalancer.traefik",
-            HashSet::from(["traefik-api-read", "traefik-healthcheck", "traefik-version"]),
+            HashSet::from([
+                "traefik-api-delete",
+                "traefik-api-get",
+                "traefik-api-read",
+                "traefik-healthcheck",
+                "traefik-version",
+            ]),
         ),
         (
             "messaging.nats",
@@ -545,14 +579,30 @@ fn test_audit_backtracking_requirements() {
         ),
         (
             "monitoring.datadog",
-            HashSet::from(["datadog-ci-dashboards-list", "datadog-ci-monitors-list"]),
+            HashSet::from([
+                "datadog-api-delete",
+                "datadog-api-get",
+                "datadog-ci-dashboards-list",
+                "datadog-ci-monitors-list",
+            ]),
         ),
         (
             "monitoring.newrelic",
             HashSet::from([
                 "newrelic-apm-app-get",
+                "newrelic-api-delete",
+                "newrelic-api-get",
                 "newrelic-entity-search",
+                "newrelic-graphql-delete-mutation",
                 "newrelic-query",
+            ]),
+        ),
+        (
+            "monitoring.pagerduty",
+            HashSet::from([
+                "pagerduty-api-delete-schedule",
+                "pagerduty-api-delete-service",
+                "pagerduty-api-get",
             ]),
         ),
         (
@@ -600,6 +650,15 @@ fn test_audit_backtracking_requirements() {
             ]),
         ),
         (
+            "payment.braintree",
+            HashSet::from(["braintree-api-delete", "braintree-api-get"]),
+        ),
+        ("payment.square", HashSet::from(["square-api-get"])),
+        (
+            "payment.stripe",
+            HashSet::from(["stripe-api-delete", "stripe-api-get"]),
+        ),
+        (
             "platform.github",
             HashSet::from([
                 "gh-api-delete-actions-secret",
@@ -633,6 +692,45 @@ fn test_audit_backtracking_requirements() {
         (
             "remote.scp",
             HashSet::from(["scp-to-home", "scp-to-tmp", "scp-to-var-tmp"]),
+        ),
+        (
+            "search.elasticsearch",
+            HashSet::from([
+                "es-curl-close-index",
+                "es-curl-cluster-settings",
+                "es-curl-delete-by-query",
+                "es-curl-delete-doc",
+                "es-curl-delete-index",
+                "es-curl-get-cat",
+                "es-curl-get-cluster-health",
+                "es-curl-get-search",
+            ]),
+        ),
+        (
+            "search.meilisearch",
+            HashSet::from([
+                "meili-curl-delete-batch",
+                "meili-curl-delete-document",
+                "meili-curl-delete-documents",
+                "meili-curl-delete-index",
+                "meili-curl-delete-key",
+                "meili-curl-get-health",
+                "meili-curl-get-stats",
+                "meili-curl-get-version",
+                "meili-curl-search",
+            ]),
+        ),
+        (
+            "search.opensearch",
+            HashSet::from([
+                "os-curl-close-index",
+                "os-curl-delete-by-query",
+                "os-curl-delete-doc",
+                "os-curl-delete-index",
+                "os-curl-get-cat",
+                "os-curl-get-cluster-health",
+                "os-curl-get-search",
+            ]),
         ),
         (
             "secrets.aws_secrets",

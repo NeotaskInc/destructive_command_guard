@@ -59,7 +59,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         ),
         safe_pattern!(
             "jenkins-curl-explicit-get",
-            r"curl(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:-X|--request)\s+GET\b.*(?:jenkins|/job/|/api/)"
+            r"(?i)^(?!(?=.*(?:-X\s*|--request(?:=|\s+))POST\b)(?=.*\bdoDelete\b))curl(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:-X\s*|--request(?:=|\s+))GET\b.*(?:jenkins|/job/|/api/)"
         ),
     ]
 }
@@ -133,7 +133,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "jenkins-curl-do-delete",
-            r"curl(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:-X|--request)\s+POST\b.*\bdoDelete\b",
+            r"(?i)\bcurl\b(?=.*(?:-X\s*|--request(?:=|\s+))POST\b)(?=.*\bdoDelete\b).*",
             "curl POST to Jenkins doDelete endpoints deletes jobs or resources.",
             Critical,
             "POSTing to Jenkins doDelete endpoints triggers immediate deletion of jobs, builds, \
@@ -213,6 +213,11 @@ mod tests {
             "curl -X POST https://jenkins.example/job/my-job/doDelete",
             "jenkins-curl-do-delete",
         );
+        assert_blocks_with_pattern(
+            &pack,
+            "curl https://jenkins.example/job/my-job/doDelete --request=POST",
+            "jenkins-curl-do-delete",
+        );
     }
 
     #[test]
@@ -258,5 +263,15 @@ mod tests {
         );
         assert_allows(&pack, "jenkins-cli build my-job");
         assert_allows(&pack, "curl -X GET https://jenkins.example/api/json");
+    }
+
+    #[test]
+    fn curl_get_safe_pattern_does_not_mask_destructive_api_methods() {
+        let pack = create_pack();
+        let command = "curl -X GET https://jenkins.example/api/json \
+            -X POST https://jenkins.example/job/my-job/doDelete";
+
+        assert_no_safe_match(&pack, command);
+        assert_blocks_with_pattern(&pack, command, "jenkins-curl-do-delete");
     }
 }

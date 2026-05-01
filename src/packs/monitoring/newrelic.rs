@@ -44,7 +44,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         ),
         safe_pattern!(
             "newrelic-api-get",
-            r"(?i)curl\s+.*(?:-X|--request)\s+GET\b.*api\.newrelic\.com"
+            r"(?i)^(?!(?=.*(?:-X\s*|--request(?:=|\s+))(?:POST|DELETE)\b)(?=.*api\.newrelic\.com))curl\s+.*(?:-X\s*|--request(?:=|\s+))GET\b.*api\.newrelic\.com"
         ),
     ]
 }
@@ -105,7 +105,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "newrelic-api-delete",
-            r"(?i)curl\s+.*(?:-X|--request)\s+DELETE\b.*api\.newrelic\.com",
+            r"(?i)\bcurl\b(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*api\.newrelic\.com).*",
             "New Relic API DELETE calls remove monitoring/alerting resources.",
             High,
             "Direct API DELETE calls permanently remove New Relic resources without \
@@ -117,7 +117,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "newrelic-graphql-delete-mutation",
-            r"(?i)curl\s+.*api\.newrelic\.com[^\s]*?/graphql\b.*\bmutation\b.*\bdelete\w*\b",
+            r"(?i)\bcurl\b(?=.*api\.newrelic\.com[^\s]*?/graphql\b)(?=.*\bmutation\b)(?=.*\bdelete\w*\b).*",
             "New Relic GraphQL delete mutations can remove monitoring resources.",
             High,
             "GraphQL delete mutations remove New Relic resources via the NerdGraph API. \
@@ -195,6 +195,29 @@ mod tests {
             r#"curl -X POST https://api.newrelic.com/graphql -d '{"query":"mutation { deleteEntity(guid: \"abc\") }"}'"#,
             "newrelic-graphql-delete-mutation",
         );
+    }
+
+    #[test]
+    fn curl_get_safe_pattern_does_not_mask_destructive_api_methods() {
+        let pack = create_pack();
+        let api_delete = "curl -X GET https://api.newrelic.com/v2/alerts_policies.json \
+            -X DELETE https://api.newrelic.com/v2/alerts_policies/123.json";
+
+        assert_no_safe_match(&pack, api_delete);
+        assert_blocks_with_pattern(&pack, api_delete, "newrelic-api-delete");
+
+        assert_blocks_with_pattern(
+            &pack,
+            "curl https://api.newrelic.com/v2/alerts_policies/123.json --request=DELETE",
+            "newrelic-api-delete",
+        );
+
+        let graphql_delete = concat!(
+            "curl -X GET https://api.newrelic.com/v2/alerts_policies.json ",
+            r#"-X POST https://api.newrelic.com/graphql -d '{"query":"mutation { deleteEntity(guid: \"abc\") }"}'"#
+        );
+        assert_no_safe_match(&pack, graphql_delete);
+        assert_blocks_with_pattern(&pack, graphql_delete, "newrelic-graphql-delete-mutation");
     }
 
     #[test]

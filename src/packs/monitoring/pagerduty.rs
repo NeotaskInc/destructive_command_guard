@@ -40,7 +40,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         ),
         safe_pattern!(
             "pagerduty-api-get",
-            r"(?i)curl\s+.*(?:-X|--request)\s+GET\b.*api\.pagerduty\.com"
+            r"(?i)^(?!(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*api\.pagerduty\.com[^\s]*?/(?:services|schedules)/[^\s]+))curl\s+.*(?:-X\s*|--request(?:=|\s+))GET\b.*api\.pagerduty\.com"
         ),
     ]
 }
@@ -113,7 +113,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "pagerduty-api-delete-service",
-            r"(?i)curl\s+.*(?:-X|--request)\s+DELETE\b.*api\.pagerduty\.com[^\s]*?/services/[^\s]+",
+            r"(?i)\bcurl\b(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*api\.pagerduty\.com[^\s]*?/services/[^\s]+).*",
             "PagerDuty API DELETE /services/{id} deletes a PagerDuty service.",
             Critical,
             "Direct API deletion of a service removes all incident routing immediately. \
@@ -125,7 +125,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "pagerduty-api-delete-schedule",
-            r"(?i)curl\s+.*(?:-X|--request)\s+DELETE\b.*api\.pagerduty\.com[^\s]*?/schedules/[^\s]+",
+            r"(?i)\bcurl\b(?=.*(?:-X\s*|--request(?:=|\s+))DELETE\b)(?=.*api\.pagerduty\.com[^\s]*?/schedules/[^\s]+).*",
             "PagerDuty API DELETE /schedules/{id} deletes a PagerDuty schedule.",
             High,
             "API deletion of a schedule removes on-call rotations immediately. Escalation \
@@ -188,6 +188,22 @@ mod tests {
         assert_blocks_with_pattern(
             &pack,
             "curl -X DELETE https://api.pagerduty.com/schedules/P234",
+            "pagerduty-api-delete-schedule",
+        );
+    }
+
+    #[test]
+    fn curl_get_safe_pattern_does_not_mask_destructive_api_methods() {
+        let pack = create_pack();
+        let service_delete = "curl -X GET https://api.pagerduty.com/services \
+            -X DELETE https://api.pagerduty.com/services/P123";
+
+        assert_no_safe_match(&pack, service_delete);
+        assert_blocks_with_pattern(&pack, service_delete, "pagerduty-api-delete-service");
+
+        assert_blocks_with_pattern(
+            &pack,
+            "curl https://api.pagerduty.com/schedules/P234 -XDELETE",
             "pagerduty-api-delete-schedule",
         );
     }
