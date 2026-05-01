@@ -44,6 +44,22 @@ mod tests {
             "Bypass: \"git\">/dev/null reset --hard should be denied"
         );
 
+        for cmd in [
+            "\"git\"&>/dev/null reset --hard",
+            "\"git\"&>>/dev/null reset --hard",
+            "git&>/dev/null reset --hard",
+            "git&>>/dev/null reset --hard",
+        ] {
+            let result = evaluate_command(
+                cmd,
+                &config,
+                &enabled_keywords,
+                &compiled_overrides,
+                &allowlists,
+            );
+            assert!(result.is_denied(), "Bypass: {cmd} should be denied");
+        }
+
         // Bypass attempt 2: unquoted redirection in middle
         let result = evaluate_command(
             "git >/dev/null reset --hard",

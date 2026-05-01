@@ -763,6 +763,14 @@ pub fn consume_word_token(bytes: &[u8], mut i: usize, len: usize) -> usize {
             continue;
         }
 
+        if b == b'&' && i + 1 < len && bytes[i + 1] == b'>' {
+            i += 2;
+            if i < len && bytes[i] == b'>' {
+                i += 1;
+            }
+            continue;
+        }
+
         if matches!(b, b'|' | b';' | b'&' | b'(' | b')') {
             break;
         }
@@ -1028,6 +1036,7 @@ pub fn consume_separator_token(
             });
             Some(i + 1)
         }
+        b'&' if i + 1 < len && bytes[i + 1] == b'>' => None,
         b'&' => {
             let end = if i + 1 < len && bytes[i + 1] == b'&' {
                 i + 2
@@ -1434,6 +1443,15 @@ fn attached_redirection_index(token: &str) -> Option<usize> {
             }
             b'"' if !in_single => {
                 in_double = !in_double;
+            }
+            b'&' if !in_single
+                && !in_double
+                && idx + 1 < bytes.len()
+                && bytes[idx + 1] == b'>'
+                && idx > 0
+                && !bytes[idx - 1].is_ascii_whitespace() =>
+            {
+                return Some(idx);
             }
             b'>' | b'<'
                 if !in_single && !in_double && idx > 0 && !bytes[idx - 1].is_ascii_whitespace() =>
@@ -2179,17 +2197,37 @@ fn test_mixed_quoting_normalization() {
 }
 
 #[test]
-fn test_attached_redirection_normalization_after_quoted_command() {
-    assert_eq!(
-        normalize_command_word_token(r#""git">/dev/null"#),
-        Some("git >/dev/null".to_string())
-    );
+    fn test_attached_redirection_normalization_after_quoted_command() {
+        assert_eq!(
+            normalize_command_word_token(r#""git">/dev/null"#),
+            Some("git >/dev/null".to_string())
+        );
 
-    assert_eq!(
-        normalize_command(r#""git">/dev/null reset --hard"#).as_ref(),
-        "git >/dev/null reset --hard"
-    );
-}
+        assert_eq!(
+            normalize_command_word_token(r#""git"&>/dev/null"#),
+            Some("git &>/dev/null".to_string())
+        );
+
+        assert_eq!(
+            normalize_command_word_token(r#""git"&>>/dev/null"#),
+            Some("git &>>/dev/null".to_string())
+        );
+
+        assert_eq!(
+            normalize_command(r#""git">/dev/null reset --hard"#).as_ref(),
+            "git >/dev/null reset --hard"
+        );
+
+        assert_eq!(
+            normalize_command(r#""git"&>/dev/null reset --hard"#).as_ref(),
+            "git &>/dev/null reset --hard"
+        );
+
+        assert_eq!(
+            normalize_command(r#""git"&>>/dev/null reset --hard"#).as_ref(),
+            "git &>>/dev/null reset --hard"
+        );
+    }
 
 #[test]
 fn test_attached_redirection_normalization_strips_exe_suffix() {
