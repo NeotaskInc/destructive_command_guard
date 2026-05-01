@@ -201,8 +201,3 @@ single_match = "allow"
 len_zero = "allow"
 len_without_is_empty = "allow"
 doc_link_with_quotes = "allow"
-
-# Patch uring-fs to fix ARM64 compilation: *const i8 -> *const libc::c_char
-# (on ARM64, c_char is unsigned u8, not signed i8)
-[patch.crates-io]
-uring-fs = { path = "patches/uring-fs" }
