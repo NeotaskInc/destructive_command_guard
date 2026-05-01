@@ -801,8 +801,8 @@ pub fn get_update_notice(use_color: bool) -> Option<String> {
 
 /// Check if update checking is enabled via environment variable.
 ///
-/// Returns `false` if `DCG_NO_UPDATE_CHECK` is set to any non-empty value
-/// (e.g., "1", "true", "yes").
+/// Returns `false` if `DCG_NO_UPDATE_CHECK` is enabled. Documented falsey
+/// values such as `0`, `false`, `no`, and `off` do not disable update checks.
 #[must_use]
 pub fn is_update_check_enabled() -> bool {
     is_update_check_enabled_with(|key| std::env::var(key).ok())
@@ -812,7 +812,14 @@ fn is_update_check_enabled_with<F>(mut get_env: F) -> bool
 where
     F: FnMut(&str) -> Option<String>,
 {
-    get_env("DCG_NO_UPDATE_CHECK").is_none_or(|v| v.is_empty())
+    get_env("DCG_NO_UPDATE_CHECK").is_none_or(|value| !disable_env_flag_enabled(&value))
+}
+
+fn disable_env_flag_enabled(value: &str) -> bool {
+    !matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "no" | "n" | "off"
+    )
 }
 
 #[cfg(test)]
@@ -1395,13 +1402,24 @@ mod tests {
 
     #[test]
     fn test_is_update_check_disabled_various_values() {
-        // Any non-empty value should disable update check
         for val in &["1", "true", "yes", "anything"] {
             let env_map: std::collections::HashMap<&str, &str> =
                 std::collections::HashMap::from([("DCG_NO_UPDATE_CHECK", *val)]);
             assert!(
                 !is_update_check_enabled_with(|key| { env_map.get(key).map(|v| (*v).to_string()) }),
                 "DCG_NO_UPDATE_CHECK={val} should disable update check"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_update_check_falsey_values_do_not_disable() {
+        for val in &["0", "false", "no", "n", "off", " FALSE "] {
+            let env_map: std::collections::HashMap<&str, &str> =
+                std::collections::HashMap::from([("DCG_NO_UPDATE_CHECK", *val)]);
+            assert!(
+                is_update_check_enabled_with(|key| { env_map.get(key).map(|v| (*v).to_string()) }),
+                "DCG_NO_UPDATE_CHECK={val} should not disable update check"
             );
         }
     }

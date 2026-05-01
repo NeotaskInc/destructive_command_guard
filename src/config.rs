@@ -1142,7 +1142,7 @@ pub struct GeneralConfig {
     /// Whether to check for updates in the background.
     /// When enabled, dcg will spawn a background thread to check for updates
     /// and show a notice if a newer version is available.
-    /// Default: true. Disable with `DCG_NO_UPDATE_CHECK` (any non-empty value)
+    /// Default: true. Disable with truthy `DCG_NO_UPDATE_CHECK`
     /// or `check_updates` = false.
     pub check_updates: bool,
 
@@ -3492,7 +3492,7 @@ impl Config {
 
         // DCG_NO_UPDATE_CHECK=1 (override)
         if let Some(disable) = get_env("DCG_NO_UPDATE_CHECK") {
-            if !disable.trim().is_empty() {
+            if env_disable_flag_enabled(&disable) {
                 self.general.check_updates = false;
             }
         }
@@ -3506,7 +3506,7 @@ impl Config {
 
         // DCG_NO_SELF_HEAL=1 (override)
         if let Some(disable) = get_env("DCG_NO_SELF_HEAL") {
-            if !disable.trim().is_empty() {
+            if env_disable_flag_enabled(&disable) {
                 self.general.self_heal_hook = false;
             }
         }
@@ -4260,6 +4260,13 @@ fn parse_env_bool(value: &str) -> Option<bool> {
         "0" | "false" | "no" | "n" | "off" => Some(false),
         _ => None,
     }
+}
+
+fn env_disable_flag_enabled(value: &str) -> bool {
+    !matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "no" | "n" | "off"
+    )
 }
 
 fn parse_policy_mode(value: &str) -> Option<PolicyMode> {
@@ -5775,7 +5782,33 @@ enabled = false
         let env_map: std::collections::HashMap<&str, &str> =
             std::collections::HashMap::from([("DCG_NO_UPDATE_CHECK", "false")]);
         config.apply_env_overrides_from(|key| env_map.get(key).map(|v| (*v).to_string()));
-        assert!(!config.general.check_updates);
+        assert!(config.general.check_updates);
+
+        let mut config = Config::default();
+        let env_map: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::from([("DCG_NO_UPDATE_CHECK", "0")]);
+        config.apply_env_overrides_from(|key| env_map.get(key).map(|v| (*v).to_string()));
+        assert!(config.general.check_updates);
+    }
+
+    #[test]
+    fn test_env_override_no_self_heal_falsey_values_do_not_disable() {
+        let mut config = Config::default();
+        let env_map: std::collections::HashMap<&str, &str> =
+            std::collections::HashMap::from([("DCG_NO_SELF_HEAL", "1")]);
+        config.apply_env_overrides_from(|key| env_map.get(key).map(|v| (*v).to_string()));
+        assert!(!config.general.self_heal_hook);
+
+        for value in ["0", "false", "no", "n", "off", ""] {
+            let mut config = Config::default();
+            let env_map: std::collections::HashMap<&str, &str> =
+                std::collections::HashMap::from([("DCG_NO_SELF_HEAL", value)]);
+            config.apply_env_overrides_from(|key| env_map.get(key).map(|v| (*v).to_string()));
+            assert!(
+                config.general.self_heal_hook,
+                "DCG_NO_SELF_HEAL={value:?} should not disable self-heal"
+            );
+        }
     }
 
     #[test]
