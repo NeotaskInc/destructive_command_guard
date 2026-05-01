@@ -91,6 +91,187 @@ find_dcg_binary() {
     command -v dcg 2>/dev/null || true
 }
 
+json_settings_has_dcg_command_hook() {
+    local settings="$1"
+    local event_name="$2"
+    local matcher="${3:-}"
+
+    if [ ! -f "$settings" ]; then
+        return 1
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        grep -q '"command".*dcg' "$settings" 2>/dev/null
+        return $?
+    fi
+
+    python3 - "$settings" "$event_name" "$matcher" <<'PYEOF'
+import json
+import os
+import shlex
+import sys
+
+settings_file = sys.argv[1]
+event_name = sys.argv[2]
+matcher = sys.argv[3]
+
+def is_dcg_command(command):
+    if not isinstance(command, str) or not command:
+        return False
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+    name = os.path.basename(parts[0])
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name == "dcg"
+
+try:
+    with open(settings_file, "r", encoding="utf-8") as f:
+        settings = json.load(f)
+except (IOError, ValueError, json.JSONDecodeError):
+    sys.exit(1)
+
+if not isinstance(settings, dict):
+    sys.exit(1)
+hooks = settings.get("hooks")
+if not isinstance(hooks, dict):
+    sys.exit(1)
+entries = hooks.get(event_name)
+if not isinstance(entries, list):
+    sys.exit(1)
+
+for entry in entries:
+    if not isinstance(entry, dict):
+        continue
+    if matcher and entry.get("matcher") != matcher:
+        continue
+    inner_hooks = entry.get("hooks")
+    if not isinstance(inner_hooks, list):
+        continue
+    if any(isinstance(hook, dict) and is_dcg_command(hook.get("command")) for hook in inner_hooks):
+        sys.exit(0)
+
+sys.exit(1)
+PYEOF
+}
+
+json_copilot_has_dcg_hook() {
+    local hook_file="$1"
+
+    if [ ! -f "$hook_file" ]; then
+        return 1
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        grep -q 'dcg' "$hook_file" 2>/dev/null
+        return $?
+    fi
+
+    python3 - "$hook_file" <<'PYEOF'
+import json
+import os
+import shlex
+import sys
+
+hook_file = sys.argv[1]
+
+def is_dcg_command(command):
+    if not isinstance(command, str) or not command:
+        return False
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+    name = os.path.basename(parts[0])
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name == "dcg"
+
+try:
+    with open(hook_file, "r", encoding="utf-8") as f:
+        settings = json.load(f)
+except (IOError, ValueError, json.JSONDecodeError):
+    sys.exit(1)
+
+if not isinstance(settings, dict):
+    sys.exit(1)
+hooks = settings.get("hooks")
+if not isinstance(hooks, dict):
+    sys.exit(1)
+pre_tool = hooks.get("preToolUse")
+if not isinstance(pre_tool, list):
+    sys.exit(1)
+
+for entry in pre_tool:
+    if not isinstance(entry, dict):
+        continue
+    if is_dcg_command(entry.get("bash")) or is_dcg_command(entry.get("powershell")):
+        sys.exit(0)
+
+sys.exit(1)
+PYEOF
+}
+
+json_cursor_has_dcg_hook() {
+    local hooks_json="$1"
+
+    if [ ! -f "$hooks_json" ]; then
+        return 1
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        grep -q 'dcg' "$hooks_json" 2>/dev/null
+        return $?
+    fi
+
+    python3 - "$hooks_json" <<'PYEOF'
+import json
+import os
+import shlex
+import sys
+
+hooks_file = sys.argv[1]
+
+def is_dcg_cursor_command(command):
+    if not isinstance(command, str) or not command:
+        return False
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+    return os.path.basename(parts[0]) == "dcg-pre-shell.py"
+
+try:
+    with open(hooks_file, "r", encoding="utf-8") as f:
+        settings = json.load(f)
+except (IOError, ValueError, json.JSONDecodeError):
+    sys.exit(1)
+
+if not isinstance(settings, dict):
+    sys.exit(1)
+hooks = settings.get("hooks")
+if not isinstance(hooks, dict):
+    sys.exit(1)
+entries = hooks.get("beforeShellExecution")
+if not isinstance(entries, list):
+    sys.exit(1)
+
+for entry in entries:
+    if isinstance(entry, dict) and is_dcg_cursor_command(entry.get("command")):
+        sys.exit(0)
+
+sys.exit(1)
+PYEOF
+}
+
 # Remove dcg hook from Claude Code settings
 unconfigure_claude_code() {
     local settings="$HOME/.claude/settings.json"
@@ -100,7 +281,7 @@ unconfigure_claude_code() {
     fi
 
     # Check if dcg is configured
-    if ! grep -q '"command".*dcg' "$settings" 2>/dev/null; then
+    if ! json_settings_has_dcg_command_hook "$settings" "PreToolUse" "Bash"; then
         return 0
     fi
 
@@ -203,7 +384,7 @@ unconfigure_gemini() {
     fi
 
     # Check if dcg is configured
-    if ! grep -q '"command".*dcg' "$settings" 2>/dev/null; then
+    if ! json_settings_has_dcg_command_hook "$settings" "BeforeTool"; then
         return 0
     fi
 
@@ -305,7 +486,7 @@ unconfigure_copilot() {
         return 0
     fi
 
-    if ! grep -q 'dcg' "$hook_file" 2>/dev/null; then
+    if ! json_copilot_has_dcg_hook "$hook_file"; then
         return 0
     fi
 
@@ -435,7 +616,7 @@ unconfigure_codex() {
         return 0
     fi
 
-    if ! grep -q '"command".*dcg' "$hooks_json" 2>/dev/null; then
+    if ! json_settings_has_dcg_command_hook "$hooks_json" "PreToolUse"; then
         return 0
     fi
 
@@ -544,7 +725,7 @@ unconfigure_cursor() {
     fi
 
     # Remove entry from hooks.json
-    if [ -f "$hooks_json" ] && grep -q 'dcg' "$hooks_json" 2>/dev/null; then
+    if [ -f "$hooks_json" ] && json_cursor_has_dcg_hook "$hooks_json"; then
         if command -v python3 >/dev/null 2>&1; then
             python3 - "$hooks_json" <<'PYEOF'
 import json
@@ -648,33 +829,35 @@ main() {
     log ""
 
     local found_anything=0
+    local aider_configured=0
 
     # Agent hooks
-    if [ -f "$claude_settings" ] && grep -q '"command".*dcg' "$claude_settings" 2>/dev/null; then
+    if json_settings_has_dcg_command_hook "$claude_settings" "PreToolUse" "Bash"; then
         log "  • Claude Code hook ($claude_settings)"
         found_anything=1
     fi
-    if [ -f "$gemini_settings" ] && grep -q '"command".*dcg' "$gemini_settings" 2>/dev/null; then
+    if json_settings_has_dcg_command_hook "$gemini_settings" "BeforeTool"; then
         log "  • Gemini CLI hook ($gemini_settings)"
         found_anything=1
     fi
     if [ -f "$aider_config" ] && grep -q 'Added by dcg installer' "$aider_config" 2>/dev/null; then
         log "  • Aider configuration ($aider_config)"
         found_anything=1
+        aider_configured=1
     fi
-    if [ -n "$copilot_hook_file" ] && [ -f "$copilot_hook_file" ] && grep -q 'dcg' "$copilot_hook_file" 2>/dev/null; then
+    if [ -n "$copilot_hook_file" ] && json_copilot_has_dcg_hook "$copilot_hook_file"; then
         log "  • GitHub Copilot CLI hook ($copilot_hook_file)"
         found_anything=1
     fi
     local cursor_hooks_json="$HOME/.cursor/hooks.json"
     local cursor_hook_script="$HOME/.cursor/hooks/dcg-pre-shell.py"
     if { [ -f "$cursor_hook_script" ] && grep -q 'dcg-cursor-hook' "$cursor_hook_script" 2>/dev/null; } || \
-       { [ -f "$cursor_hooks_json" ] && grep -q 'dcg' "$cursor_hooks_json" 2>/dev/null; }; then
+       { json_cursor_has_dcg_hook "$cursor_hooks_json"; }; then
         log "  • Cursor IDE hook ($cursor_hooks_json, $cursor_hook_script)"
         found_anything=1
     fi
     local codex_hooks_json="$HOME/.codex/hooks.json"
-    if [ -f "$codex_hooks_json" ] && grep -q '"command".*dcg' "$codex_hooks_json" 2>/dev/null; then
+    if json_settings_has_dcg_command_hook "$codex_hooks_json" "PreToolUse"; then
         log "  • Codex CLI hook ($codex_hooks_json)"
         found_anything=1
     fi
@@ -765,7 +948,7 @@ main() {
     fi
 
     # Remove Aider config
-    if unconfigure_aider; then
+    if [ "$aider_configured" -eq 1 ] && unconfigure_aider; then
         if [ ! -f "$aider_config" ] || ! grep -q 'Added by dcg installer' "$aider_config" 2>/dev/null; then
             ok "Removed Aider configuration"
         fi

@@ -442,6 +442,110 @@ EOF
     grep -qF '/opt/dcgrep/bin/scan' "$HOME/.cursor/hooks.json"
 }
 
+@test "uninstall: preflight ignores substring-only agent hook configs" {
+    log_test "Testing uninstall preflight exact hook detection..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+    command -v git &>/dev/null || skip "git not available"
+
+    mv "$HOME/.local/bin/dcg" "$HOME/.local/bin/dcg.disabled"
+
+    mkdir -p "$HOME/.claude"
+    cat > "$HOME/.claude/settings.json" << 'EOF'
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {"type": "command", "command": "/opt/dcgrep/bin/scan"}
+        ]
+      }
+    ]
+  }
+}
+EOF
+
+    mkdir -p "$HOME/.gemini"
+    cat > "$HOME/.gemini/settings.json" << 'EOF'
+{
+  "hooks": {
+    "BeforeTool": [
+      {
+        "matcher": "run_shell_command",
+        "hooks": [
+          {"name": "dcgrep", "type": "command", "command": "/opt/dcgrep/bin/scan"}
+        ]
+      }
+    ]
+  }
+}
+EOF
+
+    mkdir -p "$HOME/.codex"
+    cat > "$HOME/.codex/hooks.json" << 'EOF'
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {"type": "command", "command": "/opt/dcgrep/bin/scan"}
+        ]
+      }
+    ]
+  }
+}
+EOF
+
+    mkdir -p "$HOME/.cursor"
+    cat > "$HOME/.cursor/hooks.json" << 'EOF'
+{
+  "version": 1,
+  "hooks": {
+    "beforeShellExecution": [
+      {
+        "command": "/opt/dcgrep/bin/scan"
+      }
+    ]
+  }
+}
+EOF
+
+    mkdir -p "$TEST_TMPDIR/repo"
+    cd "$TEST_TMPDIR/repo"
+    git init -q
+    mkdir -p .github/hooks
+    cat > .github/hooks/dcg.json << 'EOF'
+{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [
+      {
+        "type": "command",
+        "bash": "/opt/dcgrep/bin/scan",
+        "powershell": "/opt/dcgrep/bin/scan",
+        "cwd": ".",
+        "timeoutSec": 30
+      }
+    ]
+  }
+}
+EOF
+
+    run "$UNINSTALL_SCRIPT" --yes
+
+    log_test "uninstall status: $status"
+    log_test "uninstall output: $output"
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Nothing to remove"* ]]
+    [[ "$output" != *"Claude Code hook"* ]]
+    [[ "$output" != *"Gemini CLI hook"* ]]
+    [[ "$output" != *"Codex CLI hook"* ]]
+    [[ "$output" != *"GitHub Copilot CLI hook"* ]]
+    [[ "$output" != *"Cursor IDE hook"* ]]
+}
+
 # ============================================================================
 # Aider Uninstall Tests
 # ============================================================================
@@ -479,6 +583,19 @@ EOF
 
     # File should be removed if it's now empty
     [ ! -f "$HOME/.aider.conf.yml" ]
+}
+
+@test "uninstall: does not report Aider removal when Aider config is absent" {
+    log_test "Testing Aider removal output is not emitted for absent config..."
+
+    run "$UNINSTALL_SCRIPT" --yes
+
+    log_test "uninstall status: $status"
+    log_test "uninstall output: $output"
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Removed binary"* ]]
+    [[ "$output" != *"Removed Aider configuration"* ]]
 }
 
 # ============================================================================
