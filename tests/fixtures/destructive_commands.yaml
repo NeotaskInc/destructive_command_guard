@@ -491,6 +491,8 @@ platform.railway:
     reason: "Deletes a Railway environment via alias"
   - command: "railway service delete --service postgres --yes"
     reason: "Deletes a Railway service"
+  - command: "railway functions delete --function prod-worker --yes"
+    reason: "Deletes a Railway serverless function"
   - command: "railway volume delete --volume prod-db --yes"
     reason: "Deletes persistent Railway storage"
   - command: "railway volume detach --volume prod-db --yes"

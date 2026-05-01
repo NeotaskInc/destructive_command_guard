@@ -158,7 +158,7 @@ risk_acknowledged = true
 
 **Pack ID:** `platform.railway`
 
-Protects against destructive Railway CLI and Public API operations that can delete projects, environments, services, volumes, variables, or deployments.
+Protects against destructive Railway CLI and Public API operations that can delete projects, environments, services, functions, volumes, variables, or deployments.
 
 ### Keywords
 
@@ -197,6 +197,7 @@ These patterns match safe commands that are always allowed:
 | `railway-whoami` | `railway(?:\s+--?\S+(?:\s+\S+)?)*\s+whoami(?:\s\|$)` |
 | `railway-logs` | `railway(?:\s+--?\S+(?:\s+\S+)?)*\s+logs(?:\s\|$)` |
 | `railway-service-list` | `railway(?:\s+--?\S+(?:\s+\S+)?)*\s+service\s+(?:list\|ls)(?:\s\|$)` |
+| `railway-function-list` | `railway(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:function\|functions\|func\|funcs\|fn\|fns)\s+(?:list\|ls)(?:\s\|$)` |
 | `railway-environment-list` | `railway(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:environment\|env)\s+(?:list\|ls)(?:\s\|$)` |
 | `railway-volume-list` | `railway(?:\s+--?\S+(?:\s+\S+)?)*\s+volume\s+(?:list\|ls)(?:\s\|$)` |
 | `railway-variable-list` | `railway(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:variable\|variables\|vars\|var)\s+(?:list\|ls)(?:\s\|$)` |
@@ -211,6 +212,7 @@ These patterns match potentially destructive commands:
 | `railway-project-subcommand-delete` | railway project delete schedules deletion of the entire Railway project. | critical |
 | `railway-environment-delete` | railway environment delete removes a Railway environment and its resources. | critical |
 | `railway-service-delete` | railway service delete permanently deletes a Railway service. | critical |
+| `railway-function-delete` | railway functions delete removes a Railway serverless function. | critical |
 | `railway-volume-delete` | railway volume delete removes persistent Railway storage. | critical |
 | `railway-volume-detach` | railway volume detach disconnects persistent storage from a service. | high |
 | `railway-variable-delete` | railway variable delete removes Railway environment variables. | high |

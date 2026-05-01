@@ -1,9 +1,9 @@
 //! Railway Platform pack - protections for destructive Railway CLI and API operations.
 //!
 //! Railway projects commonly hold production databases, attached volumes,
-//! environment variables, and deployments. This pack blocks operations that can
-//! delete or detach those resources through either the Railway CLI or the public
-//! GraphQL API.
+//! environment variables, functions, and deployments. This pack blocks operations
+//! that can delete or detach those resources through either the Railway CLI or
+//! the public GraphQL API.
 
 use crate::packs::{DestructivePattern, Pack, PatternSuggestion, SafePattern};
 use crate::{destructive_pattern, safe_pattern};
@@ -38,6 +38,17 @@ const SERVICE_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new(
         "railway logs",
         "Inspect the service state without removing it",
+    ),
+];
+
+const FUNCTION_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "railway functions list",
+        "List functions before deleting one",
+    ),
+    PatternSuggestion::new(
+        "railway status",
+        "Confirm the active project and environment before changing functions",
     ),
 ];
 
@@ -80,7 +91,7 @@ pub fn create_pack() -> Pack {
     Pack {
         id: "platform.railway".to_string(),
         name: "Railway Platform",
-        description: "Protects against destructive Railway CLI and Public API operations that can delete projects, environments, services, volumes, variables, or deployments.",
+        description: "Protects against destructive Railway CLI and Public API operations that can delete projects, environments, services, functions, volumes, variables, or deployments.",
         keywords: &[
             "railway",
             "backboard.railway.app",
@@ -138,6 +149,10 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             r"railway(?:\s+--?\S+(?:\s+\S+)?)*\s+service\s+(?:list|ls)(?:\s|$)"
         ),
         safe_pattern!(
+            "railway-function-list",
+            r"railway(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:function|functions|func|funcs|fn|fns)\s+(?:list|ls)(?:\s|$)"
+        ),
+        safe_pattern!(
             "railway-environment-list",
             r"railway(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:environment|env)\s+(?:list|ls)(?:\s|$)"
         ),
@@ -185,6 +200,14 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             Critical,
             "Deleting a service can remove the production app or managed database service and its deployment history.",
             SERVICE_SUGGESTIONS
+        ),
+        destructive_pattern!(
+            "railway-function-delete",
+            r"railway(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:function|functions|func|funcs|fn|fns)\s+(?:delete|remove|rm)(?:\s|$)",
+            "railway functions delete removes a Railway serverless function.",
+            Critical,
+            "Deleting a Railway function can remove production serverless code, HTTP endpoints, or scheduled jobs.",
+            FUNCTION_SUGGESTIONS
         ),
         destructive_pattern!(
             "railway-volume-delete",
@@ -354,6 +377,8 @@ mod tests {
         assert_allows(&pack, "railway whoami");
         assert_allows(&pack, "railway logs --service web");
         assert_allows(&pack, "railway service list --json");
+        assert_allows(&pack, "railway functions list");
+        assert_allows(&pack, "railway fn ls");
         assert_allows(&pack, "railway environment list");
         assert_allows(&pack, "railway env list");
         assert_allows(&pack, "railway volume list");
@@ -385,6 +410,18 @@ mod tests {
             (
                 "railway service rm --service api --yes",
                 "railway-service-delete",
+            ),
+            (
+                "railway functions delete --function prod-worker --yes",
+                "railway-function-delete",
+            ),
+            (
+                "railway function rm --function api-handler --yes",
+                "railway-function-delete",
+            ),
+            (
+                "railway fn remove --function cron-job --yes",
+                "railway-function-delete",
             ),
             (
                 "railway volume delete --volume data --yes",
@@ -569,6 +606,7 @@ mod tests {
             "railway project rm prod --yes",
             "railway environment rm production --yes",
             "railway service remove postgres --yes",
+            "railway functions delete --function prod-worker --yes",
             "railway volume rm prod-db --yes",
         ];
         for command in critical {

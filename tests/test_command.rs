@@ -351,6 +351,34 @@ fn test_with_packs_checks_railway_api_token_header_payloads() {
 }
 
 #[test]
+fn test_with_packs_checks_railway_function_delete() {
+    let output = run_dcg_isolated(
+        &[
+            "test",
+            "--format",
+            "json",
+            "--with-packs",
+            "platform.railway",
+            "railway functions delete --function prod-worker --yes",
+        ],
+        None,
+    );
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "Railway function deletion should be blocked\nstdout: {}\nstderr: {}",
+        stdout_text(&output),
+        stderr_text(&output)
+    );
+
+    let json = parse_json(&output);
+    assert_eq!(json["decision"], "deny");
+    assert_eq!(json["pack_id"], "platform.railway");
+    assert_eq!(json["pattern_name"], "railway-function-delete");
+}
+
+#[test]
 fn test_test_subcommand_help_text_includes_key_flags() {
     let output = run_dcg_isolated(&["help", "test"], None);
     let combined = format!("{}{}", stdout_text(&output), stderr_text(&output));

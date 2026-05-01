@@ -219,7 +219,7 @@ dcg uses a modular "pack" system to organize destructive command patterns by cat
 ### Platform Packs
 - `platform.github` - Protects against destructive GitHub CLI operations like deleting repositories, gists, releases, or SSH keys.
 - `platform.gitlab` - Protects against destructive GitLab platform operations like deleting projects, releases, protected branches, and webhooks.
-- `platform.railway` - Protects against destructive Railway CLI and Public API operations that can delete projects, environments, services, volumes, variables, or deployments.
+- `platform.railway` - Protects against destructive Railway CLI and Public API operations that can delete projects, environments, services, functions, volumes, variables, or deployments.
 
 ### DNS Packs
 - `dns.cloudflare` - Protects against destructive Cloudflare DNS operations like record deletion, zone deletion, and targeted Terraform destroy.
