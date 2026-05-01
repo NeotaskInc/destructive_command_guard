@@ -556,8 +556,9 @@ fn parse_rm_segment(
         return RmParseDecision::Allow;
     }
 
-    let first_path = paths.first();
-    let is_critical = !flag_state.saw_terminator && first_path.is_some_and(path_is_root_home);
+    let is_critical = paths
+        .iter()
+        .any(|path| path_is_root_home(path) && !path_is_safe_for_style(path, flag_state.style));
 
     let (pattern_name, reason, severity) = if is_critical {
         match flag_state.style {
@@ -3196,6 +3197,7 @@ mod tests {
         assert_blocks_with_severity(&pack, "rm -rf /etc", Severity::Critical);
         assert_blocks_with_severity(&pack, "rm -rf /home", Severity::Critical);
         assert_blocks_with_severity(&pack, "rm -rf ~/", Severity::Critical);
+        assert_blocks_with_severity(&pack, "rm -rf /tmp/cache /etc", Severity::Critical);
         assert_blocks_with_pattern(&pack, "rm -rf /", "rm-rf-root-home");
         // Quoted / or ~ — shell evaluates to / or ~; must still block.
         assert_blocks_with_severity(&pack, "rm -rf \"/\"", Severity::Critical);
@@ -3404,5 +3406,17 @@ mod tests {
     #[test]
     fn test_rm_parser_option_terminator() {
         assert_rm_parser_no_match("rm -- -rf /tmp/safe");
+        assert_rm_parser_denies("rm -rf -- /tmp/safe", RM_RF_GENERAL_NAME, Severity::High);
+        assert_rm_parser_denies("rm -rf -- /", RM_RF_ROOT_HOME_NAME, Severity::Critical);
+        assert_rm_parser_denies(
+            "rm -r -f -- /",
+            RM_R_F_SEPARATE_ROOT_HOME_NAME,
+            Severity::Critical,
+        );
+        assert_rm_parser_denies(
+            "rm --recursive --force -- /",
+            RM_RECURSIVE_FORCE_ROOT_HOME_NAME,
+            Severity::Critical,
+        );
     }
 }

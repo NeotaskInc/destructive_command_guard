@@ -950,10 +950,12 @@ test_command_with_policy "git branch -D feature" "log" "silent" "policy log: git
 
 # Critical rules must remain blocked even under global warn/log.
 test_command_with_policy "git reset --hard" "warn" "block" "policy warn: git reset --hard remains blocked (critical)"
+test_command_with_policy "rm -rf -- /" "warn" "block" "policy warn: rm -- terminator root remains blocked (critical)"
 
 log_section "Destructive Filesystem Commands (should BLOCK)"
 
 test_command "rm -rf /" "block" "rm -rf /"
+test_command "rm -rf -- /" "block" "rm -rf -- /"
 test_command "rm -rf /etc" "block" "rm -rf /etc"
 test_command "rm -rf /home" "block" "rm -rf /home"
 test_command "rm -rf ~/" "block" "rm -rf ~/"
