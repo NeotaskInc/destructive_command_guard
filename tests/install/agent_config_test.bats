@@ -426,6 +426,67 @@ EOF
     grep -q "/opt/not-dcg-wrapper/bin/hook" "$GEMINI_SETTINGS"
 }
 
+@test "configure_gemini: updates stale dcg hook path and removes duplicates" {
+    log_test "Testing Gemini stale dcg hook path update and duplicate cleanup..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    GEMINI_SETTINGS="$HOME/.gemini/settings.json"
+    setup_mock_gemini
+
+    cat > "$GEMINI_SETTINGS" <<EOF
+{
+  "hooks": {
+    "BeforeTool": [
+      {
+        "matcher": "run_shell_command",
+        "hooks": [
+          {"name": "dcg", "type": "command", "command": "/old/bin/dcg", "timeout": 5000},
+          {"name": "other", "type": "command", "command": "atuin history start", "timeout": 5000}
+        ]
+      },
+      {
+        "matcher": "run_shell_command",
+        "hooks": [
+          {"name": "dcg", "type": "command", "command": "$DEST/dcg", "timeout": 5000}
+        ]
+      }
+    ]
+  }
+}
+EOF
+
+    configure_gemini "$GEMINI_SETTINGS"
+
+    log_test "GEMINI_STATUS: $GEMINI_STATUS"
+    log_test "Settings content: $(cat "$GEMINI_SETTINGS")"
+
+    [ "$GEMINI_STATUS" = "merged" ]
+    grep -q "\"command\": \"$DEST/dcg\"" "$GEMINI_SETTINGS"
+    ! grep -q "/old/bin/dcg" "$GEMINI_SETTINGS"
+    grep -q "atuin history start" "$GEMINI_SETTINGS"
+
+    python3 - "$GEMINI_SETTINGS" "$DEST/dcg" <<'PYEOF'
+import json
+import sys
+
+settings_file, dcg_path = sys.argv[1], sys.argv[2]
+with open(settings_file, "r") as f:
+    settings = json.load(f)
+
+before_tool = settings["hooks"]["BeforeTool"]
+shell_entries = [entry for entry in before_tool if entry.get("matcher") == "run_shell_command"]
+assert len(shell_entries) == 1, shell_entries
+
+commands = [
+    hook.get("command")
+    for hook in shell_entries[0].get("hooks", [])
+    if isinstance(hook, dict)
+]
+assert commands[0] == dcg_path, commands
+assert commands.count(dcg_path) == 1, commands
+PYEOF
+}
+
 @test "configure_gemini: invalid settings.json is preserved and reports failed" {
     log_test "Testing Gemini invalid settings.json preservation..."
     command -v python3 &>/dev/null || skip "python3 not available"

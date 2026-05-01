@@ -1514,28 +1514,26 @@ if not isinstance(settings['hooks']['BeforeTool'], list):
 
 dcg_hook = {"name": "dcg", "type": "command", "command": dcg_path, "timeout": 5000}
 
-# Check if run_shell_command matcher exists
-shell_matcher = None
-for entry in settings['hooks']['BeforeTool']:
-    if entry.get('matcher') == 'run_shell_command':
-        shell_matcher = entry
-        break
+shell_hooks = []
+new_before_tool = []
 
-if shell_matcher:
-    if 'hooks' not in shell_matcher:
-        shell_matcher['hooks'] = []
-    dcg_exists = any(
-        is_dcg_command(h.get('command', ''))
-        for h in shell_matcher['hooks']
-        if isinstance(h, dict)
-    )
-    if not dcg_exists:
-        shell_matcher['hooks'].insert(0, dcg_hook)
-else:
-    settings['hooks']['BeforeTool'].append({
-        "matcher": "run_shell_command",
-        "hooks": [dcg_hook]
-    })
+for entry in settings['hooks']['BeforeTool']:
+    if isinstance(entry, dict) and entry.get('matcher') == 'run_shell_command':
+        hooks = entry.get('hooks', [])
+        if isinstance(hooks, list):
+            for hook in hooks:
+                if isinstance(hook, dict) and is_dcg_command(hook.get('command', '')):
+                    continue
+                shell_hooks.append(hook)
+    else:
+        new_before_tool.append(entry)
+
+shell_hooks.insert(0, dcg_hook)
+new_before_tool.insert(0, {
+    "matcher": "run_shell_command",
+    "hooks": shell_hooks
+})
+settings['hooks']['BeforeTool'] = new_before_tool
 
 with open(settings_file, 'w') as f:
     json.dump(settings, f, indent=2)
