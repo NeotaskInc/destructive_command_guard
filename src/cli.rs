@@ -9835,6 +9835,46 @@ fn is_dcg_hook_entry(entry: &serde_json::Value) -> bool {
             })
 }
 
+fn remove_dcg_hooks_from_pre_tool_use(pre_tool_use: &mut Vec<serde_json::Value>) -> bool {
+    let mut removed = false;
+    let mut retained_entries = Vec::with_capacity(pre_tool_use.len());
+
+    for mut entry in std::mem::take(pre_tool_use) {
+        let is_bash_entry = entry
+            .get("matcher")
+            .and_then(|m| m.as_str())
+            .is_some_and(|m| m == "Bash");
+
+        if !is_bash_entry {
+            retained_entries.push(entry);
+            continue;
+        }
+
+        let drop_entry = if let Some(hooks) = entry.get_mut("hooks").and_then(|h| h.as_array_mut())
+        {
+            let before = hooks.len();
+            hooks.retain(|hook| {
+                !hook
+                    .get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(is_dcg_command)
+            });
+            let entry_removed = hooks.len() < before;
+            removed |= entry_removed;
+            entry_removed && hooks.is_empty()
+        } else {
+            false
+        };
+
+        if !drop_entry {
+            retained_entries.push(entry);
+        }
+    }
+
+    *pre_tool_use = retained_entries;
+    removed
+}
+
 /// Install the dcg hook entry into Claude Code settings without printing.
 fn install_hook_silent(force: bool) -> Result<bool, Box<dyn std::error::Error>> {
     let settings_path = claude_settings_path();
@@ -9917,7 +9957,7 @@ fn install_dcg_hook_into_settings(
     }
 
     if force {
-        pre_tool_use.retain(|h| !is_dcg_hook_entry(h));
+        remove_dcg_hooks_from_pre_tool_use(pre_tool_use);
     }
 
     pre_tool_use.push(hook_config);
@@ -9946,9 +9986,7 @@ fn uninstall_dcg_hook_from_settings(
         return Err("Invalid PreToolUse hooks format (expected JSON array)".into());
     };
 
-    let before = arr.len();
-    arr.retain(|h| !is_dcg_hook_entry(h));
-    Ok(arr.len() < before)
+    Ok(remove_dcg_hooks_from_pre_tool_use(arr))
 }
 
 /// Install the dcg hook entry into Claude Code settings.
@@ -13844,6 +13882,31 @@ mod tests {
     }
 
     #[test]
+    fn install_into_settings_force_preserves_coexisting_hook_in_same_entry() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [
+                        { "type": "command", "command": "dcg" },
+                        { "type": "command", "command": "other-hook" }
+                    ]
+                }]
+            }
+        });
+
+        let changed = install_dcg_hook_into_settings(&mut settings, true).expect("install ok");
+        assert!(changed);
+
+        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.iter().filter(|e| is_dcg_hook_entry(e)).count(), 1);
+        assert!(
+            pre.iter().any(|e| entry_has_hook_command(e, "other-hook")),
+            "force reinstall should retain non-dcg hooks from mixed hook entries"
+        );
+    }
+
+    #[test]
     fn install_into_settings_errors_on_invalid_pre_tool_use_type() {
         let mut settings = serde_json::json!({
             "hooks": { "PreToolUse": { "not": "an array" } }
@@ -13868,6 +13931,29 @@ mod tests {
         let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(pre.iter().filter(|e| is_dcg_hook_entry(e)).count(), 0);
         assert_eq!(pre.len(), 1, "should retain non-dcg hook");
+        assert!(entry_has_hook_command(&pre[0], "other-hook"));
+    }
+
+    #[test]
+    fn uninstall_from_settings_preserves_coexisting_hook_in_same_entry() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": "Bash",
+                    "hooks": [
+                        { "type": "command", "command": "dcg" },
+                        { "type": "command", "command": "other-hook" }
+                    ]
+                }]
+            }
+        });
+
+        let removed = uninstall_dcg_hook_from_settings(&mut settings).expect("uninstall ok");
+        assert!(removed);
+
+        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 1, "should keep the mixed entry for other hooks");
+        assert!(!is_dcg_hook_entry(&pre[0]));
         assert!(entry_has_hook_command(&pre[0], "other-hook"));
     }
 
