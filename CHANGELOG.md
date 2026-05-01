@@ -9,9 +9,21 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
-## [Unreleased] (after v0.4.8)
+## [Unreleased] (after v0.4.9)
 
 No unreleased changes yet.
+
+## [v0.4.9](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.4.9) -- 2026-05-01 [Release]
+
+Patch release after v0.4.8 for the remaining DCG-specific output environment
+flag semantics that need to ship in prebuilt binaries.
+
+### CLI Reliability
+
+- Honored documented falsey values for `DCG_NO_COLOR` and `DCG_NO_RICH` in
+  non-clap output paths, so values such as `0`, `false`, `no`, and `off` no
+  longer disable colors or rich output by mere presence
+  ([14f1aac](https://github.com/Dicklesworthstone/destructive_command_guard/commit/14f1aac)).
 
 ## [v0.4.8](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.4.8) -- 2026-05-01 [Release]
 
