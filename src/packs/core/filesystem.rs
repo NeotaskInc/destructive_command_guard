@@ -738,8 +738,8 @@ pub fn create_pack() -> Pack {
         // (the duplicate-source-of-truth that gates execution).
         keywords: &[
             "rm", "find", "unlink", "truncate", "shred", "tar", "dd", "mv", "cp", "ln", "rsync",
-            ">/", "> /", ">~", "> ~", ">$", "> $", ">\"", "> \"", ">'", "> '", "&>", ">&",
-            ">|", "1>", "2>",
+            ">/", "> /", ">~", "> ~", ">$", "> $", ">\"", "> \"", ">'", "> '", "&>", ">&", ">|",
+            "1>", "2>",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
