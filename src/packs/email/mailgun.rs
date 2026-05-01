@@ -39,7 +39,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Domain deletion (must end after domain name, no further path)
         destructive_pattern!(
             "mailgun-delete-domain",
-            r"(?:-X\s*DELETE|--request\s+DELETE).*api\.mailgun\.net/v3/domains/[^\s/]+(?:\s|$)|api\.mailgun\.net/v3/domains/[^\s/]+(?:\s|$).*(?:-X\s*DELETE|--request\s+DELETE)",
+            r"(?:-X\s*DELETE|--request(?:=|\s+)DELETE).*api\.mailgun\.net/v3/domains/[^\s/]+(?:\s|$)|api\.mailgun\.net/v3/domains/[^\s/]+(?:\s|$).*(?:-X\s*DELETE|--request(?:=|\s+)DELETE)",
             "DELETE to Mailgun /v3/domains removes a domain configuration.",
             Critical,
             "Deleting a domain removes all DNS settings, DKIM keys, tracking configuration, \
@@ -53,7 +53,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Route deletion
         destructive_pattern!(
             "mailgun-delete-route",
-            r"(?:-X\s*DELETE|--request\s+DELETE).*api\.mailgun\.net/v3/routes/|api\.mailgun\.net/v3/routes/\w+.*(?:-X\s*DELETE|--request\s+DELETE)",
+            r"(?:-X\s*DELETE|--request(?:=|\s+)DELETE).*api\.mailgun\.net/v3/routes/|api\.mailgun\.net/v3/routes/\w+.*(?:-X\s*DELETE|--request(?:=|\s+)DELETE)",
             "DELETE to Mailgun /v3/routes removes an email route.",
             High,
             "Deleting a route stops email forwarding, storage, or webhook delivery for \
@@ -67,7 +67,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Mailing list deletion
         destructive_pattern!(
             "mailgun-delete-list",
-            r"(?:-X\s*DELETE|--request\s+DELETE).*api\.mailgun\.net/v3/lists/|api\.mailgun\.net/v3/lists/[^\s/]+.*(?:-X\s*DELETE|--request\s+DELETE)",
+            r"(?:-X\s*DELETE|--request(?:=|\s+)DELETE).*api\.mailgun\.net/v3/lists/|api\.mailgun\.net/v3/lists/[^\s/]+.*(?:-X\s*DELETE|--request(?:=|\s+)DELETE)",
             "DELETE to Mailgun /v3/lists removes a mailing list.",
             High,
             "Deleting a mailing list removes all members and subscription data permanently. \
@@ -81,7 +81,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Template deletion
         destructive_pattern!(
             "mailgun-delete-template",
-            r"(?:-X\s*DELETE|--request\s+DELETE).*api\.mailgun\.net/v3/[^/]+/templates/|api\.mailgun\.net/v3/[^/]+/templates/\w+.*(?:-X\s*DELETE|--request\s+DELETE)",
+            r"(?:-X\s*DELETE|--request(?:=|\s+)DELETE).*api\.mailgun\.net/v3/[^/]+/templates/|api\.mailgun\.net/v3/[^/]+/templates/\w+.*(?:-X\s*DELETE|--request(?:=|\s+)DELETE)",
             "DELETE to Mailgun templates endpoint removes an email template.",
             Medium,
             "Deleting a template breaks email sends that reference it. Applications will \
@@ -95,7 +95,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Webhook deletion
         destructive_pattern!(
             "mailgun-delete-webhook",
-            r"(?:-X\s*DELETE|--request\s+DELETE).*api\.mailgun\.net/v3/domains/[^/]+/webhooks/|api\.mailgun\.net/v3/domains/[^/]+/webhooks/\w+.*(?:-X\s*DELETE|--request\s+DELETE)",
+            r"(?:-X\s*DELETE|--request(?:=|\s+)DELETE).*api\.mailgun\.net/v3/domains/[^/]+/webhooks/|api\.mailgun\.net/v3/domains/[^/]+/webhooks/\w+.*(?:-X\s*DELETE|--request(?:=|\s+)DELETE)",
             "DELETE to Mailgun webhooks endpoint removes a webhook.",
             Medium,
             "Deleting a webhook stops event delivery to your application. Bounce, complaint, \
@@ -109,7 +109,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Credential deletion
         destructive_pattern!(
             "mailgun-delete-credential",
-            r"(?:-X\s*DELETE|--request\s+DELETE).*api\.mailgun\.net/v3/domains/[^/]+/credentials/|api\.mailgun\.net/v3/domains/[^/]+/credentials/[^\s/]+.*(?:-X\s*DELETE|--request\s+DELETE)",
+            r"(?:-X\s*DELETE|--request(?:=|\s+)DELETE).*api\.mailgun\.net/v3/domains/[^/]+/credentials/|api\.mailgun\.net/v3/domains/[^/]+/credentials/[^\s/]+.*(?:-X\s*DELETE|--request(?:=|\s+)DELETE)",
             "DELETE to Mailgun credentials endpoint removes SMTP credentials.",
             High,
             "Deleting SMTP credentials immediately revokes access. Applications using these \
@@ -123,7 +123,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Tag deletion
         destructive_pattern!(
             "mailgun-delete-tag",
-            r"(?:-X\s*DELETE|--request\s+DELETE).*api\.mailgun\.net/v3/[^/]+/tags/|api\.mailgun\.net/v3/[^/]+/tags/\w+.*(?:-X\s*DELETE|--request\s+DELETE)",
+            r"(?:-X\s*DELETE|--request(?:=|\s+)DELETE).*api\.mailgun\.net/v3/[^/]+/tags/|api\.mailgun\.net/v3/[^/]+/tags/\w+.*(?:-X\s*DELETE|--request(?:=|\s+)DELETE)",
             "DELETE to Mailgun tags endpoint removes a tag.",
             Low,
             "Deleting a tag removes the grouping but does not affect sent emails. Statistics \
@@ -137,7 +137,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Suppression deletion (bounces, complaints, unsubscribes)
         destructive_pattern!(
             "mailgun-delete-suppression",
-            r"(?:-X\s*DELETE|--request\s+DELETE).*api\.mailgun\.net/v3/[^/]+/(?:bounces|complaints|unsubscribes)/",
+            r"(?:-X\s*DELETE|--request(?:=|\s+)DELETE).*api\.mailgun\.net/v3/[^/]+/(?:bounces|complaints|unsubscribes)/",
             "DELETE to Mailgun suppression endpoints removes suppression entries.",
             High,
             "Removing suppression entries allows emails to addresses that previously \
@@ -199,6 +199,11 @@ mod tests {
         assert_blocks_with_pattern(
             &pack,
             "curl --request DELETE https://api.mailgun.net/v3/domains/sandbox123.mailgun.org",
+            "mailgun-delete-domain",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "curl --request=DELETE https://api.mailgun.net/v3/domains/sandbox123.mailgun.org",
             "mailgun-delete-domain",
         );
         // Route deletion

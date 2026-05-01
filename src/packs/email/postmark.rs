@@ -40,7 +40,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Server deletion
         destructive_pattern!(
             "postmark-delete-server",
-            r"(?:-X\s*DELETE|--request\s+DELETE).*api\.postmarkapp\.com/servers/|api\.postmarkapp\.com/servers/\d+.*(?:-X\s*DELETE|--request\s+DELETE)",
+            r"(?:-X\s*DELETE|--request(?:=|\s+)DELETE).*api\.postmarkapp\.com/servers/|api\.postmarkapp\.com/servers/\d+.*(?:-X\s*DELETE|--request(?:=|\s+)DELETE)",
             "DELETE to Postmark /servers removes a server configuration.",
             Critical,
             "Deleting a Postmark server removes all associated templates, message streams, \
@@ -54,7 +54,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Template deletion
         destructive_pattern!(
             "postmark-delete-template",
-            r"(?:-X\s*DELETE|--request\s+DELETE).*api\.postmarkapp\.com/templates/|api\.postmarkapp\.com/templates/[^\s/]+.*(?:-X\s*DELETE|--request\s+DELETE)",
+            r"(?:-X\s*DELETE|--request(?:=|\s+)DELETE).*api\.postmarkapp\.com/templates/|api\.postmarkapp\.com/templates/[^\s/]+.*(?:-X\s*DELETE|--request(?:=|\s+)DELETE)",
             "DELETE to Postmark /templates removes an email template.",
             Medium,
             "Deleting a Postmark template breaks any email sends referencing that template \
@@ -68,7 +68,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Domain deletion
         destructive_pattern!(
             "postmark-delete-domain",
-            r"(?:-X\s*DELETE|--request\s+DELETE).*api\.postmarkapp\.com/domains/|api\.postmarkapp\.com/domains/\d+.*(?:-X\s*DELETE|--request\s+DELETE)",
+            r"(?:-X\s*DELETE|--request(?:=|\s+)DELETE).*api\.postmarkapp\.com/domains/|api\.postmarkapp\.com/domains/\d+.*(?:-X\s*DELETE|--request(?:=|\s+)DELETE)",
             "DELETE to Postmark /domains removes a domain configuration.",
             Critical,
             "Deleting a Postmark domain removes DKIM keys and domain verification. Emails \
@@ -82,7 +82,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Sender signature deletion
         destructive_pattern!(
             "postmark-delete-sender-signature",
-            r"(?:-X\s*DELETE|--request\s+DELETE).*api\.postmarkapp\.com/senders/|api\.postmarkapp\.com/senders/\d+.*(?:-X\s*DELETE|--request\s+DELETE)",
+            r"(?:-X\s*DELETE|--request(?:=|\s+)DELETE).*api\.postmarkapp\.com/senders/|api\.postmarkapp\.com/senders/\d+.*(?:-X\s*DELETE|--request(?:=|\s+)DELETE)",
             "DELETE to Postmark /senders removes a sender signature.",
             High,
             "Deleting a sender signature prevents sending from that email address. \
@@ -96,7 +96,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Webhook deletion
         destructive_pattern!(
             "postmark-delete-webhook",
-            r"(?:-X\s*DELETE|--request\s+DELETE).*api\.postmarkapp\.com/webhooks/|api\.postmarkapp\.com/webhooks/\d+.*(?:-X\s*DELETE|--request\s+DELETE)",
+            r"(?:-X\s*DELETE|--request(?:=|\s+)DELETE).*api\.postmarkapp\.com/webhooks/|api\.postmarkapp\.com/webhooks/\d+.*(?:-X\s*DELETE|--request(?:=|\s+)DELETE)",
             "DELETE to Postmark /webhooks removes a webhook configuration.",
             Medium,
             "Deleting a webhook stops event notifications to your application. Bounce, \
@@ -110,7 +110,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Suppression deletion (more specific, must come before message-stream)
         destructive_pattern!(
             "postmark-delete-suppression",
-            r"(?:-X\s*DELETE|--request\s+DELETE).*api\.postmarkapp\.com/message-streams/[^/]+/suppressions/|api\.postmarkapp\.com/message-streams/[^/]+/suppressions/.*(?:-X\s*DELETE|--request\s+DELETE)",
+            r"(?:-X\s*DELETE|--request(?:=|\s+)DELETE).*api\.postmarkapp\.com/message-streams/[^/]+/suppressions/|api\.postmarkapp\.com/message-streams/[^/]+/suppressions/.*(?:-X\s*DELETE|--request(?:=|\s+)DELETE)",
             "DELETE to Postmark suppressions endpoint removes suppression entries.",
             High,
             "Removing suppression entries allows emails to addresses that previously bounced, \
@@ -124,7 +124,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Message stream deletion (must not have additional path after stream name)
         destructive_pattern!(
             "postmark-delete-message-stream",
-            r"(?:-X\s*DELETE|--request\s+DELETE).*api\.postmarkapp\.com/message-streams/[\w-]+(?:\s|$)|api\.postmarkapp\.com/message-streams/[\w-]+(?:\s|$).*(?:-X\s*DELETE|--request\s+DELETE)",
+            r"(?:-X\s*DELETE|--request(?:=|\s+)DELETE).*api\.postmarkapp\.com/message-streams/[\w-]+(?:\s|$)|api\.postmarkapp\.com/message-streams/[\w-]+(?:\s|$).*(?:-X\s*DELETE|--request(?:=|\s+)DELETE)",
             "DELETE to Postmark /message-streams removes a message stream.",
             High,
             "Deleting a message stream removes all associated statistics, suppressions, and \
@@ -189,6 +189,11 @@ mod tests {
         assert_blocks_with_pattern(
             &pack,
             "curl --request DELETE https://api.postmarkapp.com/servers/12345",
+            "postmark-delete-server",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "curl --request=DELETE https://api.postmarkapp.com/servers/12345",
             "postmark-delete-server",
         );
         // Template deletion

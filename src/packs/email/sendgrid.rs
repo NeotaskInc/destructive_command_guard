@@ -38,7 +38,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Template deletion
         destructive_pattern!(
             "sendgrid-delete-template",
-            r"(?:-X\s*DELETE|--request\s+DELETE).*sendgrid\.com/v3/templates/|sendgrid\.com/v3/templates/\S+.*(?:-X\s*DELETE|--request\s+DELETE)",
+            r"(?:-X\s*DELETE|--request(?:=|\s+)DELETE).*sendgrid\.com/v3/templates/|sendgrid\.com/v3/templates/\S+.*(?:-X\s*DELETE|--request(?:=|\s+)DELETE)",
             "DELETE to SendGrid /v3/templates removes a transactional template.",
             High,
             "Deleting a template breaks any email sends referencing that template ID. \
@@ -52,7 +52,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // API key deletion
         destructive_pattern!(
             "sendgrid-delete-api-key",
-            r"(?:-X\s*DELETE|--request\s+DELETE).*sendgrid\.com/v3/api_keys/|sendgrid\.com/v3/api_keys/\S+.*(?:-X\s*DELETE|--request\s+DELETE)",
+            r"(?:-X\s*DELETE|--request(?:=|\s+)DELETE).*sendgrid\.com/v3/api_keys/|sendgrid\.com/v3/api_keys/\S+.*(?:-X\s*DELETE|--request(?:=|\s+)DELETE)",
             "DELETE to SendGrid /v3/api_keys removes an API key.",
             Critical,
             "Deleting an API key immediately revokes access. All applications using this \
@@ -65,7 +65,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Domain authentication deletion
         destructive_pattern!(
             "sendgrid-delete-whitelabel-domain",
-            r"(?:-X\s*DELETE|--request\s+DELETE).*sendgrid\.com/v3/whitelabel/domains/|sendgrid\.com/v3/whitelabel/domains/\d+.*(?:-X\s*DELETE|--request\s+DELETE)",
+            r"(?:-X\s*DELETE|--request(?:=|\s+)DELETE).*sendgrid\.com/v3/whitelabel/domains/|sendgrid\.com/v3/whitelabel/domains/\d+.*(?:-X\s*DELETE|--request(?:=|\s+)DELETE)",
             "DELETE to SendGrid /v3/whitelabel/domains removes domain authentication.",
             Critical,
             "Deleting domain authentication removes DKIM and SPF records. Emails sent \
@@ -79,7 +79,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Sender identity deletion
         destructive_pattern!(
             "sendgrid-delete-sender",
-            r"(?:-X\s*DELETE|--request\s+DELETE).*sendgrid\.com/v3/(?:senders|verified_senders)/|sendgrid\.com/v3/(?:senders|verified_senders)/\d+.*(?:-X\s*DELETE|--request\s+DELETE)",
+            r"(?:-X\s*DELETE|--request(?:=|\s+)DELETE).*sendgrid\.com/v3/(?:senders|verified_senders)/|sendgrid\.com/v3/(?:senders|verified_senders)/\d+.*(?:-X\s*DELETE|--request(?:=|\s+)DELETE)",
             "DELETE to SendGrid /v3/senders or /v3/verified_senders removes a sender identity.",
             High,
             "Deleting a sender identity prevents sending from that email address. \
@@ -93,7 +93,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Teammate deletion
         destructive_pattern!(
             "sendgrid-delete-teammate",
-            r"(?:-X\s*DELETE|--request\s+DELETE).*sendgrid\.com/v3/teammates/|sendgrid\.com/v3/teammates/\w+.*(?:-X\s*DELETE|--request\s+DELETE)",
+            r"(?:-X\s*DELETE|--request(?:=|\s+)DELETE).*sendgrid\.com/v3/teammates/|sendgrid\.com/v3/teammates/\w+.*(?:-X\s*DELETE|--request(?:=|\s+)DELETE)",
             "DELETE to SendGrid /v3/teammates removes a teammate from the account.",
             Medium,
             "Deleting a teammate revokes their access to the SendGrid account. They lose \
@@ -106,7 +106,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Suppression deletion
         destructive_pattern!(
             "sendgrid-delete-suppression",
-            r"(?:-X\s*DELETE|--request\s+DELETE).*sendgrid\.com/v3/(?:suppression|asm)/",
+            r"(?:-X\s*DELETE|--request(?:=|\s+)DELETE).*sendgrid\.com/v3/(?:suppression|asm)/",
             "DELETE to SendGrid suppression endpoints removes entries from suppression lists.",
             High,
             "Removing suppression entries allows emails to be sent to addresses that \
@@ -120,7 +120,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Webhook deletion
         destructive_pattern!(
             "sendgrid-delete-webhook",
-            r"(?:-X\s*DELETE|--request\s+DELETE).*sendgrid\.com/v3/user/webhooks/",
+            r"(?:-X\s*DELETE|--request(?:=|\s+)DELETE).*sendgrid\.com/v3/user/webhooks/",
             "DELETE to SendGrid /v3/user/webhooks removes a webhook configuration.",
             Medium,
             "Deleting a webhook stops event notifications to your application. Bounce \
@@ -134,7 +134,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Subuser deletion
         destructive_pattern!(
             "sendgrid-delete-subuser",
-            r"(?:-X\s*DELETE|--request\s+DELETE).*sendgrid\.com/v3/subusers/|sendgrid\.com/v3/subusers/\w+.*(?:-X\s*DELETE|--request\s+DELETE)",
+            r"(?:-X\s*DELETE|--request(?:=|\s+)DELETE).*sendgrid\.com/v3/subusers/|sendgrid\.com/v3/subusers/\w+.*(?:-X\s*DELETE|--request(?:=|\s+)DELETE)",
             "DELETE to SendGrid /v3/subusers removes a subuser account.",
             Critical,
             "Deleting a subuser removes all their data including templates, statistics, \
@@ -203,6 +203,11 @@ mod tests {
         assert_blocks_with_pattern(
             &pack,
             "curl -X DELETE https://api.sendgrid.com/v3/api_keys/abc123",
+            "sendgrid-delete-api-key",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "curl --request=DELETE https://api.sendgrid.com/v3/api_keys/abc123",
             "sendgrid-delete-api-key",
         );
         // Domain deletion
