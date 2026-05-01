@@ -1753,6 +1753,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         //   `cat /dev/null > /etc/passwd`  — pipe /dev/null
         //   `>| /etc/passwd`               — force-overwrite (ignores noclobber)
         //   `&> /etc/passwd`               — stdout+stderr to file
+        //   `>& /etc/passwd`               — stdout+stderr to file
         //   `1>| /etc/passwd`              — fd1 force-overwrite
         //   `2> /etc/passwd`               — fd2 to file
         //
@@ -1793,13 +1794,13 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         //      bypass with `> $'/etc/passwd'` or `> $"/etc/passwd"`.
         destructive_pattern!(
             "redirect-truncate-root-home",
-            r#"(?<![<>])(?:[12]?>\|?|&>)\s*(?:['"\\]|\$['"])?(?!/dev/(?:null|zero|full)\b)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
-            "shell redirect (>, >|, &>, 1>, 2>) to a sensitive system or home path truncates the file to zero bytes. EXTREMELY DANGEROUS.",
+            r#"(?<![<>])(?:[12]?>\|?|&>|>&)\s*(?:['"\\]|\$['"])?(?!/dev/(?:null|zero|full)\b)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
+            "shell redirect (>, >|, &>, >&, 1>, 2>) to a sensitive system or home path truncates the file to zero bytes. EXTREMELY DANGEROUS.",
             Critical,
             "`> /etc/passwd` (or `: > /etc/passwd`, `echo > /etc/passwd`, etc.) opens \
              the target file with O_WRONLY|O_CREAT|O_TRUNC — the contents are destroyed \
              before any write happens. This applies equally to `>|` (force-overwrite), \
-             `&>` (stdout+stderr to file), and numbered FD forms (`1>`, `2>`, `1>|`, \
+             `&>` / `>&` (stdout+stderr to file), and numbered FD forms (`1>`, `2>`, `1>|`, \
              `2>|`). All of these are silent, immediate, irrecoverable.\n\n\
              There is NO recovery without backups.\n\n\
              Safer alternatives:\n\
@@ -2932,9 +2933,12 @@ mod tests {
             // Force-overwrite (>|).
             ">| /etc/passwd",
             "echo x >| /etc/passwd",
-            // stdout+stderr (&>).
+            // stdout+stderr (&> / >&).
             "&> /etc/passwd",
             "make &> /etc/log",
+            ">& /etc/passwd",
+            "make >& /etc/log",
+            "make >&/etc/log",
             // Numbered FDs.
             "echo x 1> /etc/passwd",
             "echo x 2> /etc/passwd",
@@ -3002,6 +3006,7 @@ mod tests {
             "command > ${TMPDIR}/scratch",
             "echo x >| build.log",
             "echo x &> build.log",
+            "echo x >& build.log",
             "echo x 2> err.log",
         ] {
             assert_no_match(&pack, cmd);
@@ -3026,13 +3031,14 @@ mod tests {
     fn redirect_to_fd_is_allowed() {
         // `1>&2` and `2>&1` redirect FD-to-FD, not file truncation.
         // The regex's `\s*['"]?<sensitive>` clause requires `/`/`~`/
-        // `$HOME` next, which `&` doesn't satisfy.
+        // `$HOME` next, which fd numbers and `-` don't satisfy.
         let pack = create_pack();
         for cmd in [
             "echo x 1>&2",
             "echo x 2>&1",
             "command 2>&1 | tee log.txt",
             "echo x >&2",
+            "exec >&-",
         ] {
             assert_no_match(&pack, cmd);
         }

@@ -75,6 +75,24 @@ fn test_basic_allowed_command_exits_zero() {
 }
 
 #[test]
+fn test_stdout_stderr_redirect_truncate_is_blocked() {
+    let output = run_dcg_isolated(&["test", "--format", "json", ": >&/etc/passwd"], None);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "`>&word` stdout/stderr truncation should be blocked\nstdout: {}\nstderr: {}",
+        stdout_text(&output),
+        stderr_text(&output)
+    );
+
+    let json = parse_json(&output);
+    assert_eq!(json["decision"], "deny");
+    assert_eq!(json["pack_id"], "core.filesystem");
+    assert_eq!(json["pattern_name"], "redirect-truncate-root-home");
+}
+
+#[test]
 fn test_allowlist_match_allows_blocked_command() {
     let repo = tempfile::tempdir().expect("temp repo");
     std::fs::create_dir_all(repo.path().join(".git")).expect("create .git marker");
