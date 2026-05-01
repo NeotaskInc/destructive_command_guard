@@ -36,6 +36,17 @@ semantics and release validation fixes that need to ship in prebuilt binaries.
   macOS and Windows release builds stay warning-clean
   ([bdcbb9b](https://github.com/Dicklesworthstone/destructive_command_guard/commit/bdcbb9b)).
 
+### Railway Pack
+
+- Blocked Railway Public API `variableCollectionUpsert` mutations that set
+  `replace: true`, because omitted variables are deleted and this can remove
+  production credentials even when no database variable name appears in the
+  payload
+  ([fb6431e](https://github.com/Dicklesworthstone/destructive_command_guard/commit/fb6431e)).
+- Kept that Railway replacement mutation detector on the linear regex path for
+  predictable hook latency
+  ([b7aa4e2](https://github.com/Dicklesworthstone/destructive_command_guard/commit/b7aa4e2)).
+
 ### Release Validation
 
 - Isolated the Codex subprocess memory test HOME so stale pending-exception
