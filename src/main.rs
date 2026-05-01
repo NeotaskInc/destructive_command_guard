@@ -109,6 +109,15 @@ fn build_history_entry(
     }
 }
 
+fn history_agent_type_for_protocol(protocol: hook::HookProtocol, detected_agent: &Agent) -> &str {
+    match protocol {
+        hook::HookProtocol::Codex => Agent::CodexCli.config_key(),
+        hook::HookProtocol::Gemini => Agent::GeminiCli.config_key(),
+        hook::HookProtocol::Copilot => Agent::CopilotCli.config_key(),
+        hook::HookProtocol::ClaudeCompatible => detected_agent.config_key(),
+    }
+}
+
 /// Process-wide registry of shutdown actions.
 ///
 /// `std::process::exit` skips Drop, so any subsystem with cross-call buffered
@@ -341,7 +350,6 @@ fn main() {
     // Load configuration
     let config = Config::load();
     let detected_agent = detect_agent();
-    let history_agent_type = detected_agent.config_key();
 
     // Check if bypass is requested (escape hatch)
     if Config::is_bypassed() {
@@ -438,6 +446,7 @@ fn main() {
     let Some((command, hook_protocol)) = hook::extract_command_with_protocol(&hook_input) else {
         return;
     };
+    let history_agent_type = history_agent_type_for_protocol(hook_protocol, &detected_agent);
 
     // Check command size limit (fail-open: allow and warn)
     let max_command_bytes = config.general.max_command_bytes();
@@ -1099,6 +1108,32 @@ mod tests {
             assert_eq!(entry.agent_type, "codex-cli");
             assert_eq!(entry.command, "git status");
             assert_eq!(entry.eval_duration_us, 42);
+        }
+
+        #[test]
+        fn history_agent_type_prefers_definitive_hook_protocols() {
+            assert_eq!(
+                history_agent_type_for_protocol(hook::HookProtocol::Codex, &Agent::Unknown),
+                "codex-cli"
+            );
+            assert_eq!(
+                history_agent_type_for_protocol(hook::HookProtocol::Gemini, &Agent::Unknown),
+                "gemini-cli"
+            );
+            assert_eq!(
+                history_agent_type_for_protocol(hook::HookProtocol::Copilot, &Agent::Unknown),
+                "copilot-cli"
+            );
+        }
+
+        #[test]
+        fn history_agent_type_preserves_detected_claude_compatible_agent() {
+            let custom = Agent::Custom("internal-agent".to_string());
+
+            assert_eq!(
+                history_agent_type_for_protocol(hook::HookProtocol::ClaudeCompatible, &custom),
+                "internal-agent"
+            );
         }
     }
 
