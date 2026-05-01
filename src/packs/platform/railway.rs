@@ -237,7 +237,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "railway-database-variable-set",
-            r"railway(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:variable|variables|vars|var)\s+(?:set|upsert)(?:\s|.)*(?:DATABASE_URL|DATABASE_PRIVATE_URL|DATABASE_PUBLIC_URL|RAILWAY_DATABASE_URL|PGHOST|PGPORT|PGUSER|PGPASSWORD|PGDATABASE|POSTGRES_HOST|POSTGRES_PORT|POSTGRES_USER|POSTGRES_PASSWORD|POSTGRES_DB|POSTGRES_DATABASE|POSTGRES_URL|POSTGRES_PRIVATE_URL|POSTGRES_PUBLIC_URL|POSTGRESQL_URL|POSTGRESQL_PRIVATE_URL|POSTGRESQL_PUBLIC_URL|MYSQL_URL|MYSQL_PRIVATE_URL|MYSQL_PUBLIC_URL|MYSQLHOST|MYSQLPORT|MYSQLUSER|MYSQLPASSWORD|MYSQLDATABASE|REDIS_URL|REDIS_PRIVATE_URL|REDIS_PUBLIC_URL|REDISHOST|REDISUSER|REDISPORT|REDISPASSWORD|MONGO_URL|MONGO_PRIVATE_URL|MONGO_PUBLIC_URL|MONGODB_URI|MONGODB_URL|MONGODB_PRIVATE_URL|MONGODB_PUBLIC_URL|MONGOHOST|MONGOPORT|MONGOUSER|MONGOPASSWORD)(?:\s|=|$)",
+            r#"railway(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:variable|variables|vars|var)\s+(?:set|upsert)(?:[^;&|\r\n]|\\\r?\n)*(?:\s|(?<!=)["'])(?:DATABASE_URL|DATABASE_PRIVATE_URL|DATABASE_PUBLIC_URL|RAILWAY_DATABASE_URL|PGHOST|PGPORT|PGUSER|PGPASSWORD|PGDATABASE|POSTGRES_HOST|POSTGRES_PORT|POSTGRES_USER|POSTGRES_PASSWORD|POSTGRES_DB|POSTGRES_DATABASE|POSTGRES_URL|POSTGRES_PRIVATE_URL|POSTGRES_PUBLIC_URL|POSTGRESQL_URL|POSTGRESQL_PRIVATE_URL|POSTGRESQL_PUBLIC_URL|MYSQL_URL|MYSQL_PRIVATE_URL|MYSQL_PUBLIC_URL|MYSQLHOST|MYSQLPORT|MYSQLUSER|MYSQLPASSWORD|MYSQLDATABASE|REDIS_URL|REDIS_PRIVATE_URL|REDIS_PUBLIC_URL|REDISHOST|REDISUSER|REDISPORT|REDISPASSWORD|MONGO_URL|MONGO_PRIVATE_URL|MONGO_PUBLIC_URL|MONGODB_URI|MONGODB_URL|MONGODB_PRIVATE_URL|MONGODB_PUBLIC_URL|MONGOHOST|MONGOPORT|MONGOUSER|MONGOPASSWORD)(?:\s|=|$)"#,
             "railway variable set is changing a database connection variable.",
             High,
             "Overwriting database connection variables can redirect production traffic or disconnect an app from its production database.",
@@ -459,6 +459,14 @@ mod tests {
                 "railway-database-variable-set",
             ),
             (
+                r#"railway variable set "DATABASE_URL=postgres://prod""#,
+                "railway-database-variable-set",
+            ),
+            (
+                "railway variable set --json DATABASE_PUBLIC_URL=postgres://prod",
+                "railway-database-variable-set",
+            ),
+            (
                 "railway vars set REDIS_PUBLIC_URL=redis://prod",
                 "railway-database-variable-set",
             ),
@@ -609,6 +617,15 @@ mod tests {
         assert_allows(&pack, "grep projectDelete curl_examples.txt");
         assert_allows(&pack, "echo serviceDelete is a mutation name");
         assert_allows(&pack, "railway variable set FEATURE_FLAG=true");
+        assert_allows(&pack, "railway variable set FEATURE_FLAG=DATABASE_URL");
+        assert_allows(
+            &pack,
+            r#"railway variable set FEATURE_FLAG="DATABASE_URL=postgres://prod""#,
+        );
+        assert_allows(
+            &pack,
+            "railway variable set FEATURE_FLAG=true && echo DATABASE_URL",
+        );
         assert_allows(&pack, "railway variables --set FEATURE_FLAG=true");
         assert_allows(
             &pack,
