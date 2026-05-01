@@ -965,10 +965,10 @@ static PACK_ENTRIES: [PackEntry; 84] = [
         // variants: sensitive source copied/symlinked/synced into a temp
         // path, followed by a forced recursive temp deletion.
         //
-        // `>/`, `> /`, `>~`, `> ~`, `>$`, `> $`, `&>`, `>|`, `1>`, `2>`
+        // `>/`, `> /`, `>~`, `> ~`, `>$`, `> $`, `&>`, `>&`, `>|`, `1>`, `2>`
         // are the Bash output-redirect quick-reject keywords for the
         // `redirect-truncate-root-home` rule — `> /etc/passwd` and its
-        // variants (numbered FDs, `>|` force-overwrite, `&>` combined
+        // variants (numbered FDs, `>|` force-overwrite, `&>` / `>&` combined
         // stdout+stderr) truncate the target file to zero bytes, the
         // same destructive primitive as `truncate -s 0`. Append (`>>`)
         // is intentionally excluded by negative lookbehind in the
@@ -1009,6 +1009,7 @@ static PACK_ENTRIES: [PackEntry; 84] = [
             ">'",
             "> '",
             "&>",
+            ">&",
             ">|",
             "1>",
             "2>",
