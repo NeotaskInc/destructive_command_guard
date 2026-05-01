@@ -382,9 +382,7 @@ impl ContextClassifier {
                             stack.push(TokenizerState::Backtick);
                         }
                         b'|' | b';' | b'&'
-                            if !(byte == b'&'
-                                && i + 1 < len
-                                && bytes[i + 1] == b'>') =>
+                            if !(byte == b'&' && is_ampersand_redirection_byte(bytes, i, len)) =>
                         {
                             // Check for operators
                             // For simple classification, treat as break.
@@ -1823,6 +1821,12 @@ fn is_shell_redirect_operator(token: &str) -> bool {
     }
 }
 
+#[inline]
+fn is_ampersand_redirection_byte(bytes: &[u8], i: usize, len: usize) -> bool {
+    debug_assert_eq!(bytes[i], b'&');
+    (i + 1 < len && bytes[i + 1] == b'>') || (i > 0 && matches!(bytes[i - 1], b'<' | b'>'))
+}
+
 #[derive(Debug, Clone)]
 struct SanitizeToken {
     kind: SanitizeTokenKind,
@@ -1933,6 +1937,9 @@ fn consume_separator_token(
             Some(i + 1)
         }
         b'&' => {
+            if is_ampersand_redirection_byte(bytes, i, len) {
+                return None;
+            }
             let end = if i + 1 < len && bytes[i + 1] == b'&' {
                 i + 2
             } else {
@@ -1958,6 +1965,11 @@ fn consume_word_token(command: &str, bytes: &[u8], mut i: usize, len: usize) -> 
 
         if b.is_ascii_whitespace() {
             break;
+        }
+
+        if b == b'&' && is_ampersand_redirection_byte(bytes, i, len) {
+            i += 1;
+            continue;
         }
 
         if matches!(b, b'|' | b';' | b'&') {
@@ -3064,13 +3076,35 @@ mod tests {
 
     #[test]
     fn classifier_keeps_ampersand_redirection_with_command_span() {
-        for cmd in ["git&>/dev/null status", "git&>>/dev/null status"] {
+        for cmd in [
+            "git&>/dev/null status",
+            "git&>>/dev/null status",
+            "echo 2>&1 status",
+            "echo 1<&2 status",
+            "echo >&2 status",
+        ] {
             let spans = classify_command(cmd);
             let executable = spans.executable_text(cmd);
 
             assert!(
-                executable.iter().any(|span| span.contains("git&>")),
-                "&> redirection must not be classified as a command separator: {cmd}"
+                !executable.iter().any(|span| *span == "status"),
+                "fd redirection must not be classified as a command separator: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_keeps_fd_duplication_inside_data_command() {
+        for cmd in [
+            "echo 2>&1 rm -rf /",
+            "echo 1<&2 rm -rf /",
+            "printf %s >&2 rm -rf /",
+        ] {
+            let sanitized = sanitize_for_pattern_matching(cmd);
+
+            assert!(
+                !sanitized.as_ref().contains("rm -rf"),
+                "fd redirection must not expose data-only arguments: {cmd} -> {sanitized}"
             );
         }
     }
