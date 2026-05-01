@@ -1090,6 +1090,7 @@ AUTO_CONFIGURED=0
 
 # Detailed tracking for what was configured
 CLAUDE_STATUS=""  # "created"|"merged"|"already"|"failed"
+CLAUDE_FAILURE_REASON=""
 GEMINI_STATUS=""  # "created"|"merged"|"already"|"failed"|"skipped"
 AIDER_STATUS=""   # "created"|"merged"|"already"|"skipped"|"failed"
 CONTINUE_STATUS="" # "unsupported"|"skipped"
@@ -1109,6 +1110,7 @@ COPILOT_HOOK_FILE=""
 configure_claude_code() {
   local settings_file="$1"
   local cleanup_predecessor="$2"
+  CLAUDE_FAILURE_REASON=""
   # Default to cleaning up predecessor if not specified or empty
   [ -z "$cleanup_predecessor" ] && cleanup_predecessor=1
   local settings_dir=$(dirname "$settings_file")
@@ -1150,23 +1152,32 @@ def is_dcg_command(cmd):
 
 try:
     with open(settings_file, 'r') as f:
-        settings = json.load(f)
-except (IOError, ValueError, json.JSONDecodeError):
+        raw_settings = f.read()
+except IOError:
     print("merge")
     raise SystemExit(0)
 
+if raw_settings.strip():
+    try:
+        settings = json.loads(raw_settings)
+    except (ValueError, json.JSONDecodeError):
+        print("invalid")
+        raise SystemExit(0)
+else:
+    settings = {}
+
 if not isinstance(settings, dict):
-    print("merge")
+    print("invalid")
     raise SystemExit(0)
 
 hooks_obj = settings.get("hooks", {})
 if not isinstance(hooks_obj, dict):
-    print("merge")
+    print("invalid")
     raise SystemExit(0)
 
 pre_tool_use = hooks_obj.get("PreToolUse", [])
 if not isinstance(pre_tool_use, list):
-    print("merge")
+    print("invalid")
     raise SystemExit(0)
 
 dcg_commands = []
@@ -1201,6 +1212,12 @@ else:
     print("merge")
 PYEOF
 )
+      if [ "$claude_hook_state" = "invalid" ]; then
+        CLAUDE_STATUS="failed"
+        CLAUDE_FAILURE_REASON="existing settings.json is invalid or has malformed hooks; left unchanged"
+        warn "Claude Code settings.json is invalid or has malformed hooks; leaving it unchanged: $settings_file"
+        return 0
+      fi
       if [ "$claude_hook_state" = "already" ]; then
         CLAUDE_STATUS="already"
         AUTO_CONFIGURED=1
@@ -1267,17 +1284,37 @@ def is_dcg_command(cmd):
         name = name[:-4]
     return name == 'dcg'
 
+raw_settings = ""
 try:
     with open(settings_file, 'r') as f:
-        settings = json.load(f)
-except (IOError, ValueError, json.JSONDecodeError):
+        raw_settings = f.read()
+except IOError:
     settings = {}
+
+if raw_settings.strip():
+    try:
+        settings = json.loads(raw_settings)
+    except (ValueError, json.JSONDecodeError):
+        print(f"invalid Claude Code settings.json: {settings_file}", file=sys.stderr)
+        raise SystemExit(1)
+else:
+    settings = {}
+
+if not isinstance(settings, dict):
+    print(f"Claude Code settings.json must contain a JSON object: {settings_file}", file=sys.stderr)
+    raise SystemExit(1)
 
 # Ensure hooks structure exists
 if 'hooks' not in settings:
     settings['hooks'] = {}
+elif not isinstance(settings['hooks'], dict):
+    print(f"Claude Code settings.json hooks must contain a JSON object: {settings_file}", file=sys.stderr)
+    raise SystemExit(1)
 if 'PreToolUse' not in settings['hooks']:
     settings['hooks']['PreToolUse'] = []
+elif not isinstance(settings['hooks']['PreToolUse'], list):
+    print(f"Claude Code settings.json PreToolUse must contain a list: {settings_file}", file=sys.stderr)
+    raise SystemExit(1)
 
 # First pass: process Bash matchers, optionally removing predecessor hooks
 # and consolidate all Bash matchers into one
@@ -1286,6 +1323,9 @@ new_pre_tool_use = []
 predecessor_removed = False
 
 for entry in settings['hooks']['PreToolUse']:
+    if not isinstance(entry, dict):
+        new_pre_tool_use.append(entry)
+        continue
     if entry.get('matcher') == 'Bash':
         # Collect hooks from this Bash matcher
         if 'hooks' in entry:
@@ -1331,6 +1371,7 @@ PYEOF
       else
         mv "$CLAUDE_BACKUP" "$settings_file" 2>/dev/null || true
         CLAUDE_STATUS="failed"
+        CLAUDE_FAILURE_REASON="merge failed; restored backup"
         CLAUDE_BACKUP=""
       fi
     else
@@ -1338,6 +1379,7 @@ PYEOF
       rm -f "$CLAUDE_BACKUP" 2>/dev/null || true
       CLAUDE_BACKUP=""
       CLAUDE_STATUS="failed"
+      CLAUDE_FAILURE_REASON="python3 required for merge"
       return 1
     fi
   else
@@ -2598,7 +2640,11 @@ case "$CLAUDE_STATUS" in
     summary_lines+=("Claude Code: Already configured (no changes)")
     ;;
   failed)
-    summary_lines+=("Claude Code: Configuration failed (python3 required)")
+    if [ -n "$CLAUDE_FAILURE_REASON" ]; then
+      summary_lines+=("Claude Code: Configuration failed ($CLAUDE_FAILURE_REASON)")
+    else
+      summary_lines+=("Claude Code: Configuration failed (python3 required)")
+    fi
     ;;
   *)
     summary_lines+=("Claude Code: Configured")

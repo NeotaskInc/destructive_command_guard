@@ -864,24 +864,79 @@ EOF
 
 @test "configure_claude_code: handles malformed JSON gracefully" {
     log_test "Testing malformed JSON handling..."
+    command -v python3 &>/dev/null || skip "python3 not available"
 
     CLAUDE_SETTINGS="$HOME/.claude/settings.json"
     mkdir -p "$HOME/.claude"
 
     # Create malformed JSON
     echo "not valid json {{{" > "$CLAUDE_SETTINGS"
+    local before
+    before=$(cat "$CLAUDE_SETTINGS")
 
     log_test "Malformed content: $(cat "$CLAUDE_SETTINGS")"
 
-    # This might fail or succeed depending on implementation
-    # The key is it shouldn't crash
-    configure_claude_code "$CLAUDE_SETTINGS" "0" || true
+    configure_claude_code "$CLAUDE_SETTINGS" "0"
 
     log_test "CLAUDE_STATUS: $CLAUDE_STATUS"
+    log_test "CLAUDE_FAILURE_REASON: ${CLAUDE_FAILURE_REASON:-}"
     log_test "After: $(cat "$CLAUDE_SETTINGS" 2>/dev/null || echo 'N/A')"
 
-    # Either status should be set
-    [ -n "$CLAUDE_STATUS" ]
+    [ "$CLAUDE_STATUS" = "failed" ]
+    [[ "$CLAUDE_FAILURE_REASON" == *"invalid"* ]]
+    [ -z "$CLAUDE_BACKUP" ]
+    [ "$(cat "$CLAUDE_SETTINGS")" = "$before" ]
+}
+
+@test "configure_claude_code: non-object hooks is preserved and reports failed" {
+    log_test "Testing Claude Code malformed hooks preservation..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+    mkdir -p "$HOME/.claude"
+    printf '%s\n' '{"hooks":["bad-shape"]}' > "$CLAUDE_SETTINGS"
+    local before
+    before=$(cat "$CLAUDE_SETTINGS")
+
+    configure_claude_code "$CLAUDE_SETTINGS" "0"
+
+    log_test "CLAUDE_STATUS: $CLAUDE_STATUS"
+    log_test "CLAUDE_FAILURE_REASON: ${CLAUDE_FAILURE_REASON:-}"
+    log_test "After: $(cat "$CLAUDE_SETTINGS")"
+
+    [ "$CLAUDE_STATUS" = "failed" ]
+    [[ "$CLAUDE_FAILURE_REASON" == *"invalid"* ]]
+    [ -z "$CLAUDE_BACKUP" ]
+    [ "$(cat "$CLAUDE_SETTINGS")" = "$before" ]
+}
+
+@test "configure_claude_code: non-list PreToolUse is preserved and reports failed" {
+    log_test "Testing Claude Code malformed PreToolUse preservation..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+    mkdir -p "$HOME/.claude"
+    cat > "$CLAUDE_SETTINGS" <<'EOF'
+{
+  "hooks": {
+    "PreToolUse": {"bad": "shape"}
+  },
+  "theme": "dark"
+}
+EOF
+    local before
+    before=$(cat "$CLAUDE_SETTINGS")
+
+    configure_claude_code "$CLAUDE_SETTINGS" "0"
+
+    log_test "CLAUDE_STATUS: $CLAUDE_STATUS"
+    log_test "CLAUDE_FAILURE_REASON: ${CLAUDE_FAILURE_REASON:-}"
+    log_test "After: $(cat "$CLAUDE_SETTINGS")"
+
+    [ "$CLAUDE_STATUS" = "failed" ]
+    [[ "$CLAUDE_FAILURE_REASON" == *"invalid"* ]]
+    [ -z "$CLAUDE_BACKUP" ]
+    [ "$(cat "$CLAUDE_SETTINGS")" = "$before" ]
 }
 
 @test "configure_claude_code: handles empty settings file" {
