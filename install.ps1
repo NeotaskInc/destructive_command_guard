@@ -102,6 +102,12 @@ function Get-JsonArray {
   @($Value)
 }
 
+function Test-JsonArray {
+  param([object]$Value)
+
+  $Value -is [array]
+}
+
 function Test-JsonObject {
   param([object]$Value)
 
@@ -211,7 +217,7 @@ function Configure-CodexHook {
   if ($hooksExists) {
     $preToolUseExists = Test-ObjectPropertyExists $hooks "PreToolUse"
     $preToolUse = Get-ObjectPropertyValue $hooks "PreToolUse"
-    if ($preToolUseExists -and -not ($preToolUse -is [array])) {
+    if ($preToolUseExists -and -not (Test-JsonArray $preToolUse)) {
       throw "Codex hooks.json PreToolUse must contain a list; leaving it unchanged: $hooksFile"
     }
   }
@@ -230,7 +236,11 @@ function Configure-CodexHook {
 
   foreach ($entry in (Get-JsonArray (Get-ObjectPropertyValue $hooks "PreToolUse"))) {
     if ((Get-ObjectPropertyValue $entry "matcher") -eq "Bash") {
-      foreach ($hook in (Get-JsonArray (Get-ObjectPropertyValue $entry "hooks"))) {
+      $entryHooks = Get-ObjectPropertyValue $entry "hooks"
+      if ($null -ne $entryHooks -and -not (Test-JsonArray $entryHooks)) {
+        throw "Codex hooks.json Bash matcher hooks must contain a list; leaving it unchanged: $hooksFile"
+      }
+      foreach ($hook in (Get-JsonArray $entryHooks)) {
         if (-not (Test-DcgHookCommand $hook)) {
           $bashHooks += $hook
         }

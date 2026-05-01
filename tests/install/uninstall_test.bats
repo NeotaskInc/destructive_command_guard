@@ -362,7 +362,9 @@ EOF
 
     [ "$status" -eq 0 ]
     [[ "$output" == *"removed"* ]]
-    ! grep -qF '/usr/local/bin/dcg' .github/hooks/dcg.json
+    if grep -qF '/usr/local/bin/dcg' .github/hooks/dcg.json; then
+        return 1
+    fi
     grep -qF '/opt/dcgrep/bin/scan' .github/hooks/dcg.json
 }
 
@@ -471,7 +473,9 @@ EOF
     [ "$status" -eq 0 ]
     [[ "$output" == *"removed"* ]]
     [ ! -f "$HOME/.cursor/hooks/dcg-pre-shell.py" ]
-    ! grep -qF 'dcg-pre-shell.py' "$HOME/.cursor/hooks.json"
+    if grep -qF 'dcg-pre-shell.py' "$HOME/.cursor/hooks.json"; then
+        return 1
+    fi
     grep -qF '/opt/dcgrep/bin/scan' "$HOME/.cursor/hooks.json"
 }
 
@@ -689,6 +693,115 @@ if ($bashCommands -notcontains "other-tool") {
     [ "$status" -eq 0 ]
 }
 
+@test "uninstall.ps1: preserves malformed PreToolUse shape" {
+    log_test "Testing PowerShell Codex uninstall preserves non-list PreToolUse..."
+    local pwsh_bin
+    pwsh_bin="$(PATH="${ORIGINAL_PATH:-$PATH}" command -v pwsh || true)"
+    [ -n "$pwsh_bin" ] || skip "pwsh not available"
+
+    mkdir -p "$HOME/.codex"
+    cat > "$HOME/.codex/hooks.json" << 'EOF'
+{
+  "hooks": {
+    "PreToolUse": {
+      "matcher": "Bash",
+      "hooks": [
+        {"type": "command", "command": "C:\\tools\\dcg.exe"}
+      ]
+    }
+  }
+}
+EOF
+    local before
+    before="$(cat "$HOME/.codex/hooks.json")"
+
+    run env DCG_UNINSTALL_PS1="$PROJECT_ROOT/uninstall.ps1" DCG_HOOKS_JSON="$HOME/.codex/hooks.json" "$pwsh_bin" -NoProfile -Command '
+$ScriptPath = $env:DCG_UNINSTALL_PS1
+$HooksPath = $env:DCG_HOOKS_JSON
+$errors = $null
+$tokens = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($ScriptPath, [ref]$tokens, [ref]$errors)
+if ($errors.Count -gt 0) {
+  $errors | ForEach-Object { Write-Error $_ }
+  exit 1
+}
+$ast.EndBlock.Statements |
+  Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] } |
+  ForEach-Object { . ([scriptblock]::Create($_.Extent.Text)) }
+
+$result = Remove-DcgHooksFromJsonFile -Path $HooksPath -DeleteEmptyFile
+if ($result) {
+  Write-Error "malformed PreToolUse should have been left unchanged"
+  exit 2
+}
+'
+
+    log_test "pwsh uninstall.ps1 status: $status"
+    log_test "pwsh uninstall.ps1 output: $output"
+
+    [ "$status" -eq 0 ]
+    [ "$(cat "$HOME/.codex/hooks.json")" = "$before" ]
+}
+
+@test "uninstall.ps1: preserves malformed Bash hooks shape" {
+    log_test "Testing PowerShell Codex uninstall preserves non-list Bash hooks..."
+    local pwsh_bin
+    pwsh_bin="$(PATH="${ORIGINAL_PATH:-$PATH}" command -v pwsh || true)"
+    [ -n "$pwsh_bin" ] || skip "pwsh not available"
+
+    mkdir -p "$HOME/.codex"
+    cat > "$HOME/.codex/hooks.json" << 'EOF'
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": {
+          "type": "command",
+          "command": "C:\\tools\\dcg.exe"
+        }
+      },
+      {
+        "matcher": "Read",
+        "hooks": [
+          {"type": "command", "command": "echo read-hook"}
+        ]
+      }
+    ]
+  }
+}
+EOF
+    local before
+    before="$(cat "$HOME/.codex/hooks.json")"
+
+    run env DCG_UNINSTALL_PS1="$PROJECT_ROOT/uninstall.ps1" DCG_HOOKS_JSON="$HOME/.codex/hooks.json" "$pwsh_bin" -NoProfile -Command '
+$ScriptPath = $env:DCG_UNINSTALL_PS1
+$HooksPath = $env:DCG_HOOKS_JSON
+$errors = $null
+$tokens = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($ScriptPath, [ref]$tokens, [ref]$errors)
+if ($errors.Count -gt 0) {
+  $errors | ForEach-Object { Write-Error $_ }
+  exit 1
+}
+$ast.EndBlock.Statements |
+  Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] } |
+  ForEach-Object { . ([scriptblock]::Create($_.Extent.Text)) }
+
+$result = Remove-DcgHooksFromJsonFile -Path $HooksPath -DeleteEmptyFile
+if ($result) {
+  Write-Error "malformed Bash hooks should have been left unchanged"
+  exit 2
+}
+'
+
+    log_test "pwsh uninstall.ps1 status: $status"
+    log_test "pwsh uninstall.ps1 output: $output"
+
+    [ "$status" -eq 0 ]
+    [ "$(cat "$HOME/.codex/hooks.json")" = "$before" ]
+}
+
 # ============================================================================
 # Aider Uninstall Tests
 # ============================================================================
@@ -709,7 +822,9 @@ EOF
     log_test "After: $(cat "$HOME/.aider.conf.yml" 2>/dev/null || echo 'N/A')"
 
     # dcg-added lines should be removed
-    ! grep -q "Added by dcg installer" "$HOME/.aider.conf.yml"
+    if grep -q "Added by dcg installer" "$HOME/.aider.conf.yml"; then
+        return 1
+    fi
     # Other settings should remain
     grep -q "model: gpt-4" "$HOME/.aider.conf.yml"
 }

@@ -2053,6 +2053,62 @@ EOF
     assert_codex_hooks_unchanged
 }
 
+@test "install.ps1: malformed Codex Bash hooks is preserved and reports failed" {
+    log_test "Testing PowerShell Codex installer malformed Bash hooks preservation..."
+    local pwsh_bin
+    pwsh_bin="$(PATH="${ORIGINAL_PATH:-$PATH}" command -v pwsh || true)"
+    [ -n "$pwsh_bin" ] || skip "pwsh not available"
+
+    setup_mock_codex
+    seed_codex_hooks_json '{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": {"bad": "shape"}
+      },
+      {
+        "matcher": "Read",
+        "hooks": [
+          {"type": "command", "command": "echo read-hook"}
+        ]
+      }
+    ]
+  }
+}'
+
+    run env DCG_INSTALL_PS1="$PROJECT_ROOT/install.ps1" DCG_DCG_PATH="$DEST/dcg.exe" "$pwsh_bin" -NoProfile -Command '
+$ScriptPath = $env:DCG_INSTALL_PS1
+$errors = $null
+$tokens = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($ScriptPath, [ref]$tokens, [ref]$errors)
+if ($errors.Count -gt 0) {
+  $errors | ForEach-Object { Write-Error $_ }
+  exit 1
+}
+$ast.EndBlock.Statements |
+  Where-Object { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] } |
+  ForEach-Object { . ([scriptblock]::Create($_.Extent.Text)) }
+
+try {
+  Configure-CodexHook -DcgPath $env:DCG_DCG_PATH
+  Write-Error "expected malformed Bash hooks to be rejected"
+  exit 2
+} catch {
+  if ($_.Exception.Message -notlike "*Bash matcher hooks must contain a list*") {
+    Write-Error "unexpected error: $($_.Exception.Message)"
+    exit 3
+  }
+}
+'
+
+    log_test "pwsh install.ps1 status: $status"
+    log_test "pwsh install.ps1 output: $output"
+
+    [ "$status" -eq 0 ]
+    assert_codex_hooks_unchanged
+}
+
 @test "configure_codex: invalid hooks.json is preserved and reports failed" {
     log_test "Testing Codex invalid hooks.json preservation..."
     command -v python3 &>/dev/null || skip "python3 not available"

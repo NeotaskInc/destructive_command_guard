@@ -77,6 +77,12 @@ function Get-ObjectPropertyValue {
   $prop.Value
 }
 
+function Test-ObjectPropertyExists {
+  param([object]$Object, [string]$Name)
+
+  $null -ne $Object -and $null -ne $Object.PSObject.Properties[$Name]
+}
+
 function Set-ObjectPropertyValue {
   param([object]$Object, [string]$Name, [object]$Value)
 
@@ -103,6 +109,12 @@ function Get-JsonArray {
   @($Value)
 }
 
+function Test-JsonArray {
+  param([object]$Value)
+
+  $Value -is [array]
+}
+
 function Test-EmptyObject {
   param([object]$Object)
 
@@ -126,8 +138,9 @@ function Remove-DcgHooksFromJsonFile {
   $hooks = Get-ObjectPropertyValue $config "hooks"
   if ($null -eq $hooks -or $hooks -isnot [psobject]) { return $false }
 
+  if (-not (Test-ObjectPropertyExists $hooks "PreToolUse")) { return $false }
   $preToolUse = Get-ObjectPropertyValue $hooks "PreToolUse"
-  if ($null -eq $preToolUse) { return $false }
+  if (-not (Test-JsonArray $preToolUse)) { return $false }
 
   $newPreToolUse = @()
   $removed = $false
@@ -142,6 +155,9 @@ function Remove-DcgHooksFromJsonFile {
     if ($null -eq $inner) {
       $newPreToolUse += $entry
       continue
+    }
+    if (-not (Test-JsonArray $inner)) {
+      return $false
     }
 
     $filtered = @()
