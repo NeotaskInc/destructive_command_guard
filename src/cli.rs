@@ -10383,12 +10383,27 @@ fn update_installer_tag(
         }
         None => match crate::update::check_for_update(true) {
             Ok(result) => update_installer_tag_from_versions(None, &result.latest_version),
-            Err(err) => {
-                eprintln!(
-                    "dcg update: failed to resolve latest release ({err}); falling back to current installer tag."
-                );
-                update_installer_tag_from_versions(None, env!("CARGO_PKG_VERSION"))
-            }
+            Err(err) => Err(format!(
+                "Failed to resolve latest release for dcg update: {err}. Re-run with --version vX.Y.Z to install a known release."
+            )
+            .into()),
+        },
+    }
+}
+
+#[cfg(test)]
+fn update_installer_tag_from_check_result(
+    requested_version: Option<&str>,
+    latest_result: Result<&str, &str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    match requested_version {
+        Some(version) => update_installer_tag_from_versions(Some(version), env!("CARGO_PKG_VERSION")),
+        None => match latest_result {
+            Ok(latest_version) => update_installer_tag_from_versions(None, latest_version),
+            Err(err) => Err(format!(
+                "Failed to resolve latest release for dcg update: {err}. Re-run with --version vX.Y.Z to install a known release."
+            )
+            .into()),
         },
     }
 }
@@ -14337,6 +14352,25 @@ mod tests {
         assert_eq!(
             update_installer_tag_from_versions(None, "v0.9.0").unwrap(),
             "v0.9.0"
+        );
+    }
+
+    #[test]
+    fn test_update_installer_tag_errors_when_latest_unknown() {
+        let err = update_installer_tag_from_check_result(None, Err("network unavailable"))
+            .expect_err("default update must not silently reinstall current version");
+        assert!(
+            err.to_string().contains("Failed to resolve latest release"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_update_installer_tag_allows_requested_version_when_latest_unknown() {
+        assert_eq!(
+            update_installer_tag_from_check_result(Some("0.2.0"), Err("network unavailable"))
+                .unwrap(),
+            "v0.2.0"
         );
     }
 
