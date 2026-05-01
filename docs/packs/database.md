@@ -392,7 +392,7 @@ These patterns match safe commands that are always allowed:
 | `supabase-migration-list` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+migration\s+list` |
 | `supabase-migration-new` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+migration\s+new` |
 | `supabase-migration-fetch` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+migration\s+fetch` |
-| `supabase-db-push-dry-run` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+db\s+push\b.*--dry-run` |
+| `supabase-db-push-dry-run` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+db\s+push\b.*--dry-run(?:=true)?(?:\s\|$)` |
 | `supabase-functions-list` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+functions\s+list` |
 | `supabase-functions-serve` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+functions\s+serve` |
 | `supabase-functions-download` | `supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+functions\s+download` |

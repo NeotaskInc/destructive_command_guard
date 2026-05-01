@@ -327,10 +327,12 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "supabase-migration-fetch",
             r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+migration\s+fetch"
         ),
-        // supabase db push --dry-run (anywhere in args) is safe
+        // supabase db push --dry-run (anywhere in args) is safe.
+        // Treat only bare `--dry-run` or explicit true as previews;
+        // false-valued flags must not mask the destructive push rule.
         safe_pattern!(
             "supabase-db-push-dry-run",
-            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+db\s+push\b.*--dry-run"
+            r"supabase(?:\s+--?\S+(?:\s+\S+)?)*\s+db\s+push\b.*--dry-run(?:=true)?(?:\s|$)"
         ),
         // -- Functions read-only --
         safe_pattern!(
@@ -787,8 +789,24 @@ mod tests {
         let pack = create_pack();
         // --dry-run immediately after push
         assert_allows(&pack, "supabase db push --dry-run");
+        assert_allows(&pack, "supabase db push --dry-run=true");
         // --dry-run after other flags
         assert_allows(&pack, "supabase db push --linked --dry-run");
+    }
+
+    #[test]
+    fn test_db_push_false_dry_run_does_not_bypass() {
+        let pack = create_pack();
+
+        for command in [
+            "supabase db push --dry-run=false",
+            "supabase db push --linked --dry-run=false",
+            "supabase db push --dry-run=0",
+            "supabase db push --no-dry-run",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "supabase-db-push");
+            assert_no_safe_match(&pack, command);
+        }
     }
 
     #[test]

@@ -95,7 +95,7 @@ These patterns match safe commands that are always allowed:
 | `rclone-size` | `rclone(?:\s+--?\S+(?:\s+\S+)?)*\s+size(?=\s\|$)` |
 | `rclone-check` | `rclone(?:\s+--?\S+(?:\s+\S+)?)*\s+check(?=\s\|$)` |
 | `rclone-config` | `rclone(?:\s+--?\S+(?:\s+\S+)?)*\s+config(?=\s\|$)` |
-| `rclone-dry-run` | `rclone\b(?:\s+\S+)*\s+--dry-run\b` |
+| `rclone-dry-run` | `\brclone\b(?:\s+\S+)*\s+(?:--dry-run(?:=true)?\|-n)(?:\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 

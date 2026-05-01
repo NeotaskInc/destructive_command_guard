@@ -55,7 +55,10 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "rclone-config",
             r"rclone(?:\s+--?\S+(?:\s+\S+)?)*\s+config(?=\s|$)"
         ),
-        safe_pattern!("rclone-dry-run", r"rclone\b(?:\s+\S+)*\s+--dry-run\b"),
+        safe_pattern!(
+            "rclone-dry-run",
+            r"\brclone\b(?:\s+\S+)*\s+(?:--dry-run(?:=true)?|-n)(?:\s|$)"
+        ),
     ]
 }
 
@@ -176,6 +179,8 @@ mod tests {
         assert_safe_pattern_matches(&pack, "rclone check src: dest:");
         assert_safe_pattern_matches(&pack, "rclone config");
         assert_safe_pattern_matches(&pack, "rclone sync src: dest: --dry-run");
+        assert_safe_pattern_matches(&pack, "rclone sync src: dest: --dry-run=true");
+        assert_safe_pattern_matches(&pack, "rclone sync src: dest: -n");
     }
 
     #[test]
@@ -261,9 +266,28 @@ mod tests {
         assert_safe_pattern_matches(&pack, "rclone check src: dest:");
         assert_safe_pattern_matches(&pack, "rclone config");
         assert_safe_pattern_matches(&pack, "rclone sync src: dest: --dry-run");
+        assert_safe_pattern_matches(&pack, "rclone sync src: dest: -n");
         // With flags before subcommand
         assert_safe_pattern_matches(&pack, "rclone --verbose copy src: dest:");
         assert_safe_pattern_matches(&pack, "rclone -v ls remote:");
+    }
+
+    #[test]
+    fn rclone_false_dry_run_does_not_bypass_destructive_patterns() {
+        let pack = create_pack();
+
+        for (command, pattern) in [
+            ("rclone sync src: dest: --dry-run=false", "rclone-sync"),
+            ("rclone delete remote:path --dry-run=false", "rclone-delete"),
+            ("rclone purge remote:path --dry-run=false", "rclone-purge"),
+            ("rclone move src: dest: --dry-run=false", "rclone-move"),
+            ("rclone dedupe remote:path --dry-run=false", "rclone-dedupe"),
+            ("rclone sync src: dest: --dry-run=0", "rclone-sync"),
+            ("rclone sync src: dest: --no-dry-run", "rclone-sync"),
+        ] {
+            assert_blocks_with_pattern(&pack, command, pattern);
+            assert_no_safe_match(&pack, command);
+        }
     }
 
     #[test]
