@@ -336,8 +336,8 @@ pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
 /// Claude Code and Gemini payloads share several fields (`session_id`,
 /// `transcript_path`, `cwd`) which makes naive field-presence checks
 /// ambiguous. We disambiguate by checking Claude Code-specific indicators
-/// **first** (tool name `"Bash"`, hook event `"PreToolUse"`, and
-/// `CLAUDE_CODE` env var), then Gemini-specific markers (tool name
+/// **first** (Claude-compatible shell tool names, hook event `"PreToolUse"`,
+/// and `CLAUDE_CODE` env var), then Gemini-specific markers (tool name
 /// `"run_shell_command"` with hook event `"BeforeTool"`).
 ///
 /// See: <https://github.com/Dicklesworthstone/destructive_command_guard/issues/77>
@@ -370,22 +370,25 @@ pub fn detect_protocol(input: &HookInput) -> HookProtocol {
     // classify Codex separately because its JSON parser is strict
     // (`deny_unknown_fields`) and would silently drop dcg's standard deny
     // payload, letting the destructive command through.
-    let is_claude_tool = matches!(tool_name.as_str(), "bash" | "launch-process");
+    let is_claude_compatible_shell_tool = matches!(
+        tool_name.as_str(),
+        "bash" | "launch-process" | "powershell" | "pwsh"
+    );
     let has_codex_turn_id = input
         .turn_id
         .as_deref()
         .is_some_and(|s| !s.trim().is_empty());
-    if is_claude_tool && has_codex_turn_id {
+    if is_claude_compatible_shell_tool && has_codex_turn_id {
         return HookProtocol::Codex;
     }
 
-    // --- Claude Code indicators ---
-    // Claude Code uses tool_name="Bash" or "launch-process". These tool
-    // names are never used by Gemini (which uses "run_shell_command").
-    // Check this BEFORE Gemini envelope fields, because Claude Code
-    // payloads also include session_id/cwd/transcript_path which would
-    // otherwise trigger a false Gemini classification (issue #77).
-    if is_claude_tool {
+    // --- Claude-compatible indicators ---
+    // Claude Code uses tool_name="Bash" or "launch-process"; Codex-style
+    // shell payloads can also use PowerShell names. These tool names are not
+    // Gemini's shell tool names, so check them before Gemini envelope fields.
+    // Claude Code payloads also include session_id/cwd/transcript_path, which
+    // would otherwise trigger a false Gemini classification (issue #77).
+    if is_claude_compatible_shell_tool {
         return HookProtocol::ClaudeCompatible;
     }
 
@@ -447,7 +450,12 @@ pub(crate) fn is_supported_shell_tool(tool_name: Option<&str>) -> bool {
 
     matches!(
         tool_name.to_ascii_lowercase().as_str(),
-        "bash" | "launch-process" | "run_shell_command" | "run-shell-command"
+        "bash"
+            | "launch-process"
+            | "powershell"
+            | "pwsh"
+            | "run_shell_command"
+            | "run-shell-command"
     )
 }
 
@@ -1421,6 +1429,31 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_copilot_powershell_tool_args_object() {
+        // GitHub Copilot CLI documents "powershell" as its Windows shell tool
+        // name. It must be treated as a shell-command hook, not ignored as a
+        // non-shell tool.
+        let json = r#"{"event":"pre-tool-use","toolName":"powershell","toolArgs":{"command":"git reset --hard"}}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Copilot);
+        assert_eq!(
+            extract_command(&input),
+            Some("git reset --hard".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_copilot_powershell_tool_input_command() {
+        let json = r#"{"event":"pre-tool-use","toolName":"powershell","toolInput":{"command":"git reset --hard"}}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Copilot);
+        assert_eq!(
+            extract_command(&input),
+            Some("git reset --hard".to_string())
+        );
+    }
+
+    #[test]
     fn test_parse_copilot_tool_args_without_tool_name() {
         let json = r#"{"event":"pre-tool-use","toolArgs":"{\"command\":\"git reset --hard\"}"}"#;
         let input: HookInput = serde_json::from_str(json).unwrap();
@@ -2119,6 +2152,13 @@ mod tests {
         // launch-process is a valid shell tool for Codex.
         let json =
             r#"{"tool_name":"launch-process","tool_input":{"command":"ls"},"turn_id":"turn-2"}"#;
+        let input: HookInput = serde_json::from_str(json).unwrap();
+        assert_eq!(detect_protocol(&input), HookProtocol::Codex);
+    }
+
+    #[test]
+    fn test_detect_protocol_powershell_with_turn_id_is_codex() {
+        let json = r#"{"tool_name":"powershell","tool_input":{"command":"git status"},"turn_id":"turn-ps"}"#;
         let input: HookInput = serde_json::from_str(json).unwrap();
         assert_eq!(detect_protocol(&input), HookProtocol::Codex);
     }

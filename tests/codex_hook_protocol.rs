@@ -392,6 +392,33 @@ fn copilot_tool_args_without_tool_name_blocks_destructive_command() {
 }
 
 #[test]
+fn copilot_powershell_tool_args_blocks_destructive_command() {
+    let payload = serde_json::json!({
+        "event": "pre-tool-use",
+        "toolName": "powershell",
+        "toolArgs": {
+            "command": "git reset --hard"
+        },
+    })
+    .to_string();
+
+    let outcome = run_hook_raw(payload.as_bytes(), &[]);
+    assert_eq!(
+        outcome.exit_code, 0,
+        "Copilot PowerShell deny should exit 0 with JSON on stdout\n{outcome}"
+    );
+    assert!(
+        !outcome.stdout.is_empty(),
+        "Copilot PowerShell deny must produce stdout JSON\n{outcome}"
+    );
+
+    let json = outcome.stdout_json();
+    assert_eq!(json["permissionDecision"], "deny", "{outcome}");
+    assert_eq!(json["ruleId"], "core.git:reset-hard", "{outcome}");
+    assert_eq!(json["continue"], false, "{outcome}");
+}
+
+#[test]
 fn codex_protocol_applies_codex_agent_profile_without_env() {
     let payload = build_codex_payload("git reset --hard HEAD~1");
     let outcome = run_hook_raw_with_config(
