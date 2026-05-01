@@ -47,6 +47,8 @@ mod tests {
         for cmd in [
             "\"git\"&>/dev/null reset --hard",
             "\"git\"&>>/dev/null reset --hard",
+            "git>/dev/null reset --hard",
+            "git>>/dev/null reset --hard",
             "git&>/dev/null reset --hard",
             "git&>>/dev/null reset --hard",
         ] {

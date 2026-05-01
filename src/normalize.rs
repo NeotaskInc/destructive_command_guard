@@ -1539,12 +1539,14 @@ fn normalize_subcommand_token(token: &str) -> Option<String> {
 /// change semantics for downstream parsers (notably `rm`).
 #[must_use]
 pub fn dequote_segment_command_words(command: &str) -> Cow<'_, str> {
-    // Fast path: most commands contain no quotes, backslashes, or .exe extensions
-    // that need normalization. Check for these special cases to enable normalization.
+    // Fast path: most commands contain no quotes, backslashes, redirections, or
+    // .exe extensions that need normalization. Check for these special cases to
+    // enable token-aware normalization without paying the tokenizer cost for
+    // ordinary commands.
     let needs_normalization = command
         .as_bytes()
         .iter()
-        .any(|b| matches!(b, b'\'' | b'"' | b'\\'))
+        .any(|b| matches!(b, b'\'' | b'"' | b'\\' | b'<' | b'>'))
         || command.to_ascii_lowercase().contains(".exe");
 
     if !needs_normalization {
@@ -2214,6 +2216,26 @@ fn test_mixed_quoting_normalization() {
         );
 
         assert_eq!(
+            normalize_command_word_token("git&>/dev/null"),
+            Some("git &>/dev/null".to_string())
+        );
+
+        assert_eq!(
+            normalize_command_word_token("git&>>/dev/null"),
+            Some("git &>>/dev/null".to_string())
+        );
+
+        assert_eq!(
+            normalize_command_word_token("git>/dev/null"),
+            Some("git >/dev/null".to_string())
+        );
+
+        assert_eq!(
+            normalize_command_word_token("git>>/dev/null"),
+            Some("git >>/dev/null".to_string())
+        );
+
+        assert_eq!(
             normalize_command(r#""git">/dev/null reset --hard"#).as_ref(),
             "git >/dev/null reset --hard"
         );
@@ -2226,6 +2248,26 @@ fn test_mixed_quoting_normalization() {
         assert_eq!(
             normalize_command(r#""git"&>>/dev/null reset --hard"#).as_ref(),
             "git &>>/dev/null reset --hard"
+        );
+
+        assert_eq!(
+            normalize_command("git&>/dev/null reset --hard").as_ref(),
+            "git &>/dev/null reset --hard"
+        );
+
+        assert_eq!(
+            normalize_command("git&>>/dev/null reset --hard").as_ref(),
+            "git &>>/dev/null reset --hard"
+        );
+
+        assert_eq!(
+            normalize_command("git>/dev/null reset --hard").as_ref(),
+            "git >/dev/null reset --hard"
+        );
+
+        assert_eq!(
+            normalize_command("git>>/dev/null reset --hard").as_ref(),
+            "git >>/dev/null reset --hard"
         );
     }
 
