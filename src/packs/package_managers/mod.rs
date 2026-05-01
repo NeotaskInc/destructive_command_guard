@@ -34,65 +34,69 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // npm/yarn/pnpm install are generally safe
         safe_pattern!(
             "npm-install",
-            r"npm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:install|i|ci)(?=\s|$)"
+            r"\bnpm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:install|i|ci)(?=\s|$)"
         ),
         safe_pattern!(
             "yarn-add",
-            r"yarn\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:add|install)(?=\s|$)"
+            r"\byarn\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:add|install)(?=\s|$)"
         ),
         safe_pattern!(
             "pnpm-install",
-            r"pnpm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:add|install|i)(?=\s|$)"
+            r"\bpnpm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:add|install|i)(?=\s|$)"
         ),
         // list/info commands are safe
         safe_pattern!(
             "npm-list",
-            r"npm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list|ls|info|view)(?=\s|$)"
+            r"\bnpm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list|ls|info|view)(?=\s|$)"
         ),
         safe_pattern!(
             "yarn-list",
-            r"yarn\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list|info|why)(?=\s|$)"
+            r"\byarn\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list|info|why)(?=\s|$)"
         ),
         // audit is safe
         safe_pattern!(
             "npm-audit",
-            r"npm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+audit(?=\s|$)"
+            r"\bnpm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+audit(?=\s|$)"
         ),
         safe_pattern!(
             "yarn-audit",
-            r"yarn\b(?:\s+--?\S+(?:\s+\S+)?)*\s+audit(?=\s|$)"
+            r"\byarn\b(?:\s+--?\S+(?:\s+\S+)?)*\s+audit(?=\s|$)"
         ),
         // pip list/show are safe
         safe_pattern!(
             "pip-list",
-            r"pip\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list|show|freeze)(?=\s|$)"
+            r"\bpip\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list|show|freeze)(?=\s|$)"
         ),
         // poetry show/info are safe
         safe_pattern!(
             "poetry-show",
-            r"poetry\b(?:\s+--?\S+(?:\s+\S+)?)*\s+show(?=\s|$)"
+            r"\bpoetry\b(?:\s+--?\S+(?:\s+\S+)?)*\s+show(?=\s|$)"
         ),
         safe_pattern!(
             "poetry-env-list",
-            r"poetry\b(?:\s+--?\S+(?:\s+\S+)?)*\s+env\s+list(?=\s|$)"
+            r"\bpoetry\b(?:\s+--?\S+(?:\s+\S+)?)*\s+env\s+list(?=\s|$)"
         ),
         // cargo build/test/check are safe
         safe_pattern!(
             "cargo-safe",
-            r"cargo\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:build|test|check|clippy|fmt|doc|bench)\b"
+            r"\bcargo\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:build|test|check|clippy|fmt|doc|bench)\b"
         ),
         // apt list/show are safe
         safe_pattern!(
             "apt-list",
-            r"apt\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list|show|search)(?=\s|$)"
+            r"\bapt\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list|show|search)(?=\s|$)"
         ),
         safe_pattern!(
             "apt-get-list",
-            r"apt-get\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:update|upgrade)(?!\s+.*-y)"
+            r"\bapt-get\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:update|upgrade)(?!\s+.*-y)"
         ),
-        // dry-run flags
-        safe_pattern!("npm-dry-run", r"npm\b.*--dry-run"),
-        safe_pattern!("cargo-dry-run", r"cargo\b.*--dry-run"),
+        // dry-run flags. Treat only bare `--dry-run` or explicit true
+        // as previews; false-valued flags must not mask publish rules.
+        safe_pattern!("npm-dry-run", r"\bnpm\b.*--dry-run(?:=true)?(?:\s|$)"),
+        safe_pattern!("yarn-dry-run", r"\byarn\b.*--dry-run(?:=true)?(?:\s|$)"),
+        safe_pattern!("pnpm-dry-run", r"\bpnpm\b.*--dry-run(?:=true)?(?:\s|$)"),
+        safe_pattern!("cargo-dry-run", r"\bcargo\b.*--dry-run(?:=true)?(?:\s|$)"),
+        safe_pattern!("poetry-dry-run", r"\bpoetry\b.*--dry-run(?:=true)?(?:\s|$)"),
     ]
 }
 
@@ -101,17 +105,17 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // npm/yarn/pnpm publish
         destructive_pattern!(
             "npm-publish",
-            r"npm\b.*?\bpublish\b(?!.*--dry-run)",
+            r"\bnpm\b.*?\bpublish\b(?!.*--dry-run(?:=true)?(?:\s|$))",
             "npm publish releases a package publicly. Use --dry-run first."
         ),
         destructive_pattern!(
             "yarn-publish",
-            r"yarn\b.*?\bpublish\b(?!.*--dry-run)",
+            r"\byarn\b.*?\bpublish\b(?!.*--dry-run(?:=true)?(?:\s|$))",
             "yarn publish releases a package publicly. Verify package.json first."
         ),
         destructive_pattern!(
             "pnpm-publish",
-            r"pnpm\b.*?\bpublish\b(?!.*--dry-run)",
+            r"\bpnpm\b.*?\bpublish\b(?!.*--dry-run(?:=true)?(?:\s|$))",
             "pnpm publish releases a package publicly."
         ),
         // npm unpublish. The `(?=\s|$)` trailing anchor ensures the
@@ -120,93 +124,93 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // `unpublish-helper`) would false-match.
         destructive_pattern!(
             "npm-unpublish",
-            r"npm\b.*?\bunpublish(?=\s|$)",
+            r"\bnpm\b.*?\bunpublish(?=\s|$)",
             "npm unpublish removes a published package. This can break dependent projects."
         ),
         // pip uninstall. Same trailing-anchor rule so installing a package
         // named `uninstall-tool` doesn't false-match the destructive rule.
         destructive_pattern!(
             "pip-uninstall",
-            r"pip(?:3)?\b.*?\buninstall(?=\s|$)",
+            r"\bpip(?:3)?\b.*?\buninstall(?=\s|$)",
             "pip uninstall removes installed packages. Verify dependencies before removing."
         ),
         // pip install from URL (potential security risk)
         destructive_pattern!(
             "pip-url",
-            r"pip\b.*?\binstall\s+.*(?:https?://|git\+)",
+            r"\bpip\b.*?\binstall\s+.*(?:https?://|git\+)",
             "pip install from URL can install unvetted code. Verify the source first."
         ),
         // pip install --user or --system
         destructive_pattern!(
             "pip-system",
-            r"pip\b.*?\binstall\s+.*--(?:system|target\s*/usr)",
+            r"\bpip\b.*?\binstall\s+.*--(?:system|target\s*/usr)",
             "pip install to system directories requires careful review."
         ),
         // apt remove/purge. Trailing `(?=\s|$)` so a package literally named
         // `remove-tool` doesn't false-match when installed via apt.
         destructive_pattern!(
             "apt-remove",
-            r"apt(?:-get)?\b.*?\b(?:remove|purge|autoremove)(?=\s|$)",
+            r"\bapt(?:-get)?\b.*?\b(?:remove|purge|autoremove)(?=\s|$)",
             "apt remove/purge removes packages. Verify no critical packages are affected."
         ),
         // yum/dnf remove (same anchor logic as apt)
         destructive_pattern!(
             "yum-remove",
-            r"(?:yum|dnf)\b.*?\b(?:remove|erase|autoremove)(?=\s|$)",
+            r"\b(?:yum|dnf)\b.*?\b(?:remove|erase|autoremove)(?=\s|$)",
             "yum/dnf remove removes packages. Verify no critical packages are affected."
         ),
         // cargo publish
         destructive_pattern!(
             "cargo-publish",
-            r"cargo\b.*?\bpublish\b(?!.*--dry-run)",
+            r"\bcargo\b.*?\bpublish\b(?!.*--dry-run(?:=true)?(?:\s|$))",
             "cargo publish releases a crate to crates.io. Use --dry-run first."
         ),
         // cargo yank. Same trailing anchor so a crate named `yank-helper`
         // doesn't false-match during install/build operations.
         destructive_pattern!(
             "cargo-yank",
-            r"cargo\b.*?\byank(?=\s|$)",
+            r"\bcargo\b.*?\byank(?=\s|$)",
             "cargo yank marks a version as unavailable. This can break dependent projects."
         ),
         // gem push
         destructive_pattern!(
             "gem-push",
-            r"gem\b.*?\bpush\b",
+            r"\bgem\b.*?\bpush\b",
             "gem push releases a gem to rubygems.org. Verify before publishing."
         ),
         // brew uninstall. `(?=\s|$)` so `brew install uninstall-helper` doesn't
         // false-match the destructive rule.
         destructive_pattern!(
             "brew-uninstall",
-            r"brew\b.*?\b(?:uninstall|remove)(?=\s|$)",
+            r"\bbrew\b.*?\b(?:uninstall|remove)(?=\s|$)",
             "brew uninstall removes packages. Verify no dependent packages are affected."
         ),
         // poetry publish/remove
         destructive_pattern!(
             "poetry-publish",
-            r"poetry\b.*?\bpublish\b(?!.*--dry-run)",
+            r"\bpoetry\b.*?\bpublish\b(?!.*--dry-run(?:=true)?(?:\s|$))",
             "poetry publish releases a package. Use --dry-run first."
         ),
         destructive_pattern!(
             "poetry-remove",
-            r"poetry\b.*?\bremove(?=\s|$)",
+            r"\bpoetry\b.*?\bremove(?=\s|$)",
             "poetry remove uninstalls a dependency. Verify no critical packages are affected."
         ),
         // maven deploy / release
         destructive_pattern!(
             "maven-deploy",
-            r"(?:mvn|mvnw)\b.*?\bdeploy\b",
+            r"\b(?:mvn|mvnw)\b.*?\bdeploy\b",
             "mvn deploy publishes artifacts to a remote repository. Verify target repository."
         ),
         destructive_pattern!(
             "maven-release-perform",
-            r"(?:mvn|mvnw)\s+.*release:perform\b",
+            r"\b(?:mvn|mvnw)\s+.*release:perform\b",
             "mvn release:perform publishes a release. Verify version and repository."
         ),
         // gradle publish / release
         destructive_pattern!(
             "gradle-publish",
-            r"(?:gradle|gradlew)\s+.*\bpublish\b",
+            r"\b(?:gradle|gradlew)\s+.*\bpublish\b",
             "gradle publish uploads artifacts. Use --dry-run first when possible."
         ),
     ]
@@ -215,7 +219,10 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packs::test_helpers::assert_blocks;
+    use crate::packs::test_helpers::{
+        assert_allows, assert_blocks, assert_blocks_with_pattern, assert_no_safe_match,
+        assert_safe_pattern_matches,
+    };
 
     #[test]
     fn package_manager_patterns_match_with_global_flags() {
@@ -272,6 +279,36 @@ mod tests {
         assert_blocks(&pack, "./gradlew publish", "gradle publish");
         assert_blocks(&pack, "pip uninstall boto3", "pip uninstall");
         assert_blocks(&pack, "pip3 uninstall requests", "pip uninstall");
+    }
+
+    #[test]
+    fn publish_dry_run_false_does_not_bypass_destructive_patterns() {
+        let pack = create_pack();
+
+        for command in [
+            "npm publish --dry-run",
+            "npm publish --dry-run=true",
+            "yarn publish --dry-run",
+            "pnpm publish --dry-run",
+            "cargo publish --dry-run",
+            "poetry publish --dry-run",
+        ] {
+            assert_allows(&pack, command);
+            assert_safe_pattern_matches(&pack, command);
+        }
+
+        for (command, pattern) in [
+            ("npm publish --dry-run=false", "npm-publish"),
+            ("yarn publish --dry-run=false", "yarn-publish"),
+            ("pnpm publish --dry-run=false", "pnpm-publish"),
+            ("cargo publish --dry-run=false", "cargo-publish"),
+            ("poetry publish --dry-run=false", "poetry-publish"),
+            ("npm publish --dry-run=0", "npm-publish"),
+            ("npm publish --no-dry-run", "npm-publish"),
+        ] {
+            assert_blocks_with_pattern(&pack, command, pattern);
+            assert_no_safe_match(&pack, command);
+        }
     }
 
     #[test]

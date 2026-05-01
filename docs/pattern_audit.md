@@ -730,30 +730,30 @@ Generated: 2026-04-30T22:58:33.693996
 
 | Kind | Name | Reason | Regex Preview |
 |------|------|--------|---------------|
-| safe | `npm-install` | Found '(?=' | `npm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:install\|i\|ci)(?=\s\|$)` |
-| safe | `yarn-add` | Found '(?=' | `yarn\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:add\|install)(?=\s\|$)` |
-| safe | `pnpm-install` | Found '(?=' | `pnpm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:add\|install\|i)(?=\...` |
-| safe | `npm-list` | Found '(?=' | `npm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list\|ls\|info\|view)...` |
-| safe | `yarn-list` | Found '(?=' | `yarn\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list\|info\|why)(?=\...` |
-| safe | `npm-audit` | Found '(?=' | `npm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+audit(?=\s\|$)` |
-| safe | `yarn-audit` | Found '(?=' | `yarn\b(?:\s+--?\S+(?:\s+\S+)?)*\s+audit(?=\s\|$)` |
-| safe | `pip-list` | Found '(?=' | `pip\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list\|show\|freeze)(?...` |
-| safe | `poetry-show` | Found '(?=' | `poetry\b(?:\s+--?\S+(?:\s+\S+)?)*\s+show(?=\s\|$)` |
-| safe | `poetry-env-list` | Found '(?=' | `poetry\b(?:\s+--?\S+(?:\s+\S+)?)*\s+env\s+list(?=\s\|$)` |
-| safe | `apt-list` | Found '(?=' | `apt\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list\|show\|search)(?...` |
-| safe | `apt-get-list` | Found '!' | `apt-get\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:update\|upgrade)(...` |
-| destructive | `npm-publish` | Found '!' | `npm\b.*?\bpublish\b(?!.*--dry-run)` |
-| destructive | `yarn-publish` | Found '!' | `yarn\b.*?\bpublish\b(?!.*--dry-run)` |
-| destructive | `pnpm-publish` | Found '!' | `pnpm\b.*?\bpublish\b(?!.*--dry-run)` |
-| destructive | `npm-unpublish` | Found '(?=' | `npm\b.*?\bunpublish(?=\s\|$)` |
-| destructive | `pip-uninstall` | Found '(?=' | `pip(?:3)?\b.*?\buninstall(?=\s\|$)` |
-| destructive | `apt-remove` | Found '(?=' | `apt(?:-get)?\b.*?\b(?:remove\|purge\|autoremove)(?=\s\|$)` |
-| destructive | `yum-remove` | Found '(?=' | `(?:yum\|dnf)\b.*?\b(?:remove\|erase\|autoremove)(?=\s\|$)` |
-| destructive | `cargo-publish` | Found '!' | `cargo\b.*?\bpublish\b(?!.*--dry-run)` |
-| destructive | `cargo-yank` | Found '(?=' | `cargo\b.*?\byank(?=\s\|$)` |
-| destructive | `brew-uninstall` | Found '(?=' | `brew\b.*?\b(?:uninstall\|remove)(?=\s\|$)` |
-| destructive | `poetry-publish` | Found '!' | `poetry\b.*?\bpublish\b(?!.*--dry-run)` |
-| destructive | `poetry-remove` | Found '(?=' | `poetry\b.*?\bremove(?=\s\|$)` |
+| safe | `npm-install` | Found '(?=' | `\bnpm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:install\|i\|ci)(?=\s\|$)` |
+| safe | `yarn-add` | Found '(?=' | `\byarn\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:add\|install)(?=\s\|$)` |
+| safe | `pnpm-install` | Found '(?=' | `\bpnpm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:add\|install\|i)(?...` |
+| safe | `npm-list` | Found '(?=' | `\bnpm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list\|ls\|info\|view...` |
+| safe | `yarn-list` | Found '(?=' | `\byarn\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list\|info\|why)(?...` |
+| safe | `npm-audit` | Found '(?=' | `\bnpm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+audit(?=\s\|$)` |
+| safe | `yarn-audit` | Found '(?=' | `\byarn\b(?:\s+--?\S+(?:\s+\S+)?)*\s+audit(?=\s\|$)` |
+| safe | `pip-list` | Found '(?=' | `\bpip\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list\|show\|freeze)(...` |
+| safe | `poetry-show` | Found '(?=' | `\bpoetry\b(?:\s+--?\S+(?:\s+\S+)?)*\s+show(?=\s\|$)` |
+| safe | `poetry-env-list` | Found '(?=' | `\bpoetry\b(?:\s+--?\S+(?:\s+\S+)?)*\s+env\s+list(?=\s\|$)` |
+| safe | `apt-list` | Found '(?=' | `\bapt\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list\|show\|search)(...` |
+| safe | `apt-get-list` | Found '!' | `\bapt-get\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:update\|upgrade)(...` |
+| destructive | `npm-publish` | Found '!' | `\bnpm\b.*?\bpublish\b(?!.*--dry-run(?:=true)?(?:\s\|$))` |
+| destructive | `yarn-publish` | Found '!' | `\byarn\b.*?\bpublish\b(?!.*--dry-run(?:=true)?(?:\s\|$))` |
+| destructive | `pnpm-publish` | Found '!' | `\bpnpm\b.*?\bpublish\b(?!.*--dry-run(?:=true)?(?:\s\|$))` |
+| destructive | `npm-unpublish` | Found '(?=' | `\bnpm\b.*?\bunpublish(?=\s\|$)` |
+| destructive | `pip-uninstall` | Found '(?=' | `\bpip(?:3)?\b.*?\buninstall(?=\s\|$)` |
+| destructive | `apt-remove` | Found '(?=' | `\bapt(?:-get)?\b.*?\b(?:remove\|purge\|autoremove)(?=\s\|$)` |
+| destructive | `yum-remove` | Found '(?=' | `\b(?:yum\|dnf)\b.*?\b(?:remove\|erase\|autoremove)(?=\s\|$)` |
+| destructive | `cargo-publish` | Found '!' | `\bcargo\b.*?\bpublish\b(?!.*--dry-run(?:=true)?(?:\s\|$))` |
+| destructive | `cargo-yank` | Found '(?=' | `\bcargo\b.*?\byank(?=\s\|$)` |
+| destructive | `brew-uninstall` | Found '(?=' | `\bbrew\b.*?\b(?:uninstall\|remove)(?=\s\|$)` |
+| destructive | `poetry-publish` | Found '!' | `\bpoetry\b.*?\bpublish\b(?!.*--dry-run(?:=true)?(?:\s\|$))` |
+| destructive | `poetry-remove` | Found '(?=' | `\bpoetry\b.*?\bremove(?=\s\|$)` |
 
 ## `src/packs/payment/braintree.rs`
 

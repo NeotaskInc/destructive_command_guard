@@ -41,21 +41,24 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `npm-install` | `npm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:install\|i\|ci)(?=\s\|$)` |
-| `yarn-add` | `yarn\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:add\|install)(?=\s\|$)` |
-| `pnpm-install` | `pnpm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:add\|install\|i)(?=\s\|$)` |
-| `npm-list` | `npm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list\|ls\|info\|view)(?=\s\|$)` |
-| `yarn-list` | `yarn\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list\|info\|why)(?=\s\|$)` |
-| `npm-audit` | `npm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+audit(?=\s\|$)` |
-| `yarn-audit` | `yarn\b(?:\s+--?\S+(?:\s+\S+)?)*\s+audit(?=\s\|$)` |
-| `pip-list` | `pip\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list\|show\|freeze)(?=\s\|$)` |
-| `poetry-show` | `poetry\b(?:\s+--?\S+(?:\s+\S+)?)*\s+show(?=\s\|$)` |
-| `poetry-env-list` | `poetry\b(?:\s+--?\S+(?:\s+\S+)?)*\s+env\s+list(?=\s\|$)` |
-| `cargo-safe` | `cargo\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:build\|test\|check\|clippy\|fmt\|doc\|bench)\b` |
-| `apt-list` | `apt\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list\|show\|search)(?=\s\|$)` |
-| `apt-get-list` | `apt-get\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:update\|upgrade)(?!\s+.*-y)` |
-| `npm-dry-run` | `npm\b.*--dry-run` |
-| `cargo-dry-run` | `cargo\b.*--dry-run` |
+| `npm-install` | `\bnpm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:install\|i\|ci)(?=\s\|$)` |
+| `yarn-add` | `\byarn\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:add\|install)(?=\s\|$)` |
+| `pnpm-install` | `\bpnpm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:add\|install\|i)(?=\s\|$)` |
+| `npm-list` | `\bnpm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list\|ls\|info\|view)(?=\s\|$)` |
+| `yarn-list` | `\byarn\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list\|info\|why)(?=\s\|$)` |
+| `npm-audit` | `\bnpm\b(?:\s+--?\S+(?:\s+\S+)?)*\s+audit(?=\s\|$)` |
+| `yarn-audit` | `\byarn\b(?:\s+--?\S+(?:\s+\S+)?)*\s+audit(?=\s\|$)` |
+| `pip-list` | `\bpip\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list\|show\|freeze)(?=\s\|$)` |
+| `poetry-show` | `\bpoetry\b(?:\s+--?\S+(?:\s+\S+)?)*\s+show(?=\s\|$)` |
+| `poetry-env-list` | `\bpoetry\b(?:\s+--?\S+(?:\s+\S+)?)*\s+env\s+list(?=\s\|$)` |
+| `cargo-safe` | `\bcargo\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:build\|test\|check\|clippy\|fmt\|doc\|bench)\b` |
+| `apt-list` | `\bapt\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list\|show\|search)(?=\s\|$)` |
+| `apt-get-list` | `\bapt-get\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:update\|upgrade)(?!\s+.*-y)` |
+| `npm-dry-run` | `\bnpm\b.*--dry-run(?:=true)?(?:\s\|$)` |
+| `yarn-dry-run` | `\byarn\b.*--dry-run(?:=true)?(?:\s\|$)` |
+| `pnpm-dry-run` | `\bpnpm\b.*--dry-run(?:=true)?(?:\s\|$)` |
+| `cargo-dry-run` | `\bcargo\b.*--dry-run(?:=true)?(?:\s\|$)` |
+| `poetry-dry-run` | `\bpoetry\b.*--dry-run(?:=true)?(?:\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 
