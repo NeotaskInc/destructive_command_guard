@@ -2515,7 +2515,11 @@ fn collect_command_segments<'a>(
         let split_width: Option<usize> = if b == b';' || b == b'\n' {
             Some(1)
         } else if b == b'&' {
-            Some(usize::from(bytes.get(i + 1) == Some(&b'&')) + 1)
+            if is_redirection_ampersand(bytes, i) {
+                None
+            } else {
+                Some(usize::from(bytes.get(i + 1) == Some(&b'&')) + 1)
+            }
         } else if b == b'|' {
             Some(usize::from(matches!(bytes.get(i + 1), Some(&b'|') | Some(&b'&'))) + 1)
         } else {
@@ -2544,6 +2548,14 @@ fn push_trimmed_segment<'a>(cmd: &'a str, start: usize, end: usize, segments: &m
     if !segment.is_empty() {
         segments.push(segment);
     }
+}
+
+fn is_redirection_ampersand(bytes: &[u8], index: usize) -> bool {
+    matches!(bytes.get(index + 1), Some(b'>'))
+        || index
+            .checked_sub(1)
+            .and_then(|previous| bytes.get(previous))
+            .is_some_and(|previous| matches!(previous, b'<' | b'>'))
 }
 
 fn find_matching_command_substitution(cmd: &str, start: usize, end: usize) -> Option<usize> {
@@ -2979,6 +2991,27 @@ mod tests {
         assert_eq!(
             split_command_segments("docker logs foo &"),
             vec!["docker logs foo"]
+        );
+    }
+
+    #[test]
+    fn split_command_segments_does_not_split_redirection_ampersands() {
+        assert_eq!(
+            split_command_segments("command 2>&1 | tee log.txt"),
+            vec!["command 2>&1", "tee log.txt"]
+        );
+        assert_eq!(split_command_segments("echo x >&2"), vec!["echo x >&2"]);
+        assert_eq!(
+            split_command_segments("make &> build.log"),
+            vec!["make &> build.log"]
+        );
+        assert_eq!(
+            split_command_segments("make &>> build.log && echo done"),
+            vec!["make &>> build.log", "echo done"]
+        );
+        assert_eq!(
+            split_command_segments("cat <&0; echo done"),
+            vec!["cat <&0", "echo done"]
         );
     }
 
