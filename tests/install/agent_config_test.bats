@@ -776,6 +776,47 @@ EOF
     [ -z "$GEMINI_BACKUP" ]
 }
 
+@test "configure_gemini: run_shell_command with non-list hooks is preserved and reports failed" {
+    log_test "Testing Gemini malformed run_shell_command hooks preservation..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    GEMINI_SETTINGS="$HOME/.gemini/settings.json"
+    setup_mock_gemini
+    cat > "$GEMINI_SETTINGS" <<'EOF'
+{
+  "hooks": {
+    "BeforeTool": [
+      {
+        "matcher": "run_shell_command",
+        "hooks": {"bad": "shape"}
+      },
+      {
+        "matcher": "read_file",
+        "hooks": [
+          {"name": "read", "type": "command", "command": "echo read", "timeout": 5000}
+        ]
+      }
+    ]
+  }
+}
+EOF
+    local before
+    before=$(cat "$GEMINI_SETTINGS")
+
+    configure_gemini "$GEMINI_SETTINGS"
+    local rc=$?
+
+    log_test "GEMINI_STATUS: $GEMINI_STATUS"
+    log_test "GEMINI_FAILURE_REASON: ${GEMINI_FAILURE_REASON:-}"
+    log_test "Settings content: $(cat "$GEMINI_SETTINGS")"
+
+    [ "$rc" -eq 0 ]
+    [ "$GEMINI_STATUS" = "failed" ]
+    [[ "$GEMINI_FAILURE_REASON" == *"invalid"* ]]
+    [ "$(cat "$GEMINI_SETTINGS")" = "$before" ]
+    [ -z "$GEMINI_BACKUP" ]
+}
+
 # ============================================================================
 # Predecessor Migration Tests
 # ============================================================================
@@ -1886,13 +1927,12 @@ EOF
     fi
 }
 
-@test "configure_codex: repairs malformed Bash hooks shape" {
-    log_test "Testing Codex malformed Bash hooks repair..."
+@test "configure_codex: Bash matcher with non-list hooks is preserved and reports failed" {
+    log_test "Testing Codex malformed Bash hooks preservation..."
     command -v python3 &>/dev/null || skip "python3 not available"
 
     setup_mock_codex
-    cat > "$CODEX_SETTINGS" <<'EOF'
-{
+    seed_codex_hooks_json '{
   "hooks": {
     "PreToolUse": [
       {
@@ -1907,19 +1947,20 @@ EOF
       }
     ]
   }
-}
-EOF
+}'
 
     configure_codex
+    local rc=$?
 
     log_test "CODEX_STATUS: $CODEX_STATUS"
-    log_test "After hooks.json: $(cat "$CODEX_SETTINGS")"
+    log_test "CODEX_FAILURE_REASON: ${CODEX_FAILURE_REASON:-}"
+    log_codex_hooks_transition
 
-    [ "$CODEX_STATUS" = "merged" ]
-    assert_codex_hooks_has_current_dcg
-    assert_codex_first_bash_hook_command "$DEST/dcg"
-    assert_codex_dcg_hook_count 1
-    grep -q "echo read-hook" "$CODEX_SETTINGS"
+    [ "$rc" -eq 0 ]
+    [ "$CODEX_STATUS" = "failed" ]
+    [[ "$CODEX_FAILURE_REASON" == *"invalid"* ]]
+    [ -z "$CODEX_BACKUP" ]
+    assert_codex_hooks_unchanged
 }
 
 @test "configure_codex: invalid hooks.json is preserved and reports failed" {

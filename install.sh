@@ -1486,7 +1486,8 @@ for entry in before_tool:
         continue
     hooks = entry.get("hooks", [])
     if not isinstance(hooks, list):
-        continue
+        print("invalid")
+        raise SystemExit(0)
     if not first_shell_matcher_seen:
         first_shell_matcher_seen = True
         first_hook = hooks[0] if hooks else None
@@ -1600,11 +1601,13 @@ for entry in settings['hooks']['BeforeTool']:
                 else shell_sequential or entry['sequential']
             )
         hooks = entry.get('hooks', [])
-        if isinstance(hooks, list):
-            for hook in hooks:
-                if isinstance(hook, dict) and is_dcg_command(hook.get('command', '')):
-                    continue
-                shell_hooks.append(hook)
+        if not isinstance(hooks, list):
+            print(f"Gemini run_shell_command hooks must contain a list: {settings_file}", file=sys.stderr)
+            raise SystemExit(1)
+        for hook in hooks:
+            if isinstance(hook, dict) and is_dcg_command(hook.get('command', '')):
+                continue
+            shell_hooks.append(hook)
     else:
         new_before_tool.append(entry)
 
@@ -1892,7 +1895,8 @@ for entry in pre_tool_use:
         continue
     hooks = entry.get("hooks", [])
     if not isinstance(hooks, list):
-        continue
+        print("invalid")
+        raise SystemExit(0)
     if not first_bash_matcher_seen:
         first_bash_matcher_seen = True
         first_hook = hooks[0] if hooks else None
@@ -1987,16 +1991,18 @@ for entry in config['hooks']['PreToolUse']:
         new_pre_tool_use.append(entry)
     elif entry.get('matcher') == 'Bash':
         hooks = entry.get('hooks', [])
-        if isinstance(hooks, list):
-            for hook in hooks:
-                if isinstance(hook, dict) and 'command' in hook:
-                    cmd = str(hook.get('command', ''))
-                    if not is_dcg_command(cmd):  # Don't duplicate dcg
-                        bash_hooks.append(hook)
-                    else:
-                        dcg_seen = True
-                else:
+        if not isinstance(hooks, list):
+            print(f"Codex Bash matcher hooks must contain a list: {hooks_file}", file=sys.stderr)
+            raise SystemExit(1)
+        for hook in hooks:
+            if isinstance(hook, dict) and 'command' in hook:
+                cmd = str(hook.get('command', ''))
+                if not is_dcg_command(cmd):  # Don't duplicate dcg
                     bash_hooks.append(hook)
+                else:
+                    dcg_seen = True
+            else:
+                bash_hooks.append(hook)
     else:
         new_pre_tool_use.append(entry)
 
