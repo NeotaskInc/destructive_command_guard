@@ -24,6 +24,8 @@ flag semantics that need to ship in prebuilt binaries.
   non-clap output paths, so values such as `0`, `false`, `no`, and `off` no
   longer disable colors or rich output by mere presence
   ([14f1aac](https://github.com/Dicklesworthstone/destructive_command_guard/commit/14f1aac)).
+- Kept Linux-only allowlist process inspection imports behind a Linux cfg so
+  macOS and Windows release builds stay warning-clean.
 
 ## [v0.4.8](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.4.8) -- 2026-05-01 [Release]
 

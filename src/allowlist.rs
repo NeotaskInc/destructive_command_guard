@@ -15,6 +15,7 @@
 //! - Explicit, testable layering precedence (project > user > system)
 
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
