@@ -195,6 +195,12 @@ pub fn list_backups() -> Result<Vec<BackupEntry>, VersionCheckError> {
 ///
 /// Returns `VersionCheckError::BackupError` if the backup cannot be created.
 pub fn create_backup() -> Result<PathBuf, VersionCheckError> {
+    create_backup_preserving(None)
+}
+
+fn create_backup_preserving(
+    preserve_artifact_name: Option<&str>,
+) -> Result<PathBuf, VersionCheckError> {
     let dir = backup_dir().ok_or_else(|| {
         VersionCheckError::BackupError("Could not determine backup directory".to_string())
     })?;
@@ -240,17 +246,44 @@ pub fn create_backup() -> Result<PathBuf, VersionCheckError> {
         VersionCheckError::BackupError(format!("Failed to write backup metadata: {e}"))
     })?;
 
-    // Prune old backups
-    prune_old_backups()?;
+    prune_old_backups_preserving(preserve_artifact_name)?;
 
     Ok(backup_path)
 }
 
-/// Prune old backups, keeping only the most recent `MAX_BACKUPS`.
-fn prune_old_backups() -> Result<(), VersionCheckError> {
+fn backup_names_to_prune(
+    backups: &[BackupEntry],
+    preserve_artifact_name: Option<&str>,
+) -> Vec<String> {
+    let mut sorted = backups.to_vec();
+    sorted.sort_by_key(|entry| std::cmp::Reverse(entry.created_at));
+
+    let mut retained_total = 0;
+    let mut prune_names = Vec::new();
+
+    for backup in sorted {
+        let backup_name = backup_artifact_name(&backup);
+
+        if retained_total < MAX_BACKUPS {
+            retained_total += 1;
+            continue;
+        }
+
+        if preserve_artifact_name != Some(backup_name.as_str()) {
+            prune_names.push(backup_name);
+        }
+    }
+
+    prune_names
+}
+
+fn prune_old_backups_preserving(
+    preserve_artifact_name: Option<&str>,
+) -> Result<(), VersionCheckError> {
     let backups = list_backups()?;
 
-    if backups.len() <= MAX_BACKUPS {
+    let prune_names = backup_names_to_prune(&backups, preserve_artifact_name);
+    if prune_names.is_empty() {
         return Ok(());
     }
 
@@ -258,9 +291,9 @@ fn prune_old_backups() -> Result<(), VersionCheckError> {
         VersionCheckError::BackupError("Could not determine backup directory".to_string())
     })?;
 
-    // Remove oldest backups (they're already sorted newest first)
-    for backup in backups.into_iter().skip(MAX_BACKUPS) {
-        let backup_name = backup_artifact_name(&backup);
+    // During rollback, the selected restore target must survive even if it is
+    // older than the retention window. A later normal backup can restore the cap.
+    for backup_name in prune_names {
         let backup_path = dir.join(&backup_name);
         let metadata_path = dir.join(format!("{backup_name}.json"));
 
@@ -331,8 +364,9 @@ pub fn rollback(target_version: Option<&str>) -> Result<String, VersionCheckErro
         VersionCheckError::BackupError(format!("Failed to get current executable path: {e}"))
     })?;
 
-    // Create a backup of the current version before rollback
-    create_backup()?;
+    // Create a backup of the current version before rollback without pruning the
+    // restore target we already validated above.
+    create_backup_preserving(Some(&backup_name))?;
 
     // Replace current binary with backup
     // On Unix, we can directly copy over the executable (it's memory-mapped)
@@ -949,6 +983,66 @@ mod tests {
             original_path: std::path::PathBuf::from("/usr/local/bin/dcg"),
         };
         assert_eq!(backup_artifact_name(&legacy), "dcg-0.2.11-1737100000");
+    }
+
+    fn backup_entry(version: &str, created_at: u64) -> BackupEntry {
+        BackupEntry {
+            version: version.to_string(),
+            created_at,
+            artifact_name: None,
+            original_path: std::path::PathBuf::from("/usr/local/bin/dcg"),
+        }
+    }
+
+    #[test]
+    fn test_backup_names_to_prune_preserves_selected_rollback_target() {
+        let backups = vec![
+            backup_entry("0.2.13", 500),
+            backup_entry("0.2.12", 400),
+            backup_entry("0.2.11", 300),
+            backup_entry("0.2.10", 200),
+        ];
+        let rollback_target = backup_artifact_name(&backups[3]);
+
+        let normal_prune = backup_names_to_prune(&backups, None);
+        assert_eq!(normal_prune, vec![rollback_target.clone()]);
+
+        let rollback_prune = backup_names_to_prune(&backups, Some(&rollback_target));
+        assert!(
+            rollback_prune.is_empty(),
+            "rollback must not prune the selected restore target"
+        );
+    }
+
+    #[test]
+    fn test_backup_names_to_prune_still_removes_non_preserved_overflow() {
+        let backups = vec![
+            backup_entry("0.2.14", 600),
+            backup_entry("0.2.13", 500),
+            backup_entry("0.2.12", 400),
+            backup_entry("0.2.11", 300),
+            backup_entry("0.2.10", 200),
+        ];
+        let rollback_target = backup_artifact_name(&backups[4]);
+
+        let rollback_prune = backup_names_to_prune(&backups, Some(&rollback_target));
+        assert_eq!(rollback_prune, vec!["dcg-0.2.11-300".to_string()]);
+        assert!(!rollback_prune.contains(&rollback_target));
+    }
+
+    #[test]
+    fn test_backup_names_to_prune_keeps_cap_when_preserved_target_is_recent() {
+        let backups = vec![
+            backup_entry("0.2.13", 500),
+            backup_entry("0.2.12", 400),
+            backup_entry("0.2.11", 300),
+            backup_entry("0.2.10", 200),
+        ];
+        let rollback_target = backup_artifact_name(&backups[1]);
+
+        let rollback_prune = backup_names_to_prune(&backups, Some(&rollback_target));
+        assert_eq!(rollback_prune, vec!["dcg-0.2.10-200".to_string()]);
+        assert!(!rollback_prune.contains(&rollback_target));
     }
 
     #[test]
