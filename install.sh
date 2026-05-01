@@ -1189,7 +1189,8 @@ for entry in pre_tool_use:
         continue
     hooks = entry.get("hooks", [])
     if not isinstance(hooks, list):
-        continue
+        print("invalid")
+        raise SystemExit(0)
     if not first_bash_matcher_seen:
         first_bash_matcher_seen = True
         first_hook = hooks[0] if hooks else None
@@ -1327,6 +1328,9 @@ for entry in settings['hooks']['PreToolUse']:
         new_pre_tool_use.append(entry)
         continue
     if entry.get('matcher') == 'Bash':
+        if 'hooks' in entry and not isinstance(entry['hooks'], list):
+            print(f"Claude Code Bash matcher hooks must contain a list: {settings_file}", file=sys.stderr)
+            raise SystemExit(1)
         # Collect hooks from this Bash matcher
         if 'hooks' in entry:
             for hook in entry['hooks']:

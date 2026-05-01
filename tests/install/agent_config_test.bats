@@ -939,6 +939,40 @@ EOF
     [ "$(cat "$CLAUDE_SETTINGS")" = "$before" ]
 }
 
+@test "configure_claude_code: Bash matcher with non-list hooks is preserved and reports failed" {
+    log_test "Testing Claude Code malformed Bash matcher hooks preservation..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+    mkdir -p "$HOME/.claude"
+    cat > "$CLAUDE_SETTINGS" <<'EOF'
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": {"bad": "shape"}
+      }
+    ]
+  },
+  "theme": "dark"
+}
+EOF
+    local before
+    before=$(cat "$CLAUDE_SETTINGS")
+
+    configure_claude_code "$CLAUDE_SETTINGS" "0"
+
+    log_test "CLAUDE_STATUS: $CLAUDE_STATUS"
+    log_test "CLAUDE_FAILURE_REASON: ${CLAUDE_FAILURE_REASON:-}"
+    log_test "After: $(cat "$CLAUDE_SETTINGS")"
+
+    [ "$CLAUDE_STATUS" = "failed" ]
+    [[ "$CLAUDE_FAILURE_REASON" == *"invalid"* ]]
+    [ -z "$CLAUDE_BACKUP" ]
+    [ "$(cat "$CLAUDE_SETTINGS")" = "$before" ]
+}
+
 @test "configure_claude_code: handles empty settings file" {
     log_test "Testing empty settings file..."
 
