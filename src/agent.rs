@@ -39,7 +39,7 @@ use serde::{Deserialize, Serialize};
 /// Agent detection is stable within a process, so we use a longer TTL.
 const CACHE_TTL: Duration = Duration::from_secs(300);
 
-const WINDOWS_EXECUTABLE_SUFFIXES: &[&str] = &[".exe", ".cmd", ".bat", ".com", ".ps1"];
+const WINDOWS_EXECUTABLE_SUFFIXES: &[&str] = &[".exe", ".cmd", ".bat", ".ps1"];
 
 /// Known AI coding agents that dcg can detect and configure per-agent policies for.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -762,6 +762,7 @@ mod tests {
         assert_eq!(agent_from_process_name("zsh"), None);
         assert_eq!(agent_from_process_name("cargo test agent"), None);
         assert_eq!(agent_from_process_name("node"), None);
+        assert_eq!(agent_from_process_name("curl https://codex.com"), None);
     }
 
     #[test]
