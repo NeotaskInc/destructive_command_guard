@@ -2402,22 +2402,214 @@ pub fn pack_aware_quick_reject(cmd: &str, enabled_keywords: &[&str]) -> bool {
 /// By running pack evaluation on each segment independently, a safe prefix
 /// or safe suffix cannot shield a destructive segment.
 ///
-/// Returns the full command as a single element when no separator is
-/// present — callers can use `len() == 1` to short-circuit to the single-
-/// segment path without changing existing behavior.
+/// Returns the full command as a single element when no separator or executable
+/// embedded shell form is present. Command substitutions, process substitutions,
+/// and backticks are returned before their enclosing segment so destructive
+/// inner commands cannot be hidden behind a safe outer command.
 #[must_use]
 pub fn split_command_segments(cmd: &str) -> Vec<&str> {
-    let bytes = cmd.as_bytes();
     let mut segments: Vec<&str> = Vec::new();
-    let mut segment_start = 0usize;
-    let mut i = 0usize;
+    collect_command_segments(cmd, 0, cmd.len(), 0, true, &mut segments);
+
+    if segments.is_empty() {
+        let trimmed = cmd.trim();
+        if !trimmed.is_empty() {
+            segments.push(trimmed);
+        }
+    }
+
+    segments
+}
+
+const MAX_SEGMENT_RECURSION: usize = 64;
+
+fn collect_command_segments<'a>(
+    cmd: &'a str,
+    start: usize,
+    end: usize,
+    recursion_depth: usize,
+    emit_plain_segments: bool,
+    segments: &mut Vec<&'a str>,
+) {
+    if recursion_depth > MAX_SEGMENT_RECURSION {
+        if emit_plain_segments {
+            push_trimmed_segment(cmd, start, end, segments);
+        }
+        return;
+    }
+
+    let bytes = cmd.as_bytes();
+    let mut segment_start = start;
+    let mut i = start;
     let mut in_single = false;
     let mut in_double = false;
 
-    while i < bytes.len() {
+    while i < end {
         let b = bytes[i];
 
-        if b == b'\\' && !in_single && i + 1 < bytes.len() {
+        if b == b'\\' && !in_single && i + 1 < end {
+            i += 2;
+            continue;
+        }
+        if b == b'\'' && !in_double {
+            in_single = !in_single;
+            i += 1;
+            continue;
+        }
+        if b == b'"' && !in_single {
+            in_double = !in_double;
+            i += 1;
+            continue;
+        }
+
+        if !in_single && b == b'$' && i + 2 < end && bytes[i + 1] == b'(' && bytes[i + 2] == b'(' {
+            if let Some(close) = find_matching_arithmetic_expansion(cmd, i + 3, end) {
+                collect_command_segments(cmd, i + 3, close, recursion_depth + 1, false, segments);
+                i = close + 2;
+                continue;
+            }
+        }
+
+        if !in_single && b == b'$' && i + 1 < end && bytes[i + 1] == b'(' {
+            if let Some(close) = find_matching_command_substitution(cmd, i + 2, end) {
+                collect_command_segments(cmd, i + 2, close, recursion_depth + 1, true, segments);
+                i = close + 1;
+                continue;
+            }
+        }
+
+        if !in_single && matches!(b, b'<' | b'>') && i + 1 < end && bytes[i + 1] == b'(' {
+            if let Some(close) = find_matching_command_substitution(cmd, i + 2, end) {
+                collect_command_segments(cmd, i + 2, close, recursion_depth + 1, true, segments);
+                i = close + 1;
+                continue;
+            }
+        }
+
+        if !in_single && b == b'`' {
+            if let Some(close) = find_matching_backtick(cmd, i + 1, end) {
+                collect_command_segments(cmd, i + 1, close, recursion_depth + 1, true, segments);
+                i = close + 1;
+                continue;
+            }
+        }
+
+        if in_single || in_double {
+            i += 1;
+            continue;
+        }
+
+        let split_width: Option<usize> = if b == b';' || b == b'\n' {
+            Some(1)
+        } else if b == b'&' {
+            Some(usize::from(bytes.get(i + 1) == Some(&b'&')) + 1)
+        } else if b == b'|' {
+            Some(usize::from(matches!(bytes.get(i + 1), Some(&b'|') | Some(&b'&'))) + 1)
+        } else {
+            None
+        };
+
+        if let Some(width) = split_width {
+            if emit_plain_segments {
+                push_trimmed_segment(cmd, segment_start, i, segments);
+            }
+            i += width;
+            segment_start = i;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    if emit_plain_segments {
+        push_trimmed_segment(cmd, segment_start, end, segments);
+    }
+}
+
+fn push_trimmed_segment<'a>(cmd: &'a str, start: usize, end: usize, segments: &mut Vec<&'a str>) {
+    let segment = cmd[start..end].trim();
+    if !segment.is_empty() {
+        segments.push(segment);
+    }
+}
+
+fn find_matching_command_substitution(cmd: &str, start: usize, end: usize) -> Option<usize> {
+    let bytes = cmd.as_bytes();
+    let mut i = start;
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while i < end {
+        let b = bytes[i];
+
+        if b == b'\\' && !in_single && i + 1 < end {
+            i += 2;
+            continue;
+        }
+        if b == b'\'' && !in_double {
+            in_single = !in_single;
+            i += 1;
+            continue;
+        }
+        if b == b'"' && !in_single {
+            in_double = !in_double;
+            i += 1;
+            continue;
+        }
+        if in_single {
+            i += 1;
+            continue;
+        }
+
+        if b == b'`' {
+            if let Some(close) = find_matching_backtick(cmd, i + 1, end) {
+                i = close + 1;
+                continue;
+            }
+        }
+
+        if b == b'$' && i + 2 < end && bytes[i + 1] == b'(' && bytes[i + 2] == b'(' {
+            if let Some(close) = find_matching_arithmetic_expansion(cmd, i + 3, end) {
+                i = close + 2;
+                continue;
+            }
+        }
+
+        if b == b'$' && i + 1 < end && bytes[i + 1] == b'(' {
+            if let Some(close) = find_matching_command_substitution(cmd, i + 2, end) {
+                i = close + 1;
+                continue;
+            }
+        }
+
+        if matches!(b, b'<' | b'>') && i + 1 < end && bytes[i + 1] == b'(' {
+            if let Some(close) = find_matching_command_substitution(cmd, i + 2, end) {
+                i = close + 1;
+                continue;
+            }
+        }
+
+        if b == b')' && !in_double {
+            return Some(i);
+        }
+
+        i += 1;
+    }
+
+    None
+}
+
+fn find_matching_arithmetic_expansion(cmd: &str, start: usize, end: usize) -> Option<usize> {
+    let bytes = cmd.as_bytes();
+    let mut i = start;
+    let mut paren_depth = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while i < end {
+        let b = bytes[i];
+
+        if b == b'\\' && !in_single && i + 1 < end {
             i += 2;
             continue;
         }
@@ -2436,42 +2628,46 @@ pub fn split_command_segments(cmd: &str) -> Vec<&str> {
             continue;
         }
 
-        let split_width: Option<usize> = if b == b';' || b == b'\n' {
-            Some(1)
-        } else if b == b'&' {
-            Some(usize::from(bytes.get(i + 1) == Some(&b'&')) + 1)
-        } else if b == b'|' {
-            Some(usize::from(matches!(bytes.get(i + 1), Some(&b'|') | Some(&b'&'))) + 1)
-        } else {
-            None
-        };
-
-        if let Some(width) = split_width {
-            let seg = cmd[segment_start..i].trim();
-            if !seg.is_empty() {
-                segments.push(seg);
+        if b == b'`' {
+            if let Some(close) = find_matching_backtick(cmd, i + 1, end) {
+                i = close + 1;
+                continue;
             }
-            i += width;
-            segment_start = i;
-            continue;
+        }
+
+        if b == b'$' && i + 1 < end && bytes[i + 1] == b'(' {
+            if let Some(close) = find_matching_command_substitution(cmd, i + 2, end) {
+                i = close + 1;
+                continue;
+            }
+        }
+
+        match b {
+            b'(' => paren_depth += 1,
+            b')' if paren_depth > 0 => paren_depth -= 1,
+            b')' if i + 1 < end && bytes[i + 1] == b')' => return Some(i),
+            _ => {}
         }
 
         i += 1;
     }
 
-    let tail = cmd[segment_start..].trim();
-    if !tail.is_empty() {
-        segments.push(tail);
-    }
+    None
+}
 
-    if segments.is_empty() {
-        let trimmed = cmd.trim();
-        if !trimmed.is_empty() {
-            segments.push(trimmed);
+fn find_matching_backtick(cmd: &str, start: usize, end: usize) -> Option<usize> {
+    let bytes = cmd.as_bytes();
+    let mut i = start;
+
+    while i < end {
+        match bytes[i] {
+            b'\\' if i + 1 < end => i += 2,
+            b'`' => return Some(i),
+            _ => i += 1,
         }
     }
 
-    segments
+    None
 }
 
 /// Result of quick-reject check with the normalized command for reuse.
@@ -2788,6 +2984,84 @@ mod tests {
         assert_eq!(split_command_segments(r"echo a\; b"), vec![r"echo a\; b"]);
         assert_eq!(split_command_segments(r"echo a\| b"), vec![r"echo a\| b"]);
         assert_eq!(split_command_segments(r"echo a\& b"), vec![r"echo a\& b"]);
+    }
+
+    #[test]
+    fn split_command_segments_extracts_command_substitutions() {
+        assert_eq!(
+            split_command_segments("echo $(docker system prune -a --volumes)"),
+            vec![
+                "docker system prune -a --volumes",
+                "echo $(docker system prune -a --volumes)"
+            ]
+        );
+        assert_eq!(
+            split_command_segments(r#"echo "$(op item delete "Prod Secret")""#),
+            vec![
+                r#"op item delete "Prod Secret""#,
+                r#"echo "$(op item delete "Prod Secret")""#
+            ]
+        );
+        assert_eq!(
+            split_command_segments("echo `velero backup delete nightly`"),
+            vec![
+                "velero backup delete nightly",
+                "echo `velero backup delete nightly`"
+            ]
+        );
+        assert_eq!(
+            split_command_segments(r#"echo "$(echo "$(op item delete Prod)")""#),
+            vec![
+                "op item delete Prod",
+                r#"echo "$(op item delete Prod)""#,
+                r#"echo "$(echo "$(op item delete Prod)")""#
+            ]
+        );
+        assert_eq!(
+            split_command_segments("cat <(docker system prune -a --volumes)"),
+            vec![
+                "docker system prune -a --volumes",
+                "cat <(docker system prune -a --volumes)"
+            ]
+        );
+        assert_eq!(
+            split_command_segments("echo '$(docker system prune)'"),
+            vec!["echo '$(docker system prune)'"]
+        );
+        assert_eq!(
+            split_command_segments("echo $((rm -rf /))"),
+            vec!["echo $((rm -rf /))"]
+        );
+    }
+
+    #[test]
+    fn safe_outer_command_with_destructive_substitution_is_blocked() {
+        let onepassword = crate::packs::secrets::onepassword::create_pack();
+        assert!(
+            onepassword
+                .check(r#"op item get $(op item delete "Prod Secret")"#)
+                .is_some(),
+            "safe op item get must not hide destructive op item delete in command substitution"
+        );
+
+        let velero = crate::packs::backup::velero::create_pack();
+        assert!(
+            velero
+                .check("velero backup get $(velero backup delete nightly)")
+                .is_some(),
+            "safe velero backup get must not hide destructive velero backup delete"
+        );
+
+        let jenkins = crate::packs::cicd::jenkins::create_pack();
+        assert!(
+            jenkins
+                .check(
+                    "curl -X GET https://jenkins.example/api/json \
+                     $(curl -X POST https://jenkins.example/job/my-job/doDelete)"
+                )
+                .is_some(),
+            "safe Jenkins GET must not hide destructive doDelete POST"
+        );
     }
 
     #[test]
