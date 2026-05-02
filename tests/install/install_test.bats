@@ -364,6 +364,28 @@ MOCKEOF
     [ "$status" -eq 0 ]
 }
 
+@test "installer arguments: option requiring value rejects following flag" {
+    log_test "Testing required option value validation for flag-looking value..."
+
+    run env HOME="$HOME" PATH="$PATH" bash "$INSTALL_SCRIPT" --quiet --version --dest "$TEST_TMPDIR/bin"
+    log_test "Exit status: $status, Output: $output"
+
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"--version requires a value"* ]]
+    [[ "$output" != *"Downloading"* ]]
+}
+
+@test "installer arguments: option requiring value rejects missing final value" {
+    log_test "Testing required option value validation for missing final value..."
+
+    run env HOME="$HOME" PATH="$PATH" bash "$INSTALL_SCRIPT" --quiet --checksum
+    log_test "Exit status: $status, Output: $output"
+
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"--checksum requires a value"* ]]
+    [[ "$output" != *"Downloading"* ]]
+}
+
 # ============================================================================
 # Idempotency Tests
 # ============================================================================

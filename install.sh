@@ -813,16 +813,27 @@ Options:
 EOFU
 }
 
+require_option_value() {
+  local option="$1"
+  local value="${2:-}"
+
+  if [ -z "$value" ] || [[ "$value" == -* ]]; then
+    err "$option requires a value"
+    usage
+    exit 2
+  fi
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
-    --version) VERSION="$2"; shift 2;;
-    --dest) DEST="$2"; shift 2;;
+    --version) require_option_value "$1" "${2:-}"; VERSION="$2"; shift 2;;
+    --dest) require_option_value "$1" "${2:-}"; DEST="$2"; shift 2;;
     --system) SYSTEM=1; DEST="/usr/local/bin"; shift;;
     --easy-mode) EASY=1; shift;;
     --verify) VERIFY=1; shift;;
-    --artifact-url) ARTIFACT_URL="$2"; shift 2;;
-    --checksum) CHECKSUM="$2"; shift 2;;
-    --checksum-url) CHECKSUM_URL="$2"; shift 2;;
+    --artifact-url) require_option_value "$1" "${2:-}"; ARTIFACT_URL="$2"; shift 2;;
+    --checksum) require_option_value "$1" "${2:-}"; CHECKSUM="$2"; shift 2;;
+    --checksum-url) require_option_value "$1" "${2:-}"; CHECKSUM_URL="$2"; shift 2;;
     --from-source) FROM_SOURCE=1; shift;;
     --quiet|-q) QUIET=1; shift;;
     --offline) OFFLINE=1; shift;;
