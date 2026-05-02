@@ -1103,6 +1103,7 @@ CODEX_BACKUP=""
 CODEX_FAILURE_REASON=""
 GEMINI_FAILURE_REASON=""
 CURSOR_STATUS=""  # "created"|"merged"|"already"|"skipped"|"failed"|"conflict"
+CURSOR_FAILURE_REASON=""
 COPILOT_STATUS="" # "created"|"merged"|"already"|"skipped"|"no_repo"|"failed"
 CLAUDE_BACKUP=""
 GEMINI_BACKUP=""
@@ -2282,6 +2283,7 @@ configure_cursor() {
   local settings_file="$CURSOR_HOOKS_JSON"
   local hook_dir="$CURSOR_HOOK_DIR"
   local hook_script="$CURSOR_HOOK_SCRIPT"
+  CURSOR_FAILURE_REASON=""
 
   local cursor_installed=0
   if [[ -d "$HOME/.cursor" ]] || [[ -f "$CURSOR_SETTINGS_MAC" ]] || [[ -f "$CURSOR_SETTINGS_LINUX" ]] || command -v cursor >/dev/null 2>&1; then
@@ -2299,6 +2301,7 @@ configure_cursor() {
 
   if ! command -v python3 >/dev/null 2>&1; then
     CURSOR_STATUS="failed"
+    CURSOR_FAILURE_REASON="python3 required for merge"
     return 1
   fi
 
@@ -2437,21 +2440,21 @@ try:
     with open(settings_file, "r") as f:
         settings = json.load(f)
 except Exception:
-    print("merge")
+    print("invalid")
     raise SystemExit(0)
 
 if not isinstance(settings, dict):
-    print("merge")
+    print("invalid")
     raise SystemExit(0)
 
 hooks = settings.get("hooks", {})
-if not isinstance(hooks, dict):
-    print("merge")
+if "hooks" in settings and not isinstance(hooks, dict):
+    print("invalid")
     raise SystemExit(0)
 
 entries = hooks.get("beforeShellExecution", [])
-if not isinstance(entries, list):
-    print("merge")
+if "beforeShellExecution" in hooks and not isinstance(entries, list):
+    print("invalid")
     raise SystemExit(0)
 
 matching_commands = [
@@ -2467,6 +2470,12 @@ else:
     print("merge")
 PYEOF
 )
+    if [ "$cursor_hook_state" = "invalid" ]; then
+      CURSOR_STATUS="failed"
+      CURSOR_FAILURE_REASON="existing hooks.json is invalid or has malformed hooks; left unchanged"
+      warn "Cursor hooks.json is invalid or has malformed hooks; leaving it unchanged: $settings_file"
+      return 0
+    fi
     if [ "$cursor_hook_state" = "already" ]; then
       CURSOR_STATUS="already"
       AUTO_CONFIGURED=1
@@ -2476,7 +2485,7 @@ PYEOF
     CURSOR_BACKUP="${settings_file}.bak.$(date +%Y%m%d%H%M%S)"
     cp "$settings_file" "$CURSOR_BACKUP"
 
-    python3 - "$settings_file" "$hook_script" <<'PYEOF'
+    if python3 - "$settings_file" "$hook_script" <<'PYEOF'
 import json
 import sys
 
@@ -2487,20 +2496,25 @@ try:
     with open(settings_file, "r") as f:
         settings = json.load(f)
 except Exception:
-    settings = {}
+    print(f"invalid Cursor hooks.json: {settings_file}", file=sys.stderr)
+    raise SystemExit(1)
 
 if not isinstance(settings, dict):
-    settings = {}
+    print(f"Cursor hooks.json must contain a JSON object: {settings_file}", file=sys.stderr)
+    raise SystemExit(1)
 
 settings.setdefault("version", 1)
 hooks = settings.setdefault("hooks", {})
 if not isinstance(hooks, dict):
-    hooks = {}
-    settings["hooks"] = hooks
+    print(f"Cursor hooks.json hooks must contain a JSON object: {settings_file}", file=sys.stderr)
+    raise SystemExit(1)
 
 entries = hooks.get("beforeShellExecution")
-if not isinstance(entries, list):
+if "beforeShellExecution" not in hooks:
     entries = []
+elif not isinstance(entries, list):
+    print(f"Cursor hooks.json beforeShellExecution must contain a list: {settings_file}", file=sys.stderr)
+    raise SystemExit(1)
 hooks["beforeShellExecution"] = entries
 
 def is_match(entry):
@@ -2512,12 +2526,13 @@ entries.insert(0, {"command": hook_cmd})
 with open(settings_file, "w") as f:
     json.dump(settings, f, indent=2)
 PYEOF
-    if [ $? -eq 0 ]; then
+    then
       CURSOR_STATUS="merged"
       AUTO_CONFIGURED=1
     else
       mv "$CURSOR_BACKUP" "$settings_file" 2>/dev/null || true
       CURSOR_STATUS="failed"
+      CURSOR_FAILURE_REASON="merge failed; restored backup"
       CURSOR_BACKUP=""
       return 1
     fi
@@ -2809,7 +2824,11 @@ case "$CURSOR_STATUS" in
     summary_lines+=("Cursor IDE:  Not installed (skipped)")
     ;;
   failed)
-    summary_lines+=("Cursor IDE:  Configuration failed (python3 required)")
+    if [ -n "$CURSOR_FAILURE_REASON" ]; then
+      summary_lines+=("Cursor IDE:  Configuration failed ($CURSOR_FAILURE_REASON)")
+    else
+      summary_lines+=("Cursor IDE:  Configuration failed")
+    fi
     ;;
 esac
 fi

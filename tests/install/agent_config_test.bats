@@ -1416,6 +1416,93 @@ EOF
     grep -qF "/opt/other-hook" "$CURSOR_HOOKS_JSON"
 }
 
+@test "configure_cursor: invalid hooks json is preserved and reports failed" {
+    log_test "Testing Cursor invalid hooks.json preservation..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_cursor
+    mkdir -p "$HOME/.cursor"
+    printf '%s\n' '{"hooks":{"beforeShellExecution":[' > "$CURSOR_HOOKS_JSON"
+    local before
+    before=$(cat "$CURSOR_HOOKS_JSON")
+
+    configure_cursor
+    local rc=$?
+
+    log_test "configure_cursor rc: $rc"
+    log_test "CURSOR_STATUS: $CURSOR_STATUS"
+    log_test "CURSOR_FAILURE_REASON: ${CURSOR_FAILURE_REASON:-}"
+    log_test "hooks.json: $(cat "$CURSOR_HOOKS_JSON")"
+
+    [ "$rc" -eq 0 ]
+    [ "$CURSOR_STATUS" = "failed" ]
+    [[ "$CURSOR_FAILURE_REASON" == *"invalid"* ]]
+    [ -z "$CURSOR_BACKUP" ]
+    [ "$(cat "$CURSOR_HOOKS_JSON")" = "$before" ]
+}
+
+@test "configure_cursor: malformed hooks object is preserved and reports failed" {
+    log_test "Testing Cursor malformed hooks preservation..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_cursor
+    mkdir -p "$HOME/.cursor"
+    cat > "$CURSOR_HOOKS_JSON" <<'EOF'
+{
+  "version": 1,
+  "hooks": ["bad-shape"]
+}
+EOF
+    local before
+    before=$(cat "$CURSOR_HOOKS_JSON")
+
+    configure_cursor
+    local rc=$?
+
+    log_test "configure_cursor rc: $rc"
+    log_test "CURSOR_STATUS: $CURSOR_STATUS"
+    log_test "CURSOR_FAILURE_REASON: ${CURSOR_FAILURE_REASON:-}"
+    log_test "hooks.json: $(cat "$CURSOR_HOOKS_JSON")"
+
+    [ "$rc" -eq 0 ]
+    [ "$CURSOR_STATUS" = "failed" ]
+    [[ "$CURSOR_FAILURE_REASON" == *"malformed"* ]]
+    [ -z "$CURSOR_BACKUP" ]
+    [ "$(cat "$CURSOR_HOOKS_JSON")" = "$before" ]
+}
+
+@test "configure_cursor: non-list beforeShellExecution is preserved and reports failed" {
+    log_test "Testing Cursor non-list beforeShellExecution preservation..."
+    command -v python3 &>/dev/null || skip "python3 not available"
+
+    setup_mock_cursor
+    mkdir -p "$HOME/.cursor"
+    cat > "$CURSOR_HOOKS_JSON" <<'EOF'
+{
+  "version": 1,
+  "hooks": {
+    "beforeShellExecution": "bad-shape"
+  }
+}
+EOF
+    local before
+    before=$(cat "$CURSOR_HOOKS_JSON")
+
+    configure_cursor
+    local rc=$?
+
+    log_test "configure_cursor rc: $rc"
+    log_test "CURSOR_STATUS: $CURSOR_STATUS"
+    log_test "CURSOR_FAILURE_REASON: ${CURSOR_FAILURE_REASON:-}"
+    log_test "hooks.json: $(cat "$CURSOR_HOOKS_JSON")"
+
+    [ "$rc" -eq 0 ]
+    [ "$CURSOR_STATUS" = "failed" ]
+    [[ "$CURSOR_FAILURE_REASON" == *"malformed"* ]]
+    [ -z "$CURSOR_BACKUP" ]
+    [ "$(cat "$CURSOR_HOOKS_JSON")" = "$before" ]
+}
+
 # ============================================================================
 # GitHub Copilot CLI Configuration Tests
 # ============================================================================
