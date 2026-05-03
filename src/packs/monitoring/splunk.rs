@@ -88,7 +88,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "splunk-api-delete",
-            r"(?i)curl\s+.*(?:-X|--request)\s+DELETE\b.*splunk.*\/services\/",
+            r"(?i)curl\s+.*(?:-X\s*|--request(?:=|\s+))DELETE\b.*splunk.*\/services\/",
             "Splunk REST DELETE calls can permanently remove objects. Verify the endpoint.",
             High,
             "Direct API DELETE calls to Splunk services can remove indexes, saved searches, \
@@ -155,5 +155,25 @@ mod tests {
         let pack = create_pack();
         assert_no_match(&pack, "ls -la");
         assert_no_match(&pack, "git status");
+    }
+
+    // curl accepts the compact short form (`-XDELETE`) and the long-flag-with-equals
+    // form (`--request=DELETE`). Other monitoring packs (datadog, pagerduty,
+    // prometheus, newrelic) were widened to `(?:-X\s*|--request(?:=|\s+))`;
+    // splunk-api-delete was not, so a `curl -XDELETE .../services/...` would
+    // sail past unblocked. Match what curl actually accepts.
+    #[test]
+    fn splunk_api_delete_blocks_compact_curl_forms() {
+        let pack = create_pack();
+        assert_blocks_with_pattern(
+            &pack,
+            "curl -XDELETE https://splunk.example.com:8089/services/data/inputs/abc",
+            "splunk-api-delete",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "curl --request=DELETE https://splunk.example.com:8089/services/data/inputs/abc",
+            "splunk-api-delete",
+        );
     }
 }

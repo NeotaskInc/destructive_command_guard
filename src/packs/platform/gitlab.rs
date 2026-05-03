@@ -67,7 +67,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         ),
         safe_pattern!(
             "glab-api-explicit-get",
-            r"glab(?:\s+--?\S+(?:\s+\S+)?)*\s+api\b.*(?:-X|--method)\s+GET\b"
+            r"glab(?:\s+--?\S+(?:\s+\S+)?)*\s+api\b.*(?:-X\s*|--method(?:=|\s+))GET\b"
         ),
     ]
 }
@@ -96,27 +96,27 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "glab-api-delete-project",
-            r"glab(?:\s+--?\S+(?:\s+\S+)?)*\s+api\b.*(?:-X|--method)\s+DELETE\b.*(?:/)?projects/[^/\s]+(?:\s|$)",
+            r"glab(?:\s+--?\S+(?:\s+\S+)?)*\s+api\b.*(?:-X\s*|--method(?:=|\s+))DELETE\b.*(?:/)?projects/[^/\s]+(?:\s|$)",
             "glab api DELETE /projects/* deletes a GitLab project."
         ),
         destructive_pattern!(
             "glab-api-delete-release",
-            r"glab(?:\s+--?\S+(?:\s+\S+)?)*\s+api\b.*(?:-X|--method)\s+DELETE\b.*(?:/)?projects/[^/\s]+/releases/",
+            r"glab(?:\s+--?\S+(?:\s+\S+)?)*\s+api\b.*(?:-X\s*|--method(?:=|\s+))DELETE\b.*(?:/)?projects/[^/\s]+/releases/",
             "glab api DELETE releases removes GitLab releases."
         ),
         destructive_pattern!(
             "glab-api-delete-variable",
-            r"glab(?:\s+--?\S+(?:\s+\S+)?)*\s+api\b.*(?:-X|--method)\s+DELETE\b.*(?:/)?projects/[^/\s]+/variables/",
+            r"glab(?:\s+--?\S+(?:\s+\S+)?)*\s+api\b.*(?:-X\s*|--method(?:=|\s+))DELETE\b.*(?:/)?projects/[^/\s]+/variables/",
             "glab api DELETE variables removes CI/CD variables."
         ),
         destructive_pattern!(
             "glab-api-delete-protected-branch",
-            r"glab(?:\s+--?\S+(?:\s+\S+)?)*\s+api\b.*(?:-X|--method)\s+DELETE\b.*(?:/)?protected_branches/",
+            r"glab(?:\s+--?\S+(?:\s+\S+)?)*\s+api\b.*(?:-X\s*|--method(?:=|\s+))DELETE\b.*(?:/)?protected_branches/",
             "glab api DELETE protected_branches removes branch protections."
         ),
         destructive_pattern!(
             "glab-api-delete-hook",
-            r"glab(?:\s+--?\S+(?:\s+\S+)?)*\s+api\b.*(?:-X|--method)\s+DELETE\b.*(?:/)?hooks/",
+            r"glab(?:\s+--?\S+(?:\s+\S+)?)*\s+api\b.*(?:-X\s*|--method(?:=|\s+))DELETE\b.*(?:/)?hooks/",
             "glab api DELETE hooks removes GitLab webhooks."
         ),
         destructive_pattern!(
@@ -220,6 +220,48 @@ mod tests {
         assert_blocks_with_pattern(
             &pack,
             "glab api -X DELETE /projects/123/hooks/456",
+            "glab-api-delete-hook",
+        );
+    }
+
+    // glab uses cobra/spf13, which accepts the compact short form
+    // (`-XDELETE`) and the long-flag-with-equals form (`--method=DELETE`).
+    // The `gh api` patterns were already widened to `(?:-X\s*|--method(?:=|\s+))`
+    // (see `platform/github.rs`); the glab patterns were not, so `glab api
+    // -XDELETE projects/123` slipped through. Block both compact forms for
+    // every glab destructive endpoint.
+    #[test]
+    fn glab_api_delete_blocks_compact_short_and_equals_long_forms() {
+        let pack = create_pack();
+
+        assert_blocks_with_pattern(
+            &pack,
+            "glab api -XDELETE projects/123",
+            "glab-api-delete-project",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "glab api --method=DELETE projects/123",
+            "glab-api-delete-project",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "glab api -XDELETE /projects/123/variables/SECRET",
+            "glab-api-delete-variable",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "glab api --method=DELETE /projects/123/variables/SECRET",
+            "glab-api-delete-variable",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "glab api --method=DELETE /projects/123/protected_branches/main",
+            "glab-api-delete-protected-branch",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "glab api -XDELETE /projects/123/hooks/456",
             "glab-api-delete-hook",
         );
     }

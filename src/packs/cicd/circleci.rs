@@ -137,7 +137,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "circleci-api-delete-envvar",
-            r"curl(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:-X|--request)\s+DELETE\b.*circleci\.com/api/[^\s]*\b(?:envvar|environment-variable)\b",
+            r"curl(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:-X\s*|--request(?:=|\s+))DELETE\b.*circleci\.com/api/[^\s]*\b(?:envvar|environment-variable)\b",
             "curl DELETE against CircleCI envvar endpoints removes environment variables.",
             High,
             "Making DELETE requests to CircleCI environment variable endpoints removes variables \
@@ -225,6 +225,24 @@ mod tests {
         assert_blocks_with_pattern(
             &pack,
             "curl -X DELETE https://circleci.com/api/v2/project/gh/org/repo/envvar/FOO",
+            "circleci-api-delete-envvar",
+        );
+    }
+
+    // curl accepts the compact short form (`-XDELETE`) and the long-flag-with-equals
+    // form (`--request=DELETE`). Other CI/CD packs widened to
+    // `(?:-X\s*|--request(?:=|\s+))`; this one was missed.
+    #[test]
+    fn test_api_delete_envvar_blocks_compact_curl_forms() {
+        let pack = create_pack();
+        assert_blocks_with_pattern(
+            &pack,
+            "curl -XDELETE https://circleci.com/api/v2/project/gh/org/repo/envvar/FOO",
+            "circleci-api-delete-envvar",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "curl --request=DELETE https://circleci.com/api/v2/project/gh/org/repo/envvar/FOO",
             "circleci-api-delete-envvar",
         );
     }

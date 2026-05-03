@@ -50,7 +50,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         ),
         safe_pattern!(
             "glab-api-explicit-get",
-            r"glab(?:\s+--?\S+(?:\s+\S+)?)*\s+api\b.*(?:-X|--method)\s+GET\b"
+            r"glab(?:\s+--?\S+(?:\s+\S+)?)*\s+api\b.*(?:-X\s*|--method(?:=|\s+))GET\b"
         ),
     ]
 }
@@ -85,7 +85,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "glab-api-delete-variables",
-            r"glab(?:\s+--?\S+(?:\s+\S+)?)*\s+api\b.*(?:-X|--method)\s+DELETE\b.*\bvariables\b",
+            r"glab(?:\s+--?\S+(?:\s+\S+)?)*\s+api\b.*(?:-X\s*|--method(?:=|\s+))DELETE\b.*\bvariables\b",
             "glab api DELETE against variables endpoints removes CI variables.",
             High,
             "Making DELETE requests to GitLab variables API removes CI/CD variables directly. \
@@ -152,6 +152,25 @@ mod tests {
         assert_blocks_with_pattern(
             &pack,
             "glab api -X DELETE projects/1/variables/FOO",
+            "glab-api-delete-variables",
+        );
+    }
+
+    // Compact short form (`-XDELETE`) and long-flag-with-equals
+    // (`--method=DELETE`) are both accepted by glab's cobra-based CLI and
+    // must be blocked alongside the spaced form. See the matching test in
+    // `platform/gitlab.rs` for the broader rationale.
+    #[test]
+    fn test_api_delete_variables_blocks_compact_forms() {
+        let pack = create_pack();
+        assert_blocks_with_pattern(
+            &pack,
+            "glab api -XDELETE projects/1/variables/FOO",
+            "glab-api-delete-variables",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "glab api --method=DELETE projects/1/variables/FOO",
             "glab-api-delete-variables",
         );
     }
