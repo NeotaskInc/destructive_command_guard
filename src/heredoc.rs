@@ -2788,6 +2788,18 @@ mod tests {
             } else {
                 panic!("Expected Extracted result, got {result:?}");
             }
+
+            let cmd = "cat << EOF\nline1\nEOF";
+            let result = extract_content(cmd, &ExtractionLimits::default());
+            if let ExtractionResult::Extracted(contents) = result {
+                assert_eq!(contents.len(), 1);
+                assert!(
+                    !contents[0].quoted,
+                    "unquoted delimiter must set quoted=false"
+                );
+            } else {
+                panic!("Expected Extracted result, got {result:?}");
+            }
         }
 
         // Regression test for issue #109: bash accepts `<<- 'EOF'` (with a
@@ -2824,18 +2836,6 @@ mod tests {
                     contents[0].quoted,
                     "{form}: quoted delimiter must set quoted=true"
                 );
-            }
-
-            let cmd = "cat << EOF\nline1\nEOF";
-            let result = extract_content(cmd, &ExtractionLimits::default());
-            if let ExtractionResult::Extracted(contents) = result {
-                assert_eq!(contents.len(), 1);
-                assert!(
-                    !contents[0].quoted,
-                    "unquoted delimiter must set quoted=false"
-                );
-            } else {
-                panic!("Expected Extracted result, got {result:?}");
             }
         }
 
