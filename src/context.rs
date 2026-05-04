@@ -2053,7 +2053,7 @@ fn consume_process_substitution(command: &str, start: usize) -> usize {
     let len = bytes.len();
 
     debug_assert!(matches!(bytes.get(start), Some(b'<' | b'>')));
-    debug_assert!(bytes.get(start + 1) == Some(&b'('));
+    debug_assert_eq!(bytes.get(start + 1), Some(&b'('));
 
     let mut i = start + 2;
     let mut depth: u32 = 1;
@@ -2126,8 +2126,8 @@ fn consume_dollar_paren_recursive(command: &str, start: usize, recursion_depth: 
     let bytes = command.as_bytes();
     let len = bytes.len();
 
-    debug_assert!(bytes.get(start) == Some(&b'$'));
-    debug_assert!(bytes.get(start + 1) == Some(&b'('));
+    debug_assert_eq!(bytes.get(start), Some(&b'$'));
+    debug_assert_eq!(bytes.get(start + 1), Some(&b'('));
 
     let mut i = start + 2;
     let mut depth: u32 = 1;
@@ -2196,7 +2196,7 @@ fn consume_backticks(command: &str, start: usize) -> usize {
     let bytes = command.as_bytes();
     let len = bytes.len();
 
-    debug_assert!(bytes.get(start) == Some(&b'`'));
+    debug_assert_eq!(bytes.get(start), Some(&b'`'));
 
     let mut i = start + 1;
     while i < len {

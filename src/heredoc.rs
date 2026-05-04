@@ -250,8 +250,8 @@ fn scan_dollar_paren_for_heredoc_recursive(
     let bytes = command.as_bytes();
     let len = bytes.len();
 
-    debug_assert!(bytes.get(start) == Some(&b'$'));
-    debug_assert!(bytes.get(start + 1) == Some(&b'('));
+    debug_assert_eq!(bytes.get(start), Some(&b'$'));
+    debug_assert_eq!(bytes.get(start + 1), Some(&b'('));
 
     let mut i = start + 2;
     let mut depth: u32 = 1;
@@ -331,7 +331,7 @@ fn scan_backticks_for_heredoc_recursive(
     let bytes = command.as_bytes();
     let len = bytes.len();
 
-    debug_assert!(bytes.get(start) == Some(&b'`'));
+    debug_assert_eq!(bytes.get(start), Some(&b'`'));
 
     let mut i = start + 1;
     while i < len {
