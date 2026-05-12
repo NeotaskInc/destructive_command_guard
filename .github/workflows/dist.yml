@@ -92,14 +92,18 @@ jobs:
         run: |
           set -euo pipefail
           # Catch a future regression where the musl matrix entry
-          # silently links against glibc anyway. `objdump -T` exits
-          # 1 on a static binary (no dynamic symbol table), which is
-          # exactly what we want — that's the success signal. Any
-          # GLIBC_* symbol surfacing here is a release-blocker (see
-          # #114 for the original regression).
-          if objdump -T "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}" 2>/dev/null | grep -q "GLIBC_"; then
+          # silently links against glibc anyway. `objdump -T` on a
+          # static musl binary prints "no dynamic symbol table" to
+          # stderr and exits 0; the grep against `GLIBC_` is the
+          # actual gate. Any GLIBC_* symbol surfacing here is a
+          # release-blocker (see #114 for the original regression).
+          # We pipe stderr to stdout so the dump-failure case (missing
+          # binary, unreadable file) shows up in the job log instead
+          # of getting silently swallowed.
+          binary="target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
+          if objdump -T "$binary" 2>&1 | grep -q "GLIBC_"; then
             echo "::error::musl binary unexpectedly contains GLIBC symbols — release would re-introduce #114"
-            objdump -T "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}" | grep "GLIBC_" || true
+            objdump -T "$binary" | grep "GLIBC_" || true
             exit 1
           fi
           echo "musl binary verified: no GLIBC_* symbols present"
