@@ -150,6 +150,31 @@ jobs:
           cd ../../../dist
           shasum -a 256 "$TARBALL" > "$TARBALL.sha256"
 
+      - name: Verify Windows binary is actually PE32+
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          # Pin against the v0.5.1 regression (#115): the published Windows
+          # assets were Linux ELF binaries renamed to `dcg.exe`. The GH
+          # Actions test job had failed and a fallback build path
+          # (cross-compile on a non-Windows host) silently produced ELF
+          # output and packaged it as Windows. windows-latest runs natively
+          # so cargo cannot produce ELF here by construction, but checking
+          # the magic bytes is cheap insurance against a future regression
+          # (e.g. a cached target/ leaking the wrong artifact).
+          $binary = "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}"
+          if (-not (Test-Path $binary)) {
+            Write-Output "::error::expected built binary not found at $binary"
+            exit 1
+          }
+          $magic = [System.IO.File]::ReadAllBytes($binary)[0..1]
+          $mz = [BitConverter]::ToString($magic)
+          if ($mz -ne "4D-5A") {
+            Write-Output "::error::Windows build produced a non-PE32+ binary (magic=$mz, expected 4D-5A 'MZ') — release would re-introduce #115"
+            exit 1
+          }
+          Write-Output "Windows binary verified: PE32+ magic 'MZ' present"
+
       - name: Create zip (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
