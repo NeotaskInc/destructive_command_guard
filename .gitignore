@@ -81,3 +81,7 @@ hello_write.txt
 
 # E2E test run logs
 e2e_*.log
+
+# NTM agent coordination runtime state (human inbox spool, per-pane rate
+# limits, robot snapshot summaries) — regenerated every orchestrator tick.
+.ntm/
