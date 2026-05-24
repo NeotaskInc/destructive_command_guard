@@ -11,6 +11,40 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.5.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.5.3) -- 2026-05-23 [Release]
+
+### Pattern false-positive fixes
+
+- **`push-force-{long,short}` no longer fires across shell-token boundaries** ([#124](https://github.com/Dicklesworthstone/destructive_command_guard/issues/124)).
+  The walker `(?:\S+\s+)*` between `git`/`push` and the force flag matched
+  `\S` greedily, which includes shell metacharacters (`&;|`()<>` plus
+  backticks). That meant `git commit -m "...git push --force..."`,
+  here-doc bodies, `&&`-chained `echo` lines, and `git log --grep='git
+  push --force'` all tripped the Critical rule — and dcg refused the
+  entire command. Switched both regexes to the bounded form already
+  used by `branch-force-delete` since [#121](https://github.com/Dicklesworthstone/destructive_command_guard/issues/121):
+  `(?:[^\s&;|`()<>]+\s+)*`. Added five regression cases covering the
+  shell-boundary scenarios.
+
+### Codex on Windows
+
+- **`install.ps1` now writes `hooks.json` as UTF-8 without the BOM** ([#125](https://github.com/Dicklesworthstone/destructive_command_guard/issues/125)).
+  The previous `Set-Content -Encoding UTF8` on Windows PowerShell 5.1
+  (the default on Win10/Win11) prepended a UTF-8 BOM that Codex Desktop
+  rejected with `expected value at line 1 column 1`. The hook installed
+  cleanly, appeared in the Codex UI, and silently did nothing. Switched
+  both write paths to `[System.IO.File]::WriteAllText` with
+  `System.Text.UTF8Encoding $false` — works identically on PS 5.1 and
+  PS 6/7+ without the PS6-only `-Encoding UTF8NoBOM`.
+
+### crates.io
+
+- **First publish to crates.io since v0.4.5.** v0.5.0/v0.5.1/v0.5.2 were
+  cut as GitHub releases but never published to the registry. v0.5.3
+  ships there too via `cargo publish`. Closes [#126](https://github.com/Dicklesworthstone/destructive_command_guard/issues/126).
+
+---
+
 ## [Unreleased] (after v0.5.1)
 
 ### Agent support
