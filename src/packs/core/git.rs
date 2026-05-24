@@ -298,7 +298,11 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // `(?:\S+\s+)*` token walker so we only reach a fresh arg token.
         destructive_pattern!(
             "push-force-long",
-            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*push\s+(?:\S+\s+)*--force(?![-a-z])",
+            // Bounded walker between `git`/`push` and the force flag — `(?:\S+\s+)*`
+            // would walk past shell metacharacters (`&;|`()<>` plus backticks) and
+            // false-positive on `git commit -m "...git push --force..."` (#124).
+            // Matches the fix already applied to `branch-force-delete` (#121).
+            r"(?:^|[^[:alnum:]_-])git\s+(?:[^\s&;|`()<>]+\s+)*push\s+(?:[^\s&;|`()<>]+\s+)*--force(?![-a-z])",
             "Force push can destroy remote history. Use --force-with-lease if necessary.",
             Critical,
             "git push --force overwrites remote history with your local history. This can \
@@ -338,7 +342,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // excluded by the `push-force-long` rule (which takes precedence).
         destructive_pattern!(
             "push-force-short",
-            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*push\s+(?:\S+\s+)*-[a-zA-Z]*f[a-zA-Z]*\b",
+            // Bounded walker — see `push-force-long` for rationale (#124).
+            r"(?:^|[^[:alnum:]_-])git\s+(?:[^\s&;|`()<>]+\s+)*push\s+(?:[^\s&;|`()<>]+\s+)*-[a-zA-Z]*f[a-zA-Z]*\b",
             "Force push (-f) can destroy remote history. Use --force-with-lease if necessary.",
             Critical,
             "git push -f (short for --force) overwrites remote history with your local history. \
@@ -591,6 +596,37 @@ mod tests {
             pack.check("git push --force-with-lease origin main")
                 .is_none(),
             "--force-with-lease is the safer alternative and must not be blocked"
+        );
+
+        // Shell-boundary false positives: `git push --force` mentioned inside a
+        // *different* command (quoted commit message, here-doc body, chained
+        // command after `&&`/`;`/`|`) must not trigger the rule. (#124)
+        assert!(
+            pack.check(
+                "git commit -m \"refactor: explain why we avoid git push --force in this repo\""
+            )
+            .is_none(),
+            "push-force mentioned inside a quoted commit message must not trigger push-force-long"
+        );
+        assert!(
+            pack.check(
+                "git commit -m \"docs: warn against git push -f when rebasing onto main\""
+            )
+            .is_none(),
+            "push-force mentioned inside a quoted commit message must not trigger push-force-short"
+        );
+        assert!(
+            pack.check("git status && echo 'avoid git push --force in CI'").is_none(),
+            "push-force inside an echo following && must not span back to git push-force-long"
+        );
+        assert!(
+            pack.check("git status; cat <<EOF\nremember not to run git push --force\nEOF")
+                .is_none(),
+            "push-force inside a here-doc body must not trigger push-force-long"
+        );
+        assert!(
+            pack.check("git log --grep='git push --force'").is_none(),
+            "push-force inside a --grep pattern must not trigger push-force-long"
         );
     }
 
