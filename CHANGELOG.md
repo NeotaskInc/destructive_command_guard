@@ -11,6 +11,22 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.5.6](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.5.6) -- 2026-05-26 [Release]
+
+Registry-clean release of the v0.5.5 history-FTS fix.
+
+### Dependencies
+
+- **Switched `fsqlite`/`fsqlite-types`/`fsqlite-error` from the v0.5.5 git revision
+  to the published `fsqlite 0.1.4`** ([frankensqlite#94](https://github.com/Dicklesworthstone/frankensqlite/issues/94)),
+  which carries the FTS5 live-vtab DELETE fix. No code change vs v0.5.5 — same fix,
+  now from crates.io.
+- Because the dependency is no longer a git revision, **v0.5.6 is published to
+  crates.io** (`destructive_command_guard = "0.5.6"`), restoring registry installs
+  with the FTS-rebuild fix included.
+
+---
+
 ## [v0.5.5](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.5.5) -- 2026-05-26 [Release]
 
 Fixes the history full-text-search rebuild, which was broken by an upstream
