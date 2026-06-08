@@ -4134,16 +4134,16 @@ fi"#;
         );
     }
 
-    /// #136: only the languages with comprehensive exec-sink escalation
-    /// (Python, JavaScript, TypeScript, Ruby) get their heredoc body masked out
-    /// of the raw-shell rescan. Perl/PHP/Go were REMOVED from the masked set
-    /// (their exec-sink escalation was incomplete, so masking leaked literal
-    /// destructive tokens inside `system()`/`exec.Command(...)`/`qx(...)`); they
-    /// now fall back to the conservative raw-shell scan.
+    /// #136 REVERTED: interpreter-stdin heredoc bodies are no longer masked, so
+    /// `is_interpreter_source_heredoc_command` returns false for EVERY command.
+    /// Masking a body that actually executes is unsound for a zero-false-negative
+    /// scanner (it hides destructive tokens reaching an exec sink via variable
+    /// indirection, aliasing, backtick/template literals, etc.), so all bodies
+    /// fall back to the conservative raw-shell scan.
     #[test]
     fn interpreter_source_heredoc_command_classification_136() {
-        // Non-shell interpreters with comprehensive exec-sink escalation → masked.
         for cmd in [
+            // interpreters that were briefly masked …
             "python",
             "python3",
             "python3.11",
@@ -4153,62 +4153,60 @@ fi"#;
             "deno",
             "bun",
             "/usr/bin/python3",
+            "perl",
+            "php",
+            "go",
+            "/usr/local/bin/php",
+            // … shells (always read shell from stdin) …
+            "bash",
+            "sh",
+            "zsh",
+            "fish",
+            "powershell",
+            "pwsh",
+            // … and data/unknown commands.
+            "cat",
+            "tee",
+            "grep",
+            "totally-unknown-cmd",
         ] {
             assert!(
-                is_interpreter_source_heredoc_command(cmd),
-                "{cmd} should be treated as interpreter source"
-            );
-        }
-
-        // Perl/PHP/Go are DELIBERATELY NOT masked: their bodies stay raw-shell
-        // scanned so literal destructive tokens in their exec sinks still BLOCK.
-        for cmd in ["perl", "php", "go", "/usr/local/bin/php"] {
-            assert!(
                 !is_interpreter_source_heredoc_command(cmd),
-                "{cmd} must NOT be masked (incomplete exec-sink escalation; #136 FN fix)"
-            );
-        }
-
-        // Shells read SHELL from stdin → must stay raw-shell scanned (NOT masked).
-        for cmd in ["bash", "sh", "zsh", "fish", "powershell", "pwsh"] {
-            assert!(
-                !is_interpreter_source_heredoc_command(cmd),
-                "{cmd} is a shell and must not be masked as interpreter source"
-            );
-        }
-
-        // Data sinks / unknown commands are handled by the non-executing path,
-        // not this predicate.
-        for cmd in ["cat", "tee", "grep", "totally-unknown-cmd"] {
-            assert!(
-                !is_interpreter_source_heredoc_command(cmd),
-                "{cmd} must not be classified as interpreter source"
+                "{cmd} must NOT be masked as interpreter source (#136 reverted — masking executes is unsound)"
             );
         }
     }
 
-    /// #136: a python interpreter heredoc body is masked out of the raw-shell
-    /// rescan, while a bash heredoc body is left intact.
+    /// #136 REVERTED: a python (or any interpreter) heredoc body is NOT masked —
+    /// it stays intact for the raw-shell scan so a destructive literal still
+    /// blocks, exactly like a bash heredoc body. Only genuine data sinks
+    /// (`cat`/`tee`, the #109 behavior) are masked.
     #[test]
     fn mask_interpreter_source_body_136() {
         let rmrf = format!("{}{}{}", "rm", " -", "rf");
 
+        // python interpreter body must be left intact (not masked).
         let py = format!("python3 - <<PY\nprint(\"{rmrf} /etc/important\")\nPY");
-        let masked = mask_non_executing_heredocs(&py);
+        let masked_py = mask_non_executing_heredocs(&py);
         assert!(
-            matches!(masked, std::borrow::Cow::Owned(_)),
-            "python interpreter body should be masked: {masked:?}"
-        );
-        assert!(
-            !masked.contains(&rmrf),
-            "masked python body must not retain the destructive token: {masked:?}"
+            masked_py.contains(&rmrf),
+            "python interpreter body must be left intact for raw-shell scanning: {masked_py:?}"
         );
 
+        // bash body is likewise left intact.
         let sh = format!("bash <<SH\n{rmrf} /etc/important\nSH");
         let masked_sh = mask_non_executing_heredocs(&sh);
         assert!(
             masked_sh.contains(&rmrf),
-            "bash interpreter body must be left intact for raw-shell scanning: {masked_sh:?}"
+            "bash body must be left intact for raw-shell scanning: {masked_sh:?}"
+        );
+
+        // A genuine data sink (cat) IS still masked (#109 behavior, unaffected).
+        let cat = format!("cat > f.py <<PY\nprint(\"{rmrf} /etc/important\")\nPY");
+        let masked_cat = mask_non_executing_heredocs(&cat);
+        assert!(
+            !masked_cat.contains(&rmrf),
+            "cat data-sink body should still be masked: {masked_cat:?}"
         );
     }
 }
