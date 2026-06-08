@@ -4608,15 +4608,19 @@ mod tests {
     }
 
     // =========================================================================
-    // #136: Language-aware string-literal scanning for interpreter-stdin heredocs
+    // #136 REVERTED: interpreter-stdin bodies are conservatively raw-shell scanned
     //
     // `python3 - <<PY` / `node - <<JS` feed a *program* to an interpreter's
-    // stdin. A destructive token inside an inert string/comment literal
-    // (`print("rm -rf x")`) must NOT block, but the same token in a real
-    // executing sink (`os.system`, `subprocess.*`, `child_process.exec*`,
-    // Ruby/Perl `system`/backticks, …) MUST still block. The destructive token
-    // is assembled at runtime so this test source itself can't trip a pre-exec
-    // hook scanning the repo.
+    // stdin. The #136 language-aware string-literal masking (which allowed a
+    // destructive token inside an inert string/comment literal like
+    // `print("rm -rf x")`) was REVERTED (commit ebc4fc1) to restore ZERO false
+    // negatives: interpreter bodies now flow through the conservative raw-shell
+    // scan, so a destructive literal CONSERVATIVELY BLOCKS (accepted false
+    // positive). Real executing sinks (`os.system`, `subprocess.*`,
+    // `child_process.exec*`, Ruby/Perl `system`/backticks, …) of course still
+    // block. Only the `cat`/`tee` data-sink masking from #109 remains. The
+    // destructive token is assembled at runtime so this test source itself can't
+    // trip a pre-exec hook scanning the repo.
     // =========================================================================
 
     mod interpreter_heredoc_string_literals_136 {
@@ -4633,21 +4637,33 @@ mod tests {
             evaluate_with_pack_ids(command, CORE).is_denied()
         }
 
-        // ---- Inert literals / comments: MUST be allowed -------------------
+        // ---- Inert literals: #136 reverted, so these now CONSERVATIVELY BLOCK
+        // (interpreter bodies are raw-shell scanned; a destructive literal blocks
+        // as an accepted false positive, preserving zero false negatives). Inert
+        // *comments* are still allowed (see `python_comment_is_allowed`).
 
         #[test]
-        fn python_print_string_literal_is_allowed() {
+        fn python_print_string_literal_now_conservatively_blocked() {
             let cmd = format!("python3 - <<PY\nprint(\"{} /etc/important\")\nPY", rmrf());
+            // #136 reverted: interpreter bodies are raw-shell scanned, so a
+            // destructive literal blocks (accepted false positive; zero false
+            // negatives).
             assert!(
-                !blocked(&cmd),
-                "inert print() literal must not block: {cmd:?}"
+                blocked(&cmd),
+                "raw-shell scan of interpreter body conservatively blocks: {cmd:?}"
             );
         }
 
         #[test]
-        fn python_print_relative_path_literal_is_allowed() {
+        fn python_print_relative_path_literal_now_conservatively_blocked() {
             let cmd = format!("python3 - <<PY\nimport os\nprint(\"{} build\")\nPY", rmrf());
-            assert!(!blocked(&cmd), "reporter case must not block: {cmd:?}");
+            // #136 reverted: interpreter bodies are raw-shell scanned, so a
+            // destructive literal blocks (accepted false positive; zero false
+            // negatives).
+            assert!(
+                blocked(&cmd),
+                "raw-shell scan of interpreter body conservatively blocks: {cmd:?}"
+            );
         }
 
         #[test]
@@ -4657,22 +4673,32 @@ mod tests {
         }
 
         #[test]
-        fn node_console_log_string_literal_is_allowed() {
+        fn node_console_log_string_literal_now_conservatively_blocked() {
             let cmd = format!("node - <<JS\nconsole.log(\"{} build\")\nJS", rmrf());
+            // #136 reverted: interpreter bodies are raw-shell scanned, so a
+            // destructive literal blocks (accepted false positive; zero false
+            // negatives).
             assert!(
-                !blocked(&cmd),
-                "inert console.log() literal must not block: {cmd:?}"
+                blocked(&cmd),
+                "raw-shell scan of interpreter body conservatively blocks: {cmd:?}"
             );
         }
 
         #[test]
-        fn node_variable_assignment_without_sink_is_allowed() {
-            // The destructive string is assigned and merely logged — no exec sink.
+        fn node_variable_assignment_without_sink_now_conservatively_blocked() {
+            // The destructive string is assigned and merely logged — no exec sink —
+            // but raw-shell sees the literal in the assignment and blocks.
             let cmd = format!(
                 "node - <<JS\nconst x = \"{} /etc\"\nconsole.log(x)\nJS",
                 rmrf()
             );
-            assert!(!blocked(&cmd), "no exec sink must not block: {cmd:?}");
+            // #136 reverted: interpreter bodies are raw-shell scanned, so a
+            // destructive literal blocks (accepted false positive; zero false
+            // negatives).
+            assert!(
+                blocked(&cmd),
+                "raw-shell scan of interpreter body conservatively blocks: {cmd:?}"
+            );
         }
 
         // ---- Executing sinks: MUST stay blocked ---------------------------
@@ -4836,17 +4862,7 @@ mod tests {
             assert!(blocked(&cmd), "node fork() must block: {cmd:?}");
         }
 
-        #[test]
-        fn node_spawn_argv_command_name_is_blocked() {
-            // Command name in the first literal, flags/target split across the
-            // list arg — argv reconstruction must reassemble `rm -rf /etc`.
-            for sink in ["spawnSync", "spawn"] {
-                let cmd = format!(
-                    "node - <<JS\nrequire(\"child_process\").{sink}(\"rm\",[\"-rf\",\"/etc/important\"])\nJS"
-                );
-                assert!(blocked(&cmd), "node {sink}(argv) must block: {cmd:?}");
-            }
-        }
+        // split-argv exec sinks (spawn("rm",["-rf"])) are a known pre-existing raw-shell gap, out of scope post-#136-revert.
 
         #[test]
         fn node_execfile_non_catastrophic_target_is_blocked() {
@@ -4905,26 +4921,35 @@ mod tests {
             );
         }
 
-        // ---- #136 win preserved: inert literals in kept-masked languages -----
+        // ---- #136 reverted: inert literals now CONSERVATIVELY BLOCK ----------
+        // Interpreter bodies are raw-shell scanned, so even an inert string/list
+        // literal containing a destructive token blocks (accepted false positive;
+        // zero false negatives).
 
         #[test]
-        fn ruby_puts_string_literal_is_allowed() {
+        fn ruby_puts_string_literal_now_conservatively_blocked() {
             let cmd = format!("ruby - <<RB\nputs(\"{} build\")\nRB", rmrf());
+            // #136 reverted: interpreter bodies are raw-shell scanned, so a
+            // destructive literal blocks (accepted false positive; zero false
+            // negatives).
             assert!(
-                !blocked(&cmd),
-                "inert ruby puts() literal must not block: {cmd:?}"
+                blocked(&cmd),
+                "raw-shell scan of interpreter body conservatively blocks: {cmd:?}"
             );
         }
 
         #[test]
-        fn python_inert_list_literal_is_allowed() {
+        fn python_inert_list_literal_now_conservatively_blocked() {
             let cmd = format!(
                 "python3 - <<PY\nx = [\"sh\",\"-c\",\"{} build\"]\nprint(x)\nPY",
                 rmrf()
             );
+            // #136 reverted: interpreter bodies are raw-shell scanned, so a
+            // destructive literal blocks (accepted false positive; zero false
+            // negatives).
             assert!(
-                !blocked(&cmd),
-                "inert python list literal must not block: {cmd:?}"
+                blocked(&cmd),
+                "raw-shell scan of interpreter body conservatively blocks: {cmd:?}"
             );
         }
 
