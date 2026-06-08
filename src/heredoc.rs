@@ -1772,28 +1772,28 @@ pub fn is_non_executing_heredoc_command(cmd: &str) -> bool {
 pub fn is_interpreter_source_heredoc_command(cmd: &str) -> bool {
     let cmd_name = cmd.rsplit('/').next().unwrap_or(cmd);
     match ScriptLanguage::from_command(cmd_name) {
-        // Concrete non-shell languages whose source is authoritatively analyzed
-        // by the AST matcher / exec-sink escalation path. Masking the heredoc body
-        // here removes it from the conservative raw-shell rescan, so we ONLY mask
-        // languages where exec-sink escalation is comprehensive enough to guarantee
-        // ZERO false negatives. Python, JavaScript, TypeScript, and Ruby are covered
-        // by `refine_python_match` / `scan_executing_sink_fallback` and their AST
-        // backstops.
+        // #136 REVERTED: NO interpreter-stdin language is masked any more.
         //
-        // Perl, PHP, and Go are DELIBERATELY EXCLUDED (#136 regression fix): their
-        // exec-sink escalation was incomplete (`scan_executing_sink_fallback`
-        // explicitly returned None for them), so masking let literal destructive
-        // tokens inside `system()`/`exec.Command(...)`/`qx(...)`/etc. slip through.
-        // By leaving them unmasked, their bodies fall back to the conservative
-        // raw-shell scan, which BLOCKS destructive tokens (acceptable false
-        // positives, zero false negatives).
+        // Masking a body so an inert string literal like `print("rm -rf x")` is
+        // allowed inherently removes that body from the raw-shell rescan — the
+        // only layer that guarantees ZERO false negatives. No regex/AST heuristic
+        // can soundly tell an inert literal from a destructive one that reaches an
+        // exec sink via variable indirection (`c = "rm -rf /etc"; os.system(c)`),
+        // aliasing (`f = exec; f("rm -rf /etc")`), backtick/template literals
+        // (``execSync(`rm -rf /etc`)``), or an opaque imported sink — all of which
+        // execute REAL deletions and were ALLOWED while masking was active. That
+        // violates dcg's prime invariant (false positives are acceptable, false
+        // negatives are NOT). Distinguishing those cases needs true taint
+        // analysis, which is out of scope for this scanner, so every interpreter
+        // body (`python3 -`, `node -`, `ruby -`, …) now keeps flowing through the
+        // conservative raw-shell scan. The independent `cat`/`tee` data-sink
+        // masking (`is_non_executing_heredoc_command`) is unaffected — those
+        // targets genuinely do not execute their stdin.
         ScriptLanguage::Python
         | ScriptLanguage::JavaScript
         | ScriptLanguage::TypeScript
-        | ScriptLanguage::Ruby => true,
-        // Shell, Perl, PHP, Go, and Unknown are never masked — their bodies stay
-        // raw-shell-scanned so real destructive tokens still block.
-        ScriptLanguage::Bash
+        | ScriptLanguage::Ruby
+        | ScriptLanguage::Bash
         | ScriptLanguage::Perl
         | ScriptLanguage::Php
         | ScriptLanguage::Go
