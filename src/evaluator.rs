@@ -3967,6 +3967,68 @@ mod tests {
     }
 
     #[test]
+    fn git_commit_file_stdin_message_with_restore_is_allowed_136() {
+        let config = default_config();
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+
+        // `git commit -F -` reads the commit MESSAGE from stdin; a message that
+        // merely says "restore"/"reset --hard" is data, never executed, so it
+        // must not trip the core.git rules (#136 data-sink half).
+        let reset_hard = format!("{}{}", "reset --", "hard");
+        let cmd = format!("git commit -F - <<EOF\ndocs: {reset_hard} and restore notes\nEOF");
+        let result = evaluate_command(&cmd, &config, &["git"], &compiled, &allowlists);
+        assert!(
+            result.is_allowed(),
+            "commit-message heredoc body must not block: {:?}",
+            result.decision
+        );
+    }
+
+    #[test]
+    fn git_restore_after_commit_file_stdin_heredoc_still_blocks_136() {
+        let config = default_config();
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+
+        // Soundness: only the masked commit-message body is exempt. A real
+        // `git restore --worktree` chained after the heredoc terminator must
+        // still be denied.
+        let cmd = "git commit -F - <<EOF\ndocs: notes\nEOF\ngit restore --worktree .";
+        let result = evaluate_command(cmd, &config, &["git"], &compiled, &allowlists);
+        assert!(
+            result.is_denied(),
+            "git restore after the masked heredoc must still block: {:?}",
+            result.decision
+        );
+    }
+
+    #[test]
+    fn git_file_stdin_sentinel_does_not_leak_onto_later_bash_heredoc_136() {
+        let config = default_config();
+        let compiled = default_compiled_overrides();
+        let allowlists = default_allowlists();
+
+        // Soundness: a `git … -F -` on an earlier line must NOT cause a later
+        // `bash <<EOF` body (which IS executed) to be masked. The heredoc binds
+        // to the command on its own physical line.
+        let rmrf = format!("{}{}{}", "rm", " -", "rf");
+        let cmd = format!("git commit -F - msg.txt\nbash <<EOF\n{rmrf} /important\nEOF");
+        let result = evaluate_command(
+            &cmd,
+            &config,
+            &["git", "bash", "rm"],
+            &compiled,
+            &allowlists,
+        );
+        assert!(
+            result.is_denied(),
+            "bash heredoc body after a git -F - line must still block: {:?}",
+            result.decision
+        );
+    }
+
+    #[test]
     fn bd_notes_with_dangerous_text_is_allowed() {
         let config = default_config();
         let compiled = default_compiled_overrides();

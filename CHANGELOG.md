@@ -11,6 +11,33 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [Unreleased] -- v0.5.7
+
+Heredoc data-sink masking for `git` stdin targets, plus a soundness fix to
+heredoc target resolution.
+
+### Fixed
+
+- **Stop false positives on `git` commit/object messages read from stdin (#136,
+  data-sink half).** `git commit -F -`, `git commit --file=-` / `--file -` /
+  `-F-`, and `git hash-object --stdin` consume the heredoc body as *data* (a
+  commit/tag/note message or object content) that git never executes as shell.
+  Their heredoc body is now masked out of the raw-shell rescan exactly like
+  `cat`/`tee` (#109), so a commit message that merely contains "restore" or
+  "reset --hard" no longer trips the `core.git:*` rules. The unsound
+  interpreter-stdin case (`python3 -`/`node -`, whose body *is* executed) remains
+  deliberately unmasked.
+- **Soundness: heredoc target resolution is now bounded to the heredoc's own
+  physical line.** `tokenize_backwards` does not treat newlines as command
+  boundaries, so an unbounded backward scan could resolve a data-sink target (or
+  the new git stdin sentinel) from an *earlier* line and mask a *later*,
+  genuinely-executing heredoc body — e.g. `cat f\nbash <<EOF\nrm -rf /\nEOF` or
+  `git commit -F - f\nbash <<EOF\nrm -rf /\nEOF` were wrongly allowed. Both
+  `extract_heredoc_target_command` and the new `is_git_stdin_data_sink` now scan
+  only the heredoc operator's own line. This closes a false negative (the
+  conservative direction: at worst a false positive, never a missed destructive
+  command). Found via adversarial review.
+
 ## [v0.5.6](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.5.6) -- 2026-05-26 [Release]
 
 Registry-clean release of the v0.5.5 history-FTS fix.
