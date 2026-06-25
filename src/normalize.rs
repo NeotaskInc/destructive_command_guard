@@ -254,6 +254,9 @@ fn strip_sudo(command: &str) -> Option<(String, StrippedWrapper)> {
         idx = word_end;
 
         if saw_arg_inline {
+            if token_has_inline_code(word.as_bytes()) {
+                return None;
+            }
             continue;
         }
 
@@ -267,7 +270,11 @@ fn strip_sudo(command: &str) -> Option<(String, StrippedWrapper)> {
                 return None;
             }
             // Skip argument token
+            let arg_start = idx;
             idx = consume_word_token(bytes, idx, bytes.len());
+            if token_has_inline_code(&bytes[arg_start..idx]) {
+                return None;
+            }
         }
     }
 
@@ -390,7 +397,12 @@ fn parse_env_options(rest: &str, bytes: &[u8], mut idx: usize) -> EnvParseResult
         if idx >= bytes.len() {
             return None;
         }
-        Some(consume_word_token(bytes, idx, bytes.len()))
+        let arg_start = idx;
+        let end = consume_word_token(bytes, idx, bytes.len());
+        if token_has_inline_code(&bytes[arg_start..end]) {
+            return None;
+        }
+        Some(end)
     };
 
     while idx < bytes.len() {
@@ -445,7 +457,10 @@ fn parse_env_options(rest: &str, bytes: &[u8], mut idx: usize) -> EnvParseResult
                     continue;
                 }
                 "--unset" | "--chdir" | "--file" | "--argv0" | "--ignore-signal" => {
-                    if value_opt.is_some() {
+                    if let Some(value) = value_opt {
+                        if token_has_inline_code(value.as_bytes()) {
+                            return EnvParseResult::Abort;
+                        }
                         idx = word_end;
                         continue;
                     }
@@ -535,6 +550,9 @@ fn parse_env_options(rest: &str, bytes: &[u8], mut idx: usize) -> EnvParseResult
                 }
                 'u' | 'P' | 'C' | 'f' | 'a' => {
                     if pos + 1 < word_bytes.len() {
+                        if token_has_inline_code(&word_bytes[pos + 1..]) {
+                            return EnvParseResult::Abort;
+                        }
                         idx = word_end;
                     } else {
                         let Some(next_idx) = consume_env_arg(word_end) else {
@@ -616,6 +634,11 @@ fn token_has_inline_code(token: &[u8]) -> bool {
             }
             b'`' if !in_single => return true,
             b'$' if !in_single && i + 1 < token.len() && token[i + 1] == b'(' => return true,
+            b'<' | b'>'
+                if !in_single && !in_double && i + 1 < token.len() && token[i + 1] == b'(' =>
+            {
+                return true;
+            }
             _ => {}
         }
 
@@ -1315,7 +1338,11 @@ pub fn normalize_command_word_token(token: &str) -> Option<String> {
     // shell command words.
     let is_windows_drive_path = {
         let b = out.as_bytes();
-        b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/')
+        let start = usize::from(matches!(b.first(), Some(b'"' | b'\'')));
+        b.len() >= start + 3
+            && b[start].is_ascii_alphabetic()
+            && b[start + 1] == b':'
+            && matches!(b[start + 2], b'\\' | b'/')
     };
 
     // Strip internal backslash escapes before regular ASCII letters.
@@ -1986,6 +2013,71 @@ mod tests {
     fn test_env_chdir_long_option() {
         let result = strip_wrapper_prefixes("env --chdir /tmp git reset --hard");
         assert_eq!(result.normalized, "git reset --hard");
+    }
+
+    #[test]
+    fn env_sudo_flag_value_with_substitution_is_not_stripped() {
+        let dangerous = [
+            "env -C /tmp/$(rm -rf /) git status",
+            "env -u $(rm -rf /) git status",
+            "env --chdir /tmp/$(rm -rf /) git status",
+            "env -C/tmp/$(reboot) git status",
+            "env --chdir=$(reboot) git status",
+            "env -C `rm -rf /` git status",
+            "env -C <(rm -rf /) git status",
+            "sudo -D /tmp/$(rm -rf /) git status",
+            "sudo -u $(rm -rf /) git status",
+            "sudo -D/tmp/$(reboot) git status",
+            "sudo -u `id` git status",
+        ];
+        for cmd in dangerous {
+            let result = strip_wrapper_prefixes(cmd);
+            assert!(
+                !result
+                    .stripped_wrappers
+                    .iter()
+                    .any(|w| matches!(w.wrapper_type, "env" | "sudo")),
+                "env/sudo wrapper with a substitution in a flag value must NOT be stripped: {cmd} -> {:?}",
+                result.normalized
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_windows_path_with_backslashes_is_not_mangled() {
+        for cmd in [
+            r#""C:/Program Files/Git/bin/git.exe" reset --hard"#,
+            r#""C:\Program Files\Git\bin\git.exe" reset --hard"#,
+        ] {
+            let normalized = normalize_command(cmd);
+            assert!(
+                !normalized.contains("bingit"),
+                "quoted path was mangled (bin+git glued): {cmd} -> {normalized}"
+            );
+            assert!(
+                normalized.contains("git reset --hard"),
+                "git must remain a matchable word: {cmd} -> {normalized}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_sudo_benign_flag_value_still_strips() {
+        for (cmd, expected) in [
+            ("env -C /tmp git reset --hard", "git reset --hard"),
+            ("env --chdir=/tmp git reset --hard", "git reset --hard"),
+            ("env -u FOO git reset --hard", "git reset --hard"),
+            ("sudo -u root git reset --hard", "git reset --hard"),
+            ("sudo -D /tmp git reset --hard", "git reset --hard"),
+            ("sudo -uroot git reset --hard", "git reset --hard"),
+        ] {
+            let result = strip_wrapper_prefixes(cmd);
+            assert!(
+                result.was_normalized(),
+                "should strip benign wrapper: {cmd}"
+            );
+            assert_eq!(result.normalized, expected, "for {cmd}");
+        }
     }
 
     #[test]

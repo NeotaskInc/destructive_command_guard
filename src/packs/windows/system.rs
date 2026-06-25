@@ -71,6 +71,7 @@ pub fn create_pack() -> Pack {
             "WMIC",
             "shadowcopy",
             "ShadowCopy",
+            "SHADOWCOPY",
             "diskpart",
             "DISKPART",
             "Format-Volume",
@@ -81,10 +82,13 @@ pub fn create_pack() -> Pack {
             "CLEAR-DISK",
             "Remove-Partition",
             "remove-partition",
+            "REMOVE-PARTITION",
             "Initialize-Disk",
             "initialize-disk",
+            "INITIALIZE-DISK",
             "Reset-PhysicalDisk",
             "reset-physicaldisk",
+            "RESET-PHYSICALDISK",
             "cipher",
             "CIPHER",
             "bcdedit",
@@ -259,6 +263,21 @@ mod tests {
         assert_patterns_compile(&pack);
         assert_all_patterns_have_reasons(&pack);
         assert_unique_pattern_names(&pack);
+    }
+
+    #[test]
+    fn keyword_gate_admits_uppercase_cmdlets() {
+        let pack = create_pack();
+        for cmd in [
+            "REMOVE-PARTITION -DiskNumber 0 -PartitionNumber 2",
+            "INITIALIZE-DISK -Number 0",
+            "RESET-PHYSICALDISK -FriendlyName Disk1",
+            "FORMAT-VOLUME -DriveLetter D",
+            "CLEAR-DISK -Number 1 -RemoveData",
+            "wmic SHADOWCOPY delete",
+        ] {
+            assert!(pack.might_match(cmd), "keyword gate should admit: {cmd}");
+        }
     }
 
     #[test]

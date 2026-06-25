@@ -11,6 +11,22 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.6.3](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.3) -- 2026-06-25 [Release]
+
+Patch release for Windows command normalization coverage.
+
+### Fixed
+
+- **Block wrapper flag-value command substitutions.** `env` and `sudo` wrapper
+  normalization no longer strips option values that contain command/process
+  substitutions, preserving destructive payloads for detection.
+- **Normalize quoted Windows binary paths with backslashes.** Quoted paths such
+  as `"C:\Program Files\Git\bin\git.exe" reset --hard` now normalize to the
+  `git` command instead of being mangled by escape handling.
+- **Tighten quick-reject keyword coverage.** Windows uppercase destructive
+  aliases and Redis-compatible `valkey-cli` / `keydb-cli` commands now reach the
+  destructive pattern matchers instead of being skipped by the fast path.
+
 ## [v0.6.2](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.2) -- 2026-06-25 [Release]
 
 Patch release for the native-Windows installer.

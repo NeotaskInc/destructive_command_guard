@@ -87,10 +87,12 @@ pub fn create_pack() -> Pack {
             "RI",
             "Clear-Content",
             "clear-content",
+            "CLEAR-CONTENT",
             "clc",
             "CLC",
             "Clear-RecycleBin",
             "clear-recyclebin",
+            "CLEAR-RECYCLEBIN",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
@@ -311,8 +313,11 @@ mod tests {
             "RD /S /Q C:\\src",
             "Remove-Item -Recurse -Force C:\\src",
             "remove-item -recurse -force C:\\src",
+            "REMOVE-ITEM -RECURSE -FORCE C:\\src",
             "rm -Recurse -Force C:\\src",
             "format C: /q",
+            "CLEAR-CONTENT C:\\app\\server.log",
+            "CLEAR-RECYCLEBIN -Force",
         ] {
             assert!(pack.might_match(cmd), "keyword gate should admit: {cmd}");
         }
