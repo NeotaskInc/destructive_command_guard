@@ -558,7 +558,8 @@ Environment variables override config files (highest priority):
 - `DCG_LEGACY_OUTPUT=1`: force plain output paths (same as `--legacy-output`)
 - `DCG_ROBOT=1`: enable robot mode for JSON stdout and quiet stderr
 - `DCG_HIGH_CONTRAST=1`: enable high-contrast output (ASCII borders + monochrome palette)
-- `DCG_FORMAT=text|json|sarif`: default output format (command-specific; SARIF applies to `dcg scan`)
+- `DCG_FORMAT=text|json|sarif`: default output format (command-specific — see [Output Formats](#output-formats-and-dcg_format) for which values each subcommand actually accepts; real SARIF is `dcg scan`-only)
+- `DCG_FAIL_CLOSED=1`: block (deny) on hook input that cannot be parsed, instead of the default fail-open allow (opt-in; see [Fail-Open Philosophy](#fail-open-philosophy))
 - `DCG_BYPASS=1`: bypass dcg entirely (escape hatch; use sparingly)
 - `DCG_CONFIG=/path/to/config.toml`: use explicit config file
 - `DCG_HEREDOC_ENABLED=true|false`: enable/disable heredoc scanning
@@ -567,6 +568,32 @@ Environment variables override config files (highest priority):
 - `DCG_HEREDOC_LANGUAGES=python,bash`: filter heredoc languages
 - `DCG_POLICY_DEFAULT_MODE=deny|warn|log`: global default decision mode
 - `DCG_HOOK_TIMEOUT_MS=200`: hook evaluation timeout budget (milliseconds)
+
+### Output Formats and `DCG_FORMAT`
+
+`--format` (and the `DCG_FORMAT` env var, which seeds the default) is
+**command-specific**: each subcommand accepts only its own set of values, and an
+unrecognized value is a usage error (exit 2). `DCG_FORMAT` applies wherever a
+command has a `--format` flag and is silently ignored by commands that don't.
+
+| Command | Accepted `--format` values | Notes |
+|---------|----------------------------|-------|
+| `dcg scan` | `pretty`, `json`, `markdown`, `sarif` | **Only** command that emits real SARIF 2.1.0 |
+| `dcg test` | `pretty` (alias `text`), `json` (aliases `sarif`, `structured`), `toon` | |
+| `dcg config` | `pretty` (alias `text`), `json` (alias `sarif`) | |
+| `dcg packs` | `pretty` (alias `text`), `json` (alias `sarif`) | |
+| `dcg explain` | `pretty`, `json` (alias `sarif`) | |
+| `dcg doctor` | `pretty`, `json` (alias `sarif`) | |
+| `dcg simulate` | `pretty`, `json` (alias `sarif`) | |
+| `dcg corpus` | `json`, `pretty` (alias `sarif`) | |
+| `dcg suggest-allowlist` | `text`, `json` (alias `sarif`) | |
+
+**`sarif` is a JSON alias on every command except `dcg scan`.** This is
+deliberate so that setting `DCG_FORMAT=sarif` globally degrades gracefully —
+`dcg scan` produces a real SARIF report while other commands fall back to their
+structured JSON rather than erroring. If you need machine-readable output from a
+non-scan command, prefer `--format json` (which is unambiguous); use `dcg scan
+--format sarif` for SARIF. `--robot` forces JSON regardless of `--format`.
 
 ### Configuration Hierarchy
 
@@ -655,13 +682,41 @@ dcg is designed with a **fail-open** philosophy: when the tool cannot safely ana
 
 **Configurable Strictness**:
 
-For high-security environments, fail-open can be disabled:
+For high-security environments, fail-open can be disabled.
+
+For **heredoc/inline-script** analysis specifically:
 
 ```toml
 [heredoc]
-fallback_on_parse_error = false  # Block on parse errors
-fallback_on_timeout = false      # Block on timeouts
+fallback_on_parse_error = false  # Block on heredoc parse errors
+fallback_on_timeout = false      # Block on heredoc timeouts
 ```
+
+For the **top-level hook input** (the JSON dcg reads from stdin), enable
+fail-closed mode so that input which cannot be parsed at all is **blocked**
+instead of allowed:
+
+```toml
+[general]
+fail_closed = true   # Deny when the hook input itself is unparseable
+```
+
+or at runtime:
+
+```bash
+DCG_FAIL_CLOSED=1   # env var overrides the config value
+```
+
+The default is **fail-open** (unparseable input is allowed) and is unchanged
+unless you opt in. With fail-closed enabled, a genuinely unparseable hook
+payload produces a deny (a `permissionDecision: deny` for Claude-style hooks; a
+`"decision":"deny"` line plus a non-zero exit for `dcg hook --batch`).
+Transient IO read errors still fail open even in this mode, since they are not
+attacker-controlled malformed payloads.
+
+> A leading UTF-8 BOM (`EF BB BF`) is stripped before parsing in all hook
+> paths, so a BOM-prefixed but otherwise-valid command is correctly evaluated
+> (and blocked if dangerous) rather than allowed through as "unparseable".
 
 With strict mode enabled, dcg will block commands when analysis fails, providing detailed error messages explaining why.
 

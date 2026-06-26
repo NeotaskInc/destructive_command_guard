@@ -1175,6 +1175,16 @@ pub struct GeneralConfig {
     /// mid-session.
     /// Default: true. Disable with `DCG_NO_SELF_HEAL` or `self_heal_hook = false`.
     pub self_heal_hook: bool,
+
+    /// Fail-closed mode for unparseable hook input.
+    ///
+    /// When `true`, hook input that cannot be parsed as JSON is BLOCKED
+    /// (denied) instead of allowed. The default (`false`) is the documented
+    /// fail-open behavior: malformed input is allowed so a transient encoding
+    /// glitch never blocks legitimate work. Intended for high-security
+    /// environments. Override at runtime with the `DCG_FAIL_CLOSED` env var
+    /// (a truthy value forces fail-closed, a falsy value forces fail-open).
+    pub fail_closed: bool,
 }
 
 /// Default limits for input size (used when not configured).
@@ -1194,6 +1204,7 @@ impl Default for GeneralConfig {
             max_findings_per_command: None,
             check_updates: true,
             self_heal_hook: true,
+            fail_closed: false,
         }
     }
 }
@@ -3802,6 +3813,24 @@ impl Config {
             .ok()
             .and_then(|value| parse_env_bool(&value))
             .unwrap_or(false)
+    }
+
+    /// Whether dcg should fail CLOSED (block) on hook input it cannot parse.
+    ///
+    /// The `DCG_FAIL_CLOSED` environment variable overrides the config value:
+    /// a truthy value forces fail-closed, a falsy value forces fail-open. When
+    /// the env var is unset, the configured `general.fail_closed` is used
+    /// (default: `false`, i.e. fail-open). Default behavior is unchanged for
+    /// anyone who does not opt in (issue #160).
+    #[must_use]
+    pub fn is_fail_closed(&self) -> bool {
+        if let Some(value) = env::var(format!("{ENV_PREFIX}_FAIL_CLOSED"))
+            .ok()
+            .and_then(|value| parse_env_bool(&value))
+        {
+            return value;
+        }
+        self.general.fail_closed
     }
 
     /// Get the effective pack configuration for a specific project path.

@@ -157,6 +157,61 @@ fn effective_agent_for_hook_protocol(
     }
 }
 
+/// Handle hook input that could not be parsed (issue #160).
+///
+/// Records an audit-trail entry to history — so operators can see malformed
+/// inputs even though dcg fails open by default — and, when fail-closed mode is
+/// enabled (`DCG_FAIL_CLOSED` / `general.fail_closed`) AND the failure is a JSON
+/// parse error, emits a Claude-compatible deny so the agent blocks the command
+/// instead of silently allowing it. Transient IO errors keep the historic
+/// fail-open behavior even under fail-closed, since they are not attacker-
+/// controlled malformed payloads.
+fn handle_unparseable_hook_input(
+    config: &Config,
+    detected_agent: &Agent,
+    read_err: &hook::HookReadError,
+) {
+    let is_json_error = matches!(read_err, hook::HookReadError::Json(_));
+    let block = is_json_error && config.is_fail_closed();
+
+    // Audit trail: record the event to history (best-effort, never fatal).
+    if config.history.enabled {
+        let working_dir = std::env::current_dir().ok().map_or_else(
+            || "<unknown>".to_string(),
+            |p| p.to_string_lossy().to_string(),
+        );
+        let outcome = if block {
+            HistoryOutcome::Deny
+        } else {
+            HistoryOutcome::Allow
+        };
+        let writer = HistoryWriter::new(history_db_path(&config.history), &config.history);
+        let entry = build_history_entry(
+            detected_agent.config_key(),
+            "<unparseable hook input>",
+            &working_dir,
+            outcome,
+            Duration::ZERO,
+            None,
+            None,
+            Some("parse-error"),
+        );
+        writer.log(entry);
+        // Flush synchronously so the audit entry is durable before we return.
+        writer.flush_sync();
+    }
+
+    if block {
+        hook::output_parse_failure_denial(
+            "BLOCKED by dcg: the hook input could not be parsed and DCG_FAIL_CLOSED is set \
+             (fail-closed mode). Fix the malformed hook payload, or unset DCG_FAIL_CLOSED to \
+             restore the default fail-open behavior.",
+        );
+    } else if config.general.verbose {
+        eprintln!("[dcg] Warning: could not parse hook input; allowing command (fail-open)");
+    }
+}
+
 /// Process-wide registry of shutdown actions.
 ///
 /// `std::process::exit` skips Drop, so any subsystem with cross-call buffered
@@ -469,7 +524,14 @@ fn main() {
             );
             return;
         }
-        Err(_) => return, // Fail open on IO or JSON errors
+        Err(read_err) => {
+            // Malformed or unreadable hook input. The default is fail-open
+            // (allow), but we (a) record an audit-trail entry to history so
+            // operators can see malformed inputs, and (b) BLOCK instead of
+            // allow when fail-closed mode is enabled (issue #160).
+            handle_unparseable_hook_input(&config, &detected_agent, &read_err);
+            return;
+        }
     };
 
     // Start evaluation deadline after input size checks (includes evaluation).
@@ -1043,9 +1105,13 @@ fn print_help() {
         "DCG_NO_COLOR".green()
     );
     eprintln!(
-        "    {}=text|json|sarif  Default output format (command-specific)",
+        "    {}=text|json|sarif  Default output format (command-specific).",
         "DCG_FORMAT".green()
     );
+    eprintln!("                          `sarif` is real SARIF only for `dcg scan`; on every");
+    eprintln!("                          other command `sarif`/`structured` is an alias for");
+    eprintln!("                          JSON, and `text` an alias for pretty. Per-command");
+    eprintln!("                          accepted values: see `dcg <command> --help`.");
     eprintln!(
         "    {}=/path  Use explicit config file",
         "DCG_CONFIG".green()
@@ -1057,6 +1123,10 @@ fn print_help() {
     eprintln!(
         "    {}=1      Robot mode for AI agents (JSON output, no stderr)",
         "DCG_ROBOT".green()
+    );
+    eprintln!(
+        "    {}=1  Block (deny) on unparseable hook input (default: fail-open)",
+        "DCG_FAIL_CLOSED".green()
     );
     eprintln!();
 

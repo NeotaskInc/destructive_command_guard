@@ -661,6 +661,14 @@ pub struct HookCommand {
     /// Continue processing on parse errors (skip invalid lines)
     #[arg(long)]
     pub continue_on_error: bool,
+
+    /// Additional packs to enable for this hook run (comma-separated)
+    ///
+    /// Mirrors `dcg test --with-packs`: enables extra packs (e.g.
+    /// `containers.docker`, `kubernetes.kubectl`) for the batch evaluation
+    /// without editing a config file (issue #151).
+    #[arg(long, value_delimiter = ',')]
+    pub with_packs: Option<Vec<String>>,
 }
 
 /// Output format for batch hook mode.
@@ -2314,7 +2322,20 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
     let compiled_overrides = config.overrides.compile();
     let allowlists = crate::load_default_allowlists();
     let heredoc_settings = config.heredoc_settings();
+
+    // Fail-closed: when enabled, an unparseable line is treated as a deny
+    // rather than a passive error (issue #160).
+    let fail_closed = config.is_fail_closed();
+
     let mut enabled_packs = config.enabled_pack_ids();
+    // `--with-packs` enables extra packs for this run, mirroring `dcg test`
+    // (issue #151). Done before keyword collection so the extra packs' keywords
+    // participate in the quick-reject filter.
+    if let Some(extra) = cmd.with_packs.as_ref() {
+        for pack in extra {
+            enabled_packs.insert(pack.clone());
+        }
+    }
     let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
 
     // Load external packs from custom_paths (glob + tilde expansion).
@@ -2414,6 +2435,11 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
         results.sort_by_key(|(order, _)| *order);
 
         for (_, mut result) in results {
+            // Fail-closed: an unparseable line is a DENY, not a passive error
+            // (issue #160).
+            if fail_closed && result.decision == "error" {
+                result.decision = "deny";
+            }
             result.index = emit_index;
             emit_index += 1;
             if result.decision == "deny" {
@@ -2462,6 +2488,11 @@ fn run_hook_command(config: &Config, cmd: &HookCommand) -> Result<i32, Box<dyn s
                 &allowlists,
                 &heredoc_settings,
             );
+            // Fail-closed: an unparseable line is a DENY, not a passive error
+            // (issue #160).
+            if fail_closed && result.decision == "error" {
+                result.decision = "deny";
+            }
             result.index = emit_index;
             emit_index += 1;
             if result.decision == "deny" {
@@ -2504,6 +2535,12 @@ fn evaluate_batch_line(
     allowlists: &crate::allowlist::LayeredAllowlist,
     heredoc_settings: &crate::config::HeredocSettings,
 ) -> BatchHookOutput {
+    // Strip a leading UTF-8 BOM (U+FEFF). It can only appear on the first
+    // physical line of stdin, but stripping per-line is harmless and ensures a
+    // BOM-prefixed but otherwise-valid hook line is parsed and evaluated rather
+    // than fail-open-allowed (issue #160). serde_json does not skip a BOM.
+    let line = line.strip_prefix('\u{feff}').unwrap_or(line);
+
     // Skip empty lines
     if line.trim().is_empty() {
         return BatchHookOutput {

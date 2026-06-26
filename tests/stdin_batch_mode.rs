@@ -587,3 +587,115 @@ fn test_batch_parallel_maintains_order() {
         );
     }
 }
+
+/// Run `dcg hook --batch` with extra CLI args and extra environment variables.
+fn run_dcg_batch_full(
+    input: &str,
+    extra_args: &[&str],
+    envs: &[(&str, &str)],
+) -> std::process::Output {
+    let temp = tempfile::tempdir().expect("failed to create temp dir");
+    std::fs::create_dir_all(temp.path().join(".git")).expect("failed to create .git dir");
+    let home_dir = temp.path().join("home");
+    let xdg_config_dir = temp.path().join("xdg_config");
+    std::fs::create_dir_all(&home_dir).unwrap();
+    std::fs::create_dir_all(&xdg_config_dir).unwrap();
+
+    let mut args = vec!["hook", "--batch"];
+    args.extend(extra_args);
+
+    let mut cmd = Command::new(dcg_binary());
+    cmd.env_clear()
+        .env("HOME", &home_dir)
+        .env("USERPROFILE", &home_dir)
+        .env("XDG_CONFIG_HOME", &xdg_config_dir)
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .env("DCG_PACKS", "core.git,core.filesystem")
+        .current_dir(temp.path())
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+
+    let mut child = cmd.spawn().expect("failed to spawn dcg batch mode");
+    {
+        let stdin = child.stdin.as_mut().expect("failed to open stdin");
+        stdin.write_all(input.as_bytes()).unwrap();
+    }
+    child.wait_with_output().expect("failed to wait for dcg")
+}
+
+// ============================================================================
+// Test: a UTF-8 BOM prefix no longer fail-opens a dangerous command (#160)
+// ============================================================================
+
+#[test]
+fn test_batch_bom_prefixed_command_is_evaluated() {
+    // U+FEFF BOM immediately before an otherwise-valid hook payload.
+    let input =
+        "\u{feff}{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"git reset --hard\"}}\n";
+    let output = run_dcg_batch(input);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let results = parse_jsonl_output(&stdout);
+    assert_eq!(results.len(), 1, "BOM line should parse to one result");
+    assert_eq!(
+        results[0]["decision"], "deny",
+        "BOM-prefixed dangerous command must be evaluated and blocked, not fail-open allowed"
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+// ============================================================================
+// Test: DCG_FAIL_CLOSED denies unparseable input; default fails open (#160)
+// ============================================================================
+
+#[test]
+fn test_batch_fail_closed_denies_unparseable() {
+    let input = "this is not json\n";
+
+    // Default (fail-open): malformed line is an `error`, processing halts, exit 4.
+    let default_out = run_dcg_batch_full(input, &[], &[]);
+    let default_results = parse_jsonl_output(&String::from_utf8_lossy(&default_out.stdout));
+    assert_eq!(default_results[0]["decision"], "error");
+    assert_eq!(default_out.status.code(), Some(4));
+
+    // Fail-closed: malformed line becomes a `deny`, exit 1.
+    let fc_out = run_dcg_batch_full(input, &[], &[("DCG_FAIL_CLOSED", "1")]);
+    let fc_results = parse_jsonl_output(&String::from_utf8_lossy(&fc_out.stdout));
+    assert_eq!(
+        fc_results[0]["decision"], "deny",
+        "with DCG_FAIL_CLOSED=1, unparseable input must be denied"
+    );
+    assert_eq!(fc_out.status.code(), Some(1));
+}
+
+// ============================================================================
+// Test: --with-packs enables extra packs in hook --batch (#151)
+// ============================================================================
+
+#[test]
+fn test_batch_with_packs_enables_extra_pack() {
+    let input =
+        "{\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"docker system prune -a\"}}\n";
+
+    // Without the extra pack, docker is not guarded -> allow.
+    let baseline = run_dcg_batch(input);
+    let baseline_results = parse_jsonl_output(&String::from_utf8_lossy(&baseline.stdout));
+    assert_eq!(
+        baseline_results[0]["decision"], "allow",
+        "docker prune should be allowed without containers.docker enabled"
+    );
+
+    // With --with-packs containers.docker, it is blocked.
+    let with_pack = run_dcg_batch_with_args(input, &["--with-packs", "containers.docker"]);
+    let with_pack_results = parse_jsonl_output(&String::from_utf8_lossy(&with_pack.stdout));
+    assert_eq!(
+        with_pack_results[0]["decision"], "deny",
+        "docker prune should be blocked with --with-packs containers.docker"
+    );
+    assert_eq!(with_pack.status.code(), Some(1));
+}

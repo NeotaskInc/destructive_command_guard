@@ -121,6 +121,109 @@ fn run_dcg_hook(command: &str) -> HookRunOutput {
     run_dcg_hook_with_env(command, &[])
 }
 
+/// Run bare `dcg` (hook mode, no subcommand) writing RAW bytes to stdin, with
+/// optional extra environment. Used to exercise UTF-8 BOM handling and
+/// unparseable-input handling (issue #160).
+fn run_dcg_hook_raw(raw: &[u8], extra_env: &[(&str, &str)]) -> std::process::Output {
+    let temp = tempfile::tempdir().expect("failed to create temp dir");
+    std::fs::create_dir_all(temp.path().join(".git")).unwrap();
+    let home_dir = temp.path().join("home");
+    let xdg_config_dir = temp.path().join("xdg_config");
+    std::fs::create_dir_all(&home_dir).unwrap();
+    std::fs::create_dir_all(&xdg_config_dir).unwrap();
+
+    let mut cmd = Command::new(dcg_binary());
+    cmd.env_clear()
+        .env("HOME", &home_dir)
+        .env("USERPROFILE", &home_dir)
+        .env("XDG_CONFIG_HOME", &xdg_config_dir)
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .env("DCG_PACKS", "core.git,core.filesystem")
+        .current_dir(temp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("failed to spawn dcg hook mode");
+    {
+        let stdin = child.stdin.as_mut().expect("failed to open stdin");
+        stdin
+            .write_all(raw)
+            .expect("failed to write raw hook input");
+    }
+    child.wait_with_output().expect("failed to wait for dcg")
+}
+
+const BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
+#[test]
+fn bare_hook_bom_prefixed_dangerous_command_is_blocked() {
+    // BOM + valid dangerous payload: must be evaluated and denied, not fail-open.
+    let mut raw = BOM.to_vec();
+    raw.extend_from_slice(br#"{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}"#);
+    let out = run_dcg_hook_raw(&raw, &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"permissionDecision\":\"deny\""),
+        "BOM-prefixed dangerous command must be blocked, not fail-open allowed.\nstdout: {stdout}"
+    );
+}
+
+#[test]
+fn bare_hook_bom_prefixed_safe_command_is_allowed() {
+    let mut raw = BOM.to_vec();
+    raw.extend_from_slice(br#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#);
+    let out = run_dcg_hook_raw(&raw, &[]);
+    assert!(out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        "BOM-prefixed safe command must be allowed (empty stdout)"
+    );
+}
+
+#[test]
+fn bare_hook_fail_closed_blocks_unparseable_input() {
+    let raw = b"this is not valid json at all";
+
+    // Default: fail-open -> no deny, exit 0, empty stdout.
+    let open = run_dcg_hook_raw(raw, &[]);
+    assert!(open.status.success(), "default must fail open (exit 0)");
+    assert!(
+        String::from_utf8_lossy(&open.stdout).trim().is_empty(),
+        "default fail-open must allow unparseable input (empty stdout)"
+    );
+
+    // DCG_FAIL_CLOSED=1: deny.
+    let closed = run_dcg_hook_raw(raw, &[("DCG_FAIL_CLOSED", "1")]);
+    let stdout = String::from_utf8_lossy(&closed.stdout);
+    assert!(
+        stdout.contains("\"permissionDecision\":\"deny\""),
+        "DCG_FAIL_CLOSED must block unparseable input.\nstdout: {stdout}"
+    );
+}
+
+#[test]
+fn bare_hook_fail_closed_still_allows_valid_commands() {
+    // Fail-closed must only block UNPARSEABLE input, never valid commands.
+    let safe = br#"{"tool_name":"Bash","tool_input":{"command":"git status"}}"#;
+    let safe_out = run_dcg_hook_raw(safe, &[("DCG_FAIL_CLOSED", "1")]);
+    assert!(safe_out.status.success());
+    assert!(
+        String::from_utf8_lossy(&safe_out.stdout).trim().is_empty(),
+        "fail-closed must still allow a valid safe command"
+    );
+
+    // And it must still DENY a valid dangerous command (not turn it into an error).
+    let danger = br#"{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}"#;
+    let danger_out = run_dcg_hook_raw(danger, &[("DCG_FAIL_CLOSED", "1")]);
+    assert!(
+        String::from_utf8_lossy(&danger_out.stdout).contains("\"permissionDecision\":\"deny\""),
+        "fail-closed must still deny a valid dangerous command"
+    );
+}
+
 #[test]
 fn documented_global_boolean_env_values_do_not_fail_clap_parsing() {
     let flag_envs = [

@@ -500,7 +500,14 @@ pub fn read_hook_input(max_bytes: usize) -> Result<HookInput, HookReadError> {
         return Err(HookReadError::InputTooLarge(input.len()));
     }
 
-    serde_json::from_str(&input).map_err(HookReadError::Json)
+    // Strip a leading UTF-8 BOM (U+FEFF) before parsing. Some text tools prepend
+    // a BOM; without this, BOM-prefixed but otherwise-valid hook input would
+    // fail to parse and (by default) fail open — silently allowing a command
+    // that should have been evaluated/blocked (issue #160). `serde_json` does
+    // not skip a leading BOM on its own.
+    let to_parse = input.strip_prefix('\u{feff}').unwrap_or(input.as_str());
+
+    serde_json::from_str(to_parse).map_err(HookReadError::Json)
 }
 
 /// Detect which hook protocol should be used for output formatting.
@@ -1611,6 +1618,28 @@ pub fn output_warning_for_protocol(
         pattern,
         explanation,
     );
+}
+
+/// Emit a deny for hook input that could not be parsed, used by fail-closed
+/// mode (`DCG_FAIL_CLOSED` / `general.fail_closed`, issue #160).
+///
+/// Because the payload didn't parse we cannot detect the wire protocol, so we
+/// emit the default Claude-compatible deny: the `hookSpecificOutput` JSON on
+/// stdout (which makes Claude Code block the tool) plus a human-readable reason
+/// on stderr (visible to other agents and to humans).
+pub fn output_parse_failure_denial(reason: &str) {
+    const FALLBACK: &str = "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"BLOCKED by dcg (fail-closed): unparseable hook input\"}}";
+
+    let payload = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    });
+    let json = serde_json::to_string(&payload).unwrap_or_else(|_| FALLBACK.to_string());
+    println!("{json}");
+    eprintln!("{reason}");
 }
 
 /// Log a blocked command to a file (if logging is enabled).
