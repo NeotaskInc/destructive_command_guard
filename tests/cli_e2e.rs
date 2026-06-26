@@ -224,6 +224,151 @@ fn bare_hook_fail_closed_still_allows_valid_commands() {
     );
 }
 
+/// Run bare `dcg` with raw stdin, optional env, and an optional user config
+/// file written to `XDG_CONFIG_HOME/dcg/config.toml`.
+fn run_dcg_hook_raw_cfg(
+    raw: &[u8],
+    extra_env: &[(&str, &str)],
+    config_toml: Option<&str>,
+) -> std::process::Output {
+    let temp = tempfile::tempdir().expect("failed to create temp dir");
+    std::fs::create_dir_all(temp.path().join(".git")).unwrap();
+    let home_dir = temp.path().join("home");
+    let xdg_config_dir = temp.path().join("xdg_config");
+    std::fs::create_dir_all(&home_dir).unwrap();
+    std::fs::create_dir_all(&xdg_config_dir).unwrap();
+    if let Some(toml) = config_toml {
+        let dcg_cfg = xdg_config_dir.join("dcg");
+        std::fs::create_dir_all(&dcg_cfg).unwrap();
+        std::fs::write(dcg_cfg.join("config.toml"), toml).unwrap();
+    }
+
+    let mut cmd = Command::new(dcg_binary());
+    cmd.env_clear()
+        .env("HOME", &home_dir)
+        .env("USERPROFILE", &home_dir)
+        .env("XDG_CONFIG_HOME", &xdg_config_dir)
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .env("DCG_PACKS", "core.git,core.filesystem")
+        .current_dir(temp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("failed to spawn dcg hook mode");
+    {
+        let stdin = child.stdin.as_mut().expect("failed to open stdin");
+        stdin
+            .write_all(raw)
+            .expect("failed to write raw hook input");
+    }
+    child.wait_with_output().expect("failed to wait for dcg")
+}
+
+#[test]
+fn fail_closed_via_config_file_blocks_unparseable() {
+    // Regression (issue #160): `[general] fail_closed = true` from a CONFIG
+    // FILE (no env var) must take effect. Previously only the env var worked.
+    let cfg = "[general]\nfail_closed = true\n";
+    let out = run_dcg_hook_raw_cfg(b"garbage not json", &[], Some(cfg));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"permissionDecision\":\"deny\""),
+        "config-file fail_closed must block unparseable input.\nstdout: {stdout}"
+    );
+
+    // Without fail_closed in the config, the default fails open.
+    let open = run_dcg_hook_raw_cfg(
+        b"garbage not json",
+        &[],
+        Some("[general]\nverbose = false\n"),
+    );
+    assert!(open.status.success());
+    assert!(String::from_utf8_lossy(&open.stdout).trim().is_empty());
+}
+
+#[test]
+fn fail_closed_under_codex_protocol_exits_2() {
+    // Regression (issue #160): a fail-closed deny must use the AGENT's wire
+    // protocol. Codex ignores stdout JSON and only honors exit 2, so a Claude
+    // JSON + exit 0 would let Codex run the command.
+    let out = run_dcg_hook_raw(
+        b"garbage not json",
+        &[("CODEX_CLI", "1"), ("DCG_FAIL_CLOSED", "1")],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "fail-closed under Codex must exit 2 so the block sticks"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).trim().is_empty(),
+        "Codex deny reason must be on stderr"
+    );
+}
+
+#[test]
+fn fail_closed_oversized_input_is_denied() {
+    // Regression (issue #160): oversized input is attacker-controllable (pad a
+    // command past max_hook_input_bytes). Under fail-closed it must be DENIED,
+    // not skipped/allowed.
+    let big = vec![b'A'; 270_000]; // > default 256 KiB limit
+
+    // Default: fail-open (allowed, exit 0).
+    let open = run_dcg_hook_raw(&big, &[]);
+    assert!(open.status.success(), "default oversized input fails open");
+    assert!(String::from_utf8_lossy(&open.stdout).trim().is_empty());
+
+    // Fail-closed: denied.
+    let closed = run_dcg_hook_raw(&big, &[("DCG_FAIL_CLOSED", "1")]);
+    let stdout = String::from_utf8_lossy(&closed.stdout);
+    assert!(
+        stdout.contains("\"permissionDecision\":\"deny\""),
+        "oversized input under fail-closed must be denied.\nstdout: {stdout}"
+    );
+}
+
+/// Run a `dcg` subcommand with an isolated HOME/XDG and capture output.
+fn run_dcg_subcmd(args: &[&str]) -> std::process::Output {
+    let temp = tempfile::tempdir().expect("failed to create temp dir");
+    let home_dir = temp.path().join("home");
+    let xdg_config_dir = temp.path().join("xdg_config");
+    std::fs::create_dir_all(&home_dir).unwrap();
+    std::fs::create_dir_all(&xdg_config_dir).unwrap();
+    Command::new(dcg_binary())
+        .env_clear()
+        .env("HOME", &home_dir)
+        .env("USERPROFILE", &home_dir)
+        .env("XDG_CONFIG_HOME", &xdg_config_dir)
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .current_dir(temp.path())
+        .args(args)
+        .output()
+        .expect("failed to run dcg subcommand")
+}
+
+#[test]
+fn allow_rejects_group_prefix_pack_id() {
+    // Regression (issue #162): a bare group prefix like `core` can never match
+    // (allowlist matching is on the full concrete pack id), so it must be
+    // rejected rather than written as a silent no-op entry.
+    let bad = run_dcg_subcmd(&["allow", "--reason", "test", "core:reset-hard"]);
+    assert!(
+        !bad.status.success(),
+        "`dcg allow core:reset-hard` must be rejected (group prefix never matches)"
+    );
+
+    // The exact concrete pack id is still accepted.
+    let good = run_dcg_subcmd(&["allow", "--reason", "ok", "core.git:reset-hard"]);
+    assert!(
+        good.status.success(),
+        "`dcg allow core.git:reset-hard` (valid concrete pack) must succeed.\nstderr: {}",
+        String::from_utf8_lossy(&good.stderr)
+    );
+}
+
 #[test]
 fn documented_global_boolean_env_values_do_not_fail_clap_parsing() {
     let flag_envs = [

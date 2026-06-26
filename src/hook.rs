@@ -1620,28 +1620,6 @@ pub fn output_warning_for_protocol(
     );
 }
 
-/// Emit a deny for hook input that could not be parsed, used by fail-closed
-/// mode (`DCG_FAIL_CLOSED` / `general.fail_closed`, issue #160).
-///
-/// Because the payload didn't parse we cannot detect the wire protocol, so we
-/// emit the default Claude-compatible deny: the `hookSpecificOutput` JSON on
-/// stdout (which makes Claude Code block the tool) plus a human-readable reason
-/// on stderr (visible to other agents and to humans).
-pub fn output_parse_failure_denial(reason: &str) {
-    const FALLBACK: &str = "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"BLOCKED by dcg (fail-closed): unparseable hook input\"}}";
-
-    let payload = serde_json::json!({
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": reason,
-        }
-    });
-    let json = serde_json::to_string(&payload).unwrap_or_else(|_| FALLBACK.to_string());
-    println!("{json}");
-    eprintln!("{reason}");
-}
-
 /// Log a blocked command to a file (if logging is enabled).
 ///
 /// # Errors

@@ -12646,22 +12646,19 @@ fn allowlist_add_rule(
 /// `custom_paths`. Used to reject allowlist rules that reference nonexistent
 /// packs (issue #162).
 fn pack_id_is_known(pack_id: &str) -> bool {
-    let prefix = format!("{pack_id}.");
-    if REGISTRY.get(pack_id).is_some()
-        || REGISTRY
-            .all_pack_ids()
-            .iter()
-            .any(|id| *id == pack_id || id.starts_with(&prefix))
-    {
+    // Allowlist-rule matching compares the rule's pack_id to a matched rule's
+    // FULL concrete pack id exactly (see `allowlist.rs`: `rule_id.pack_id !=
+    // pack_id`). A bare group prefix like `core` (for `core.git`) therefore
+    // never matches anything, so it must NOT validate. `REGISTRY.get` is an
+    // exact full-id lookup, which is precisely what we need (issue #162).
+    if REGISTRY.get(pack_id).is_some() {
         return true;
     }
 
     // Fall back to external packs declared in config `custom_paths`.
     let config = Config::load();
     let external = load_external_packs(&config.packs.expand_custom_paths());
-    external
-        .pack_ids()
-        .any(|id| id == pack_id || id.starts_with(&prefix))
+    external.pack_ids().any(|id| id == pack_id)
 }
 
 /// Add a rule to the allowlist with optional path scoping.

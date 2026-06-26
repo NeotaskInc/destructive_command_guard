@@ -263,6 +263,7 @@ struct GeneralConfigLayer {
     max_hook_input_bytes: Option<usize>,
     max_command_bytes: Option<usize>,
     max_findings_per_command: Option<usize>,
+    fail_closed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -3251,6 +3252,9 @@ impl Config {
         if let Some(self_heal_hook) = general.self_heal_hook {
             self.general.self_heal_hook = self_heal_hook;
         }
+        if let Some(fail_closed) = general.fail_closed {
+            self.general.fail_closed = fail_closed;
+        }
     }
 
     const fn merge_output_layer(&mut self, output: OutputConfigLayer) {
@@ -4777,6 +4781,24 @@ database_path = "/tmp/dcg-history.db"
             config.history.database_path.as_deref(),
             Some("/tmp/dcg-history.db")
         );
+    }
+
+    #[test]
+    fn config_file_fail_closed_survives_layer_merge() {
+        // Regression (issue #160): `[general] fail_closed = true` from a config
+        // FILE must be carried through the layered load/merge into the final
+        // config. It was previously dropped because `GeneralConfigLayer` lacked
+        // the field, so `fail_closed` was always its default `false` from a file.
+        let layer: ConfigLayer = toml::from_str("[general]\nfail_closed = true\nverbose = true\n")
+            .expect("layer parses");
+        let mut config = Config::default();
+        config.merge_layer(layer);
+        assert!(
+            config.general.fail_closed,
+            "fail_closed from a config file must survive the layer merge"
+        );
+        // Sibling field from the same section is honored too (sanity).
+        assert!(config.general.verbose);
     }
 
     #[test]
