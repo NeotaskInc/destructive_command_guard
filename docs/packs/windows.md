@@ -54,7 +54,6 @@ These patterns match safe commands that are always allowed:
 | Pattern Name | Pattern |
 |--------------|----------|
 | `whatif-preview` | `(?i)^\s*(?:(?:remove-item\|ri\|clear-content\|clc\|clear-recyclebin)\b[^\|&;\r\n]*\s-whatif\b\|rm\b(?=[^\|&;\r\n]*\s-recurse\b)(?=[^\|&;\r\n]*\s-force\b)[^\|&;\r\n]*\s-whatif\b)[^\|&;\r\n]*$` |
-| `del-temp` | `(?i)^\s*(?:del\|erase\|rd\|rmdir\|remove-item\|ri\|rm)\b[^\|&;\r\n]*(?:%temp%\|%tmp%\|\$env:te?mp\b\|\$env:localappdata\\+temp\b\|\\appdata\\+local\\+temp\\\|\\windows\\+temp\\\|\[system\.io\.path\]::gettemppath)[^\|&;\r\n]*$` |
 | `del-help` | `(?i)^\s*(?:del\|rd\|rmdir\|format\|erase)(?:\.exe)?\s+/\?\s*$` |
 
 ### Destructive Patterns (Blocked)

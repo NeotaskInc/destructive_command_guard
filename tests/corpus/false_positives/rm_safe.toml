@@ -41,30 +41,6 @@ command = "rm -rf /var/tmp/*"
 expected = "allow"
 
 # ============================================================================
-# Safe temp directory via $TMPDIR variable
-# ============================================================================
-
-[[case]]
-description = "rm -rf $TMPDIR is safe (unquoted)"
-command = "rm -rf $TMPDIR/build"
-expected = "allow"
-
-[[case]]
-description = "rm -rf ${TMPDIR} is safe (braced)"
-command = "rm -rf ${TMPDIR}/build"
-expected = "allow"
-
-[[case]]
-description = "rm -rf \"$TMPDIR\" is safe (quoted)"
-command = "rm -rf \"$TMPDIR/build\""
-expected = "allow"
-
-[[case]]
-description = "rm -rf ${TMPDIR:-/tmp} is safe (with default)"
-command = "rm -rf ${TMPDIR:-/tmp}/build"
-expected = "allow"
-
-# ============================================================================
 # Safe rm flag variations in temp dirs
 # ============================================================================
 

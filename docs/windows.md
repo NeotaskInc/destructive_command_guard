@@ -19,13 +19,19 @@ Install with PowerShell:
 - `-Verify` runs a post-install self-test.
 - `-Version vX.Y.Z` pins a specific release; `-Dest <dir>` changes the install
   location; `-ArtifactUrl <url|file://>` installs from a specific artifact.
+- `-RequireMinisign` requires both the adjacent `.minisig` and the `minisign`
+  verifier. `-MinisignSignatureUrl <url|file://>` overrides that sidecar source
+  for mirrors and hermetic/offline installs.
 
 The installer auto-selects `dcg-x86_64-pc-windows-msvc.zip` or
 `dcg-aarch64-pc-windows-msvc.zip` from the host architecture, falling back to
 the x64 artifact under Windows-on-ARM emulation if an older release has no
-native ARM64 asset. It **verifies the SHA256 checksum** (required), and verifies
-the **Sigstore/cosign** signature when `cosign` is on `PATH` (falls back to
-checksum-only otherwise).
+native ARM64 asset. It **verifies the SHA256 checksum** (required), verifies a
+present `.minisig` against the embedded release key (key ID
+`36B847D11BA5A0D0`) when `minisign` is on `PATH`, and independently verifies a
+**Sigstore/cosign** signature when `cosign` and a trusted bundle are available.
+A present but invalid minisign signature is always fatal; by default a missing
+sidecar/tool warns and continues unless `-RequireMinisign` is supplied.
 
 Update via the built-in updater (re-runs `install.ps1`):
 
@@ -137,18 +143,20 @@ wire format is recognized on Windows. Hook *configuration* coverage:
   code-signed, so first-run on Windows may show a SmartScreen *"Windows protected
   your PC"* prompt or an unknown-publisher UAC dialog (choose **More info → Run
   anyway**). This is a deliberate decision, not an oversight:
-  - Supply-chain provenance is already covered by **Sigstore/cosign** signing of
-    every release artifact (keyless, verifiable — see the install flow), and the
-    installer additionally verifies the **SHA-256 checksum** unconditionally and
-    clears the **Mark-of-the-Web** (`Unblock-File`) after verification.
+  - Every release artifact has a mandatory **SHA-256 checksum**; starting with
+    v0.6.7 it also has a long-lived **minisign** sidecar. The installer verifies
+    the checksum unconditionally and the signature whenever `minisign` is
+    available before clearing the **Mark-of-the-Web** (`Unblock-File`).
+    Actions-OIDC releases can additionally carry a trusted, keyless
+    **Sigstore/cosign** bundle.
   - An EV/OV Authenticode certificate carries real annual cost + identity-vetting
     overhead that doesn't fit a solo-maintainer, no-outside-contributions project;
     and SmartScreen *reputation* still accrues per-download even once signed, so a
     fresh certificate would not immediately remove the prompt.
   - If Windows demand grows, the lowest-friction path is **Azure Trusted Signing**
     (CI-time signing via `AzureSignTool` in `dist.yml`, verified with
-    `signtool verify /pa`); revisit then. Until then, rely on the cosign
-    verification path documented above.
+    `signtool verify /pa`); revisit then. Until then, rely on the mandatory
+    checksum plus the cosign verification path when a trusted bundle is present.
 
 ## Test harnesses on Windows
 
@@ -202,7 +210,10 @@ is intentionally not ported.
 - **`dcg update` / `dcg rollback`**: these shell out to `powershell` and require
   it on `PATH`; they may be restricted under AppLocker / Constrained Language Mode.
 - **cosign optional**: install verifies the checksum unconditionally and the
-  Sigstore signature only when `cosign` is present.
+  Sigstore signature only when `cosign` and a trusted release bundle are present.
+- **minisign strict mode**: a present invalid signature always aborts. Use
+  `-RequireMinisign` to also abort when the `.minisig` sidecar or verifier is
+  unavailable; the embedded key ID is `36B847D11BA5A0D0`.
 - **Plain output**: `NO_COLOR=1`, `DCG_NO_COLOR=1`, or piping to a file disables
   all color/escape output.
 

@@ -98,9 +98,6 @@ rm -fr /tmp/stuff
 rm -Rf /tmp/more
 rm -r -f /tmp/test
 rm --recursive --force /tmp/test
-rm -rf $TMPDIR/test
-rm -rf ${TMPDIR}/test
-rm -rf "$TMPDIR/test"
 
 # General safe commands
 echo 'hello world'

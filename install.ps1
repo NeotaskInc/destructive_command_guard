@@ -8,6 +8,8 @@
 #   -Dest DIR         Install to DIR (default: ~/.local/bin)
 #   -EasyMode         Auto-add to PATH
 #   -Verify           Run self-test after install
+#   -RequireMinisign  Require a valid release .minisig and the minisign tool
+#   -MinisignSignatureUrl <url|file://> Override the adjacent .minisig source
 #   -Force            Configure agent hooks even if the agent CLI isn't detected
 #   -NoConfigure      Install the binary only; skip all agent hook configuration
 #   -Quiet            Suppress informational output (keep warnings/errors/success)
@@ -20,6 +22,8 @@ Param(
   [string]$Repo = "destructive_command_guard",
   [string]$Checksum = "",
   [string]$ChecksumUrl = "",
+  [string]$MinisignSignatureUrl = "",
+  [switch]$RequireMinisign,
   [string]$SigstoreBundleUrl = "",
   [string]$CosignIdentityRegex = "",
   [string]$CosignOidcIssuer = "",
@@ -45,6 +49,10 @@ Param(
 
 $ErrorActionPreference = "Stop"
 
+# Long-lived release trust root. This is intentionally embedded rather than
+# caller-configurable; the corresponding minisign key ID is 36B847D11BA5A0D0.
+$script:DcgMinisignPublicKey = "RWTQoKUb0Ue4NsqTpPWnABCrIU0+m25zsMlbv6UcRClQ7jmRP3A7NmTB"
+
 # Ensure TLS 1.2+ for GitHub downloads. Windows PowerShell 5.1 can still default
 # to TLS 1.0/1.1, which GitHub rejects; harmless on PowerShell 7 (already modern).
 try {
@@ -58,6 +66,107 @@ function Write-Info { param($msg) if ($script:Quiet) { return }; Write-Host "[*]
 function Write-Ok { param($msg) Write-Host "[+] $msg" -ForegroundColor Green }
 function Write-Warn { param($msg) Write-Host "[!] $msg" -ForegroundColor Yellow }
 function Write-Err { param($msg) Write-Host "[-] $msg" -ForegroundColor Red }
+
+# Windows Defender Application Control/AppLocker can force Windows PowerShell
+# into ConstrainedLanguage mode.  Cmdlets and core primitive types still work,
+# but arbitrary .NET constructors/method calls do not.  Keep installer I/O on
+# cmdlets in that mode while preserving strict UTF-8-without-BOM JSON/YAML.
+function ConvertTo-Utf8NoBomBytes {
+  param([string]$Text)
+
+  [byte[]]$bytes = @(
+    for ($i = 0; $i -lt $Text.Length; $i++) {
+      $codePoint = [int][char]$Text[$i]
+      if ($codePoint -ge 0xD800 -and $codePoint -le 0xDBFF) {
+        if (($i + 1) -ge $Text.Length) { throw "Invalid UTF-16: unpaired high surrogate" }
+        $low = [int][char]$Text[$i + 1]
+        if ($low -lt 0xDC00 -or $low -gt 0xDFFF) { throw "Invalid UTF-16: unpaired high surrogate" }
+        $codePoint = 0x10000 + (($codePoint - 0xD800) * 0x400) + ($low - 0xDC00)
+        $i++
+      } elseif ($codePoint -ge 0xDC00 -and $codePoint -le 0xDFFF) {
+        throw "Invalid UTF-16: unpaired low surrogate"
+      }
+
+      if ($codePoint -le 0x7F) {
+        [byte]$codePoint
+      } elseif ($codePoint -le 0x7FF) {
+        [byte](0xC0 -bor ($codePoint -shr 6))
+        [byte](0x80 -bor ($codePoint -band 0x3F))
+      } elseif ($codePoint -le 0xFFFF) {
+        [byte](0xE0 -bor ($codePoint -shr 12))
+        [byte](0x80 -bor (($codePoint -shr 6) -band 0x3F))
+        [byte](0x80 -bor ($codePoint -band 0x3F))
+      } else {
+        [byte](0xF0 -bor ($codePoint -shr 18))
+        [byte](0x80 -bor (($codePoint -shr 12) -band 0x3F))
+        [byte](0x80 -bor (($codePoint -shr 6) -band 0x3F))
+        [byte](0x80 -bor ($codePoint -band 0x3F))
+      }
+    }
+  )
+  return ,$bytes
+}
+
+function Write-Utf8NoBomText {
+  param([string]$Path, [string]$Text)
+
+  if ($PSVersionTable.PSVersion.Major -ge 6) {
+    Set-Content -LiteralPath $Path -Value $Text -Encoding utf8NoBOM -NoNewline
+    return
+  }
+  if ($ExecutionContext.SessionState.LanguageMode -eq "ConstrainedLanguage") {
+    [byte[]]$bytes = ConvertTo-Utf8NoBomBytes -Text $Text
+    Set-Content -LiteralPath $Path -Value $bytes -Encoding Byte
+    return
+  }
+  [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding $false))
+}
+
+function Get-DcgFileSha256 {
+  param([string]$Path)
+
+  try {
+    $token = (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash
+    if (Test-Sha256Token $token) { return $token.ToLowerInvariant() }
+  } catch { }
+
+  # Get-FileHash currently instantiates SHA256CryptoServiceProvider and is
+  # rejected by WDAC ConstrainedLanguage. certutil.exe is a signed Windows
+  # inbox binary and remains usable under that policy.
+  $lines = @(& certutil.exe -hashfile $Path SHA256 2>&1)
+  if ($LASTEXITCODE -eq 0) {
+    foreach ($line in $lines) {
+      $token = ([string]$line).Trim()
+      if (Test-Sha256Token $token) { return $token.ToLowerInvariant() }
+    }
+  }
+  throw "Unable to compute SHA-256 for $Path with Get-FileHash or certutil.exe"
+}
+
+function Get-DcgTempRoot {
+  foreach ($candidate in @($env:TEMP, $env:TMP)) {
+    if (-not [string]::IsNullOrWhiteSpace($candidate)) { return $candidate }
+  }
+  throw "TEMP and TMP are unset; cannot create a private installer directory"
+}
+
+function Get-DcgUserPath {
+  try { return [Environment]::GetEnvironmentVariable("PATH", "User") } catch { }
+  try { return [string](Get-ItemPropertyValue -LiteralPath "HKCU:\Environment" -Name Path -ErrorAction Stop) } catch { return "" }
+}
+
+function Set-DcgUserPath {
+  param([string]$Value)
+
+  try {
+    [Environment]::SetEnvironmentVariable("PATH", $Value, "User")
+    return
+  } catch { }
+  if (-not (Test-Path -LiteralPath "HKCU:\Environment")) {
+    New-Item -Path "HKCU:\Environment" -Force | Out-Null
+  }
+  New-ItemProperty -LiteralPath "HKCU:\Environment" -Name Path -Value $Value -PropertyType ExpandString -Force | Out-Null
+}
 
 function Test-CommandTokenLooksLikePath {
   param([string]$Token)
@@ -233,7 +342,7 @@ function Write-JsonFileNoBom {
   $json = $Object | ConvertTo-Json -Depth 20
   $dir = Split-Path -Parent $Path
   $tmp = Join-Path $dir (".dcg-tmp-" + [System.Guid]::NewGuid().ToString("N"))
-  [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding $false))
+  Write-Utf8NoBomText -Path $tmp -Text $json
   Move-Item -Force -Path $tmp -Destination $Path
 }
 
@@ -395,39 +504,78 @@ function Configure-GeminiHook {
   Merge-AgentHookFile -HooksFile $settingsFile -DcgHook $dcgHook -DcgPath $DcgPath -Event "BeforeTool" -Matcher "run_shell_command" -Label "Gemini settings.json"
 }
 
-# Defend against zip-slip / path traversal BEFORE extracting: reject any entry
-# whose path is absolute, has a drive letter, or contains a `..` traversal
-# segment, and require the archive to be non-empty and to contain dcg.exe. Throws
-# on any violation so a malicious/corrupt archive can never write outside the
-# extraction directory or ship without the expected binary.
+# Defend against zip-slip, ambiguous layouts, and non-file entries BEFORE
+# extracting. A release ZIP has one valid shape: exactly one root-level regular
+# file named `dcg.exe`. Rejecting nested and extra members also makes the later
+# install path deterministic instead of searching attacker-controlled trees.
 function Assert-ZipLayoutSafe {
   param([string]$ZipPath)
 
-  Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
-  $zip = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
-  try {
-    $entryCount = 0
-    $hasDcg = $false
-    foreach ($entry in $zip.Entries) {
-      $name = $entry.FullName
-      if ([string]::IsNullOrEmpty($name)) { continue }
-      $entryCount++
-
-      $normalized = $name -replace '\\', '/'
-      if ($normalized.StartsWith('/') -or $normalized.StartsWith('//') -or $normalized -match '^[A-Za-z]:') {
-        throw "Refusing to extract: archive entry has an absolute path: '$name'"
-      }
-      foreach ($seg in ($normalized -split '/')) {
-        if ($seg -eq '..') {
-          throw "Refusing to extract: archive entry contains a '..' traversal segment: '$name'"
-        }
-      }
-      if ($entry.Name -ieq 'dcg.exe') { $hasDcg = $true }
+  $tar = @(Get-Command tar.exe -CommandType Application -ErrorAction SilentlyContinue)[0]
+  if ($null -eq $tar) {
+    if ($ExecutionContext.SessionState.LanguageMode -eq "ConstrainedLanguage") {
+      throw "Refusing to extract: trusted Windows tar.exe is unavailable"
     }
-    if ($entryCount -eq 0) { throw "Refusing to extract: archive is empty" }
-    if (-not $hasDcg) { throw "Refusing to extract: archive does not contain dcg.exe" }
-  } finally {
-    $zip.Dispose()
+    # Non-Windows test/development hosts do not have the Windows inbox bsdtar.
+    # Retain the full-language .NET inspection path there; WDAC never reaches
+    # this branch because supported Windows 10/11 hosts ship tar.exe.
+    Add-Type -AssemblyName System.IO.Compression.FileSystem | Out-Null
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try {
+      $entries = @($archive.Entries)
+      if ($entries.Count -ne 1) {
+        throw "Refusing to extract: release archive must contain exactly one member"
+      }
+      $entryName = [string]$entries[0].FullName
+      $attributes = [int]$entries[0].ExternalAttributes
+      $unixType = (($attributes -shr 16) -band 0xF000)
+      $isDirectory = (($attributes -band 0x10) -ne 0) -or $entryName.EndsWith('/') -or $entryName.EndsWith('\')
+      $isRegular = (-not $isDirectory) -and (($unixType -eq 0) -or ($unixType -eq 0x8000))
+    } finally {
+      $archive.Dispose()
+    }
+  } else {
+    $entries = @(& $tar.Source -tf $ZipPath 2>&1)
+    if ($LASTEXITCODE -ne 0) {
+      throw "Refusing to extract: tar.exe could not inspect the archive"
+    }
+    $entries = @($entries | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    if ($entries.Count -ne 1) {
+      throw "Refusing to extract: release archive must contain exactly one member"
+    }
+    $entryName = [string]$entries[0]
+    $details = @(& $tar.Source -tvf $ZipPath 2>&1)
+    if ($LASTEXITCODE -ne 0 -or $details.Count -ne 1) {
+      throw "Refusing to extract: tar.exe could not inspect the archive member type"
+    }
+    $isRegular = ([string]$details[0]).TrimStart().StartsWith('-')
+  }
+
+  $normalized = $entryName -replace '\\', '/'
+  if ($normalized -cne 'dcg.exe') {
+    throw "Refusing to extract: sole archive member must be the root-level file 'dcg.exe'"
+  }
+  if (-not $isRegular) {
+    throw "Refusing to extract: archive member 'dcg.exe' is not a regular file"
+  }
+}
+
+function Expand-DcgArchive {
+  param([string]$ZipPath, [string]$DestinationPath)
+
+  if ($ExecutionContext.SessionState.LanguageMode -ne "ConstrainedLanguage") {
+    Expand-Archive -LiteralPath $ZipPath -DestinationPath $DestinationPath -Force
+    return
+  }
+
+  $tar = @(Get-Command tar.exe -CommandType Application -ErrorAction SilentlyContinue)[0]
+  if ($null -eq $tar) {
+    throw "Cannot extract under ConstrainedLanguage: trusted Windows tar.exe is unavailable"
+  }
+  New-Item -ItemType Directory -Force -Path $DestinationPath | Out-Null
+  & $tar.Source -xf $ZipPath -C $DestinationPath
+  if ($LASTEXITCODE -ne 0) {
+    throw "tar.exe failed to extract the verified archive"
   }
 }
 
@@ -705,7 +853,7 @@ function Configure-CursorHook {
     New-Item -ItemType Directory -Force -Path $hookDir | Out-Null
   }
   $bridgeContent = Get-CursorBridgeContent -DcgPath $DcgPath
-  [System.IO.File]::WriteAllText($bridge, $bridgeContent, (New-Object System.Text.UTF8Encoding $false))
+  Write-Utf8NoBomText -Path $bridge -Text $bridgeContent
 
   # The hooks.json command line that launches the bridge. Windows PowerShell
   # (powershell.exe) is always present; -ExecutionPolicy Bypass lets the unsigned
@@ -794,8 +942,7 @@ function Configure-HermesHook {
   }
 
   if (-not (Test-Path $cfgFile -PathType Leaf)) {
-    [System.IO.File]::WriteAllText($cfgFile, (Get-HermesYamlBlock -DcgPath $DcgPath),
-      (New-Object System.Text.UTF8Encoding $false))
+    Write-Utf8NoBomText -Path $cfgFile -Text (Get-HermesYamlBlock -DcgPath $DcgPath)
     return "created"
   }
 
@@ -843,7 +990,7 @@ function Configure-HermesHook {
   if (-not $doc.Contains("hooks_auto_accept")) { $doc["hooks_auto_accept"] = $true }
 
   $yaml = ConvertTo-Yaml $doc
-  [System.IO.File]::WriteAllText($cfgFile, $yaml, (New-Object System.Text.UTF8Encoding $false))
+  Write-Utf8NoBomText -Path $cfgFile -Text $yaml
   "merged"
 }
 
@@ -881,15 +1028,77 @@ function Copy-OrDownloadToFile {
   }
 }
 
+function Invoke-DcgMinisignVerification {
+  # Fetch and verify the adjacent long-lived minisign signature. By default a
+  # missing sidecar or missing verifier warns and continues after SHA256; a
+  # present-but-invalid signature is always fatal. -Require makes every missing
+  # prerequisite fatal as well. SignatureSource supports local paths/file:// for
+  # hermetic installer E2E tests.
+  param(
+    [string]$ArtifactPath,
+    [string]$ArtifactSource,
+    [string]$SignatureSource,
+    [string]$TempDirectory,
+    [switch]$Require
+  )
+
+  if ([string]::IsNullOrWhiteSpace($SignatureSource)) {
+    $SignatureSource = "$ArtifactSource.minisig"
+  }
+  $signatureFile = Join-Path $TempDirectory "artifact.minisig"
+  Write-Info "Fetching minisign signature from $SignatureSource"
+  try {
+    Copy-OrDownloadToFile -Source $SignatureSource -OutFile $signatureFile
+  } catch {
+    if ($Require) {
+      throw "Required minisign signature could not be fetched from ${SignatureSource}: $($_.Exception.Message)"
+    }
+    Write-Warn "Minisign signature not found; continuing after mandatory checksum verification"
+    return
+  }
+
+  # Require an external executable. A PowerShell function/alias/script shim can
+  # otherwise claim success without doing any cryptographic verification.
+  $minisign = Get-Command minisign -CommandType Application -ErrorAction SilentlyContinue |
+    Select-Object -First 1
+  if (-not $minisign) {
+    if ($Require) { throw "minisign is required but was not found on PATH" }
+    Write-Warn "minisign not found; signature is present but cannot be verified"
+    return
+  }
+
+  try {
+    & $minisign -Vm $ArtifactPath -x $signatureFile -P $script:DcgMinisignPublicKey
+    $verificationSucceeded = $?
+    $verificationExitCode = $LASTEXITCODE
+    if ((-not $verificationSucceeded) -or ($verificationExitCode -ne 0)) {
+      throw "minisign exited with status $verificationExitCode"
+    }
+  } catch {
+    throw "Minisign verification failed (expected key ID 36B847D11BA5A0D0): $($_.Exception.Message)"
+  }
+
+  Write-Ok "Signature verified (minisign key 36B847D11BA5A0D0)"
+}
+
 function Convert-ContentToText {
   param($Content)
   if ($Content -is [byte[]]) {
-    return [System.Text.Encoding]::UTF8.GetString($Content)
+    $bytes = [byte[]]$Content
+  } elseif (($Content -is [System.Array]) -and ($Content.Count -gt 0) -and ($Content[0] -is [byte])) {
+    $bytes = [byte[]]$Content
+  } else {
+    return [string]$Content
   }
-  if (($Content -is [System.Array]) -and ($Content.Count -gt 0) -and ($Content[0] -is [byte])) {
-    return [System.Text.Encoding]::UTF8.GetString([byte[]]$Content)
+
+  # Release checksum manifests are deliberately ASCII. Decode that narrow
+  # authenticated-input grammar without invoking Encoding methods, which WDAC
+  # ConstrainedLanguage rejects.
+  $chars = foreach ($byte in $bytes) {
+    if ($byte -gt 0x7F) { throw "Checksum response is not ASCII" }
+    [char]$byte
   }
-  [string]$Content
+  return (-join $chars)
 }
 
 function Read-OrDownloadText {
@@ -918,9 +1127,14 @@ function ConvertTo-WindowsTarget {
 }
 
 function Get-WindowsTarget {
-  $arch = $null
-  try { $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() } catch { }
-  if ([string]::IsNullOrEmpty($arch)) { $arch = $env:PROCESSOR_ARCHITECTURE }
+  # Under WOW64/emulation PROCESSOR_ARCHITEW6432 reports the native host while
+  # PROCESSOR_ARCHITECTURE reports the current process. Prefer that explicit
+  # native value so x64 PowerShell on Windows ARM64 selects the ARM64 artifact.
+  $arch = $env:PROCESSOR_ARCHITEW6432
+  if ([string]::IsNullOrWhiteSpace($arch)) {
+    try { $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString() } catch { }
+  }
+  if ([string]::IsNullOrWhiteSpace($arch)) { $arch = $env:PROCESSOR_ARCHITECTURE }
   ConvertTo-WindowsTarget -Arch $arch
 }
 
@@ -934,18 +1148,129 @@ function Get-PathLeaf {
 
 function Get-SiblingUrl {
   # Replace the last path segment of $Url with $Leaf. Handles http(s)/file:// URIs
-  # (via UriBuilder) and bare local paths.
+  # and bare local paths without UriBuilder (blocked in ConstrainedLanguage).
   param([string]$Url, [string]$Leaf)
-  if ($Url -match '^[A-Za-z][A-Za-z0-9+.-]*://') {
-    $b = New-Object System.UriBuilder ([System.Uri]$Url)
-    $p = $b.Path
-    $idx = $p.LastIndexOf('/')
-    $b.Path = if ($idx -ge 0) { $p.Substring(0, $idx + 1) + $Leaf } else { $Leaf }
-    return $b.Uri.AbsoluteUri
+
+  $base = $Url
+  $suffix = ""
+  if ($Url -match '^([^?#]*)([?#].*)$') {
+    $base = $Matches[1]
+    $suffix = $Matches[2]
   }
-  $idx = $Url.LastIndexOfAny([char[]]@('\', '/'))
-  if ($idx -ge 0) { return $Url.Substring(0, $idx + 1) + $Leaf }
-  $Leaf
+  $idx = $base.LastIndexOfAny([char[]]@('\', '/'))
+  if ($idx -ge 0) { return $base.Substring(0, $idx + 1) + $Leaf + $suffix }
+  $Leaf + $suffix
+}
+
+function Test-Dcg64BitWindows {
+  $arch = $env:PROCESSOR_ARCHITEW6432
+  if ([string]::IsNullOrWhiteSpace($arch)) { $arch = $env:PROCESSOR_ARCHITECTURE }
+  $arch -match '(?i)amd64|x86_64|arm64|aarch64'
+}
+
+function Normalize-DcgVersionTag {
+  param([string]$Value)
+
+  $trimmed = $Value.Trim()
+  $pattern = '^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z-]+)(\.[0-9A-Za-z-]+)*)?(\+([0-9A-Za-z-]+)(\.[0-9A-Za-z-]+)*)?$'
+  if ($trimmed -notmatch $pattern) {
+    throw "Invalid version '$Value': expected SemVer such as v1.2.3"
+  }
+
+  $withoutV = $trimmed -replace '^v', ''
+  $withoutBuild = ($withoutV -split '\+', 2)[0]
+  if ($withoutBuild.Contains('-')) {
+    $prerelease = ($withoutBuild -split '-', 2)[1]
+    foreach ($identifier in ($prerelease -split '\.')) {
+      if (($identifier -match '^[0-9]+$') -and $identifier.Length -gt 1 -and $identifier.StartsWith('0')) {
+        throw "Invalid version '$Value': numeric prerelease identifiers cannot have leading zeroes"
+      }
+    }
+  }
+
+  "v$withoutV"
+}
+
+function Get-DcgReportedVersion {
+  param([string]$Path)
+
+  $output = @(& $Path --version 2>&1)
+  $status = $LASTEXITCODE
+  if ($status -ne 0) {
+    throw "Installed dcg failed --version with exit code $status"
+  }
+
+  foreach ($rawLine in $output) {
+    $candidate = ([string]$rawLine).Trim()
+    $candidate = $candidate -replace '^dcg\s+', ''
+    try { return (Normalize-DcgVersionTag -Value $candidate) } catch { }
+  }
+  throw "Installed dcg --version output did not contain a valid SemVer"
+}
+
+function Assert-DcgInstalledVersion {
+  param([string]$Path, [string]$ExpectedVersion = "")
+
+  $reported = Get-DcgReportedVersion -Path $Path
+  if ($ExpectedVersion) {
+    $expected = Normalize-DcgVersionTag -Value $ExpectedVersion
+    if ($reported -cne $expected) {
+      throw "Installed dcg version mismatch: expected $expected, got $reported"
+    }
+  }
+  Write-Ok "Installed version verified: $($reported.Substring(1))"
+}
+
+function Invoke-DcgInstallSelfTest {
+  param([string]$Path, [string]$ProbeRoot)
+
+  $resolvedPath = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path
+  $savedHome = $env:HOME
+  $savedUserProfile = $env:USERPROFILE
+  $savedXdgConfig = $env:XDG_CONFIG_HOME
+  $savedAppData = $env:APPDATA
+  $savedLocalAppData = $env:LOCALAPPDATA
+  $savedNativePreference = $PSNativeCommandUseErrorActionPreference
+  $probeHome = Join-Path $ProbeRoot 'selftest-home'
+  New-Item -ItemType Directory -Force -Path $probeHome | Out-Null
+
+  try {
+    $env:HOME = $probeHome
+    $env:USERPROFILE = $probeHome
+    $env:XDG_CONFIG_HOME = Join-Path $probeHome '.config'
+    $env:APPDATA = Join-Path $probeHome 'AppData\Roaming'
+    $env:LOCALAPPDATA = Join-Path $probeHome 'AppData\Local'
+    $PSNativeCommandUseErrorActionPreference = $false
+    Push-Location $ProbeRoot
+    try {
+      $allowOutput = @(& $resolvedPath test --format json 'git status' 2>&1)
+      $allowStatus = $LASTEXITCODE
+      $allowText = $allowOutput -join "`n"
+      if ($allowStatus -ne 0 -or $allowText -notmatch '"decision"\s*:\s*"allow"') {
+        throw "Self-test did not allow the safe probe (exit $allowStatus)"
+      }
+
+      # `dcg test` evaluates this string; it never executes it. Require both
+      # exit 1 and structured deny output so a crash cannot masquerade as a pass.
+      $denyOutput = @(& $resolvedPath test --format json 'rm -rf /' 2>&1)
+      $denyStatus = $LASTEXITCODE
+      $denyText = $denyOutput -join "`n"
+      if ($denyStatus -ne 1 -or $denyText -notmatch '"decision"\s*:\s*"deny"') {
+        throw "Self-test did not deny the destructive probe (exit $denyStatus)"
+      }
+    } finally {
+      Pop-Location
+    }
+  } finally {
+    $env:HOME = $savedHome
+    $env:USERPROFILE = $savedUserProfile
+    $env:XDG_CONFIG_HOME = $savedXdgConfig
+    $env:APPDATA = $savedAppData
+    $env:LOCALAPPDATA = $savedLocalAppData
+    $PSNativeCommandUseErrorActionPreference = $savedNativePreference
+  }
+
+  Write-Ok "Self-test complete"
 }
 
 function Resolve-ChecksumToken {
@@ -1011,7 +1336,11 @@ function Detect-Agents {
 function Get-DetectedAgentNames {
   # The display-names of agents Detect-Agents flagged as present, in order.
   param($Agents)
-  @($Agents.GetEnumerator() | Where-Object { $_.Value } | ForEach-Object { $_.Key })
+  @(
+    foreach ($name in @('Claude', 'Codex', 'Gemini', 'Cursor', 'Copilot', 'Grok', 'Agy', 'Hermes')) {
+      if ($Agents[$name]) { $name }
+    }
+  )
 }
 
 # Testing entrypoint: when dot-sourced with -LoadFunctionsOnly, stop here so the
@@ -1031,6 +1360,8 @@ Options:
   -Dest DIR         Install to DIR (default: ~/.local/bin)
   -EasyMode         Add the install dir to PATH and force agent configuration
   -Verify           Run a self-test after install
+  -RequireMinisign  Require a valid .minisig and the minisign verifier
+  -MinisignSignatureUrl <url|file://>  Override the adjacent .minisig source
   -Force            Configure agent hooks even if the agent CLI isn't detected
   -NoConfigure      Install the binary only; skip all agent hook configuration
   -Quiet            Suppress informational output (keep warnings/errors/success)
@@ -1048,6 +1379,15 @@ Configured agents (when detected, or with -Force/-EasyMode):
 # -Force is the per-agent analog of -EasyMode's config-forcing; OR them together
 # so callers can force agent (re)configuration without also touching PATH.
 $forceConfig = $EasyMode -or $Force
+
+if ($Version) {
+  try {
+    $Version = Normalize-DcgVersionTag -Value $Version
+  } catch {
+    Write-Err $_.Exception.Message
+    exit 2
+  }
+}
 
 # Resolve latest version if not specified
 if ((-not $Version) -and (-not $ArtifactUrl)) {
@@ -1081,8 +1421,17 @@ if ((-not $Version) -and (-not $ArtifactUrl)) {
   }
 }
 
+if ($Version) {
+  try {
+    $Version = Normalize-DcgVersionTag -Value $Version
+  } catch {
+    Write-Err "Resolved release version is invalid: $($_.Exception.Message)"
+    exit 1
+  }
+}
+
 # Determine target
-if (-not [Environment]::Is64BitProcess) {
+if (-not (Test-Dcg64BitWindows)) {
   Write-Err "32-bit Windows is not supported. Please use a 64-bit system."
   exit 1
 }
@@ -1104,7 +1453,7 @@ if ($ArtifactUrl) {
 }
 
 # Create a unique temp directory so concurrent installers cannot collide.
-$tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("dcg_install_" + [System.Guid]::NewGuid().ToString("N"))
+$tmp = Join-Path (Get-DcgTempRoot) ("dcg_install_" + [System.Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $tmp | Out-Null
 
 # Wrap download/verify/extract/install in try/finally so the temp directory is
@@ -1160,19 +1509,31 @@ if (-not $checksumToUse) {
   exit 1
 }
 
-$hash = Get-FileHash $zipFile -Algorithm SHA256
-if ($hash.Hash.ToLower() -ne $checksumToUse.ToLower()) {
+$hash = Get-DcgFileSha256 -Path $zipFile
+if ($hash -ne $checksumToUse.ToLower()) {
   Write-Err "Checksum mismatch!"
   Write-Err "Expected: $checksumToUse"
-  Write-Err "Got:      $($hash.Hash.ToLower())"
+  Write-Err "Got:      $hash"
   exit 1
 }
 Write-Ok "Checksum verified"
 
+try {
+  Invoke-DcgMinisignVerification `
+    -ArtifactPath $zipFile `
+    -ArtifactSource $url `
+    -SignatureSource $MinisignSignatureUrl `
+    -TempDirectory $tmp `
+    -Require:$RequireMinisign
+} catch {
+  Write-Err $_.Exception.Message
+  exit 1
+}
+
 # Verify Sigstore/cosign bundle (best-effort)
 if (Get-Command cosign -ErrorAction SilentlyContinue) {
   if (-not $SigstoreBundleUrl) { $SigstoreBundleUrl = "$url.sigstore.json" }
-  $bundleFile = Join-Path $tmp ([System.IO.Path]::GetFileName($SigstoreBundleUrl))
+  $bundleFile = Join-Path $tmp (Get-PathLeaf $SigstoreBundleUrl)
   Write-Info "Fetching sigstore bundle from $SigstoreBundleUrl"
   try {
     Copy-OrDownloadToFile -Source $SigstoreBundleUrl -OutFile $bundleFile
@@ -1181,9 +1542,8 @@ if (Get-Command cosign -ErrorAction SilentlyContinue) {
     $bundleFile = $null
   }
   if ($bundleFile) {
-    # --new-bundle-format: the release ships the modern Sigstore protobuf
-    # bundle (v0.3, cert under verificationMaterial.certificate) produced by
-    # cosign v3.x in dist.yml. cosign can only parse that --bundle shape when
+    # When a release provides the modern Sigstore protobuf bundle (v0.3, cert
+    # under verificationMaterial.certificate), cosign can only parse that shape when
     # --new-bundle-format is passed; the flag was introduced in cosign v2.4.0
     # (sigstore/cosign#3796). An older cosign on PATH dies with
     # "unknown flag: --new-bundle-format" (exit 1) and cannot verify a v0.3
@@ -1217,13 +1577,12 @@ if (Get-Command cosign -ErrorAction SilentlyContinue) {
 # Extract
 Write-Info "Extracting..."
 Assert-ZipLayoutSafe -ZipPath $zipFile
-Add-Type -AssemblyName System.IO.Compression.FileSystem
 $extractDir = Join-Path $tmp "extract"
-[System.IO.Compression.ZipFile]::ExtractToDirectory($zipFile, $extractDir)
+Expand-DcgArchive -ZipPath $zipFile -DestinationPath $extractDir
 
-# Find binary
-$bin = Get-ChildItem -Path $extractDir -Recurse -Filter "dcg.exe" | Select-Object -First 1
-if (-not $bin) {
+# The validated release layout has one deterministic root-level binary.
+$binPath = Join-Path $extractDir "dcg.exe"
+if (-not (Test-Path -LiteralPath $binPath -PathType Leaf)) {
   Write-Err "Binary not found in zip"
   exit 1
 }
@@ -1233,10 +1592,11 @@ if (-not (Test-Path $Dest)) {
   New-Item -ItemType Directory -Force -Path $Dest | Out-Null
 }
 $installedExe = Join-Path $Dest "dcg.exe"
-Copy-Item $bin.FullName $installedExe -Force
+Copy-Item $binPath $installedExe -Force
 # Strip Mark-of-the-Web (Zone.Identifier) so the freshly-installed binary does not
 # trip SmartScreen / "publisher could not be verified". Done only AFTER the
-# checksum + cosign verification above, so an unverified binary is never unblocked.
+# required checksum and, when a bundle and compatible cosign are available,
+# signature verification above, so unchecked bytes are never unblocked.
 # Wrapped in try/catch because Unblock-File is present-but-unsupported on non-Windows
 # PowerShell (it throws "does not support Linux", which -ErrorAction can't suppress);
 # on Windows it works normally. Keeps the installer body hermetically testable.
@@ -1246,13 +1606,13 @@ if (Get-Command Unblock-File -ErrorAction SilentlyContinue) {
 Write-Ok "Installed to $Dest\dcg.exe"
 
 # PATH management
-$path = [Environment]::GetEnvironmentVariable("PATH", "User")
+$path = Get-DcgUserPath
 if (-not (Test-UserPathContains -PathValue $path -PathToFind $Dest)) {
   if ($EasyMode) {
     if ([string]::IsNullOrEmpty($path)) {
-      [Environment]::SetEnvironmentVariable("PATH", $Dest, "User")
+      Set-DcgUserPath -Value $Dest
     } else {
-      [Environment]::SetEnvironmentVariable("PATH", "$path;$Dest", "User")
+      Set-DcgUserPath -Value "$path;$Dest"
     }
     # The persisted User PATH (via SetEnvironmentVariable, which also broadcasts
     # WM_SETTINGCHANGE to new processes) only affects NEW shells. Also update THIS
@@ -1266,6 +1626,17 @@ if (-not (Test-UserPathContains -PathValue $path -PathToFind $Dest)) {
   }
 }
 
+try {
+  Assert-DcgInstalledVersion -Path $installedExe -ExpectedVersion $Version
+  if ($Verify) {
+    Write-Info "Running self-test..."
+    Invoke-DcgInstallSelfTest -Path $installedExe -ProbeRoot $tmp
+  }
+} catch {
+  Write-Err $_.Exception.Message
+  exit 1
+}
+
 }
 finally {
   # Always clean up the temp dir (success, throw, or exit).
@@ -1274,18 +1645,18 @@ finally {
   }
 }
 
-# Verify
-if ($Verify) {
-  Write-Info "Running self-test..."
-  $testInput = '{"tool_name":"Bash","tool_input":{"command":"git status"}}'
-  $result = $testInput | & "$Dest\dcg.exe"
-  Write-Ok "Self-test complete"
-}
-
 Write-Ok "Done. Binary at: $Dest\dcg.exe"
 Write-Host ""
 
 $dcgExe = Join-Path $Dest "dcg.exe"
+
+# -NoConfigure: the binary is installed (and, under -EasyMode, on PATH); skip ALL
+# agent hook auto-configuration. Mirrors the install.sh --no-configure contract.
+if ($NoConfigure) {
+  Write-Info "Skipping agent hook auto-configuration (-NoConfigure)."
+  Write-Info "Configure manually later, or re-run without -NoConfigure."
+  return
+}
 
 # Detect installed agents and print a concise summary (install.sh parity).
 $detectedAgents = Detect-Agents
@@ -1294,14 +1665,6 @@ if ($detectedNames.Count -gt 0) {
   Write-Info ("Detected agents: " + ($detectedNames -join ', '))
 } else {
   Write-Info "No coding agents detected; will configure any that appear under standard paths."
-}
-
-# -NoConfigure: the binary is installed (and, under -EasyMode, on PATH); skip ALL
-# agent hook auto-configuration. Mirrors the install.sh --no-configure contract.
-if ($NoConfigure) {
-  Write-Info "Skipping agent hook auto-configuration (-NoConfigure)."
-  Write-Info "Configure manually later, or re-run without -NoConfigure."
-  return
 }
 
 # Remove the legacy git_safety_guard Python predecessor (settings entry + script)

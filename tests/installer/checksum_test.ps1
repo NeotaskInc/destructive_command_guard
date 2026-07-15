@@ -1,7 +1,8 @@
 #!/usr/bin/env pwsh
 # Tests install.ps1 checksum hardening (.4.4): Test-Sha256Token (64-hex),
-# Get-SiblingUrl, and Resolve-ChecksumToken (per-file .sha256 -> SHA256SUMS.txt ->
-# SHA256SUMS fallback, filename row match, junk rejection). Uses local files.
+# Get-SiblingUrl, Resolve-ChecksumToken (per-file .sha256 -> SHA256SUMS.txt ->
+# SHA256SUMS fallback, filename row match, junk rejection), and the minisign
+# release-trust path. Uses local files.
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
@@ -10,6 +11,20 @@ $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $script:failures = 0
 function Check([bool]$cond, [string]$msg) {
     if ($cond) { Write-Host "  ok: $msg" } else { Write-Host "  FAIL: $msg" -ForegroundColor Red; $script:failures++ }
+}
+function Set-MinisignApplicationMock([string]$Directory, [int]$ExitCode) {
+    if ($env:OS -eq 'Windows_NT') {
+        $path = Join-Path $Directory 'minisign.cmd'
+        $body = "@echo off`r`necho %* > `"%DCG_MINISIGN_ARGS_FILE%`"`r`nexit /b $ExitCode`r`n"
+        Set-Content -LiteralPath $path -Value $body -Encoding ascii -NoNewline
+    } else {
+        $path = Join-Path $Directory 'minisign'
+        $body = "#!/bin/sh`nprintf '%s\n' `"`$*`" > `"`$DCG_MINISIGN_ARGS_FILE`"`nexit $ExitCode`n"
+        Set-Content -LiteralPath $path -Value $body -Encoding ascii -NoNewline
+        & chmod +x $path
+        if ($LASTEXITCODE -ne 0) { throw "could not make mock minisign executable" }
+    }
+    return $path
 }
 $HASH = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"  # 64 hex
 $OTHER = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
@@ -34,6 +49,7 @@ Check ((Get-SiblingUrl -Url "/x/y/dcg.zip" -Leaf "S") -eq "/x/y/S") "local-path 
 
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("dcg_csum_" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tmp | Out-Null
+$savedPath = $env:PATH
 try {
     $zip = Join-Path $tmp "dcg-x86_64-pc-windows-msvc.zip"
     Set-Content -LiteralPath $zip -Value "ZIP" -NoNewline
@@ -64,7 +80,68 @@ try {
     $threw = $false
     try { Resolve-ChecksumToken -ArtifactUrl $zip -PerFileUrl "$zip.sha256" | Out-Null } catch { $threw = $true }
     Check $threw "junk .sha256 with no manifest fallback throws"
-} finally { Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue }
+
+    Write-Host "Test 8: missing minisign sidecar is optional unless explicitly required"
+    $missingSignature = Join-Path $tmp "missing.minisig"
+    $optionalThrew = $false
+    try {
+        Invoke-DcgMinisignVerification -ArtifactPath $zip -ArtifactSource $zip `
+            -SignatureSource $missingSignature -TempDirectory $tmp
+    } catch { $optionalThrew = $true }
+    Check (-not $optionalThrew) "optional missing signature warns and continues"
+    $requiredThrew = $false
+    try {
+        Invoke-DcgMinisignVerification -ArtifactPath $zip -ArtifactSource $zip `
+            -SignatureSource $missingSignature -TempDirectory $tmp -Require
+    } catch { $requiredThrew = $true }
+    Check $requiredThrew "required missing signature is fatal"
+
+    Write-Host "Test 9: present signature invokes an external minisign with the embedded public key"
+    $signature = Join-Path $tmp "release.minisig"
+    Set-Content -LiteralPath $signature -Value "signature" -NoNewline
+    $mockBin = Join-Path $tmp "mock-bin"
+    New-Item -ItemType Directory -Path $mockBin | Out-Null
+    $env:DCG_MINISIGN_ARGS_FILE = Join-Path $tmp "minisign.args"
+    Set-MinisignApplicationMock -Directory $mockBin -ExitCode 0 | Out-Null
+    $env:PATH = "$mockBin$([System.IO.Path]::PathSeparator)$savedPath"
+    $global:DcgMinisignFunctionWasCalled = $false
+    function global:minisign { $global:DcgMinisignFunctionWasCalled = $true }
+    $verifyThrew = $false
+    try {
+        Invoke-DcgMinisignVerification -ArtifactPath $zip -ArtifactSource $zip `
+            -SignatureSource $signature -TempDirectory $tmp -Require
+    } catch { $verifyThrew = $true }
+    Check (-not $verifyThrew) "external mock minisign verifier succeeds"
+    Check (-not $global:DcgMinisignFunctionWasCalled) "ignores a PowerShell function shim"
+    $minisignArgs = Get-Content -Raw -LiteralPath $env:DCG_MINISIGN_ARGS_FILE
+    Check ($minisignArgs -match '(?:^|\s)-Vm(?:\s|$)') "passes verify-message mode"
+    Check ($minisignArgs -match '(?:^|\s)-P(?:\s|$)') "passes an explicit public key"
+    Check ($minisignArgs -match 'RWTQoKUb0Ue4NsqTpPWnABCrIU0\+m25zsMlbv6UcRClQ7jmRP3A7NmTB') `
+        "uses the embedded release key"
+
+    Write-Host "Test 10: a present invalid minisign signature is always fatal"
+    Set-MinisignApplicationMock -Directory $mockBin -ExitCode 1 | Out-Null
+    $invalidThrew = $false
+    try {
+        Invoke-DcgMinisignVerification -ArtifactPath $zip -ArtifactSource $zip `
+            -SignatureSource $signature -TempDirectory $tmp
+    } catch { $invalidThrew = $true }
+    Check $invalidThrew "invalid signature fails even without -RequireMinisign"
+
+    Write-Host "Test 11: strict mode rejects a function shim when no external verifier exists"
+    $emptyPath = Join-Path $tmp "empty-path"
+    New-Item -ItemType Directory -Path $emptyPath | Out-Null
+    $env:PATH = $emptyPath
+    $shimThrew = $false
+    try {
+        Invoke-DcgMinisignVerification -ArtifactPath $zip -ArtifactSource $zip `
+            -SignatureSource $signature -TempDirectory $tmp -Require
+    } catch { $shimThrew = $true }
+    Check $shimThrew "function shim cannot satisfy -RequireMinisign"
+} finally {
+    $env:PATH = $savedPath
+    Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+}
 
 if ($script:failures -gt 0) { Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red; exit 1 }
 Write-Host "All checksum-resolution tests passed." -ForegroundColor Green

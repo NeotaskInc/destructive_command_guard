@@ -49,6 +49,7 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
+| `stdin-unverified` | psql receives indirect input that dcg cannot statically verify. | high |
 | `drop-database` | DROP DATABASE permanently deletes the entire database (even with IF EXISTS). Verify and back up first. | critical |
 | `drop-table` | DROP TABLE permanently deletes the table (even with IF EXISTS). Verify and back up first. | high |
 | `drop-schema` | DROP SCHEMA permanently deletes the schema and all its objects (even with IF EXISTS). | critical |
@@ -118,6 +119,7 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
+| `stdin-unverified` | mysql/mariadb receives indirect input that dcg cannot statically verify. | high |
 | `drop-database` | DROP DATABASE permanently deletes the entire database. Verify and back up first. | critical |
 | `drop-table` | DROP TABLE permanently deletes the table. Verify and back up first. | high |
 | `truncate-table` | TRUNCATE permanently deletes all rows. Cannot be rolled back in MySQL. | high |
@@ -189,6 +191,7 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
+| `stdin-unverified` | mongosh receives indirect input that dcg cannot statically verify. | high |
 | `drop-database` | dropDatabase permanently deletes the entire database. | critical |
 | `drop-collection` | drop/dropCollection permanently deletes the collection. | high |
 | `delete-all` | remove({}) or deleteMany({}) deletes ALL documents. Add filter criteria. | high |
@@ -252,6 +255,7 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
+| `stdin-unverified` | redis-cli receives indirect input that dcg cannot statically verify. | high |
 | `flushall` | FLUSHALL permanently deletes ALL keys in ALL databases. | critical |
 | `flushdb` | FLUSHDB permanently deletes ALL keys in the current database. | high |
 | `config-resetstat` | CONFIG RESETSTAT clears Redis runtime counters and can hide recent incidents. | medium |
@@ -320,6 +324,7 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
+| `stdin-unverified` | sqlite3 receives indirect input that dcg cannot statically verify. | high |
 | `drop-table` | DROP TABLE permanently deletes the table (even with IF EXISTS). Verify it is intended. | critical |
 | `delete-without-where` | DELETE without WHERE deletes ALL rows. Add a WHERE clause. | critical |
 | `vacuum-into` | VACUUM INTO overwrites the target file if it exists. | medium |

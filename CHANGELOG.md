@@ -11,6 +11,108 @@ Repository: <https://github.com/Dicklesworthstone/destructive_command_guard>
 
 ---
 
+## [v0.6.7](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.7) -- 2026-07-14 [Release]
+
+Security, correctness, and Windows-policy compatibility release. This closes
+the stdin-driven database-client bypass class, blocks force-refspec pushes,
+repairs project allowlists outside Git repositories, fixes two command-line
+false positives, and makes the Windows installer work under WDAC/AppLocker
+ConstrainedLanguage.
+
+### Security
+
+- **Trace indirect input into protected database clients (#191).** Bounded
+  literal `echo`/`printf` and single-file `cat` pipelines, grouped/subshell
+  consumers, redirects (including prefix and inherited `exec` forms), heredocs,
+  Redis `--pipe`, and command substitutions are reconstructed and evaluated against the
+  consumer pack for Redis-compatible clients, PostgreSQL, MySQL/MariaDB,
+  MongoDB, and SQLite. Unknown or dynamic producers, unsafe files, invalid
+  encodings, and oversized payloads fail closed under the stable
+  `<pack>:stdin-unverified` rule. File inspection rejects symlinks and special
+  files and uses nonblocking/no-follow opens on Unix. Multi-command producers
+  cannot masquerade as one literal producer.
+- **Parse kubectl dry-run semantics instead of guessing with regex.**
+  `kubectl delete -f -` is blocked unless the final effective `--dry-run`
+  value is provably bare/client/server/true. Repeated, separated, quoted,
+  escaped, dynamic, and post-`--` arguments follow pflag ordering without a
+  safe-then-unsafe override bypass.
+- **Block Git's leading-plus force refspec syntax in strict mode (#202).**
+  Arbitrary `+<refspec>` pushes now hit `push-force-any`, including quoted,
+  escaped, ANSI-C-quoted, direct `+main`/`+master`, and
+  `+HEAD:refs/heads/main` forms. Brace/glob/dynamic refspecs fail closed, and
+  `git push --mirror` is explicitly blocked because it force-updates and
+  deletes remote refs.
+- **Evaluate GNU sed shell-execution programs semantically.** Inert
+  substitutions remain maskable data, while the `e` command and `s///e` flag
+  feed their literal shell command back through the normal evaluator.
+  Input-dependent executable replacements fail closed under
+  `core.filesystem:sed-exec-unverified`; sandboxed sed invocations remain
+  allowed only when `--sandbox` is an active option rather than an operand
+  after `--`. `-f` programs are inspected with option arity respected, while
+  compound-command program files fail closed against mutation races.
+- **Remove attacker-controlled temp-root whitelists.** Only static paths under
+  literal `/tmp` and `/var/tmp` qualify for automatic POSIX safety; `$TMPDIR`,
+  `${TMPDIR:-...}`, substitutions, escaped traversal, and dynamic suffixes
+  require review. The same fail-closed rule covers redirects and moves.
+  Absolute `truncate` sizes now block because they may shrink at runtime, and
+  only the final effective `dd of=` operand determines safety. Windows
+  recursive-delete temp whitelisting was removed because ambient `%TEMP%` and
+  multi-target commands could otherwise shadow a destructive target.
+
+### Fixed
+
+- **Make project allowlists effective outside Git repositories (#199).** The
+  repository root remains authoritative inside Git. Elsewhere, the nearest
+  ancestor containing `.dcg/allowlist.toml` governs nested directories, and a
+  new scope starts in the current directory when no such ancestor exists.
+  Read, list, and write operations now share that resolver.
+- **Allow literal double-quoted `/tmp/` and `/var/tmp/` recursive deletes
+  (#201).** Quoted paths now have parity with their unquoted equivalents while
+  traversal, expansion, brace, quote-concatenation, and escape tricks remain
+  blocked.
+- **Stop inert sed substitutions from looking like shell redirects (#198).**
+  Only a single non-executing, non-writing substitution is masked; arbitrary
+  sed programs, `e`, `s///e`, and `s///w` remain visible to the guard.
+- **Treat `n` as false for display/mode environment flags (#203).**
+  `DCG_NO_COLOR=n`, `DCG_ROBOT=n`, and related flags now match the documented
+  boolean parser.
+- Thread the active hook deadline through the final pack-evaluation pass
+  instead of accidentally dropping it.
+
+### Windows installer
+
+- **Support WDAC/AppLocker ConstrainedLanguage installs and updates (#194).**
+  The installer falls back from `Get-FileHash` to signed inbox
+  `certutil.exe`, uses trusted `tar.exe` for zip inspection/extraction, emits
+  UTF-8 without a BOM using primitive operations, and avoids blocked .NET
+  helpers for URL, PATH, architecture, and configuration handling. The full
+  forced-ConstrainedLanguage install path is exercised on a real Windows
+  PowerShell 5.1 machine, while the complete 15-test installer suite covers
+  both normal and constrained paths.
+
+### Release integrity
+
+- **Authenticate manually published artifacts with a long-lived minisign trust
+  root.** Both installers verify an adjacent `.minisig` when the external
+  `minisign` executable is available, always abort on an invalid signature,
+  and offer `--require-minisign` / `-RequireMinisign` for fail-closed installs.
+  Offline artifact/signature URL overrides are covered by the installer test
+  suites. Version selection now requires an exact SemVer tag, downloaded
+  archives must contain exactly one root-level binary, and installer self-tests
+  prove that the installed binary reports the requested version.
+- The six-platform release is built outside GitHub Actions, packaged
+  reproducibly, checksummed, signed with DSR's minisign key, and accompanied by
+  an SPDX SBOM plus signed SLSA provenance statements. Sigstore bundles are not
+  claimed for these manual builds because no Actions OIDC identity is involved.
+
+### Dependencies
+
+- Upgrade FrankenSQLite to 0.1.16 (including atomic commit-marker recovery),
+  `self_update` to 1.0.0-rc.5, and the current compatible regex/memchr stack.
+  `cargo audit` reports no known dependency vulnerabilities; cargo-deny's
+  advisory, bans, and source checks also pass (the repository does not yet
+  define a license-policy configuration).
+
 ## [v0.6.6](https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v0.6.6) -- 2026-07-13 [Release]
 
 Security and correctness release. Closes a critical, attacker-triggerable

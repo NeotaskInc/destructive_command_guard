@@ -1059,9 +1059,15 @@ test_command "rm -r -f /tmp/test" "allow" "rm -r -f /tmp/test"
 test_command "rm -f -r /tmp/test" "allow" "rm -f -r /tmp/test"
 test_command "rm --recursive --force /tmp/test" "allow" "rm --recursive --force /tmp/test"
 test_command "rm --force --recursive /tmp/test" "allow" "rm --force --recursive /tmp/test"
-test_command 'rm -rf $TMPDIR/test' "allow" 'rm -rf $TMPDIR/test'
-test_command 'rm -rf ${TMPDIR}/test' "allow" 'rm -rf ${TMPDIR}/test'
-test_command 'rm -rf "$TMPDIR/test"' "allow" 'rm -rf "$TMPDIR/test"'
+
+log_section "Dynamic Temp-Root Commands (should BLOCK)"
+
+test_command 'rm -rf $TMPDIR/test' "block" 'rm -rf $TMPDIR/test (caller-controlled root)'
+test_command 'rm -rf ${TMPDIR}/test' "block" 'rm -rf ${TMPDIR}/test (caller-controlled root)'
+test_command 'rm -rf "$TMPDIR/test"' "block" 'rm -rf "$TMPDIR/test" (caller-controlled root)'
+
+log_section "Other Safe Filesystem Commands (should ALLOW)"
+
 test_command "rm file.txt" "allow" "rm file.txt (no -rf)"
 test_command "rm -f file.txt" "allow" "rm -f file.txt (force only)"
 test_command "rm -r directory" "allow" "rm -r directory (recursive only)"

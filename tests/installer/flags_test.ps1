@@ -21,6 +21,8 @@ Check ($helpRc -eq 0) "exit code 0 (got $helpRc)"
 Check ($helpText -match 'dcg PowerShell installer') "usage header printed"
 Check ($helpText -match '-NoConfigure') "documents -NoConfigure"
 Check ($helpText -match '-Quiet') "documents -Quiet"
+Check ($helpText -match '-RequireMinisign') "documents strict minisign verification"
+Check ($helpText -match '-MinisignSignatureUrl') "documents the offline signature override"
 Check ($helpText -match 'Copilot CLI') "lists the configured agents"
 Check (-not ($helpText -match 'Resolving latest version')) "install body did NOT run"
 
@@ -38,6 +40,16 @@ Check ($warn -match 'shown-warn') "Write-Warn still prints under -Quiet"
 $Quiet = $false
 $info2 = (Write-Info "shown-info" 6>&1 | Out-String)
 Check ($info2 -match 'shown-info') "Write-Info prints again when not -Quiet"
+
+Write-Host "Test 3: release versions are strict SemVer and canonicalized with v"
+Check ((Normalize-DcgVersionTag '1.2.3') -ceq 'v1.2.3') "plain SemVer gets canonical v prefix"
+Check ((Normalize-DcgVersionTag 'v1.2.3-rc.1+build.7') -ceq 'v1.2.3-rc.1+build.7') `
+    "prerelease/build SemVer is preserved"
+foreach ($invalid in @('../../main', 'v01.2.3', 'v1.2.3-01', 'v1.2')) {
+    $threw = $false
+    try { Normalize-DcgVersionTag $invalid | Out-Null } catch { $threw = $true }
+    Check $threw "rejects invalid version '$invalid'"
+}
 
 if ($script:failures -gt 0) { Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red; exit 1 }
 Write-Host "All install.ps1 flags tests passed." -ForegroundColor Green

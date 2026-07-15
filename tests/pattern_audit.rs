@@ -308,8 +308,10 @@ fn test_audit_backtracking_requirements() {
                 "mv-tmpdir",
                 "mv-tmpdir-brace",
                 "mv-var-tmp",
+                "redirect-truncate-dynamic-path",
                 "redirect-truncate-root-home",
                 "rsync-sensitive-then-delete",
+                "sed-exec-unverified",
                 "shred-root-home",
                 "shred-tmp",
                 "shred-tmpdir",
@@ -324,6 +326,7 @@ fn test_audit_backtracking_requirements() {
                 "truncate-tmpdir",
                 "truncate-tmpdir-brace",
                 "truncate-var-tmp",
+                "truncate-zero-general",
                 "truncate-zero-root-home",
                 "unlink-root-home",
                 "unlink-tmp",
@@ -350,10 +353,17 @@ fn test_audit_backtracking_requirements() {
                 "mongo-explain",
                 "mongo-find",
                 "mongodump-no-drop",
+                "stdin-unverified",
             ]),
         ),
-        ("database.mysql", HashSet::from(["mysqldump-no-drop"])),
-        ("database.postgresql", HashSet::from(["pg-dump-no-clean"])),
+        (
+            "database.mysql",
+            HashSet::from(["mysqldump-no-drop", "stdin-unverified"]),
+        ),
+        (
+            "database.postgresql",
+            HashSet::from(["pg-dump-no-clean", "stdin-unverified"]),
+        ),
         (
             "database.redis",
             HashSet::from([
@@ -363,8 +373,10 @@ fn test_audit_backtracking_requirements() {
                 "redis-info",
                 "redis-keys",
                 "redis-scan",
+                "stdin-unverified",
             ]),
         ),
+        ("database.sqlite", HashSet::from(["stdin-unverified"])),
         ("dns.generic", HashSet::from(["dns-dig-safe"])),
         (
             "dns.cloudflare",
@@ -555,9 +567,7 @@ fn test_audit_backtracking_requirements() {
         (
             "kubernetes.kubectl",
             HashSet::from([
-                "delete-pv",
-                "delete-pvc",
-                "delete-workload",
+                "delete-from-stdin",
                 "kubectl-api",
                 "kubectl-config",
                 "kubectl-describe",
@@ -1054,6 +1064,10 @@ fn test_audit_backtracking_requirements() {
             HashSet::from(["force-stop-or-restart-computer"]),
         ),
         ("windows.system", HashSet::from(["diskpart"])),
+        (
+            "strict_git",
+            HashSet::from(["push-force-any", "push-mirror"]),
+        ),
     ]);
 
     let registry = PackRegistry::new();

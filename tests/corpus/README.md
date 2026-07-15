@@ -13,7 +13,7 @@ corpus/
     docker_destructive.toml # docker system prune, kubectl delete, etc.
   false_positives/          # Commands that MUST be allowed
     git_safe.toml           # git status, git log, git checkout -b, etc.
-    rm_safe.toml            # rm -rf in /tmp, /var/tmp, $TMPDIR
+    rm_safe.toml            # literal temp paths allowed; dynamic TMPDIR roots denied
     other_safe.toml         # ls, cat, cargo, npm, etc.
     substring_safe.toml     # "digit", "form" (contain git/rm as substring)
     non_execution.toml      # command -v git, which rm, --version, etc.
@@ -87,7 +87,7 @@ these commands for golden/e2e verification. Coverage matrix:
 ### Category: Filesystem Commands
 | Behavior | File | Examples |
 |----------|------|----------|
-| rm in temp dirs | `false_positives/rm_safe.toml` | rm -rf /tmp/*, rm -rf $TMPDIR/* |
+| rm in temp dirs | `false_positives/rm_safe.toml` | literal /tmp and /var/tmp paths allowed; dynamic $TMPDIR roots denied |
 | rm elsewhere | `true_positives/rm_destructive.toml` | rm -rf /, rm -rf ~, rm -rf * |
 | Non-recursive | `false_positives/rm_safe.toml` | rm file.txt, rm -f file.txt |
 

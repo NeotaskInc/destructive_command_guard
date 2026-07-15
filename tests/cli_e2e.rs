@@ -93,6 +93,13 @@ fn run_dcg_hook_with_env(command: &str, extra_env: &[(&str, &std::ffi::OsStr)]) 
         .env("USERPROFILE", &home_dir)
         .env("XDG_CONFIG_HOME", &xdg_config_dir)
         .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        // These tests assert semantic allow/deny behavior, not the separately
+        // unit-tested 200 ms fail-open policy. A heavily loaded test host can
+        // deschedule the child after its evaluation deadline starts and turn a
+        // correct deny into an empty fail-open response, so keep a generous
+        // E2E-only budget. `extra_env` is applied below and may still override
+        // this when a test intentionally exercises deadline behavior.
+        .env("DCG_HOOK_TIMEOUT_MS", "5000")
         .env("DCG_PACKS", "core.git,core.filesystem")
         .current_dir(temp.path())
         .stdin(Stdio::piped())
@@ -1866,6 +1873,9 @@ mod hook_mode_tests {
             .env("USERPROFILE", &home_dir)
             .env("XDG_CONFIG_HOME", &xdg_config_dir)
             .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+            // Match the top-level hook helper: these are semantic E2E tests,
+            // while deadline behavior has deterministic unit coverage.
+            .env("DCG_HOOK_TIMEOUT_MS", "5000")
             .env("DCG_PACKS", "core.git,core.filesystem")
             .current_dir(cwd)
             .stdin(Stdio::piped())

@@ -19,6 +19,8 @@
 #   --no-gum           Disable gum formatting even if available
 #   --no-configure     Skip AI agent hook configuration
 #   --no-verify        Skip checksum + signature verification (for testing only)
+#   --require-minisign Require a valid release .minisig and the minisign tool
+#   --minisign-url URL Override the adjacent .minisig URL (including file://)
 #   --offline          Skip network preflight checks
 #
 set -euo pipefail
@@ -37,14 +39,18 @@ FROM_SOURCE=0
 CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
 SIGSTORE_BUNDLE_URL="${SIGSTORE_BUNDLE_URL:-}"
+MINISIGN_SIGNATURE_URL="${MINISIGN_SIGNATURE_URL:-}"
+# This is the release trust root, not a caller-configurable setting. Its
+# minisign key ID is 36B847D11BA5A0D0.
+readonly MINISIGN_PUBLIC_KEY="RWTQoKUb0Ue4NsqTpPWnABCrIU0+m25zsMlbv6UcRClQ7jmRP3A7NmTB"
 COSIGN_IDENTITY_RE="${COSIGN_IDENTITY_RE:-^https://github.com/${OWNER}/${REPO}/.github/workflows/dist.yml@refs/tags/.*$}"
 COSIGN_OIDC_ISSUER="${COSIGN_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
 ARTIFACT_URL="${ARTIFACT_URL:-}"
 LOCK_FILE="/tmp/dcg-install.lock"
-SYSTEM=0
 NO_GUM=0
 NO_CONFIGURE=0
 NO_CHECKSUM=0
+REQUIRE_MINISIGN=0
 FORCE_INSTALL=0
 OFFLINE="${DCG_OFFLINE:-0}"
 AGENT_VERSION_LOOKUP="${DCG_INSTALLER_AGENT_VERSIONS:-0}"
@@ -399,44 +405,146 @@ is_agent_detected() {
   return 1
 }
 
-# Check if installed version matches target
-# Returns 0 if versions match, 1 if they differ or dcg not installed
-check_installed_version() {
-  local target_version="$1"
+normalize_version_tag() {
+  local raw="${1:-}"
+  local without_v="${raw#v}"
+  local without_build="${without_v%%+*}"
+  local prerelease=""
+  local identifier
+
+  # SemVer 2.0.0, with the repository's conventional optional leading `v`.
+  # Core numeric identifiers may not have leading zeroes. Prerelease/build
+  # identifiers use only the characters SemVer permits.
+  if [[ ! "$raw" =~ ^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z-]+)(\.[0-9A-Za-z-]+)*)?(\+([0-9A-Za-z-]+)(\.[0-9A-Za-z-]+)*)?$ ]]; then
+    return 1
+  fi
+
+  if [[ "$without_build" == *-* ]]; then
+    prerelease="${without_build#*-}"
+    while IFS= read -r identifier; do
+      if [[ "$identifier" =~ ^[0-9]+$ ]] && [ "${#identifier}" -gt 1 ] && [[ "$identifier" == 0* ]]; then
+        return 1
+      fi
+    done < <(printf '%s\n' "$prerelease" | tr '.' '\n')
+  fi
+
+  printf 'v%s\n' "$without_v"
+}
+
+get_installed_version() {
+  local output=""
+  local line
+  local candidate
+  local normalized
+
   if [ ! -x "$DEST/dcg" ]; then
     return 1
   fi
 
-  local installed_version
-  # dcg >= 0.4.1 prints bare version to stdout; some older/test binaries
-  # print "dcg 1.2.3". Accept either shape for idempotent reinstalls.
-  installed_version=$("$DEST/dcg" --version 2>/dev/null | \
-    sed -n \
-      -e 's/.*dcg[[:space:]]\+v\{0,1\}\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' \
-      -e 's/^[[:space:]]*v\{0,1\}\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)[[:space:]]*$/\1/p' | head -1)
-  if [ -z "$installed_version" ]; then
-    # Older versions output only to stderr — parse the decorative box
-    installed_version=$(NO_COLOR=1 "$DEST/dcg" --version 2>&1 | \
-      sed -n 's/.*dcg v\{0,1\}\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1)
+  output=$("$DEST/dcg" --version 2>/dev/null) || return 1
+  if [ -z "$output" ]; then
+    output=$(NO_COLOR=1 "$DEST/dcg" --version 2>&1) || return 1
   fi
 
-  if [ -z "$installed_version" ]; then
-    return 1
-  fi
-
-  # Normalize versions (strip 'v' prefix)
-  local target_clean="${target_version#v}"
-  local installed_clean="${installed_version#v}"
-
-  if [ "$target_clean" = "$installed_clean" ]; then
-    return 0
-  fi
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    candidate="$line"
+    if [[ "$candidate" == dcg[[:space:]]* ]]; then
+      candidate="${candidate#dcg}"
+      candidate="${candidate#"${candidate%%[![:space:]]*}"}"
+    fi
+    if normalized=$(normalize_version_tag "$candidate"); then
+      printf '%s\n' "$normalized"
+      return 0
+    fi
+  done <<< "$output"
 
   return 1
 }
 
+# Check if installed version matches target
+# Returns 0 if versions match, 1 if they differ or dcg not installed
+check_installed_version() {
+  local target_version="$1"
+  local installed_version
+  local target_normalized
+
+  target_normalized=$(normalize_version_tag "$target_version") || return 1
+  installed_version=$(get_installed_version) || return 1
+  [ "$target_normalized" = "$installed_version" ]
+}
+
+assert_installed_version() {
+  local expected_version="${1:-}"
+  local reported_version
+  local expected_normalized
+
+  if ! reported_version=$(get_installed_version); then
+    err "Installed dcg failed its --version check"
+    return 1
+  fi
+
+  if [ -n "$expected_version" ]; then
+    expected_normalized=$(normalize_version_tag "$expected_version") || {
+      err "Invalid expected release version: $expected_version"
+      return 1
+    }
+    if [ "$reported_version" != "$expected_normalized" ]; then
+      err "Installed dcg version mismatch: expected ${expected_normalized}, got ${reported_version}"
+      return 1
+    fi
+  fi
+
+  ok "Installed version verified: ${reported_version#v}"
+}
+
+run_install_self_test() {
+  local allow_output
+  local dcg_path
+  local deny_output
+  local deny_status
+
+  info "Running self-test"
+  dcg_path="$(cd -- "$DEST" && pwd -P)/dcg"
+  if ! allow_output=$(cd "$TMP" && \
+    HOME="$TMP/selftest-home" XDG_CONFIG_HOME="$TMP/selftest-xdg" \
+    "$dcg_path" test --format json "git status" 2>&1); then
+    err "Self-test failed while evaluating a safe command"
+    return 1
+  fi
+  if ! printf '%s\n' "$allow_output" | grep -Eq '"decision"[[:space:]]*:[[:space:]]*"allow"'; then
+    err "Self-test did not report allow for the safe probe"
+    return 1
+  fi
+
+  # `dcg test` evaluates this string; it never executes it. A deny must be
+  # represented by both exit 1 and structured output so a crash cannot pass.
+  if deny_output=$(cd "$TMP" && \
+    HOME="$TMP/selftest-home" XDG_CONFIG_HOME="$TMP/selftest-xdg" \
+    "$dcg_path" test --format json "rm -rf /" 2>&1); then
+    err "Self-test failed: destructive probe was allowed"
+    return 1
+  else
+    deny_status=$?
+  fi
+  if [ "$deny_status" -ne 1 ] || \
+     ! printf '%s\n' "$deny_output" | grep -Eq '"decision"[[:space:]]*:[[:space:]]*"deny"'; then
+    err "Self-test failed while evaluating the destructive probe"
+    return 1
+  fi
+
+  ok "Self-test complete"
+}
+
 resolve_version() {
-  if [ -n "$VERSION" ]; then return 0; fi
+  if [ -n "$VERSION" ]; then
+    local requested_version="$VERSION"
+    if ! VERSION=$(normalize_version_tag "$requested_version"); then
+      err "Invalid version '$requested_version': expected SemVer such as v1.2.3"
+      exit 2
+    fi
+    return 0
+  fi
   if [ "$FROM_SOURCE" -eq 1 ] || [ -n "$ARTIFACT_URL" ]; then return 0; fi
 
   info "Resolving latest version..."
@@ -446,16 +554,13 @@ resolve_version() {
     tag=""
   fi
 
-  if [ -n "$tag" ]; then
-    VERSION="$tag"
+  if [ -n "$tag" ] && VERSION=$(normalize_version_tag "$tag"); then
     info "Resolved latest version: $VERSION"
   else
     # Try redirect-based resolution as fallback
     local redirect_url="https://github.com/${OWNER}/${REPO}/releases/latest"
     if tag=$(curl -fsSL -o /dev/null -w '%{url_effective}' "$redirect_url" 2>/dev/null | sed -E 's|.*/tag/||'); then
-      # Validate: tag must be non-empty, start with 'v' + digit, and not contain URL chars
-      if [ -n "$tag" ] && [[ "$tag" =~ ^v[0-9] ]] && [[ "$tag" != *"/"* ]]; then
-        VERSION="$tag"
+      if [ -n "$tag" ] && VERSION=$(normalize_version_tag "$tag"); then
         info "Resolved latest version via redirect: $VERSION"
         return 0
       fi
@@ -465,8 +570,23 @@ resolve_version() {
   fi
 }
 
+clone_source_tree() {
+  local destination="$1"
+  local repository_url="https://github.com/${OWNER}/${REPO}.git"
+
+  if [ -n "$VERSION" ]; then
+    # Pin fallback builds to the same immutable release selected for the failed
+    # artifact download. --single-branch prevents unrelated refs from being
+    # fetched and --branch accepts the exact validated tag.
+    git clone --depth 1 --branch "$VERSION" --single-branch \
+      "$repository_url" "$destination"
+  else
+    git clone --depth 1 "$repository_url" "$destination"
+  fi
+}
+
 detect_platform() {
-  OS=$(uname -s | tr 'A-Z' 'a-z')
+  OS=$(uname -s | tr '[:upper:]' '[:lower:]')
   ARCH=$(uname -m)
   case "$ARCH" in
     x86_64|amd64) ARCH="x86_64" ;;
@@ -899,8 +1019,8 @@ verify_checksum() {
     # macOS fallback
     actual=$(shasum -a 256 "$file" | cut -d' ' -f1)
   else
-    warn "No SHA256 tool found (sha256sum or shasum), skipping verification"
-    return 0
+    err "No SHA256 tool found (sha256sum or shasum); refusing unverified installation"
+    return 1
   fi
 
   if [ "$actual" != "$expected" ]; then
@@ -914,6 +1034,48 @@ verify_checksum() {
   fi
 
   ok "Checksum verified: ${actual:0:16}..."
+  return 0
+}
+
+# Verify the release's long-lived minisign signature (best-effort by default).
+# A present signature is always verified when minisign is available; a bad
+# signature is always fatal. --require-minisign additionally makes a missing
+# sidecar or missing verifier fatal. SHA256 remains mandatory and runs first.
+verify_minisign_signature() {
+  local file="$1"
+  local artifact_url="$2"
+  local minisign_bin=""
+  local signature_url="${MINISIGN_SIGNATURE_URL:-${artifact_url}.minisig}"
+  local signature_file="$TMP/artifact.minisig"
+
+  info "Fetching minisign signature from ${signature_url}"
+  if ! curl -fsSL "$signature_url" -o "$signature_file"; then
+    if [ "$REQUIRE_MINISIGN" -eq 1 ]; then
+      err "Required minisign signature could not be fetched: ${signature_url}"
+      return 1
+    fi
+    warn "Minisign signature not found; continuing after mandatory checksum verification"
+    return 0
+  fi
+
+  # Strict mode must reach a real executable from PATH, never a shell function
+  # or alias that can claim success without performing cryptographic work.
+  minisign_bin=$(type -P minisign 2>/dev/null || true)
+  if [ -z "$minisign_bin" ] || [ ! -x "$minisign_bin" ]; then
+    if [ "$REQUIRE_MINISIGN" -eq 1 ]; then
+      err "minisign is required but was not found on PATH"
+      return 1
+    fi
+    warn "minisign not found; signature is present but cannot be verified"
+    return 0
+  fi
+
+  if ! "$minisign_bin" -Vm "$file" -x "$signature_file" -P "$MINISIGN_PUBLIC_KEY"; then
+    err "Minisign verification failed (expected key ID 36B847D11BA5A0D0)"
+    return 1
+  fi
+
+  ok "Signature verified (minisign key 36B847D11BA5A0D0)"
   return 0
 }
 
@@ -934,15 +1096,16 @@ verify_sigstore_bundle() {
     bundle_url="${artifact_url}.sigstore.json"
   fi
 
-  local bundle_file="$TMP/$(basename "$bundle_url")"
+  local bundle_file
+  bundle_file="$TMP/$(basename "$bundle_url")"
   info "Fetching sigstore bundle from ${bundle_url}"
   if ! curl -fsSL "$bundle_url" -o "$bundle_file"; then
     warn "Sigstore bundle not found; skipping signature verification"
     return 0
   fi
 
-  # The release is signed by cosign v3.x (sigstore/cosign-installer in
-  # dist.yml), which emits the modern Sigstore protobuf bundle
+  # When a release publishes a Sigstore bundle, current release tooling emits
+  # the modern Sigstore protobuf bundle
   # (mediaType "application/vnd.dev.sigstore.bundle.v0.3+json", with the
   # signing cert under verificationMaterial.certificate). cosign only knows
   # how to parse that bundle shape from --bundle when --new-bundle-format is
@@ -993,7 +1156,8 @@ usage() {
   cat <<EOFU
 Usage: install.sh [--version vX.Y.Z] [--dest DIR] [--system] [--easy-mode] [--verify] \\
                   [--artifact-url URL] [--checksum HEX] [--checksum-url URL] [--quiet] \\
-                  [--offline] [--no-gum] [--no-configure] [--no-verify] [--force]
+                  [--minisign-url URL] [--require-minisign] [--offline] [--no-gum] \\
+                  [--no-configure] [--no-verify] [--force]
 
 Options:
   --version vX.Y.Z   Install specific version (default: latest)
@@ -1006,6 +1170,8 @@ Options:
   --offline          Skip network preflight checks
   --no-gum           Disable gum formatting even if available
   --no-configure     Skip AI agent hook configuration
+  --minisign-url URL Override the adjacent .minisig URL (supports file://)
+  --require-minisign Require a valid .minisig and the minisign verifier
   --no-verify        Skip checksum + signature verification (for testing only)
   --force            Force reinstall even if same version is installed
 EOFU
@@ -1026,12 +1192,14 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --version) require_option_value "$1" "${2:-}"; VERSION="$2"; shift 2;;
     --dest) require_option_value "$1" "${2:-}"; DEST="$2"; shift 2;;
-    --system) SYSTEM=1; DEST="/usr/local/bin"; shift;;
+    --system) DEST="/usr/local/bin"; shift;;
     --easy-mode) EASY=1; shift;;
     --verify) VERIFY=1; shift;;
     --artifact-url) require_option_value "$1" "${2:-}"; ARTIFACT_URL="$2"; shift 2;;
     --checksum) require_option_value "$1" "${2:-}"; CHECKSUM="$2"; shift 2;;
     --checksum-url) require_option_value "$1" "${2:-}"; CHECKSUM_URL="$2"; shift 2;;
+    --minisign-url) require_option_value "$1" "${2:-}"; MINISIGN_SIGNATURE_URL="$2"; shift 2;;
+    --require-minisign) REQUIRE_MINISIGN=1; shift;;
     --from-source) FROM_SOURCE=1; shift;;
     --quiet|-q) QUIET=1; shift;;
     --offline) OFFLINE=1; shift;;
@@ -1040,9 +1208,18 @@ while [ $# -gt 0 ]; do
     --no-verify) NO_CHECKSUM=1; shift;;
     --force) FORCE_INSTALL=1; shift;;
     -h|--help) usage; exit 0;;
-    *) shift;;
+    *) err "Unknown option: $1"; usage; exit 2;;
   esac
 done
+
+if [ "$NO_CHECKSUM" -eq 1 ] && [ "$REQUIRE_MINISIGN" -eq 1 ]; then
+  err "--no-verify and --require-minisign are mutually exclusive"
+  exit 2
+fi
+if [ "$FROM_SOURCE" -eq 1 ] && [ "$REQUIRE_MINISIGN" -eq 1 ]; then
+  err "--require-minisign authenticates release artifacts and cannot be used with --from-source"
+  exit 2
+fi
 
 # Show fancy header
 if [ "$QUIET" -eq 0 ]; then
@@ -1080,7 +1257,8 @@ mkdir -p "$DEST" 2>/dev/null || true
 preflight_checks
 
 # Check if already at target version (skip download if so, unless --force)
-if [ "$FORCE_INSTALL" -eq 0 ] && check_installed_version "$VERSION"; then
+if [ "$FORCE_INSTALL" -eq 0 ] && [ "$REQUIRE_MINISIGN" -eq 0 ] && check_installed_version "$VERSION"; then
+  assert_installed_version "$VERSION" || exit 1
   ok "dcg $VERSION is already installed at $DEST/dcg"
   info "Use --force to reinstall"
   maybe_install_completions
@@ -1122,24 +1300,33 @@ trap cleanup EXIT
 if [ "$FROM_SOURCE" -eq 0 ]; then
   info "Downloading $URL"
   if ! curl -fsSL "$URL" -o "$TMP/$TAR"; then
+    if [ "$REQUIRE_MINISIGN" -eq 1 ]; then
+      err "Artifact download failed; refusing an unauthenticated source fallback under --require-minisign"
+      exit 1
+    fi
     warn "Artifact download failed; falling back to build-from-source"
     FROM_SOURCE=1
   fi
 fi
 
+if [ "$FROM_SOURCE" -eq 1 ] && [ "$REQUIRE_MINISIGN" -eq 1 ]; then
+  err "No signed release artifact is available for this platform under --require-minisign"
+  exit 1
+fi
+
 if [ "$FROM_SOURCE" -eq 1 ]; then
   info "Building from source (requires git, rust nightly)"
   ensure_rust
-  git clone --depth 1 "https://github.com/${OWNER}/${REPO}.git" "$TMP/src"
+  clone_source_tree "$TMP/src"
   (cd "$TMP/src" && cargo build --release)
   BIN="$TMP/src/target/release/dcg"
   [ -x "$BIN" ] || { err "Build failed"; exit 1; }
   install -m 0755 "$BIN" "$DEST/dcg"
   ok "Installed to $DEST/dcg (source build)"
+  assert_installed_version "$VERSION" || exit 1
   maybe_add_path
   if [ "$VERIFY" -eq 1 ]; then
-    echo '{"tool_name":"Bash","tool_input":{"command":"git status"}}' | "$DEST/dcg" || true
-    ok "Self-test complete"
+    run_install_self_test || exit 1
   fi
   ok "Done. Binary at: $DEST/dcg"
   maybe_install_completions
@@ -1171,6 +1358,11 @@ else
     exit 1
   fi
 
+  if ! verify_minisign_signature "$TMP/$TAR" "$URL"; then
+    err "Installation aborted due to minisign verification failure"
+    exit 1
+  fi
+
   if ! verify_sigstore_bundle "$TMP/$TAR" "$URL"; then
     err "Signature verification failed"
     err "The downloaded file may be corrupted or tampered with."
@@ -1179,23 +1371,23 @@ else
 fi
 
 info "Extracting"
-tar -xf "$TMP/$TAR" -C "$TMP"
-BIN="$TMP/dcg"
-if [ ! -x "$BIN" ] && [ -n "$TARGET" ]; then
-  BIN="$TMP/dcg-${TARGET}/dcg"
+ARCHIVE_MEMBERS=$(tar -tf "$TMP/$TAR") || { err "Cannot list release archive"; exit 1; }
+ARCHIVE_MEMBER_TYPE=$(tar -tvf "$TMP/$TAR" | cut -c1) || { err "Cannot inspect release archive"; exit 1; }
+if [ "$ARCHIVE_MEMBERS" != "dcg" ] || [ "$ARCHIVE_MEMBER_TYPE" != "-" ]; then
+  err "Release archive must contain exactly one root-level regular member named dcg"
+  exit 1
 fi
-if [ ! -x "$BIN" ]; then
-  BIN=$(find "$TMP" -maxdepth 3 -type f -name "dcg" -perm -111 | head -n 1)
-fi
-
-[ -x "$BIN" ] || { err "Binary not found in tar"; exit 1; }
+BIN="$TMP/dcg.extracted"
+tar -xOf "$TMP/$TAR" dcg > "$BIN" || { err "Cannot stream dcg from release archive"; exit 1; }
+[ -s "$BIN" ] || { err "Release archive contained an empty dcg binary"; exit 1; }
+chmod 0755 "$BIN"
 install -m 0755 "$BIN" "$DEST/dcg"
 ok "Installed to $DEST/dcg"
+assert_installed_version "$VERSION" || exit 1
 maybe_add_path
 
 if [ "$VERIFY" -eq 1 ]; then
-  echo '{"tool_name":"Bash","tool_input":{"command":"git status"}}' | "$DEST/dcg" || true
-  ok "Self-test complete"
+  run_install_self_test || exit 1
 fi
 
 ok "Done. Binary at: $DEST/dcg"
@@ -1267,12 +1459,14 @@ show_upgrade_banner() {
 
 remove_predecessor() {
   local loc="$1"
-  local dir=$(dirname "$loc")
+  local dir
+  dir=$(dirname "$loc")
 
   info "Removing predecessor hook: $loc"
 
   # Create backup
-  local backup="${loc}.bak.$(date +%Y%m%d%H%M%S)"
+  local backup
+  backup="${loc}.bak.$(date +%Y%m%d%H%M%S)"
   cp "$loc" "$backup" 2>/dev/null || true
 
   # Remove the script
@@ -1332,7 +1526,8 @@ configure_claude_code() {
   CLAUDE_FAILURE_REASON=""
   # Default to cleaning up predecessor if not specified or empty
   [ -z "$cleanup_predecessor" ] && cleanup_predecessor=1
-  local settings_dir=$(dirname "$settings_file")
+  local settings_dir
+  settings_dir=$(dirname "$settings_file")
 
   # Always create the config directory if it doesn't exist
   if [ ! -d "$settings_dir" ]; then
@@ -1470,7 +1665,7 @@ PYEOF
     cp "$settings_file" "$CLAUDE_BACKUP"
 
     if command -v python3 >/dev/null 2>&1; then
-      python3 - "$settings_file" "$DEST/dcg" "$cleanup_predecessor" <<'PYEOF'
+      if python3 - "$settings_file" "$DEST/dcg" "$cleanup_predecessor" <<'PYEOF'
 import json
 import os
 import shlex
@@ -1588,7 +1783,7 @@ with open(settings_file, 'w') as f:
 if predecessor_removed:
     print("PREDECESSOR_CLEANED", file=sys.stderr)
 PYEOF
-      if [ $? -eq 0 ]; then
+      then
         CLAUDE_STATUS="merged"
         AUTO_CONFIGURED=1
       else
@@ -1631,7 +1826,8 @@ EOFSET
 
 configure_gemini() {
   local settings_file="$1"
-  local settings_dir=$(dirname "$settings_file")
+  local settings_dir
+  settings_dir=$(dirname "$settings_file")
   GEMINI_FAILURE_REASON=""
   GEMINI_BACKUP=""
 
@@ -1934,9 +2130,11 @@ configure_aider() {
       cp "$settings_file" "$AIDER_BACKUP"
 
       # Append the setting
-      echo "" >> "$settings_file"
-      echo "# Added by dcg installer - enables git hooks so dcg pre-commit can run" >> "$settings_file"
-      echo "git-commit-verify: true" >> "$settings_file"
+      {
+        printf '\n'
+        printf '%s\n' "# Added by dcg installer - enables git hooks so dcg pre-commit can run"
+        printf '%s\n' "git-commit-verify: true"
+      } >> "$settings_file"
       AIDER_STATUS="merged"
       AUTO_CONFIGURED=1
     fi
@@ -3326,6 +3524,10 @@ case "$HERMES_STATUS" in
     fi
     ;;
 esac
+
+if [ "$AUTO_CONFIGURED" -eq 0 ]; then
+  summary_lines+=("Agent hooks: No supported integration was configured")
+fi
 fi
 
 # Show summary
