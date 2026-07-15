@@ -46,6 +46,10 @@ ConstrainedLanguage path begun in v0.6.7.
   Docker findings now emitted by the current default packs. The harness now
   compares the complete normalized deterministic scan contract rather than
   only counts and a sorted rule-ID multiset.
+- Make the shell E2E suite use the same generous test-only hook deadline as the
+  Rust E2E helpers. Functional rule assertions are now deterministic under
+  scheduler pressure while the dedicated performance tests continue to enforce
+  the production 200 ms fail-open budget.
 
 ### Dependencies
 

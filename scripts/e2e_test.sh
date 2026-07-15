@@ -179,6 +179,13 @@ TEST_ENV_HOME="$TEST_ENV_ROOT/home"
 TEST_ENV_XDG="$TEST_ENV_ROOT/xdg_config"
 mkdir -p "$TEST_ENV_HOME" "$TEST_ENV_XDG"
 
+# These assertions prove semantic allow/deny behavior, not the separately
+# tested 200 ms production fail-open deadline. On a heavily loaded host the
+# kernel can deschedule a fresh dcg process after its deadline starts and turn
+# a correct denial into an empty fail-open response. Keep a generous,
+# test-only deadline so scheduler pressure cannot make this suite flaky.
+export DCG_HOOK_TIMEOUT_MS=5000
+
 # Start timing the full suite
 SUITE_START_TIME=$(get_timestamp_ms)
 
