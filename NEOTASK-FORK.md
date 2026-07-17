@@ -35,15 +35,21 @@ Electron build downloads these release assets and sha256-verifies each one.
 
 ## No source patches
 
-This fork stays **byte-identical to upstream source**. The only additions are
-release/CI plumbing and this doc:
+This fork's **Rust source is byte-identical to upstream** — the compiled `dcg`
+binary is unchanged. The only changes are release/CI plumbing and this doc:
 
-- `.github/workflows/release.yml` — builds our four ship targets
+- **Added** `.github/workflows/release.yml` — builds our four ship targets
   (`aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-pc-windows-msvc`,
   `x86_64-unknown-linux-musl`) and publishes binaries + `checksums.txt` + the
   unmodified `LICENSE` as release assets. It does not publish to crates.io and
   does not sign with upstream's keys.
-- this `NEOTASK-FORK.md`.
+- **Added** this `NEOTASK-FORK.md`.
+- **Retired** upstream's own release/ACFS CI workflows (`dist.yml`,
+  `acfs-checksums-dispatch.yml`) so `release.yml` is the SOLE release path.
+  Upstream `dist.yml` also triggers on `v*` tag pushes and would otherwise cut a
+  duplicate, differently-named (tar.xz + cosign) release for the same neotask
+  tag, and `acfs-checksums-dispatch.yml` phones home to upstream infra on
+  release publish. Removing them does not change the compiled binary.
 
 If a behavior change is ever needed, it goes in Neotask's own wrapper /
 verdict-mapping layer (gateway `src/infra/dcg.ts`), not here. If that is
