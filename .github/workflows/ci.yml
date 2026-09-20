@@ -1151,7 +1151,8 @@ jobs:
           echo "::error::Scan regression mismatch (exit code ${{ steps.scan_regression.outputs.exit_code }}). See the 'scan-regression-artifacts' artifact and the step summary for details."
           exit 1
 
-  # Process-per-invocation perf regression gate (compares against committed baseline JSON)
+  # Compare base and candidate on the same runner; historical timings from
+  # another CPU class cannot establish a code regression after runner migration.
   perf-regression:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: check
@@ -1167,21 +1168,51 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-perf-regression-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          key: blacksmith-4vcpu-ubuntu-2404-cargo-perf-regression-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            blacksmith-4vcpu-ubuntu-2404-cargo-perf-regression-
 
       - name: Build release binary
         run: cargo build --release
 
-      - name: Run perf baseline + compare to repo baseline
+      - name: Checkout comparison revision
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha || (github.event.before != '0000000000000000000000000000000000000000' && github.event.before) || github.sha }}
+          path: perf-base
+          persist-credentials: false
+
+      - name: Build comparison binary
+        run: cargo build --manifest-path perf-base/Cargo.toml --target-dir perf-base-target --release --locked
+
+      - name: Run base and candidate perf on this runner
         id: perf
         run: |
           set +e
 
-          BASELINE_JSON="perf/baselines/2026-01-11-after-lazy.json"
+          BASELINE_JSON="perf-base.json"
           CURRENT_JSON="perf-current.json"
           REPORT_MD="perf-regression-report.md"
+
+          python3 scripts/perf_baseline.py \
+            --bin perf-base-target/release/dcg \
+            --output "$BASELINE_JSON" \
+            --warmup 10 \
+            --runs 80 \
+            --skip-trace
+          BASE_EXIT=$?
+          if [ "$BASE_EXIT" -ne 0 ]; then
+            echo "exit_code=$BASE_EXIT" >> "$GITHUB_OUTPUT"
+            echo "::error::comparison baseline generation failed (exit code $BASE_EXIT)"
+            exit 0
+          fi
+
+          {
+            echo "runner_class=blacksmith-4vcpu-ubuntu-2404"
+            echo "base_sha=$(git -C perf-base rev-parse HEAD)"
+            echo "candidate_sha=$(git rev-parse HEAD)"
+            lscpu
+          } >> perf-runner.txt
 
           python3 scripts/perf_baseline.py \
             --bin target/release/dcg \
@@ -1301,8 +1332,10 @@ jobs:
         with:
           name: perf-regression-artifacts
           path: |
+            perf-base.json
             perf-current.json
             perf-regression-report.md
+            perf-runner.txt
           retention-days: 14
           if-no-files-found: ignore
 
