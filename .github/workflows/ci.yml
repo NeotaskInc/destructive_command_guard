@@ -1158,6 +1158,8 @@ jobs:
     needs: check
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
 
       - uses: dtolnay/rust-toolchain@nightly
 
@@ -1175,10 +1177,31 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
+      - name: Resolve comparison revision
+        id: comparison
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          comparison_sha="$PR_BASE_SHA"
+          if [ -z "$comparison_sha" ]; then
+            comparison_sha="$PUSH_BEFORE_SHA"
+          fi
+          if [ -z "$comparison_sha" ] || [ "$comparison_sha" = "0000000000000000000000000000000000000000" ]; then
+            # Scheduled/manual runs compare against the previous commit,
+            # never against the candidate itself.
+            comparison_sha="$(git rev-parse HEAD^)"
+          fi
+          if [[ ! "$comparison_sha" =~ ^[0-9a-f]{40}$ ]] || [ "$comparison_sha" = "$(git rev-parse HEAD)" ]; then
+            echo "::error::a distinct comparison commit is required"
+            exit 1
+          fi
+          echo "sha=$comparison_sha" >> "$GITHUB_OUTPUT"
+
       - name: Checkout comparison revision
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.pull_request.base.sha || (github.event.before != '0000000000000000000000000000000000000000' && github.event.before) || github.sha }}
+          ref: ${{ steps.comparison.outputs.sha }}
           path: perf-base
           persist-credentials: false
 

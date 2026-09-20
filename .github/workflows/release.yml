@@ -101,23 +101,31 @@ jobs:
 
       - name: Smoke test (version + allow/deny decision)
         shell: bash
+        env:
+          SMOKE_ASSET: ${{ matrix.asset }}
         run: |
           set -euo pipefail
           "./${{ matrix.asset }}" --version
           # A benign command must be allowed (exit 0).
           "./${{ matrix.asset }}" --robot test "ls -la" >/dev/null
-          # A catastrophic command must be denied (nonzero exit).
+          # A catastrophic command must return the documented denial code (1).
           # Use the scanner-recognized diagnostic entrypoint, with the staged
           # artifact's exact bytes. The quoted command is data for dcg test.
           smoke_dir="$(mktemp -d "${RUNNER_TEMP}/dcg-smoke.XXXXXX")"
-          cp "${{ matrix.asset }}" "$smoke_dir/dcg"
-          chmod 755 "$smoke_dir/dcg"
+          smoke_binary="$smoke_dir/dcg"
+          if [[ "$SMOKE_ASSET" == *.exe ]]; then
+            smoke_binary="$smoke_binary.exe"
+          fi
+          cp "${{ matrix.asset }}" "$smoke_binary"
+          chmod 755 "$smoke_binary"
+          "$smoke_binary" --version
+          "$smoke_binary" --robot test "ls -la" >/dev/null
           set +e
-          "$smoke_dir/dcg" --robot test "rm -rf /"
+          "$smoke_binary" --robot test "rm -rf /"
           deny_status=$?
           set -e
-          if [ "$deny_status" -eq 0 ]; then
-            echo "::error::dcg failed to deny 'rm -rf /'"
+          if [ "$deny_status" -ne 1 ]; then
+            echo "::error::expected denial exit 1; received $deny_status"
             exit 1
           fi
           echo "smoke ok: allowed benign, denied rm -rf /"
