@@ -161,7 +161,7 @@ If you see errors, **carefully understand and resolve each issue**. Read suffici
 
 ## Windows Support (native, `x86_64-pc-windows-msvc`)
 
-dcg ships a **native Windows** binary (built/tested on `windows-latest` with the
+dcg ships a **native Windows** binary (built/tested on `blacksmith-4vcpu-windows-2025` with the
 nightly toolchain) and a `check (windows)` CI job. When touching anything
 platform-sensitive, follow these conventions:
 
@@ -790,7 +790,7 @@ The `release-automation.yml` workflow will:
 
 The `dist.yml` workflow will:
 1. Run tests and clippy
-2. Build binaries for all platforms (Linux x86/ARM, macOS Intel/Apple Silicon, Windows)
+2. Build binaries for the active platforms (Linux x86/ARM, macOS Apple Silicon, Windows) on Blacksmith. Intel macOS is paused by the owner's September 19, 2026 decision: retain its commented workflow definition and published binaries, and restore native Intel verification only after explicit reactivation on an approved non-GitHub runner.
 3. Create `.tar.xz` archives with SHA256 checksums
 4. Sign artifacts with Sigstore (cosign) - creates `.sigstore.json` bundles
 5. Upload everything to GitHub Releases
