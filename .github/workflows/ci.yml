@@ -16,7 +16,7 @@ env:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v7
 
@@ -174,7 +174,7 @@ jobs:
   # with the MSVC target because rust-toolchain.toml pins nightly / edition 2024.
   check-windows:
     name: check (windows)
-    runs-on: windows-latest
+    runs-on: blacksmith-4vcpu-windows-2025
     steps:
       - uses: actions/checkout@v7
 
@@ -410,7 +410,7 @@ jobs:
           if-no-files-found: ignore
 
   fuzz-smoke:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: check
     steps:
       - uses: actions/checkout@v7
@@ -451,7 +451,7 @@ jobs:
           cargo fuzz run heredoc_fuzz --target x86_64-unknown-linux-gnu -- -max_total_time=30
 
   coverage:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: check
     steps:
       - uses: actions/checkout@v7
@@ -605,7 +605,7 @@ jobs:
 
   # Memory leak detection tests
   memory-tests:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: check
     steps:
       - uses: actions/checkout@v7
@@ -721,7 +721,7 @@ jobs:
   # Performance benchmark enforcement (push to main only)
   # Runs benchmarks and checks against performance budgets defined in src/perf.rs
   benchmarks:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: check
     # Only run on push to main, not on PRs (benchmarks are noisy)
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -796,7 +796,7 @@ jobs:
 
   # End-to-end shell script tests
   e2e:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: check
     steps:
       - uses: actions/checkout@v7
@@ -870,7 +870,7 @@ jobs:
 
   # Bats install/uninstall/agent-config tests
   bats:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: check
     steps:
       - uses: actions/checkout@v7
@@ -928,7 +928,7 @@ jobs:
   # Real Codex CLI smoke tests. This runs only on pushes to main because it
   # requires networked Codex API calls and consumes quota.
   codex-e2e:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: check
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     timeout-minutes: 30
@@ -1067,7 +1067,7 @@ jobs:
 
   # Scan-mode regression fixtures (ensures scan output stays stable)
   scan-regression:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: check
     steps:
       - uses: actions/checkout@v7
@@ -1143,7 +1143,7 @@ jobs:
 
   # Process-per-invocation perf regression gate (compares against committed baseline JSON)
   perf-regression:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: check
     steps:
       - uses: actions/checkout@v7
@@ -1304,7 +1304,7 @@ jobs:
 
   # Deep suite: fuzzing (scheduled or manual only)
   fuzz:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     # Only run on schedule or manual trigger, not on every PR
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:

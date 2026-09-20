@@ -31,7 +31,7 @@ jobs:
   notify-acfs:
     # Only notify on push to main, not PRs
     if: github.event_name == 'push'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v7
         with:
@@ -80,7 +80,7 @@ jobs:
   # Validate installer syntax on PRs
   validate-installer:
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v7
 
