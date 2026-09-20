@@ -107,7 +107,16 @@ jobs:
           # A benign command must be allowed (exit 0).
           "./${{ matrix.asset }}" --robot test "ls -la" >/dev/null
           # A catastrophic command must be denied (nonzero exit).
-          if "./${{ matrix.asset }}" --robot test "rm -rf /" >/dev/null; then
+          # Use the scanner-recognized diagnostic entrypoint, with the staged
+          # artifact's exact bytes. The quoted command is data for dcg test.
+          smoke_dir="$(mktemp -d "${RUNNER_TEMP}/dcg-smoke.XXXXXX")"
+          cp "${{ matrix.asset }}" "$smoke_dir/dcg"
+          chmod 755 "$smoke_dir/dcg"
+          set +e
+          "$smoke_dir/dcg" --robot test "rm -rf /"
+          deny_status=$?
+          set -e
+          if [ "$deny_status" -eq 0 ]; then
             echo "::error::dcg failed to deny 'rm -rf /'"
             exit 1
           fi

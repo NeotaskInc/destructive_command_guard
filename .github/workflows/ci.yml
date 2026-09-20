@@ -50,10 +50,17 @@ jobs:
 
       - name: Install UBS
         run: |
-          curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/main/install.sh" \
-            | bash -s -- --easy-mode
+          installer_dir="$(mktemp -d "${RUNNER_TEMP}/ubs-install.XXXXXX")"
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/0af10c926d6fbb14a1f589326d75c03f610207f0/install.sh" \
+            -o "$installer_dir/install.sh"
+          echo "b79a7a38fae28988f0c555d29a8cabd229a4245aa7071cd1c81102a8ae21fbd1  $installer_dir/install.sh" | sha256sum --check --strict
+          # The verified installer reads VERSION beside itself and verifies the
+          # matching release artifacts; never resolve an unpinned latest release.
+          printf '%s\n' '5.3.13' >> "$installer_dir/VERSION"
+          bash "$installer_dir/install.sh" --easy-mode
           # Add UBS to PATH for this job
-          echo "$HOME/.ubs" >> $GITHUB_PATH
+          echo "$HOME/.ubs" >> "$GITHUB_PATH"
 
       - name: Run UBS on changed files
         if: always()
@@ -275,8 +282,11 @@ jobs:
           $installed1 = Join-Path $dest1 'dcg.exe'
           if (-not (Test-Path $installed1)) { throw "Pass 1: binary not installed at $installed1" }
           # The installed real binary must run and DENY a destructive command...
-          $deny = '{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}' | & $installed1
-          if ($deny -notmatch 'permissionDecision') { throw "Pass 1: installed dcg.exe did not deny 'git reset --hard'" }
+          # The fixture is inert hook input, never a PowerShell command.
+          $denyInput = Get-Content -Raw -LiteralPath 'tests/fixtures/installer-deny-input.json'
+          $deny = $denyInput | & $installed1
+          $decision = $deny | ConvertFrom-Json
+          if ($decision.hookSpecificOutput.permissionDecision -ne 'deny') { throw "Pass 1: installed dcg.exe did not deny the destructive fixture" }
           # ...and ALLOW (silent) a safe one.
           $allow = '{"tool_name":"Bash","tool_input":{"command":"git status"}}' | & $installed1
           if (-not [string]::IsNullOrWhiteSpace($allow)) { throw "Pass 1: 'git status' should be allowed (silent), got: $allow" }
