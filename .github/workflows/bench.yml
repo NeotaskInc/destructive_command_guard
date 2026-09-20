@@ -36,7 +36,7 @@ env:
 
 jobs:
   benchmark:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v7
 
@@ -49,18 +49,18 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          key: blacksmith-4vcpu-ubuntu-2404-cargo-bench-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-bench-
+            blacksmith-4vcpu-ubuntu-2404-cargo-bench-
 
       - name: Cache benchmark baseline
         uses: actions/cache@v6
         with:
           path: target/criterion
-          key: ${{ runner.os }}-criterion-baseline-${{ github.ref_name }}
+          key: blacksmith-4vcpu-ubuntu-2404-criterion-baseline-${{ github.ref_name }}
           restore-keys: |
-            ${{ runner.os }}-criterion-baseline-main
-            ${{ runner.os }}-criterion-baseline-
+            blacksmith-4vcpu-ubuntu-2404-criterion-baseline-main
+            blacksmith-4vcpu-ubuntu-2404-criterion-baseline-
 
       - name: Build benchmarks
         run: cargo build --release --benches
@@ -119,7 +119,7 @@ jobs:
 
   # Optional: Compare PR benchmarks against main
   compare:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     if: github.event_name == 'pull_request'
     needs: benchmark
     steps:

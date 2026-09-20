@@ -1,6 +1,6 @@
 # Neotask release pipeline for the vendored dcg fork.
 #
-# This is the ONLY release workflow Neotask uses. It builds our four ship
+# This is the ONLY release workflow Neotask uses. It builds our active ship
 # targets from THIS fork's pinned source, then publishes binaries + a
 # sha256 checksums file + the unmodified LICENSE (MIT + OpenAI/Anthropic
 # rider) as release assets. Those assets are the sole distribution channel
@@ -32,20 +32,21 @@ jobs:
       matrix:
         include:
           # macOS Apple Silicon (native arm64 runner)
-          - os: macos-14
+          - os: blacksmith-6vcpu-macos-15
             target: aarch64-apple-darwin
             asset: dcg_darwin_arm64
-          # macOS Intel (native x86_64 runner avoids cross-arch mislabeling)
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            asset: dcg_darwin_amd64
+          # Intel Mac builds paused on 2026-09-19; retain the native lane for
+          # explicit reactivation with an approved non-GitHub Intel runner.
+          # - os: [self-hosted, macOS, X64, neotask-intel]
+          #   target: x86_64-apple-darwin
+          #   asset: dcg_darwin_amd64
           # Linux x86_64 — musl for glibc-independence (runs on old distros)
-          - os: ubuntu-latest
+          - os: blacksmith-4vcpu-ubuntu-2404
             target: x86_64-unknown-linux-musl
             asset: dcg_linux_amd64
             apt_install: musl-tools
           # Windows x64 (MSVC)
-          - os: windows-latest
+          - os: blacksmith-4vcpu-windows-2025
             target: x86_64-pc-windows-msvc
             asset: dcg_windows_amd64.exe
     runs-on: ${{ matrix.os }}
@@ -100,14 +101,31 @@ jobs:
 
       - name: Smoke test (version + allow/deny decision)
         shell: bash
+        env:
+          SMOKE_ASSET: ${{ matrix.asset }}
         run: |
           set -euo pipefail
           "./${{ matrix.asset }}" --version
           # A benign command must be allowed (exit 0).
           "./${{ matrix.asset }}" --robot test "ls -la" >/dev/null
-          # A catastrophic command must be denied (nonzero exit).
-          if "./${{ matrix.asset }}" --robot test "rm -rf /" >/dev/null; then
-            echo "::error::dcg failed to deny 'rm -rf /'"
+          # A catastrophic command must return the documented denial code (1).
+          # Use the scanner-recognized diagnostic entrypoint, with the staged
+          # artifact's exact bytes. The quoted command is data for dcg test.
+          smoke_dir="$(mktemp -d "${RUNNER_TEMP}/dcg-smoke.XXXXXX")"
+          smoke_binary="$smoke_dir/dcg"
+          if [[ "$SMOKE_ASSET" == *.exe ]]; then
+            smoke_binary="$smoke_binary.exe"
+          fi
+          cp "${{ matrix.asset }}" "$smoke_binary"
+          chmod 755 "$smoke_binary"
+          "$smoke_binary" --version
+          "$smoke_binary" --robot test "ls -la" >/dev/null
+          set +e
+          "$smoke_binary" --robot test "rm -rf /"
+          deny_status=$?
+          set -e
+          if [ "$deny_status" -ne 1 ]; then
+            echo "::error::expected denial exit 1; received $deny_status"
             exit 1
           fi
           echo "smoke ok: allowed benign, denied rm -rf /"
@@ -120,7 +138,7 @@ jobs:
 
   release:
     needs: build
-    runs-on: ubuntu-22.04
+    runs-on: blacksmith-4vcpu-ubuntu-2204
     permissions:
       contents: write
     steps:

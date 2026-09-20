@@ -31,7 +31,7 @@ env:
 jobs:
   scan:
     name: Scan for destructive commands
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: read
       pull-requests: read
@@ -181,7 +181,7 @@ jobs:
   #
   # build-dcg:
   #   name: Build dcg from source
-  #   runs-on: ubuntu-latest
+#   runs-on: blacksmith-4vcpu-ubuntu-2404
   #   steps:
   #     - uses: dtolnay/rust-toolchain@nightly
   #     - name: Build dcg

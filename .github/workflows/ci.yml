@@ -16,7 +16,7 @@ env:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v7
 
@@ -50,10 +50,17 @@ jobs:
 
       - name: Install UBS
         run: |
-          curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/main/install.sh" \
-            | bash -s -- --easy-mode
+          installer_dir="$(mktemp -d "${RUNNER_TEMP}/ubs-install.XXXXXX")"
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/0af10c926d6fbb14a1f589326d75c03f610207f0/install.sh" \
+            -o "$installer_dir/install.sh"
+          echo "b79a7a38fae28988f0c555d29a8cabd229a4245aa7071cd1c81102a8ae21fbd1  $installer_dir/install.sh" | sha256sum --check --strict
+          # The verified installer reads VERSION beside itself and verifies the
+          # matching release artifacts; never resolve an unpinned latest release.
+          printf '%s\n' '5.3.13' >> "$installer_dir/VERSION"
+          bash "$installer_dir/install.sh" --easy-mode
           # Add UBS to PATH for this job
-          echo "$HOME/.ubs" >> $GITHUB_PATH
+          echo "$HOME/.ubs" >> "$GITHUB_PATH"
 
       - name: Run UBS on changed files
         if: always()
@@ -174,7 +181,7 @@ jobs:
   # with the MSVC target because rust-toolchain.toml pins nightly / edition 2024.
   check-windows:
     name: check (windows)
-    runs-on: windows-latest
+    runs-on: blacksmith-4vcpu-windows-2025
     steps:
       - uses: actions/checkout@v7
 
@@ -275,8 +282,11 @@ jobs:
           $installed1 = Join-Path $dest1 'dcg.exe'
           if (-not (Test-Path $installed1)) { throw "Pass 1: binary not installed at $installed1" }
           # The installed real binary must run and DENY a destructive command...
-          $deny = '{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}' | & $installed1
-          if ($deny -notmatch 'permissionDecision') { throw "Pass 1: installed dcg.exe did not deny 'git reset --hard'" }
+          # The fixture is inert hook input, never a PowerShell command.
+          $denyInput = Get-Content -Raw -LiteralPath 'tests/fixtures/installer-deny-input.json'
+          $deny = $denyInput | & $installed1
+          $decision = $deny | ConvertFrom-Json
+          if ($decision.hookSpecificOutput.permissionDecision -ne 'deny') { throw "Pass 1: installed dcg.exe did not deny the destructive fixture" }
           # ...and ALLOW (silent) a safe one.
           $allow = '{"tool_name":"Bash","tool_input":{"command":"git status"}}' | & $installed1
           if (-not [string]::IsNullOrWhiteSpace($allow)) { throw "Pass 1: 'git status' should be allowed (silent), got: $allow" }
@@ -410,7 +420,7 @@ jobs:
           if-no-files-found: ignore
 
   fuzz-smoke:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: check
     steps:
       - uses: actions/checkout@v7
@@ -451,7 +461,7 @@ jobs:
           cargo fuzz run heredoc_fuzz --target x86_64-unknown-linux-gnu -- -max_total_time=30
 
   coverage:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: check
     steps:
       - uses: actions/checkout@v7
@@ -605,7 +615,7 @@ jobs:
 
   # Memory leak detection tests
   memory-tests:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: check
     steps:
       - uses: actions/checkout@v7
@@ -721,7 +731,7 @@ jobs:
   # Performance benchmark enforcement (push to main only)
   # Runs benchmarks and checks against performance budgets defined in src/perf.rs
   benchmarks:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: check
     # Only run on push to main, not on PRs (benchmarks are noisy)
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -796,7 +806,7 @@ jobs:
 
   # End-to-end shell script tests
   e2e:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: check
     steps:
       - uses: actions/checkout@v7
@@ -870,7 +880,7 @@ jobs:
 
   # Bats install/uninstall/agent-config tests
   bats:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: check
     steps:
       - uses: actions/checkout@v7
@@ -928,7 +938,7 @@ jobs:
   # Real Codex CLI smoke tests. This runs only on pushes to main because it
   # requires networked Codex API calls and consumes quota.
   codex-e2e:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: check
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     timeout-minutes: 30
@@ -1067,7 +1077,7 @@ jobs:
 
   # Scan-mode regression fixtures (ensures scan output stays stable)
   scan-regression:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: check
     steps:
       - uses: actions/checkout@v7
@@ -1141,12 +1151,15 @@ jobs:
           echo "::error::Scan regression mismatch (exit code ${{ steps.scan_regression.outputs.exit_code }}). See the 'scan-regression-artifacts' artifact and the step summary for details."
           exit 1
 
-  # Process-per-invocation perf regression gate (compares against committed baseline JSON)
+  # Compare base and candidate on the same runner; historical timings from
+  # another CPU class cannot establish a code regression after runner migration.
   perf-regression:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: check
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
 
       - uses: dtolnay/rust-toolchain@nightly
 
@@ -1157,21 +1170,72 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-perf-regression-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          key: blacksmith-4vcpu-ubuntu-2404-cargo-perf-regression-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            blacksmith-4vcpu-ubuntu-2404-cargo-perf-regression-
 
       - name: Build release binary
         run: cargo build --release
 
-      - name: Run perf baseline + compare to repo baseline
+      - name: Resolve comparison revision
+        id: comparison
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          comparison_sha="$PR_BASE_SHA"
+          if [ -z "$comparison_sha" ]; then
+            comparison_sha="$PUSH_BEFORE_SHA"
+          fi
+          if [ -z "$comparison_sha" ] || [ "$comparison_sha" = "0000000000000000000000000000000000000000" ]; then
+            # Scheduled/manual runs compare against the previous commit,
+            # never against the candidate itself.
+            comparison_sha="$(git rev-parse HEAD^)"
+          fi
+          if [[ ! "$comparison_sha" =~ ^[0-9a-f]{40}$ ]] || [ "$comparison_sha" = "$(git rev-parse HEAD)" ]; then
+            echo "::error::a distinct comparison commit is required"
+            exit 1
+          fi
+          echo "sha=$comparison_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout comparison revision
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.comparison.outputs.sha }}
+          path: perf-base
+          persist-credentials: false
+
+      - name: Build comparison binary
+        run: cargo build --manifest-path perf-base/Cargo.toml --target-dir perf-base-target --release --locked
+
+      - name: Run base and candidate perf on this runner
         id: perf
         run: |
           set +e
 
-          BASELINE_JSON="perf/baselines/2026-01-11-after-lazy.json"
+          BASELINE_JSON="perf-base.json"
           CURRENT_JSON="perf-current.json"
           REPORT_MD="perf-regression-report.md"
+
+          python3 scripts/perf_baseline.py \
+            --bin perf-base-target/release/dcg \
+            --output "$BASELINE_JSON" \
+            --warmup 10 \
+            --runs 80 \
+            --skip-trace
+          BASE_EXIT=$?
+          if [ "$BASE_EXIT" -ne 0 ]; then
+            echo "exit_code=$BASE_EXIT" >> "$GITHUB_OUTPUT"
+            echo "::error::comparison baseline generation failed (exit code $BASE_EXIT)"
+            exit 0
+          fi
+
+          {
+            echo "runner_class=blacksmith-4vcpu-ubuntu-2404"
+            echo "base_sha=$(git -C perf-base rev-parse HEAD)"
+            echo "candidate_sha=$(git rev-parse HEAD)"
+            lscpu
+          } >> perf-runner.txt
 
           python3 scripts/perf_baseline.py \
             --bin target/release/dcg \
@@ -1291,8 +1355,10 @@ jobs:
         with:
           name: perf-regression-artifacts
           path: |
+            perf-base.json
             perf-current.json
             perf-regression-report.md
+            perf-runner.txt
           retention-days: 14
           if-no-files-found: ignore
 
@@ -1304,7 +1370,7 @@ jobs:
 
   # Deep suite: fuzzing (scheduled or manual only)
   fuzz:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     # Only run on schedule or manual trigger, not on every PR
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:

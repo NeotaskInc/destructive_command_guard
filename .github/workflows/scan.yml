@@ -26,7 +26,7 @@ env:
 jobs:
   scan-pr:
     name: Scan PR for destructive commands
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
 
     # Allow the job to add PR comments and annotations
     permissions:
