@@ -52,10 +52,13 @@ binary is unchanged. The only changes are release/CI plumbing and this doc:
   release publish. Removing them does not change the compiled binary.
 - **Changed** CI plumbing only in the remaining upstream workflows: Blacksmith
   runners, actions pinned to full commit SHAs, a timeout on every job,
-  least-privilege `permissions:`, and in `ci.yml` a `CI Gate` job, draft-PR
-  skips, PR-only cancellation and no nightly schedule (the deep fuzz job runs
-  on manual dispatch and fails on a crash). Re-apply these when taking
-  upstream workflow changes.
+  least-privilege `permissions:` (`release.yml` is read-only except its
+  `release` job, and build checkouts do not keep the token), and in `ci.yml`
+  a `CI Gate` job, draft-PR skips with a `ready_for_review` trigger, PR-only
+  cancellation, `persist-credentials: false` checkouts, no ordering-only
+  `needs: check`, and no nightly schedule (the deep fuzz job runs on manual
+  dispatch with an explicit `--target`, and fails on a crash). Re-apply these
+  when taking upstream workflow changes.
 
 If a behavior change is ever needed, it goes in Neotask's own wrapper /
 verdict-mapping layer (gateway `src/infra/dcg.ts`), not here. If that is

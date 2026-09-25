@@ -1443,8 +1443,6 @@ jobs:
         with:
           toolchain: nightly
           components: llvm-tools-preview
-          # See fuzz-smoke job above — cargo-fuzz needs the musl target to
-          # link libFuzzer + AddressSanitizer with a statically-linked libc.
           targets: x86_64-unknown-linux-musl
 
       - name: Install cargo-fuzz
