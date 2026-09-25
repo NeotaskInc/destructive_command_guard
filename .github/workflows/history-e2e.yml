@@ -18,6 +18,9 @@ on:
       - ".github/workflows/history-e2e.yml"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -25,10 +28,15 @@ env:
 jobs:
   e2e:
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # v1 series 2026-09-03
+        with:
+          toolchain: nightly
 
       - name: Build release
         run: cargo build --release
@@ -40,7 +48,7 @@ jobs:
 
       - name: Upload logs
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: history-e2e-logs
           path: history-e2e.log
