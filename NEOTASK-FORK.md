@@ -50,6 +50,11 @@ binary is unchanged. The only changes are release/CI plumbing and this doc:
   duplicate, differently-named (tar.xz + cosign) release for the same neotask
   tag, and `acfs-checksums-dispatch.yml` phones home to upstream infra on
   release publish. Removing them does not change the compiled binary.
+- **Changed** CI plumbing only in the remaining upstream workflows: Blacksmith
+  runners, actions pinned to full commit SHAs, a timeout on every job,
+  least-privilege `permissions:`, and in `ci.yml` a `CI Gate` job, draft-PR
+  skips, PR-only cancellation and no nightly schedule (the deep fuzz job runs
+  on manual dispatch). Re-apply these when taking upstream workflow changes.
 
 If a behavior change is ever needed, it goes in Neotask's own wrapper /
 verdict-mapping layer (gateway `src/infra/dcg.ts`), not here. If that is

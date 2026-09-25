@@ -23,6 +23,9 @@ on:
       - 'scripts/install.sh'
       - '**/install.sh'
 
+permissions:
+  contents: read
+
 concurrency:
   group: installer-notify-${{ github.ref }}
   cancel-in-progress: true
@@ -32,10 +35,12 @@ jobs:
     # Only notify on push to main, not PRs
     if: github.event_name == 'push'
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Compute installer SHA256
         id: checksum
@@ -55,7 +60,7 @@ jobs:
           echo "Computed SHA256: $SHA256"
 
       - name: Notify ACFS
-        uses: peter-evans/repository-dispatch@v4
+        uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1
         with:
           token: ${{ secrets.ACFS_DISPATCH_TOKEN }}
           repository: Dicklesworthstone/agentic_coding_flywheel_setup
@@ -81,8 +86,11 @@ jobs:
   validate-installer:
     if: github.event_name == 'pull_request'
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
