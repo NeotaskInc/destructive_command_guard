@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -33,7 +33,7 @@ jobs:
         run: |
           ruby -e 'require "yaml"; config = YAML.load_file(".github/dependabot.yml"); puts "Dependabot config:"; puts config.inspect'
 
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master 2026-09-03
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # v1 series 2026-09-03
         with:
           toolchain: nightly
           components: rustfmt, clippy
@@ -204,7 +204,7 @@ jobs:
       - name: Enable git long paths
         run: git config --global core.longpaths true
 
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master 2026-09-03
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # v1 series 2026-09-03
         with:
           toolchain: nightly
           targets: x86_64-pc-windows-msvc
@@ -447,7 +447,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master 2026-09-03
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # v1 series 2026-09-03
         with:
           toolchain: nightly
           # cargo-fuzz defaults to building under x86_64-unknown-linux-musl
@@ -492,7 +492,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master 2026-09-03
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # v1 series 2026-09-03
         with:
           toolchain: nightly
           components: llvm-tools-preview
@@ -652,7 +652,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master 2026-09-03
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # v1 series 2026-09-03
         with:
           toolchain: nightly
 
@@ -774,7 +774,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master 2026-09-03
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # v1 series 2026-09-03
         with:
           toolchain: nightly
 
@@ -852,7 +852,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master 2026-09-03
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # v1 series 2026-09-03
         with:
           toolchain: nightly
 
@@ -931,7 +931,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master 2026-09-03
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # v1 series 2026-09-03
         with:
           toolchain: nightly
 
@@ -994,7 +994,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master 2026-09-03
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # v1 series 2026-09-03
         with:
           toolchain: nightly
 
@@ -1136,7 +1136,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master 2026-09-03
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # v1 series 2026-09-03
         with:
           toolchain: nightly
 
@@ -1219,7 +1219,7 @@ jobs:
           fetch-depth: 2
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master 2026-09-03
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # v1 series 2026-09-03
         with:
           toolchain: nightly
 
@@ -1439,7 +1439,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # master 2026-09-03
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # v1 series 2026-09-03
         with:
           toolchain: nightly
           components: llvm-tools-preview
@@ -1468,11 +1468,17 @@ jobs:
         run: |
           cd fuzz
           echo "## Fuzzing Results" >> $GITHUB_STEP_SUMMARY
+          failed=0
           for target in fuzz_context fuzz_evaluate fuzz_hook_input fuzz_normalize fuzz_heredoc_trigger fuzz_heredoc_extract fuzz_heredoc_language fuzz_shell_extract heredoc_fuzz ast_matcher_fuzz; do
             echo "Fuzzing $target (~60s runtime + build)..."
-            timeout 10m cargo fuzz run "$target" --target x86_64-unknown-linux-gnu -- -max_total_time=60 || true
-            echo "- $target: completed" >> $GITHUB_STEP_SUMMARY
+            if timeout 10m cargo fuzz run "$target" --target x86_64-unknown-linux-gnu -- -max_total_time=60; then
+              echo "- $target: completed" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- $target: FAILED (crash, build failure or timeout)" >> $GITHUB_STEP_SUMMARY
+              failed=1
+            fi
           done
+          exit "$failed"
 
       - name: Upload fuzz artifacts
         if: always()

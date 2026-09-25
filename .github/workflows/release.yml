@@ -58,7 +58,7 @@ jobs:
         # rust-toolchain.toml pins nightly-2026-06-06; install THAT nightly and
         # add the matrix target's std to it (a floating @nightly would install
         # the cross-std against the wrong nightly and fail with can't-find-core).
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1 (master 2026-09-12)
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
           toolchain: nightly-2026-06-06
           targets: ${{ matrix.target }}

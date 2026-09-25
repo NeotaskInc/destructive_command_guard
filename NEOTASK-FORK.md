@@ -54,7 +54,8 @@ binary is unchanged. The only changes are release/CI plumbing and this doc:
   runners, actions pinned to full commit SHAs, a timeout on every job,
   least-privilege `permissions:`, and in `ci.yml` a `CI Gate` job, draft-PR
   skips, PR-only cancellation and no nightly schedule (the deep fuzz job runs
-  on manual dispatch). Re-apply these when taking upstream workflow changes.
+  on manual dispatch and fails on a crash). Re-apply these when taking
+  upstream workflow changes.
 
 If a behavior change is ever needed, it goes in Neotask's own wrapper /
 verdict-mapping layer (gateway `src/infra/dcg.ts`), not here. If that is
