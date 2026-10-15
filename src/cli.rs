@@ -183,6 +183,21 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub robot: bool,
 
+    /// Read no policy from disk: config files, allowlist files, allow-once
+    /// entries and rebase-recovery signals are ignored, so only command-line
+    /// flags, DCG_* environment settings and compiled defaults decide. A file
+    /// named explicitly with `dcg test --config PATH` still applies. Use it when
+    /// the agent whose commands are checked can write the working or home
+    /// directory.
+    #[arg(
+        long,
+        action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::FalseyValueParser::new(),
+        global = true,
+        env = "DCG_NO_POLICY_FILES"
+    )]
+    pub no_policy_files: bool,
+
     /// Override automatic agent detection for agent-specific profiles
     #[arg(long, global = true, value_name = "AGENT")]
     pub agent: Option<String>,

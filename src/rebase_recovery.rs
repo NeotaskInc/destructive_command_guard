@@ -93,6 +93,10 @@ pub fn should_allow_recovery(
     pack_id: Option<&str>,
     pattern_name: Option<&str>,
 ) -> Option<RecoveryReason> {
+    // Both signals live in the working tree, which a guarded agent can write.
+    if crate::config::policy_files_disabled() {
+        return None;
+    }
     // Only `core.git` patterns participate.
     if pack_id != Some("core.git") {
         return None;
