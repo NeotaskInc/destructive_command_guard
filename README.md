@@ -578,6 +578,7 @@ Environment variables override config files (highest priority):
 - `DCG_FAIL_CLOSED=1`: block (deny) on hook input that cannot be parsed, instead of the default fail-open allow (opt-in; see [Fail-Open Philosophy](#fail-open-philosophy))
 - `DCG_BYPASS=1`: bypass dcg entirely (escape hatch; use sparingly)
 - `DCG_CONFIG=/path/to/config.toml`: use explicit config file
+- `DCG_NO_POLICY_FILES=1` (or `--no-policy-files`): read no policy from disk. Config files, allowlist files and allow-once entries are ignored; flags, these variables and compiled defaults decide. Use it when the agent being guarded can write the working or home directory.
 - `DCG_HEREDOC_ENABLED=true|false`: enable/disable heredoc scanning
 - `DCG_HEREDOC_TIMEOUT=50`: heredoc extraction timeout (milliseconds)
 - `DCG_HEREDOC_TIMEOUT_MS=50`: heredoc extraction timeout (milliseconds)

@@ -155,6 +155,27 @@ const PROJECT_CONFIG_NAME: &str = ".dcg.toml";
 /// heredoc settings, etc.). It changes *which file* is loaded as a config layer.
 pub(crate) const ENV_CONFIG_PATH: &str = "DCG_CONFIG";
 
+static POLICY_FILES_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Stop this process from reading policy from disk (`--no-policy-files`).
+///
+/// Config files (system, user, project and `DCG_CONFIG`), allowlist files
+/// (project, user and system) and allow-once entries are all ignored, so
+/// decisions come only from command-line flags, `DCG_*` environment settings
+/// and compiled defaults. For a caller that evaluates commands for an agent
+/// able to write the working or home directory: any file the agent can write
+/// would otherwise let it allow its own denied commands.
+pub fn disable_policy_files() {
+    POLICY_FILES_DISABLED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether [`disable_policy_files`] has been called in this process.
+#[must_use]
+pub fn policy_files_disabled() -> bool {
+    POLICY_FILES_DISABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Maximum parent directories to traverse when searching for a repo root.
 ///
 /// This bounds filesystem work in deeply nested directories.
@@ -3078,6 +3099,10 @@ impl Config {
         // Start with truly empty defaults - packs must be explicitly enabled.
         // generate_default() is for sample configs shown to users, not runtime defaults.
         let mut config = Self::default();
+        if policy_files_disabled() {
+            config.apply_env_overrides();
+            return config;
+        }
         let cwd = env::current_dir().ok();
 
         // Optional explicit config path override (highest-priority file config).

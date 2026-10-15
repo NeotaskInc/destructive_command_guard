@@ -20,8 +20,10 @@ Electron build downloads these release assets and sha256-verifies each one.
   layer forces `DCG_NO_UPDATE_CHECK=1` and never runs `dcg update`. New dcg
   versions reach users only inside a Neotask release.
 - **Current pin:** upstream `v0.6.7` = commit
-  `d847471364adf24d819c34a96058bc136cdc00b1`. Neotask release tag:
-  **`v0.6.7-neotask.1`**.
+  `d847471364adf24d819c34a96058bc136cdc00b1` plus the one carried patch below.
+  Neotask release tag: **`v0.6.7-neotask.2`**, cut from the
+  `release/v0.6.7-neotask.2` branch (`v0.6.7-neotask.1` plus that patch and
+  this branch's release workflow).
 - **Toolchain:** the repo pins `channel = "nightly-2026-06-06"` in
   `rust-toolchain.toml` (bare nightly cannot compile rustix 1.1.4). Our release
   CI installs that exact nightly and keeps the pin.
@@ -33,10 +35,27 @@ Electron build downloads these release assets and sha256-verifies each one.
   `v<upstream>-neotask.N` tag, bump `DCG_VERSION_FALLBACK` in the Electron
   download script, and re-run the guard closeout matrix.
 
-## No source patches
+## Source patches
 
-This fork's **Rust source is byte-identical to upstream** — the compiled `dcg`
-binary is unchanged. The only changes are release/CI plumbing and this doc:
+This fork carries exactly one source patch. Everything else in the Rust source
+is byte-identical to upstream.
+
+- **`--no-policy-files` / `DCG_NO_POLICY_FILES=1`** (dev-f31aw, recorded
+  decision). With the switch, dcg reads no policy from disk: config files
+  (system, user, project `.dcg.toml`, `DCG_CONFIG`), allowlist files (project
+  `.dcg/allowlist.toml`, user, system) and allow-once entries are ignored, so
+  only flags, `DCG_*` environment settings and compiled defaults decide. The
+  gateway passes it on every call. Without it, an agent that can write its
+  workspace or home directory could allow its own denied commands, T0
+  included, with a file such as `.dcg/allowlist.toml`. The gateway cannot
+  avoid that itself: dcg finds those files from its working directory and
+  home, and it needs the agent's real working directory to read the scripts a
+  command runs. Covered by `tests/no_policy_files.rs`. Re-apply it on every
+  upstream intake until upstream offers an equivalent switch (upstream 0.15
+  trusts project policy only when told to, but still reads the user layers and
+  allow-once entries).
+
+The rest of this fork's changes are release/CI plumbing and this doc:
 
 - **Added** `.github/workflows/release.yml` — builds our four ship targets
   (`aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-pc-windows-msvc`,
@@ -63,7 +82,7 @@ binary is unchanged. The only changes are release/CI plumbing and this doc:
 If a behavior change is ever needed, it goes in Neotask's own wrapper /
 verdict-mapping layer (gateway `src/infra/dcg.ts`), not here. If that is
 impossible, it becomes an upstream PR or an explicit, recorded decision to
-carry a patch — never a silent source edit on this fork.
+carry a patch, listed above — never a silent source edit on this fork.
 
 ## License / rider compliance
 
