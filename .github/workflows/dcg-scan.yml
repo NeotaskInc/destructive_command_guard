@@ -13,7 +13,7 @@
 #
 #   - Set DCG_VERSION to pin a specific version:
 #     - "latest" (default): Use latest release
-#     - "v0.6.7": Use specific version tag
+#     - "v0.6.8": Use specific version tag
 
 name: dcg-scan
 
@@ -21,27 +21,32 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # Fail policy: "error" | "warning" | "none"
   DCG_FAIL_ON: error
-  # Version to use: "latest" or specific tag like "v0.6.7"
+  # Version to use: "latest" or specific tag like "v0.6.8"
   DCG_VERSION: latest
 
 jobs:
   scan:
     name: Scan for destructive commands
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 20
     permissions:
       contents: read
       pull-requests: read
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Fetch enough history for git diff
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Download dcg binary
         run: |
@@ -169,7 +174,7 @@ jobs:
 
       - name: Upload scan results
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dcg-scan-results
           path: scan-results.json
@@ -181,7 +186,7 @@ jobs:
   #
   # build-dcg:
   #   name: Build dcg from source
-  #   runs-on: ubuntu-latest
+#   runs-on: blacksmith-4vcpu-ubuntu-2404
   #   steps:
   #     - uses: dtolnay/rust-toolchain@nightly
   #     - name: Build dcg
