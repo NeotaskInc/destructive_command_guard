@@ -229,6 +229,35 @@ fn rebase_does_not_unblock_reset_hard() {
 }
 
 #[test]
+fn no_policy_files_ignores_rebase_and_permit_signals() {
+    let repo = TempRepo::new("no-policy-files");
+    repo.start_rebase_merge();
+    let recover = run_rebase_recover(&repo.root, Some(120));
+    assert!(
+        recover.status.success(),
+        "dcg rebase-recover failed: {}",
+        String::from_utf8_lossy(&recover.stderr)
+    );
+
+    let switched = run_hook_in_with_env(
+        &repo.root,
+        "git checkout -- .",
+        &[("DCG_NO_POLICY_FILES", Path::new("1"))],
+    );
+    let out = String::from_utf8_lossy(&switched.stdout);
+    assert!(
+        out.contains("deny") && out.contains("checkout-discard"),
+        "with the switch, workspace recovery signals must not allow: {out}"
+    );
+
+    let out = run_hook_in(&repo.root, "git checkout -- .");
+    assert!(
+        out.trim().is_empty(),
+        "without the switch the same signals allow it: {out}"
+    );
+}
+
+#[test]
 fn permit_allows_checkout_discard_then_expires_after_use() {
     let repo = TempRepo::new("permit-single-shot");
 
