@@ -44,6 +44,7 @@ impl Fixture {
         std::fs::write(path, contents).expect("write planted file");
     }
 
+    #[cfg(unix)]
     fn user_dcg_dir(&self) -> PathBuf {
         self.home.join(".config").join("dcg")
     }

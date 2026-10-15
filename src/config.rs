@@ -161,11 +161,12 @@ static POLICY_FILES_DISABLED: std::sync::atomic::AtomicBool =
 /// Stop this process from reading policy from disk (`--no-policy-files`).
 ///
 /// Config files (system, user, project and `DCG_CONFIG`), allowlist files
-/// (project, user and system) and allow-once entries are all ignored, so
-/// decisions come only from command-line flags, `DCG_*` environment settings
-/// and compiled defaults. For a caller that evaluates commands for an agent
-/// able to write the working or home directory: any file the agent can write
-/// would otherwise let it allow its own denied commands.
+/// (project, user and system), allow-once entries and rebase-recovery signals
+/// are all ignored, so decisions come only from command-line flags, `DCG_*`
+/// environment settings and compiled defaults; a file the caller names with
+/// `dcg test --config PATH` still applies. For a caller that evaluates commands
+/// for an agent able to write the working or home directory: any file the agent
+/// can write would otherwise let it allow its own denied commands.
 pub fn disable_policy_files() {
     POLICY_FILES_DISABLED.store(true, std::sync::atomic::Ordering::SeqCst);
 }

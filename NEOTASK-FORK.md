@@ -21,9 +21,11 @@ Electron build downloads these release assets and sha256-verifies each one.
   versions reach users only inside a Neotask release.
 - **Current pin:** upstream `v0.6.7` = commit
   `d847471364adf24d819c34a96058bc136cdc00b1` plus the one carried patch below.
-  Neotask release tag: **`v0.6.7-neotask.2`**, cut from the
-  `release/v0.6.7-neotask.2` branch (`v0.6.7-neotask.1` plus that patch and
-  this branch's release workflow).
+  Neotask release tag: **`v0.6.7-neotask.3`**, cut from the
+  `release/v0.6.7-neotask.3` branch (`v0.6.7-neotask.1` plus that patch and
+  main's release workflow). The `v0.6.7-neotask.2` tag was never released:
+  its release run was cancelled before publishing because review found the
+  hook-mode rebase-recovery signals still applied under the switch.
 - **Toolchain:** the repo pins `channel = "nightly-2026-06-06"` in
   `rust-toolchain.toml` (bare nightly cannot compile rustix 1.1.4). Our release
   CI installs that exact nightly and keeps the pin.
@@ -43,8 +45,10 @@ is byte-identical to upstream.
 - **`--no-policy-files` / `DCG_NO_POLICY_FILES=1`** (dev-f31aw, recorded
   decision). With the switch, dcg reads no policy from disk: config files
   (system, user, project `.dcg.toml`, `DCG_CONFIG`), allowlist files (project
-  `.dcg/allowlist.toml`, user, system) and allow-once entries are ignored, so
-  only flags, `DCG_*` environment settings and compiled defaults decide. The
+  `.dcg/allowlist.toml`, user, system), allow-once entries and hook-mode
+  rebase-recovery signals are ignored, so only flags, `DCG_*` environment
+  settings and compiled defaults decide (an explicit `dcg test --config PATH`
+  still applies). The
   gateway passes it on every call. Without it, an agent that can write its
   workspace or home directory could allow its own denied commands, T0
   included, with a file such as `.dcg/allowlist.toml`. The gateway cannot
