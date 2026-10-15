@@ -1415,6 +1415,9 @@ fn allow_once_match(
     command: &str,
     allow_once_audit: Option<&crate::pending_exceptions::AllowOnceAuditConfig<'_>>,
 ) -> Option<crate::pending_exceptions::AllowOnceEntry> {
+    if crate::config::policy_files_disabled() {
+        return None;
+    }
     let cwd = std::env::current_dir().ok()?;
     let store = AllowOnceStore::new(AllowOnceStore::default_path(Some(&cwd)));
     match store.match_command(command, &cwd, Utc::now(), allow_once_audit) {
@@ -1428,6 +1431,9 @@ fn allow_once_match_force_config(
     command: &str,
     allow_once_audit: Option<&crate::pending_exceptions::AllowOnceAuditConfig<'_>>,
 ) -> Option<crate::pending_exceptions::AllowOnceEntry> {
+    if crate::config::policy_files_disabled() {
+        return None;
+    }
     let cwd = std::env::current_dir().ok()?;
     let store = AllowOnceStore::new(AllowOnceStore::default_path(Some(&cwd)));
     match store.match_command_force_config(command, &cwd, Utc::now(), allow_once_audit) {
