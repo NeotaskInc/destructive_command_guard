@@ -15436,8 +15436,22 @@ fn evaluate_command_in_dialect_union(
         return primary;
     }
 
-    for view in [ShellDialect::Cmd, ShellDialect::PowerShell] {
-        if !dialect_view_may_expose_hidden_execution(command, view, keyword_index, ordered_packs) {
+    // The Unknown view is not the POSIX view (it can read a quote POSIX closes
+    // as still open), yet a POSIX shell is what most callers without a dialect
+    // run. Its deny is a real one, so it needs no hidden-execution proof.
+    for view in [
+        ShellDialect::Posix,
+        ShellDialect::Cmd,
+        ShellDialect::PowerShell,
+    ] {
+        if view != ShellDialect::Posix
+            && !dialect_view_may_expose_hidden_execution(
+                command,
+                view,
+                keyword_index,
+                ordered_packs,
+            )
+        {
             continue;
         }
         // An exhausted budget is never proof that the un-run views are clean.
@@ -50901,6 +50915,63 @@ mod tests {
                 assert!(!result.is_denied(), "{command:?} must allow");
             }
         }
+    }
+
+    #[test]
+    fn an_unknown_dialect_denies_what_the_posix_view_denies_dev_lh7en3() {
+        // A caller that cannot name its shell (the robot CLI default) must not
+        // allow what the POSIX shell it most likely runs would be denied for:
+        // here a quote that POSIX closes is read as still open, hiding the
+        // outer redirect the shell performs.
+        for command in [
+            "env -S 'python3 -c \"x(' x > /etc/hosts",
+            "env --split-string='python3 -c \"x(' x > /etc/hosts",
+            "env -S 'echo #c' x > ~/.bashrc",
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let result =
+                    evaluate_with_pack_ids_in_dialect(command, &["core.filesystem"], dialect);
+                assert!(
+                    result.is_denied(),
+                    "{command:?} must deny under {dialect:?}"
+                );
+            }
+        }
+        for command in [
+            "env -S 'ls -la' /tmp",
+            "env -S 'echo \"a b\"' c",
+            "env -S 'echo #c' x > /tmp/scratch/out",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Unknown,
+            );
+            assert!(!result.is_denied(), "{command:?} must allow");
+        }
+    }
+
+    #[test]
+    fn an_env_option_cluster_ending_in_s_hands_over_its_command_dev_lh7en3() {
+        // `env -vS 'cmd'` splits and runs `cmd` exactly as `env -S 'cmd'` does.
+        for command in [
+            "env -vS 'python3 -c \"__import__(\\\"os\\\").system(\\\"echo x > /etc/hosts\\\")\"'",
+            "env -ivS 'bash -c \"echo x > /etc/hosts\"'",
+            "env -vS'bash -c \"echo x > /etc/hosts\"'",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(result.is_denied(), "{command:?} must deny");
+        }
+        let result = evaluate_with_pack_ids_in_dialect(
+            "env -vS 'python3 -c \"print(1)\"'",
+            &["core.filesystem"],
+            ShellDialect::Posix,
+        );
+        assert!(!result.is_denied());
     }
 
     #[test]
