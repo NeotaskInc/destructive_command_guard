@@ -25549,10 +25549,7 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
         // `${VAR}` and `${VAR:-default}`; an unset reference without a default
         // expands to nothing, and non-references stay literal.
         assert_eq!(normalize("${BASE}/rx"), abs(&"/srv/base/rx"));
-        assert_eq!(
-            normalize("${MISSING:-/fallback}/rx"),
-            abs(&"/fallback/rx")
-        );
+        assert_eq!(normalize("${MISSING:-/fallback}/rx"), abs(&"/fallback/rx"));
         assert_eq!(normalize("/a${MISSING}/rx"), abs(&"/a/rx"));
         assert_eq!(normalize("/a/${1}/rx"), abs(&"/a/${1}/rx"));
         assert_eq!(normalize("/a/$BASE"), abs(&"/a/$BASE"));
@@ -25631,7 +25628,7 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
             std::path::Path::new(&muse_test_absolute(path)),
             false,
         )
-            .expect("absolute path")
+        .expect("absolute path")
     }
 
     /// #358: the settings merge keeps foreign keys and hooks, is idempotent,
@@ -25872,9 +25869,8 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
     #[test]
     fn reasonix_windows_entry_is_quoted_and_recognized() {
         let executable = muse_test_absolute("/opt/my tools/dcg");
-        let entry =
-            reasonix_dcg_hook_entry_for_executable(std::path::Path::new(&executable), true)
-                .unwrap();
+        let entry = reasonix_dcg_hook_entry_for_executable(std::path::Path::new(&executable), true)
+            .unwrap();
         assert_eq!(entry["command"], format!("\"{executable}\""));
         assert!(reasonix_hook_entry_is_dcg(&entry));
         assert!(
