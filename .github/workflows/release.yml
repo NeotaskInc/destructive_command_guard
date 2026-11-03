@@ -171,4 +171,4 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" assets/* \
             --repo "${GITHUB_REPOSITORY}" \
             --title "dcg ${GITHUB_REF_NAME}" \
-            --notes "Neotask build of destructive_command_guard (dcg), MIT + OpenAI/Anthropic rider. Static per-platform binaries for the Neotask gateway destructive-command guard. LICENSE ships unmodified beside every distribution. Upstream: Dicklesworthstone/destructive_command_guard v0.16.0 @ 665fcd8f, plus the two carried source patches recorded in NEOTASK-FORK.md (--no-policy-files and the neotask-inline-code-redirect deny). Self-update is disabled downstream via DCG_NO_UPDATE_CHECK=1."
+            --notes "Neotask build of destructive_command_guard (dcg), MIT + OpenAI/Anthropic rider. Static per-platform binaries for the Neotask gateway destructive-command guard. LICENSE ships unmodified beside every distribution. Upstream: Dicklesworthstone/destructive_command_guard v0.16.0 @ 665fcd8f, plus the two carried source patches recorded in NEOTASK-FORK.md (--no-policy-files and the neotask-quoted-redirect deny). Self-update is disabled downstream via DCG_NO_UPDATE_CHECK=1."

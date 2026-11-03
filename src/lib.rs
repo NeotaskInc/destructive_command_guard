@@ -78,7 +78,7 @@ pub mod hook;
 pub mod interactive;
 pub mod logging;
 pub mod mcp;
-mod neotask_inline_code;
+mod neotask_quoted_redirect;
 pub mod normalize;
 pub mod output;
 pub mod packs;

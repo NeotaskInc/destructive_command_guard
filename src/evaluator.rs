@@ -15159,8 +15159,9 @@ fn dialect_view_may_expose_hidden_execution(
             || names_powershell_word(command, &POWERSHELL_ALIAS_DEFINERS))
 }
 
-/// The evaluation, then the fork's inline-code rule for the outermost command
-/// (see [`crate::neotask_inline_code`]); it only turns an allow into a deny.
+/// The evaluation, then the fork's quoted-redirect rule, at every nesting depth
+/// so a command nested in a shell script is judged as its own command (see
+/// [`crate::neotask_quoted_redirect`]); it only turns an allow into a deny.
 #[allow(clippy::too_many_arguments)]
 fn evaluate_command_with_pack_order_deadline_at_path_inner(
     command: &str,
@@ -15192,11 +15193,8 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
         nested_command_depth,
         inherited_automated_stdin,
     );
-    if nested_command_depth == 0
-        && result.is_allowed()
-        && crate::neotask_inline_code::matches(command)
-    {
-        return crate::neotask_inline_code::denial();
+    if result.is_allowed() && crate::neotask_quoted_redirect::matches(command) {
+        return crate::neotask_quoted_redirect::denial();
     }
     result
 }
