@@ -3560,10 +3560,8 @@ static PERL_FILE_PATH_RMTREE_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
         .expect("perl File::Path rmtree/remove_tree regex compiles")
 });
 
-static PERL_UNLINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?m)\bunlink\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#)
-        .expect("perl unlink regex compiles")
-});
+static PERL_UNLINK_CALL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)\bunlink\b").expect("perl unlink regex compiles"));
 
 static PERL_RMDIR_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?m)\brmdir\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#)
@@ -3580,7 +3578,7 @@ fn precompile_perl_patterns() {
     LazyLock::force(&PERL_SYSTEM_EXEC_LITERAL);
     LazyLock::force(&PERL_BACKTICKS_LITERAL);
     LazyLock::force(&PERL_FILE_PATH_RMTREE_LITERAL);
-    LazyLock::force(&PERL_UNLINK_LITERAL);
+    LazyLock::force(&PERL_UNLINK_CALL);
     LazyLock::force(&PERL_RMDIR_LITERAL);
 }
 
@@ -3897,38 +3895,58 @@ fn scan_perl_unlink_rmdir(
     timeout: Duration,
     budget_ms: u64,
 ) -> Result<(), MatchError> {
-    for caps in PERL_UNLINK_LITERAL.captures_iter(haystack) {
+    for m in PERL_UNLINK_CALL.find_iter(haystack) {
         perl_check_timeout(start_time, timeout, budget_ms)?;
-        let Some(m) = caps.get(0) else {
+        // A bareword before a fat comma or alone in a hash subscript is a
+        // string, not a call: `tempfile(UNLINK => 1)`, `$opts{unlink}`.
+        let after = haystack[m.end()..].trim_start();
+        let before = haystack[..m.start()].trim_end();
+        if after.starts_with("=>") || (before.ends_with('{') && after.starts_with('}')) {
             continue;
+        }
+        // Every target the call deletes, as `rmtree` weighs them. A catastrophic
+        // literal blocks (#455). Otherwise only a list of temp scratch literals
+        // stays warn-only: `unlink glob('*')` empties the working directory,
+        // and `unlink $file`, `unlink @ARGV`, a bare `unlink` ($_) or
+        // `unlink 'notes.txt'` delete what no temp literal bounds. The shell's
+        // `unlink-general` and v0.6.7-neotask.3 deny those (dev-igbgn.2).
+        let region = exec_argv_region(exec_sink_arg_region(haystack, m.start()));
+        let targets: Vec<&str> = ANY_STRING_LITERAL
+            .captures_iter(region)
+            .filter_map(|caps| string_literal_from_caps(&caps))
+            .collect();
+        let literals_only = !targets.is_empty()
+            && ANY_STRING_LITERAL
+                .replace_all(region, "")
+                .chars()
+                .all(|c| c.is_whitespace() || matches!(c, ',' | '(' | ')'));
+        let (rule_id, reason, severity) = if targets.iter().any(|path| is_catastrophic_path(path)) {
+            (
+                "heredoc.perl.unlink.catastrophic",
+                "unlink() deletes files (catastrophic target path)",
+                Severity::Critical,
+            )
+        } else if literals_only && targets.iter().all(|path| is_temp_scratch_path(path)) {
+            (
+                "heredoc.perl.unlink",
+                "unlink() deletes files",
+                Severity::Low,
+            )
+        } else {
+            (
+                "heredoc.perl.unlink.non_temp",
+                "unlink() deletes files that are not named temp paths",
+                Severity::High,
+            )
         };
-        // Only match string-literal unlink; warn-only by default.
-        //
-        // #455's smaller half: a catastrophic literal target blocks, the way
-        // Ruby's `File.delete('/etc/passwd')` already does. Neither call
-        // recurses, so this is the catastrophic-target rule and not the
-        // recursive-delete one — `unlink('./a.txt')` stays warn-only.
-        let catastrophic = string_literal_from_caps(&caps).is_some_and(is_catastrophic_path);
         push_regex_match(
             out,
             code,
             newline_positions,
-            if catastrophic {
-                "heredoc.perl.unlink.catastrophic"
-            } else {
-                "heredoc.perl.unlink"
-            },
-            if catastrophic {
-                "unlink() deletes files (catastrophic target path)"
-            } else {
-                "unlink() deletes files"
-            },
-            if catastrophic {
-                Severity::Critical
-            } else {
-                Severity::Low
-            },
-            None,
+            rule_id,
+            reason,
+            severity,
+            Some("Name each file as a literal temp path, or review the targets first".to_string()),
             m.start(),
             m.end(),
         );
@@ -8789,9 +8807,50 @@ mod tests {
         }
 
         #[test]
+        fn perl_unlink_blocks_unless_every_target_is_a_temp_literal() {
+            // dev-igbgn.2: v0.6.7-neotask.3 denied these through
+            // `core.filesystem:unlink-general`; v0.16 weighed only a catastrophic
+            // literal, so a glob, a variable or a plain file name ran unreviewed.
+            let ast_matcher = AstMatcher::new().with_timeout(std::time::Duration::from_millis(100));
+            let blocks = |code: &str| {
+                ast_matcher
+                    .find_matches(code, ScriptLanguage::Perl)
+                    .expect("perl ast_matcher should run within 100ms")
+                    .iter()
+                    .any(|m| m.severity.blocks_by_default())
+            };
+            for code in [
+                "unlink glob('*')",
+                "unlink(glob('*.bak'))",
+                "unlink <*>",
+                "unlink $file",
+                "unlink @ARGV",
+                "unlink;",
+                "unlink 'notes.txt'",
+                "unlink('/tmp/x', $f)",
+                "unlink '/tmp/x/a' . $suffix",
+                "unlink '/tmp'",
+                "unlink glob('/tmp/x/*')",
+            ] {
+                assert!(blocks(code), "must block: {code}");
+            }
+            for code in [
+                "unlink '/tmp/x/scratch'",
+                "unlink('/tmp/a', '/var/tmp/b')",
+                "unlink '/tmp/a' or die 'cannot'",
+                "my ($fh, $name) = tempfile(UNLINK => 1);",
+                "my ($fh, $name) = tempfile(unlink => 1);",
+                "my $keep = $opts{unlink};",
+                "print 'done'",
+            ] {
+                assert!(!blocks(code), "must not block: {code}");
+            }
+        }
+
+        #[test]
         fn perl_unqualified_rmtree_does_not_require_the_import() {
             // Deliberate: the qualifier is optional and there is no
-            // import gate, matching `PERL_UNLINK_LITERAL` and
+            // import gate, matching `PERL_UNLINK_CALL` and
             // `PERL_RMDIR_LITERAL` beside it, which have never required one.
             //
             // The cost is that a local `sub rmtree` deleting a catastrophic
