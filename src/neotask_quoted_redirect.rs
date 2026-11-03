@@ -247,7 +247,7 @@ fn code_words<'a>(name: &str, rest: &[&'a Word]) -> Vec<&'a Word> {
     }
     let mut code: Vec<&Word> = rest
         .windows(2)
-        .filter(|pair| (is_code_flag(pair[0]) || pair[0].text == "<<<") && pair[1].was_quoted)
+        .filter(|pair| (names_code_flag(pair[0]) || pair[0].text == "<<<") && pair[1].was_quoted)
         .map(|pair| pair[1])
         .collect();
     code.extend(
@@ -300,6 +300,19 @@ fn is_code_flag(word: &Word) -> bool {
             && (1..=4).contains(&cluster.len())
             && cluster.chars().all(|c| c.is_ascii_alphabetic())
             && cluster.ends_with(['c', 'e', 'r', 'E'])
+    })
+}
+
+/// A code flag in flag position, whether or not the shell word was quoted.
+/// Quoting a flag is invisible to the launched program — `python3 '-c' '<code>'`
+/// runs the same inline code as the bare `python3 -c '<code>'` — so the flag is
+/// judged by its text. (`is_code_flag` itself keeps its quoted-word guard for
+/// the here-string/stdin callers, where a quoted operand is data, not a flag.)
+fn names_code_flag(word: &Word) -> bool {
+    is_code_flag(&Word {
+        text: word.text.clone(),
+        was_quoted: false,
+        ..Word::default()
     })
 }
 
@@ -523,6 +536,10 @@ mod tests {
             "groovy -e \"['sh','-c','echo x > /etc/passwd'].execute()\"",
             "env FOO=1 timeout 5 node --input-type=module -e 'globalThis[\"req\"+\"uire\"](\"child_process\").execSync(\"echo x > ~/.bashrc\")'",
             "true && sudo python3 -Ic \"__import__('os').system('echo x > /etc/passwd')\"",
+            // A quoted code flag is shell-invisible to the interpreter, so it
+            // must not bypass the scan (dev-tyz9co / dev-igbgn.2 bucket-1).
+            "python3 '-c' \"__import__('os').system('echo x > /etc/passwd')\"",
+            "python3 '-c' '__import__(\"os\").system(\"echo x > /etc/passwd\")'",
             "deno eval \"Deno.run({cmd: ['sh', '-c', 'echo x > /etc/passwd']})\"",
             "ruby - <<'EOF'\nKernel.send(:sys + 'tem', 'echo x > ~/.bashrc')\nEOF",
             // Code on stdin, or attached to its flag (FuchsiaHare's second carry).
