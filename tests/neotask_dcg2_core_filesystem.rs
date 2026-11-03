@@ -2,9 +2,9 @@
 //! no-regression gate checks. v0.6.7-neotask.3 denied each `deny` row; the
 //! evaluator splits a compound command into segments, so a segment's own
 //! temp exemption decides it.
+use destructive_command_guard::allowlist::LayeredAllowlist;
 use destructive_command_guard::config::Config;
 use destructive_command_guard::evaluator::evaluate_command;
-use destructive_command_guard::load_default_allowlists;
 use destructive_command_guard::packs::REGISTRY;
 use std::collections::HashSet;
 
@@ -16,7 +16,7 @@ fn allowed(cmd: &str) -> bool {
         .collect();
     let keywords = REGISTRY.collect_enabled_keywords(&enabled);
     let overrides = config.overrides.compile();
-    let allowlists = load_default_allowlists();
+    let allowlists = LayeredAllowlist::default();
     evaluate_command(cmd, &config, &keywords, &overrides, &allowlists).is_allowed()
 }
 
@@ -36,6 +36,9 @@ fn a_temp_root_delete_or_an_unbounded_perl_unlink_is_denied() {
         "rm -rf /tmp/*",
         "rm -rf /tmp/.*",
         "echo done; rm -rf /tmp/*",
+        "perl -e 'map { unlink } glob \"*\"'",
+        "perl -e \"unlink('/tmp/a', '/tmp/b' => '/home/user/notes.txt')\"",
+        "find /tmp -mindepth 1 -delete",
     ] {
         assert!(!allowed(cmd), "must deny: {cmd}");
     }
@@ -51,6 +54,13 @@ fn temp_scratch_below_the_root_stays_allowed() {
         "echo done; unlink /tmp/scratch",
         "rm -rf /tmp/build/*",
         "rm -rf /tmp/sigtest* 2>/dev/null",
+        "perl -e 'print \"unlink\\n\"'",
+        "perl -ne 'print if /unlink/' file.txt",
+        "perl -e 'my $unlink = 1; print $unlink'",
+        "perl -e 'unlink \"/tmp/x/a\" or die \"cannot unlink: $!\"'",
+        "find /tmp -name '*.log' -delete",
+        "find /tmp -mindepth 1 -mtime +7 -delete",
+        "rm -rf \"/tmp/[build]\"",
         "perl -e 'use File::Temp qw(tempfile); my ($fh, $n) = tempfile(UNLINK => 1)'",
     ] {
         assert!(allowed(cmd), "must allow: {cmd}");

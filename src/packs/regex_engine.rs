@@ -1001,9 +1001,11 @@ mod tests {
             .iter()
             .filter(|pattern| needs_backtracking_engine(pattern.regex.as_str()))
             .collect();
+        // +4: the temp-root `find` patterns that a selecting predicate keeps
+        // exempt (`find-delete-tmp-filtered-root` and its three siblings, dcg#7).
         assert_eq!(
             backtracking.len(),
-            32,
+            36,
             "audited anchored safe-pattern corpus"
         );
         for pattern in &backtracking {
