@@ -291,7 +291,10 @@ fn terminates_options(name: &str, flag: &str) -> bool {
 
 /// The words a recognized interpreter hands to [`code_words`], found by walking
 /// its own options: the slice from the first code flag onward, or empty when a
-/// script path or terminating option comes first. The value-option check runs
+/// script path or terminating option comes first. [`code_words`] scans this
+/// slice IN ADDITION to the whole `rest`, so an empty return only ever adds
+/// `-X`/runner denies — it never narrows base's whole-`rest` coverage. The
+/// value-option check runs
 /// before the code-flag check so a value flag that looks like a code flag
 /// (node/ruby `-r`, ruby `-E`) consumes its value instead of being scanned.
 /// After an UNKNOWN option we keep walking to a code flag rather than treating
@@ -342,12 +345,15 @@ fn interpreter_code_rest<'a>(name: &str, words: &[&'a Word]) -> Vec<&'a Word> {
 /// (`--eval="..."`, `-e'...'`), a here-string (`<<< "..."`), or an awk
 /// program's quoted words.
 fn code_words<'a>(name: &str, rest: &[&'a Word]) -> Vec<&'a Word> {
-    // For a recognized interpreter, walk its own options to the inline-code
-    // slice first (so `-X sh` isn't read as a handoff), then extract the code
-    // from that slice with the shared logic.
+    // Deny-wins union for a recognized interpreter: the whole-`rest` scan keeps
+    // base's coverage (a code flag anywhere, even after a script path, `-m`,
+    // `--` or a lone `-`), and the option-walked slice adds the `-X`/runner
+    // denies base's raw-text scan missed. `code_words` feeds only the deny check
+    // in `matches()`, so a union can never newly-allow vs base (RedPuma, R2).
     if recognized_interpreter(name) {
-        let slice = interpreter_code_rest(name, rest);
-        return plain_code_words(name, &slice);
+        let mut code = plain_code_words(name, rest);
+        code.extend(plain_code_words(name, &interpreter_code_rest(name, rest)));
+        return code;
     }
     plain_code_words(name, rest)
 }
@@ -679,6 +685,16 @@ mod tests {
             "uv run --with python python -c \"__import__('os').system('echo x > /etc/passwd')\"",
             "uv run --python python3.12 python -X sh -c \"__import__('os').system('echo x > /etc/passwd')\"",
             "npx tsx -e \"require('child_process').execSync('echo x > /etc/passwd')\"",
+            // A code flag after a script path, -m, -- or a lone - is still
+            // scanned (base's whole-rest coverage; the walk alone would stop
+            // there). dev-tyz9co R2 / PinkSpire probe:interp-args.
+            "python3 script.py -c \"__import__('os').system('echo x > /etc/passwd')\"",
+            "python3 -m mod -c \"__import__('os').system('echo x > /etc/passwd')\"",
+            "python3 -- -c \"__import__('os').system('echo x > /etc/passwd')\"",
+            "python3 - -c \"__import__('os').system('echo x > /etc/passwd')\"",
+            "node app.js -e \"require('child_process').execSync('echo x > /etc/passwd')\"",
+            "ruby script.rb -e \"system('echo x > /etc/passwd')\"",
+            "perl script.pl -e \"system('echo x > /etc/passwd')\"",
             "uv run -- python -X sh -c \"__import__('os').system('echo x > /etc/passwd')\"",
             "poetry run python -X sh -c \"__import__('os').system('echo x > /etc/passwd')\"",
             "pipx run python -X sh -c \"__import__('os').system('echo x > /etc/passwd')\"",
