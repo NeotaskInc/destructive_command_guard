@@ -282,6 +282,13 @@ fn test_audit_backtracking_requirements() {
         (
             "core.filesystem",
             HashSet::from([
+                // Neotask fork (dcg#7, dev-igbgn.2): a filtered find under a
+                // temp root is exempt only when no operator can widen it, which
+                // these patterns check with lookaheads.
+                "find-delete-tmp-filtered-root",
+                "find-delete-var-tmp-filtered-root",
+                "find-exec-rm-tmp-filtered-root",
+                "find-exec-rm-var-tmp-filtered-root",
                 "rm-f-r-tmp",
                 "rm-f-r-tmpdir",
                 "rm-f-r-tmpdir-brace",
