@@ -40,7 +40,7 @@ Electron build downloads these release assets and sha256-verifies each one.
 
 ## Source patches
 
-This fork carries exactly two source patches. Everything else in the Rust
+This fork carries the source patches below. Everything else in the Rust
 source is byte-identical to upstream, except one upstream test about the
 retired `dist.yml` (see the CI plumbing below).
 
@@ -98,6 +98,37 @@ retired `dist.yml` (see the CI plumbing below).
   reopened the same bypass. Re-apply on every intake until upstream denies
   these shapes itself; drop it when the module's own tests pass with the hook
   removed.
+
+- **Temp-root deletes and Perl `unlink`** (dev-igbgn.2, dev-igbgn.4,
+  dev-qgoxf1, dev-hs30uj; recorded decisions in the dcg .2 gate reviews).
+  Upstream 0.16 judges each segment of a command, so the `/tmp` and `/var/tmp`
+  exemptions now decide compound commands that v0.6.7 denied as a whole; and
+  it judges Perl's `unlink` only by a catastrophic literal target.
+  - **`core.filesystem`** (`src/packs/core/filesystem.rs`): a temp path counts
+    as scratch only when it names an entry **below** the root by a literal
+    first component. The root itself (however spelled, with redundant `/` or
+    `.`), and a first component that starts with a glob, name every child of
+    the shared directory, so `find … -delete`, `find … -exec rm`, `rm -rf` and
+    the Windows per-user Temp exemption review them. A `find` on the root stays
+    exempt when a predicate that selects by name, path, time, size, owner or
+    permission comes before the action, as v0.6.7 allowed, unless the name
+    pattern matches anything or the expression can undo the selection
+    (`-o`, `!`, `,`) or the action is a recursive `rm`.
+  - **Perl `unlink`** (`src/ast_pattern_engine.rs`): only calls Perl runs are
+    weighed, through a code view that blanks string, quote-like, regex,
+    heredoc, POD, `format` and `__END__` bodies and errs toward code wherever
+    Perl's reading is ambiguous. Every target is weighed: a catastrophic one is
+    Critical; a list of literal temp scratch paths stays warn-only; anything
+    else (a glob, a variable, a list, a bare `unlink`, a non-temp name) is
+    `heredoc.perl.unlink.non_temp`, High.
+  - **Intended differences from v0.6.7:** stricter on the whole temp root
+    (the bare root, `-mindepth`/`-type`-only expressions and child globs were
+    allowed by v0.6.7 and now review); looser on literal temp scratch (`echo
+    done; unlink /tmp/x`, `echo done; find /tmp/x -delete` and a Perl `unlink`
+    of a literal `/tmp/<subdir>/…` path, which v0.6.7 denied by matching raw
+    text, are allowed, as the same command alone always was). Re-apply on every
+    intake until upstream treats a temp root as non-scratch and weighs Perl
+    `unlink` targets itself.
 
 The rest of this fork's changes are release/CI plumbing and this doc:
 
