@@ -124,14 +124,14 @@ jobs:
           "$smoke_binary" --version
           "$smoke_binary" --robot test "ls -la" >/dev/null
           set +e
-          "$smoke_binary" --robot test "rm -rf /"
+          "$smoke_binary" --robot test "git reset --hard"
           deny_status=$?
           set -e
           if [ "$deny_status" -ne 1 ]; then
             echo "::error::expected denial exit 1; received $deny_status"
             exit 1
           fi
-          echo "smoke ok: allowed benign, denied rm -rf /"
+          echo "smoke ok: allowed benign, denied git reset --hard"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -171,4 +171,4 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" assets/* \
             --repo "${GITHUB_REPOSITORY}" \
             --title "dcg ${GITHUB_REF_NAME}" \
-            --notes "Neotask build of destructive_command_guard (dcg), MIT + OpenAI/Anthropic rider. Static per-platform binaries for the Neotask gateway destructive-command guard. LICENSE ships unmodified beside every distribution. Upstream: Dicklesworthstone/destructive_command_guard v0.16.0 @ 665fcd8f, plus the two carried source patches recorded in NEOTASK-FORK.md (--no-policy-files and the neotask-dynamic-exec-redirect deny). Self-update is disabled downstream via DCG_NO_UPDATE_CHECK=1."
+            --notes "Neotask build of destructive_command_guard (dcg), MIT + OpenAI/Anthropic rider. Static per-platform binaries for the Neotask gateway destructive-command guard. LICENSE ships unmodified beside every distribution. Upstream: Dicklesworthstone/destructive_command_guard v0.16.0 @ 665fcd8f, plus the two carried source patches recorded in NEOTASK-FORK.md (--no-policy-files and the neotask-inline-code-redirect deny). Self-update is disabled downstream via DCG_NO_UPDATE_CHECK=1."

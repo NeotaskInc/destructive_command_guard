@@ -15159,8 +15159,8 @@ fn dialect_view_may_expose_hidden_execution(
             || names_powershell_word(command, &POWERSHELL_ALIAS_DEFINERS))
 }
 
-/// The evaluation, then the fork's dynamic-exec rule for the outermost command
-/// (see [`crate::neotask_dynamic_exec`]); it only turns an allow into a deny.
+/// The evaluation, then the fork's inline-code rule for the outermost command
+/// (see [`crate::neotask_inline_code`]); it only turns an allow into a deny.
 #[allow(clippy::too_many_arguments)]
 fn evaluate_command_with_pack_order_deadline_at_path_inner(
     command: &str,
@@ -15194,9 +15194,9 @@ fn evaluate_command_with_pack_order_deadline_at_path_inner(
     );
     if nested_command_depth == 0
         && result.is_allowed()
-        && crate::neotask_dynamic_exec::matches(command)
+        && crate::neotask_inline_code::matches(command)
     {
-        return crate::neotask_dynamic_exec::denial();
+        return crate::neotask_inline_code::denial();
     }
     result
 }

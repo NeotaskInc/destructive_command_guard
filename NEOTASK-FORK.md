@@ -60,22 +60,26 @@ retired `dist.yml` (see the CI plumbing below).
   upstream intake until upstream offers an equivalent switch (upstream 0.16
   trusts project policy only when `DCG_CONFIG` names it, but still reads the
   user layers, which follow `XDG_CONFIG_HOME`, and allow-once grants).
-- **`core.filesystem:neotask-dynamic-exec-redirect`** (dev-igbgn, recorded
+- **`core.filesystem:neotask-inline-code-redirect`** (dev-igbgn, recorded
   decision). Upstream 0.16 reads inline interpreter code in its own language,
   which ends the dev-4fg5k false positives (`node -e "x.match(/<p>/)"` read as
-  a redirect), but it cannot follow a module or function name the code builds
-  at run time: `__import__('os').system('echo x > /etc/passwd')`,
-  `require('child' + '_process')` and `new Function(...)` writing a protected
-  path were allowed, where v0.6.7 denied them by reading every redirect in the
-  raw text. `src/neotask_dynamic_exec.rs` keeps that deny for exactly the
-  obfuscated case (inline interpreter code, a run-time-built import or
-  function, and a truncating write to a system, home or variable path, all in
-  the raw command), applied once to the outermost command and only to an
-  allow; the hook in `src/evaluator.rs` wraps the upstream entry point. The
-  quote-aware fix and the old block are one mechanism, so taking upstream's
-  fix alone onto v0.6.7 would have reopened the same bypass. Re-apply on
-  every intake until upstream denies these shapes itself; drop it when the
-  module's own tests pass with the hook removed.
+  a redirect), but it cannot see a sink the code builds at run time:
+  `__import__('os').system(...)`, `globalThis['req'+'uire']`,
+  `Kernel.send(:sys + 'tem', ...)`, Perl's `&$f(...)`, PHP's `$f(...)` and
+  Lua's `os['exe'..'cute']` writing `/etc/passwd` were allowed, where v0.6.7
+  denied them by reading every redirect in the raw text (as did awk's
+  `print > "/etc/passwd"`). Run-time names cannot be enumerated, so
+  `src/neotask_inline_code.rs` keeps v0.6.7's deny for code handed to an
+  interpreter (python, pypy, node, deno, bun, ruby, perl, php, lua, awk): a
+  truncating write to a system, home or variable path in the command's quoted
+  text or heredoc bodies. A real redirect outside the code stays upstream's
+  decision, and so does every other verdict: the hook in `src/evaluator.rs`
+  wraps the upstream entry point, applies once to the outermost command and
+  only turns an allow into a deny. The quote-aware fix and the old block are
+  one mechanism, so taking upstream's fix alone onto v0.6.7 would have
+  reopened the same bypass. Re-apply on every intake until upstream denies
+  these shapes itself; drop it when the module's own tests pass with the hook
+  removed.
 
 The rest of this fork's changes are release/CI plumbing and this doc:
 
