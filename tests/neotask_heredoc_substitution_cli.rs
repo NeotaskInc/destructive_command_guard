@@ -34,10 +34,15 @@ fn an_expanding_heredoc_substitution_is_denied_and_a_quoted_one_is_data() {
         let json: serde_json::Value = serde_json::from_str(&stdout).expect("robot JSON");
         assert_eq!(json["decision"], "deny", "{command:?}: {stdout}");
     }
-    let quoted = "git commit -F - <<'EOF'\n$(rm -rf ~/project)\nEOF";
-    let (code, stdout) = verdict(quoted);
-    assert_eq!(
-        code, 0,
-        "{quoted:?} is a literal body and must be allowed: {stdout}"
-    );
+    // A quoted delimiter keeps the body literal in POSIX shells; on Windows the
+    // default windows.filesystem pack reads the text without POSIX heredoc rules.
+    #[cfg(unix)]
+    {
+        let quoted = "git commit -F - <<'EOF'\n$(rm -rf ~/project)\nEOF";
+        let (code, stdout) = verdict(quoted);
+        assert_eq!(
+            code, 0,
+            "{quoted:?} is a literal body and must be allowed: {stdout}"
+        );
+    }
 }
