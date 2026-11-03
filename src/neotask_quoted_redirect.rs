@@ -1,5 +1,6 @@
 //! Neotask fork rule (dev-igbgn): inline code whose quoted text spells a
-//! truncating write to a system, home or variable path.
+//! write (a truncating or appending redirect, `tee` or `dd of=`) to a system,
+//! home or variable path.
 //!
 //! Upstream reads inline interpreter code in its own language, which is what
 //! keeps `node -e "x.match(/<p>/)"` from reading as a redirect. It cannot see
@@ -29,11 +30,23 @@ use crate::packs::regex_engine::LazyCompiledRegex;
 pub(crate) const PACK_ID: &str = "core.filesystem";
 pub(crate) const PATTERN_NAME: &str = "neotask-quoted-redirect";
 
-/// A truncating write to a system or home path, or to a path held in a named
-/// variable (`$1`, an awk field, is not one).
-static PROTECTED_WRITE: LazyCompiledRegex = LazyCompiledRegex::new(
-    r#"(?<![<>=-])(?:&>|>&|[0-9]*>\|?)\s*['"\\]?(?!/dev/(?:null|zero|full|tty|stdout|stderr)\b)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|\b)|~|\$\{?[A-Za-z_])"#,
-);
+/// A system or home path, or a path held in a named variable (`$1`, an awk
+/// field, is not one), after an optional opening quote or escape.
+macro_rules! protected_target {
+    () => {
+        r#"['"\\]?(?!/dev/(?:null|zero|full|tty|stdout|stderr)\b)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|\b)|~|\$\{?[A-Za-z_])"#
+    };
+}
+
+/// A write to a protected target: a truncating or appending redirect, or a
+/// sink that writes the path it is given, `tee` (with any flags) and `dd`'s
+/// `of=` (dev-65yunv: `echo x >> /etc/passwd` and `tee /etc/passwd` inside
+/// code were allowed).
+static PROTECTED_WRITE: LazyCompiledRegex = LazyCompiledRegex::new(concat!(
+    r#"(?:(?<![<>=-])(?:&>>?|>&|[0-9]*>>?\|?)\s*|(?:^|[\s;&|(`'"])tee(?:\s+-{1,2}[A-Za-z][A-Za-z-]*)*\s+|\bof="#,
+    r")",
+    protected_target!(),
+));
 
 /// A line that runs Ruby, whose heredoc bodies the rule reads.
 static RUBY: LazyCompiledRegex =
@@ -504,6 +517,13 @@ mod tests {
             "perl -e'my $f = \"sys\".\"tem\"; &$f(\"echo x > /etc/passwd\")'",
             "python3 <<< \"__import__('os').system('echo x > ~/.bashrc')\"",
             "printf '%s' \"Kernel.send(:sys + 'tem', 'echo x > $T')\" | timeout 5 ruby",
+            // An append, or a sink that writes the path it is given (dev-65yunv, FuchsiaHare on dev-igbgn).
+            "python3 -c \"__import__('os').system('echo x>>/etc/passwd')\"",
+            "python3 -c \"__import__('os').system('echo x &>> ~/.bashrc')\"",
+            "python3 -c \"__import__('os').system('tee /etc/passwd < /dev/null')\"",
+            "node -e \"globalThis['req'+'uire']('child_process').execSync('echo x | tee -a /etc/sudoers')\"",
+            "ruby -e \"Kernel.send(:sys + 'tem', 'echo x | tee --append \\\"$HOME/.profile\\\"')\"",
+            "perl -e \"my \\$f = 'sys'.'tem'; &\\$f('dd if=/dev/zero of=/etc/hosts count=1')\"",
         ] {
             assert!(matches(command), "{command}");
         }
@@ -553,6 +573,11 @@ mod tests {
             // GNU parallel runs each stdin line as a shell command, which upstream parses.
             "printf '%s\\n' 'echo x > ~/new-note' | parallel",
             "sudo printf '%s\\n' 'echo x > ~/new-note' | parallel",
+            // A shift, a tee or dd into the working directory, and reading a protected path are not writes to one.
+            "python3 -c 'print(1 >> 2)'",
+            "node -e \"require('child_process').execSync('echo x | tee -a ./build.log')\"",
+            "python3 -c \"__import__('os').system('dd if=/etc/hostname of=./copy')\"",
+            "python3 -c \"__import__('os').system('cat /etc/hosts | tee out.txt')\"",
         ] {
             assert!(!matches(command), "{command}");
         }
