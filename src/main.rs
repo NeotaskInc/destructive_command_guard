@@ -2095,6 +2095,10 @@ fn main() {
         }
     };
 
+    if cli.no_policy_files {
+        destructive_command_guard::config::disable_policy_files();
+    }
+
     // Initialize output system based on CLI flags.
     // --legacy-output, --no-color, or --robot forces plain output mode.
     // Robot mode also suppresses human diagnostics. A hook protocol that

@@ -1890,6 +1890,9 @@ pub fn resolve_path_for_matching(
 /// Invalid TOML is treated as empty for that layer and reported in `errors`.
 #[must_use]
 pub fn load_default_allowlists() -> LayeredAllowlist {
+    if crate::config::policy_files_disabled() {
+        return LayeredAllowlist::default();
+    }
     let project = std::env::current_dir().ok().and_then(|cwd| {
         crate::config::explicitly_trusts_project_policy(&cwd).then(|| project_allowlist_path(&cwd))
     });

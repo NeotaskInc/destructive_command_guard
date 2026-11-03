@@ -786,7 +786,8 @@ impl AllowOnceStore {
         now: DateTime<Utc>,
         allow_once_audit: Option<&AllowOnceAuditConfig<'_>>,
     ) -> io::Result<Option<AllowOnceEntry>> {
-        if !self.path.exists() {
+        // With --no-policy-files no allow-once grant on disk applies.
+        if crate::config::policy_files_disabled() || !self.path.exists() {
             return Ok(None);
         }
 
@@ -853,7 +854,8 @@ impl AllowOnceStore {
         now: DateTime<Utc>,
         allow_once_audit: Option<&AllowOnceAuditConfig<'_>>,
     ) -> io::Result<Option<AllowOnceEntry>> {
-        if !self.path.exists() {
+        // With --no-policy-files no allow-once grant on disk applies.
+        if crate::config::policy_files_disabled() || !self.path.exists() {
             return Ok(None);
         }
 

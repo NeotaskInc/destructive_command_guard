@@ -505,6 +505,28 @@ const PROJECT_CONFIG_NAME: &str = ".dcg.toml";
 /// heredoc settings, etc.). It changes *which file* is loaded as a config layer.
 pub(crate) const ENV_CONFIG_PATH: &str = "DCG_CONFIG";
 
+static POLICY_FILES_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Stop this process from reading policy from disk (`--no-policy-files`).
+///
+/// Config files (system, user, project and `DCG_CONFIG`), allowlist files
+/// (project, user and system), allow-once entries and rebase-recovery signals
+/// are all ignored, so decisions come only from command-line flags, `DCG_*`
+/// environment settings and compiled defaults; a file the caller names with
+/// `dcg test --config PATH` still applies. For a caller that evaluates commands
+/// for an agent able to write the working or home directory: any file the agent
+/// can write would otherwise let it allow its own denied commands.
+pub fn disable_policy_files() {
+    POLICY_FILES_DISABLED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether [`disable_policy_files`] has been called in this process.
+#[must_use]
+pub fn policy_files_disabled() -> bool {
+    POLICY_FILES_DISABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Maximum parent directories to traverse when searching for a repo root.
 ///
 /// This bounds filesystem work in deeply nested directories.
@@ -4144,6 +4166,8 @@ impl Config {
             } else {
                 Ok(Some(path.to_path_buf()))
             }
+        } else if policy_files_disabled() {
+            Ok(None)
         } else {
             match env::var(ENV_CONFIG_PATH) {
                 Ok(value) => resolve_config_path_value(&value, cwd.as_deref())
@@ -4193,17 +4217,19 @@ impl Config {
             });
 
         // Load system config (lowest priority of file configs)
-        let system_path = system_config_dir().join(CONFIG_FILE_NAME);
-        let (system_config, system_outcome) = Self::load_layer_from_file_with_outcome(
-            &system_path,
-            ConfigSource::System,
-            ConfigFileLayer::System,
-            ConfigFileAuthority::Full,
-            capture_sources,
-        );
-        record_config_outcome(&mut sources, system_outcome);
-        if let Some(system_config) = system_config {
-            config.merge_layer(system_config);
+        if !policy_files_disabled() {
+            let system_path = system_config_dir().join(CONFIG_FILE_NAME);
+            let (system_config, system_outcome) = Self::load_layer_from_file_with_outcome(
+                &system_path,
+                ConfigSource::System,
+                ConfigFileLayer::System,
+                ConfigFileAuthority::Full,
+                capture_sources,
+            );
+            record_config_outcome(&mut sources, system_outcome);
+            if let Some(system_config) = system_config {
+                config.merge_layer(system_config);
+            }
         }
 
         // Load user config
@@ -4226,7 +4252,7 @@ impl Config {
                     ),
                 ));
             }
-        } else {
+        } else if !policy_files_disabled() {
             let user_config = Self::load_user_config_layer_with_outcomes(&mut sources);
             if let Some(user_config) = user_config {
                 config.merge_layer(user_config);
@@ -4235,6 +4261,7 @@ impl Config {
 
         let project_path = cwd
             .as_deref()
+            .filter(|_| !policy_files_disabled())
             .and_then(|start_dir| find_repo_root(start_dir, REPO_ROOT_SEARCH_MAX_HOPS))
             .map(|repo_root| repo_root.join(PROJECT_CONFIG_NAME));
         if explicit_project_policy {
