@@ -39,9 +39,14 @@ pub(crate) fn matches(command: &str) -> bool {
     INTERPRETER.is_match(command) && PROTECTED_WRITE.is_match(&code_text(command))
 }
 
-/// The text of the command's quoted words and heredoc bodies, one per line:
-/// where inline code lives. Unquoted text, including a real redirect after
-/// the code, is left out.
+/// Separates quoted words in [`code_text`]; not whitespace, so a write cannot
+/// be assembled from a `>` in one word and a path in the next.
+const WORD_BREAK: char = '\u{1f}';
+
+/// Where inline code lives: the quoted words of the command's shell lines, and
+/// the bodies of heredocs fed to Ruby. Unquoted text (including a real
+/// redirect after the code) and other heredoc bodies are left out: upstream
+/// reads heredoc programs for every other interpreter this rule names.
 fn code_text(command: &str) -> String {
     #[derive(PartialEq, Eq, Clone, Copy)]
     enum Quote {
@@ -50,9 +55,10 @@ fn code_text(command: &str) -> String {
         Double,
         AnsiC,
     }
+    let (shell, ruby_bodies) = split_heredocs(command);
     let mut text = String::new();
     let mut quote = Quote::None;
-    let mut chars = command.chars().peekable();
+    let mut chars = shell.chars().peekable();
     while let Some(c) = chars.next() {
         match (quote, c) {
             (Quote::None, '\\') => {
@@ -67,7 +73,7 @@ fn code_text(command: &str) -> String {
             (Quote::None, _) => {}
             (Quote::Single, '\'') | (Quote::Double, '"') | (Quote::AnsiC, '\'') => {
                 quote = Quote::None;
-                text.push('\n');
+                text.push(WORD_BREAK);
             }
             (Quote::Double | Quote::AnsiC, '\\') => {
                 if let Some(next) = chars.next() {
@@ -77,28 +83,35 @@ fn code_text(command: &str) -> String {
             _ => text.push(c),
         }
     }
-    text.push('\n');
-    text.push_str(&heredoc_bodies(command));
+    text.push(WORD_BREAK);
+    text.push_str(&ruby_bodies);
     text
 }
 
-/// The bodies of the command's heredocs, delimiter lines excluded.
-fn heredoc_bodies(command: &str) -> String {
-    let mut bodies = String::new();
-    let mut pending: Vec<String> = Vec::new();
+/// Splits a command into its shell lines and the bodies of heredocs whose
+/// opening line runs Ruby (delimiter lines go with neither).
+fn split_heredocs(command: &str) -> (String, String) {
+    static RUBY: LazyCompiledRegex =
+        LazyCompiledRegex::new(r"(?:^|[\s;&|(`$])(?:\S*/)?(?:ruby[0-9.]*|jruby)(?=\s|$)");
+    let mut shell = String::new();
+    let mut ruby_bodies = String::new();
+    let mut pending: Vec<(String, bool)> = Vec::new();
     for line in command.split('\n') {
-        if let Some(delimiter) = pending.first() {
+        if let Some((delimiter, ruby)) = pending.first() {
             if line.trim_start_matches('\t') == delimiter {
                 pending.remove(0);
-            } else {
-                bodies.push_str(line);
-                bodies.push('\n');
+            } else if *ruby {
+                ruby_bodies.push_str(line);
+                ruby_bodies.push('\n');
             }
             continue;
         }
-        pending.extend(heredoc_delimiters(line));
+        shell.push_str(line);
+        shell.push('\n');
+        let ruby = RUBY.is_match(line);
+        pending.extend(heredoc_delimiters(line).into_iter().map(|d| (d, ruby)));
     }
-    bodies
+    (shell, ruby_bodies)
 }
 
 /// The delimiters of the heredocs a line opens (`<<EOF`, `<<-'EOF'`, `<< "EOF"`),
@@ -176,7 +189,7 @@ mod tests {
             "ruby -e \"Kernel.send(:sys + 'tem', 'echo x > $T')\"",
             "php -r '$f = \"sys\".\"tem\"; $f(\"echo x > $T\");'",
             "awk '{print > \"/etc/passwd\"}' f",
-            "perl - <<'EOF'\nmy $f = 'sys'.'tem'; &$f('echo x > ~/.bashrc');\nEOF",
+            "ruby - <<'EOF'\nKernel.send(:sys + 'tem', 'echo x > ~/.bashrc')\nEOF",
         ] {
             assert!(matches(command), "{command}");
         }
@@ -198,6 +211,11 @@ mod tests {
             "node -e \"require(name)\" > out.txt",
             "grep -E 'a > /etc' notes.txt",
             "cat > check_html.py <<'EOF'\nprint(re.findall(r'<(\\w+)[^>]*>/', s))\nEOF",
+            // Heredoc programs for other interpreters are upstream's to read.
+            "python3 - <<'PY'\nold = ''\nnew = ('echo $(date)\\n' '(task >\"$W/out.log\")\\n' + old)\nPY",
+            "perl <<'PERL'\nprint <<'DATA';\nopen(FH, '>', '/etc/shadow');\nDATA\nPERL",
+            // A `>` and a path in separate quoted words are not one write.
+            "python3 -c 'import sys; print(sys.argv)' '>' '/etc/hosts'",
         ] {
             assert!(!matches(command), "{command}");
         }
