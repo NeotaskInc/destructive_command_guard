@@ -50849,11 +50849,35 @@ mod tests {
         }
     }
 
-    /// dev-igbgn.6: moving the carrier's pack forward (#428) reorders the pack
-    /// list, and the keyword index's candidate bits are positional. Decoded
-    /// against the reordered list they named the wrong packs, so with
-    /// `database.mongodb` enabled beside `database.mysql` a here-string into
-    /// `mysql` reached no database rule at all and was allowed.
+    /// A rule id is the key an allowlist entry names, so a SQL payload on a
+    /// client's here-string must be named by that client's own pack, as on its
+    /// `-e`/`-c` flag and heredoc.
+    #[test]
+    fn a_here_string_payload_is_named_by_its_own_client_pack_dev_6fcypx() {
+        let packs = ["database.mysql", "database.postgresql", "database.sqlite"];
+        for (command, rule) in [
+            ("mysql <<< \"DROP DATABASE prod\"", "database.mysql"),
+            ("psql <<< \"DROP DATABASE prod\"", "database.postgresql"),
+            ("sqlite3 app.db <<< \"DROP TABLE users\"", "database.sqlite"),
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let result = evaluate_with_pack_ids_in_dialect(command, &packs, dialect);
+                assert!(
+                    result.is_denied(),
+                    "{command:?} must deny under {dialect:?}"
+                );
+                assert_eq!(
+                    result
+                        .pattern_info
+                        .as_ref()
+                        .and_then(|info| info.pack_id.as_deref()),
+                    Some(rule),
+                    "{command:?} under {dialect:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn an_index_built_for_another_pack_order_is_not_decoded_dev_h3yib1() {
         let enabled: std::collections::HashSet<String> = ["database.mysql", "database.mongodb"]
@@ -50886,6 +50910,11 @@ mod tests {
         );
     }
 
+    /// dev-igbgn.6: moving the carrier's pack forward (#428) reorders the pack
+    /// list, and the keyword index's candidate bits are positional. Decoded
+    /// against the reordered list they named the wrong packs, so with
+    /// `database.mongodb` enabled beside `database.mysql` a here-string into
+    /// `mysql` reached no database rule at all and was allowed.
     #[test]
     fn a_reordered_carrier_keeps_its_own_keyword_candidates_dev_igbgn_6() {
         let packs = [
