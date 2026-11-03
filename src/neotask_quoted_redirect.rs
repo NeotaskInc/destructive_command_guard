@@ -110,14 +110,6 @@ const WRAPPERS: &[&str] = &[
     "env", "timeout", "nice", "nohup", "command", "exec", "time", "stdbuf", "xargs", "sudo", "doas",
 ];
 
-/// Runners that launch an interpreter named later in the command (`uv run
-/// python …`, `poetry run python …`, `npx node …`). `command_of` parses the
-/// launched interpreter, not the runner, so an interpreter option value is not
-/// read as a handoff through the runner (dev-tyz9co B1, FuchsiaHare).
-const RUNNERS: &[&str] = &[
-    "uv", "poetry", "pipx", "pdm", "hatch", "rye", "pipenv", "conda", "npx", "bunx",
-];
-
 /// Long flags that hand a program its code.
 const LONG_CODE_FLAGS: &[&str] = &[
     "--eval",
@@ -201,6 +193,24 @@ pub(crate) fn matches(command: &str) -> bool {
                 return true;
             }
         }
+        // A runner launches an interpreter named later, and a runner option value
+        // can sit where the interpreter name would (`uv run --python python3.12
+        // python -c …`). So scan every recognized-interpreter word as its own
+        // program and union their inline-code payloads. A deny still needs a
+        // protected write in a payload, so this fails closed without a runner
+        // option-arity table (dev-tyz9co R1, FuchsiaHare).
+        for index in 0..segment.words.len() {
+            let interpreter = basename(&segment.words[index].text);
+            if recognized_interpreter(interpreter) {
+                let rest: Vec<&Word> = segment.words[index + 1..].iter().collect();
+                if code_words(interpreter, &rest)
+                    .iter()
+                    .any(|word| writes_protected(word))
+                {
+                    return true;
+                }
+            }
+        }
         piped_write |= segment.words.iter().any(writes_protected);
     }
     PROTECTED_WRITE.is_match(&ruby_bodies)
@@ -230,44 +240,14 @@ fn command_of(segment: &[Word]) -> Option<(&str, Vec<&Word>)> {
             break;
         }
     }
-    let mut program = words.next()?;
-    let mut name = basename(&program.text);
-    // A runner (`uv run python …`, `poetry run python …`, `npx node …`) launches
-    // an interpreter named later: advance to the first argument whose basename is
-    // a recognized interpreter and parse from there, so `uv run python -X sh -c`
-    // is read like `python -X sh -c` rather than stopping at `sh` (dev-tyz9co B1).
-    if RUNNERS.contains(&name) {
-        let mut interpreter = None;
-        while let Some(word) = words.peek() {
-            if recognized_interpreter(basename(&word.text)) {
-                interpreter = words.next();
-                break;
-            }
-            words.next();
-        }
-        if let Some(word) = interpreter {
-            program = word;
-            name = basename(&program.text);
-        }
-    }
+    let program = words.next()?;
+    let name = basename(&program.text);
     if UPSTREAM_OWNED.contains(&name) {
         return None;
     }
-    let remaining: Vec<&Word> = words.collect();
-    // A recognized interpreter keeps every argument (no handoff stop): it does
-    // not hand a later upstream-owned word off to a shell the way `find -exec`
-    // or `parallel` do, and `reads_code_from_stdin` needs the script operand so
-    // `python3 tool.py` is not read as stdin-code (dev-tyz9co). `code_words`
-    // then walks the interpreter's own options to the real inline payload.
-    // Every other program keeps the handoff rule.
-    let rest: Vec<&Word> = if recognized_interpreter(name) {
-        remaining
-    } else {
-        remaining
-            .into_iter()
-            .take_while(|word| word.was_quoted || !UPSTREAM_OWNED.contains(&basename(&word.text)))
-            .collect()
-    };
+    let rest = words
+        .take_while(|word| word.was_quoted || !UPSTREAM_OWNED.contains(&basename(&word.text)))
+        .collect();
     Some((name, rest))
 }
 
@@ -692,6 +672,13 @@ mod tests {
             // A runner launching the interpreter must not let the -X value drop
             // the code flag either (dev-tyz9co B1, FuchsiaHare).
             "uv run python -X sh -c \"__import__('os').system('echo x > /etc/passwd')\"",
+            // A runner option value may sit where the interpreter name would, so
+            // every recognized-interpreter word is scanned as a program; the real
+            // interpreter's payload still denies (dev-tyz9co R1, FuchsiaHare).
+            "uv run --python python3.12 python -c \"__import__('os').system('echo x > /etc/passwd')\"",
+            "uv run --with python python -c \"__import__('os').system('echo x > /etc/passwd')\"",
+            "uv run --python python3.12 python -X sh -c \"__import__('os').system('echo x > /etc/passwd')\"",
+            "npx tsx -e \"require('child_process').execSync('echo x > /etc/passwd')\"",
             "uv run -- python -X sh -c \"__import__('os').system('echo x > /etc/passwd')\"",
             "poetry run python -X sh -c \"__import__('os').system('echo x > /etc/passwd')\"",
             "pipx run python -X sh -c \"__import__('os').system('echo x > /etc/passwd')\"",
@@ -754,6 +741,8 @@ mod tests {
             "uv run python script.py",
             "uv run pytest -q tests/",
             "poetry run python -X dev app.py --flag",
+            "uv run --python python3.12 python script.py",
+            "npx prettier --check .",
             "find . -name '*.py' -exec bash -c 'echo \"$1\"' _ {} \\;",
             "parallel sh -c 'echo {}' ::: a b",
             "node -e \"const ok = html.includes('</p>') && /<p>/.test(html)\"",
