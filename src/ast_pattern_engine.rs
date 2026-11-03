@@ -3886,6 +3886,292 @@ fn scan_perl_file_path(
     Ok(())
 }
 
+/// The Perl code with every string, quote-like and regex body blanked to spaces,
+/// at the same byte offsets, so a scanner weighs only words Perl runs. It errs
+/// toward code. These stay code:
+/// - an unterminated quote;
+/// - a body that runs code (`@{[ … ]}`, `${\ … }`, `(?{ … })`, `s/…/…/e`);
+/// - a quote-like operator glued to `-`, a sigil, `->` or `::` (`-s`, `$s`);
+/// - a `'` glued to a word (the old package separator).
+///
+/// So no spelling can hide a call by opening a quote Perl does not see.
+fn perl_code_view(code: &str) -> String {
+    let bytes = code.as_bytes();
+    let mut out = bytes.to_vec();
+    let mut index = 0usize;
+    let mut regex_can_start = true;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte.is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        if byte.is_ascii_alphabetic() || byte == b'_' {
+            let start = index;
+            while index < bytes.len() && is_perl_identifier_byte(bytes[index]) {
+                index += 1;
+            }
+            let word = &code[start..index];
+            let glued = start > 0
+                && matches!(
+                    bytes[start - 1],
+                    b'$' | b'@' | b'%' | b'&' | b'*' | b'-' | b'>' | b':'
+                );
+            if !glued && matches!(word, "q" | "qq" | "qw" | "qr" | "m" | "s" | "tr" | "y") {
+                if let Some(end) = blank_perl_quote_like(bytes, &mut out, index, word) {
+                    index = end;
+                    regex_can_start = false;
+                    continue;
+                }
+            }
+            regex_can_start = !glued
+                && matches!(
+                    word,
+                    "split"
+                        | "grep"
+                        | "map"
+                        | "if"
+                        | "unless"
+                        | "while"
+                        | "until"
+                        | "and"
+                        | "or"
+                        | "not"
+                        | "xor"
+                        | "return"
+                        | "when"
+                        | "lt"
+                        | "gt"
+                        | "le"
+                        | "ge"
+                        | "eq"
+                        | "ne"
+                        | "cmp"
+                );
+            continue;
+        }
+        match byte {
+            b'\'' if index > 0 && is_perl_identifier_byte(bytes[index - 1]) => {
+                index += 1;
+                regex_can_start = false;
+            }
+            b'\'' | b'"' | b'`' => {
+                match perl_delimited_end(bytes, index + 1, byte, byte) {
+                    Some(end) => {
+                        if byte == b'\'' || !perl_body_runs_code(&bytes[index + 1..end]) {
+                            blank_perl_body(&mut out, index + 1, end);
+                        }
+                        index = end + 1;
+                    }
+                    None => index += 1,
+                }
+                regex_can_start = false;
+            }
+            b'/' if regex_can_start => {
+                match perl_delimited_end(bytes, index + 1, b'/', b'/') {
+                    Some(end) => {
+                        if !perl_body_runs_code(&bytes[index + 1..end]) {
+                            blank_perl_body(&mut out, index + 1, end);
+                        }
+                        index = end + 1;
+                        while bytes.get(index).is_some_and(u8::is_ascii_alphabetic) {
+                            index += 1;
+                        }
+                    }
+                    None => index += 1,
+                }
+                regex_can_start = false;
+            }
+            _ => {
+                regex_can_start = !(byte.is_ascii_digit()
+                    || matches!(byte, b')' | b']' | b'}' | b'$' | b'@' | b'%' | b'.'));
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| code.to_string())
+}
+
+/// Blanks a quote-like operator's bodies, starting after its name; the index
+/// after its flags, or `None` when this is no quote-like operator (`s => 1`,
+/// `q;`) or it never closes.
+fn blank_perl_quote_like(
+    bytes: &[u8],
+    out: &mut [u8],
+    after_name: usize,
+    word: &str,
+) -> Option<usize> {
+    let mut open_at = after_name;
+    while bytes.get(open_at).is_some_and(u8::is_ascii_whitespace) {
+        open_at += 1;
+    }
+    let open = *bytes.get(open_at)?;
+    if !open.is_ascii_punctuation()
+        || open == b'_'
+        || (open_at > after_name && open == b'#')
+        || matches!(open, b',' | b';' | b')' | b']' | b'}' | b'>' | b'=')
+    {
+        return None;
+    }
+    let close = perl_closing_delimiter(open);
+    let first_end = perl_delimited_end(bytes, open_at + 1, open, close)?;
+    let mut bodies = vec![(
+        open_at + 1,
+        first_end,
+        matches!(word, "qq" | "qr" | "m" | "s"),
+    )];
+    let mut end = first_end + 1;
+    if matches!(word, "s" | "tr" | "y") {
+        let (second_open_at, second_open) = if open == close {
+            (first_end, open)
+        } else {
+            let mut at = end;
+            while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
+                at += 1;
+            }
+            let second = *bytes.get(at)?;
+            if !second.is_ascii_punctuation() {
+                return None;
+            }
+            (at, second)
+        };
+        let second_end = perl_delimited_end(
+            bytes,
+            second_open_at + 1,
+            second_open,
+            perl_closing_delimiter(second_open),
+        )?;
+        bodies.push((second_open_at + 1, second_end, word == "s"));
+        end = second_end + 1;
+    }
+    let flags_start = end;
+    while bytes.get(end).is_some_and(u8::is_ascii_alphabetic) {
+        end += 1;
+    }
+    // `s///e` runs its replacement as code: nothing of it is blanked.
+    if word == "s" && bytes[flags_start..end].contains(&b'e') {
+        return Some(end);
+    }
+    for (from, to, interpolates) in bodies {
+        if !(interpolates && perl_body_runs_code(&bytes[from..to])) {
+            blank_perl_body(out, from, to);
+        }
+    }
+    Some(end)
+}
+
+fn perl_closing_delimiter(open: u8) -> u8 {
+    match open {
+        b'(' => b')',
+        b'[' => b']',
+        b'{' => b'}',
+        b'<' => b'>',
+        other => other,
+    }
+}
+
+/// The index of the delimiter that closes a body starting at `from`; bracket
+/// pairs nest, and a backslash escapes the next byte.
+fn perl_delimited_end(bytes: &[u8], from: usize, open: u8, close: u8) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut index = from;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'\\' {
+            index += 2;
+            continue;
+        }
+        if open != close && byte == open {
+            depth += 1;
+        } else if byte == close {
+            if depth == 0 {
+                return Some(index);
+            }
+            depth -= 1;
+        }
+        index += 1;
+    }
+    None
+}
+
+/// An interpolating body that runs code: `@{[ … ]}`, `${\ … }`, `(?{ … })`.
+fn perl_body_runs_code(body: &[u8]) -> bool {
+    body.windows(2).any(|pair| pair == b"@{" || pair == b"${")
+        || body.windows(3).any(|w| w == b"(?{")
+        || body.windows(4).any(|w| w == b"(??{")
+}
+
+fn blank_perl_body(out: &mut [u8], from: usize, to: usize) {
+    for byte in &mut out[from..to] {
+        if *byte != b'\n' {
+            *byte = b' ';
+        }
+    }
+}
+
+/// A `{` that opens a hash subscript: glued to `->`, `}`, `]` or a sigiled name
+/// (`$h{…}`, `$o->{…}`, `$a[0]{…}`), not a code block (`map {`, `sub {`, `) {`).
+fn perl_opens_subscript(before_brace: &str) -> bool {
+    if before_brace.ends_with("->") || before_brace.ends_with(['}', ']']) {
+        return true;
+    }
+    let name = before_brace.trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '_');
+    name.len() < before_brace.len() && name.ends_with(['$', '@', '%'])
+}
+
+/// The span of `unlink`'s arguments in the code view: the whole parenthesized
+/// list (`=>` is a comma there), or without parentheses up to `;`, a closing
+/// bracket, `||`/`&&` or a low-precedence `or`/`and`/`if`/`unless`/loop word.
+fn perl_unlink_argument_span(view: &[u8], after_name: usize) -> (usize, usize) {
+    let mut index = after_name;
+    while view.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+    if view.get(index) == Some(&b'(') {
+        let end = perl_delimited_end(view, index + 1, b'(', b')').unwrap_or(view.len());
+        return (index + 1, end);
+    }
+    let from = index;
+    let mut depth = 0usize;
+    while index < view.len() {
+        let byte = view[index];
+        match byte {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' if depth == 0 => break,
+            b')' | b']' | b'}' => depth -= 1,
+            b';' if depth == 0 => break,
+            b'|' | b'&' if depth == 0 && view.get(index + 1) == Some(&byte) => break,
+            _ if depth == 0
+                && byte.is_ascii_alphabetic()
+                && (index == 0 || !is_perl_identifier_byte(view[index - 1])) =>
+            {
+                let word_end = (index..view.len())
+                    .find(|&at| !is_perl_identifier_byte(view[at]))
+                    .unwrap_or(view.len());
+                if matches!(
+                    &view[index..word_end],
+                    b"or"
+                        | b"and"
+                        | b"xor"
+                        | b"if"
+                        | b"unless"
+                        | b"while"
+                        | b"until"
+                        | b"for"
+                        | b"foreach"
+                ) {
+                    break;
+                }
+                index = word_end;
+                continue;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    (from, index)
+}
+
 fn scan_perl_unlink_rmdir(
     out: &mut Vec<PatternMatch>,
     code: &str,
@@ -3895,22 +4181,35 @@ fn scan_perl_unlink_rmdir(
     timeout: Duration,
     budget_ms: u64,
 ) -> Result<(), MatchError> {
-    for m in PERL_UNLINK_CALL.find_iter(haystack) {
+    // Only `unlink` in code Perl runs: not inside a string, a quote-like or a
+    // regex body (`print "unlink"`, `/unlink/`), not a sigiled name (`$unlink`),
+    // not a bareword before a fat comma (`tempfile(UNLINK => 1)`), and not a hash
+    // key (`$opts{unlink}`); a code block's bare `unlink` (`map { unlink } …`)
+    // deletes `$_` and is weighed (dcg#7 REV R1, B1).
+    let view = perl_code_view(haystack);
+    for m in PERL_UNLINK_CALL.find_iter(&view) {
         perl_check_timeout(start_time, timeout, budget_ms)?;
-        // A bareword before a fat comma or alone in a hash subscript is a
-        // string, not a call: `tempfile(UNLINK => 1)`, `$opts{unlink}`.
-        let after = haystack[m.end()..].trim_start();
-        let before = haystack[..m.start()].trim_end();
-        if after.starts_with("=>") || (before.ends_with('{') && after.starts_with('}')) {
+        let before = &view[..m.start()];
+        let after = view[m.end()..].trim_start();
+        if before.ends_with(['$', '@', '%']) || after.starts_with("=>") {
             continue;
         }
-        // Every target the call deletes, as `rmtree` weighs them. A catastrophic
-        // literal blocks (#455). Otherwise only a list of temp scratch literals
-        // stays warn-only: `unlink glob('*')` empties the working directory,
-        // and `unlink $file`, `unlink @ARGV`, a bare `unlink` ($_) or
-        // `unlink 'notes.txt'` delete what no temp literal bounds. The shell's
+        if after.starts_with('}') {
+            if let Some(before_brace) = before.trim_end().strip_suffix('{') {
+                if perl_opens_subscript(before_brace) {
+                    continue;
+                }
+            }
+        }
+        // Every target the call deletes, as `rmtree` weighs them; in Perl `=>` is a
+        // comma, so the whole list counts (dcg#7 REV B2). A catastrophic literal
+        // blocks (#455). Otherwise only a list of temp scratch literals stays
+        // warn-only: `unlink glob('*')` empties the working directory, and
+        // `unlink $file`, `unlink @ARGV`, a bare `unlink` ($_) or `unlink
+        // 'notes.txt'` delete what no temp literal bounds. The shell's
         // `unlink-general` and v0.6.7-neotask.3 deny those (dev-igbgn.2).
-        let region = exec_argv_region(exec_sink_arg_region(haystack, m.start()));
+        let (from, to) = perl_unlink_argument_span(view.as_bytes(), m.end());
+        let region = &haystack[from..to];
         let targets: Vec<&str> = ANY_STRING_LITERAL
             .captures_iter(region)
             .filter_map(|caps| string_literal_from_caps(&caps))
@@ -3919,7 +4218,7 @@ fn scan_perl_unlink_rmdir(
             && ANY_STRING_LITERAL
                 .replace_all(region, "")
                 .chars()
-                .all(|c| c.is_whitespace() || matches!(c, ',' | '(' | ')'));
+                .all(|c| c.is_whitespace() || matches!(c, ',' | '(' | ')' | '=' | '>'));
         let (rule_id, reason, severity) = if targets.iter().any(|path| is_catastrophic_path(path)) {
             (
                 "heredoc.perl.unlink.catastrophic",
@@ -8831,6 +9130,16 @@ mod tests {
                 "unlink '/tmp/x/a' . $suffix",
                 "unlink '/tmp'",
                 "unlink glob('/tmp/x/*')",
+                "map { unlink } glob '*'",
+                "for (glob '*') { unlink }",
+                "unlink('/tmp/a', '/tmp/b' => '/home/user/notes.txt')",
+                "q{'}; unlink glob('*'); q{'}",
+                "Foo'x; unlink glob('*'); print 'y'",
+                "print \"@{[ unlink glob('*') ]}\"",
+                "s/x/unlink glob('*')/e",
+                "CORE::unlink glob('*')",
+                "$a = 4 / 2; unlink glob('*'); $b = 6 / 3",
+                "$x / 2; unlink glob('*'); $y / 3",
             ] {
                 assert!(blocks(code), "must block: {code}");
             }
@@ -8842,6 +9151,15 @@ mod tests {
                 "my ($fh, $name) = tempfile(unlink => 1);",
                 "my $keep = $opts{unlink};",
                 "print 'done'",
+                "print \"unlink\\n\"",
+                "print if /unlink/",
+                "my $unlink = 1; print $unlink",
+                "unlink \"/tmp/x/a\" or die \"cannot unlink: $!\"",
+                "my %h = (unlink => 1)",
+                "print $o->{unlink}",
+                "s/unlink/remove/g",
+                "my @w = qw(unlink rmdir)",
+                "print m{unlink}",
             ] {
                 assert!(!blocks(code), "must not block: {code}");
             }
