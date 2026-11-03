@@ -4735,16 +4735,23 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         //   find /tmp/foo /etc -delete
         // from short-circuiting through (the `/etc` would also be deleted).
         //
+        // Every <tmp-path> names something BELOW the temp root, as the
+        // `rm -rf` temp exemption does: `find /tmp -delete` (also `/tmp/`,
+        // `/tmp/.`, `/tmp//./`) empties the whole shared temp directory, every
+        // other process's files and sockets included, so it is not scratch the
+        // caller owns (dev-qgoxf1). Redundant `/` and `.` components do not
+        // count as the descendant.
+        //
         // `-delete` must terminate the command (followed by end-of-string
         // or only more non-path flags).
         // -----------------------------------------------------------------
         safe_pattern!(
             "find-delete-tmp",
-            r"^(?![^|;&]*[\\$`])find\s+(?:--\s+)?/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
+            r"^(?![^|;&]*[\\$`])find\s+(?:--\s+)?/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))[^/\s]\S*(?:\s+(?:/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
         ),
         safe_pattern!(
             "find-delete-var-tmp",
-            r"^(?![^|;&]*[\\$`])find\s+(?:--\s+)?/var/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:/var/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
+            r"^(?![^|;&]*[\\$`])find\s+(?:--\s+)?/var/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))[^/\s]\S*(?:\s+(?:/var/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
         ),
         // The `-exec rm … {}` spelling of the same temp-only delete. Since
         // `find-delete-*` learned that action it denied here while `-delete`
@@ -4752,11 +4759,11 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // the terminating `\;`.
         safe_pattern!(
             "find-exec-rm-tmp",
-            r"^(?![^|;&]*[$`])(?![^|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:(?:/private)?/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-zA-Z]+)*\s+\{\}\s+(?:\\;|\+)\s*$"
+            r"^(?![^|;&]*[$`])(?![^|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))[^/\s]\S*(?:\s+(?:(?:/private)?/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-zA-Z]+)*\s+\{\}\s+(?:\\;|\+)\s*$"
         ),
         safe_pattern!(
             "find-exec-rm-var-tmp",
-            r"^(?![^|;&]*[$`])(?![^|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/var/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:(?:/private)?/var/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-zA-Z]+)*\s+\{\}\s+(?:\\;|\+)\s*$"
+            r"^(?![^|;&]*[$`])(?![^|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/var/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))[^/\s]\S*(?:\s+(?:(?:/private)?/var/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-zA-Z]+)*\s+\{\}\s+(?:\\;|\+)\s*$"
         ),
         // -----------------------------------------------------------------
         // `unlink <file>` safe whitelist for temp directories.
@@ -6651,13 +6658,35 @@ mod tests {
         // path argument matters; safe pattern must NOT short-circuit if
         // a second argument is sensitive (test below).
         for cmd in [
-            "find /tmp -delete",
             "find /tmp/foo -delete",
             "find /tmp/foo -name '*.log' -delete",
-            "find /var/tmp -delete",
+            "find /tmp/.cache -delete",
             "find /var/tmp/dir -type f -delete",
+            "find /tmp/foo -exec rm {} \\;",
         ] {
             assert_safe_pattern_matches(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn find_delete_of_a_temp_root_blocks() {
+        let pack = create_pack();
+        // dev-qgoxf1: the temp root itself is every process's temp directory, not
+        // scratch the caller owns, so it never matches the temp exemption, however
+        // the root is spelled.
+        for cmd in [
+            "find /tmp -delete",
+            "find /tmp/ -delete",
+            "find /tmp/. -delete",
+            "find /tmp//./ -delete",
+            "find /tmp -name '*.log' -delete",
+            "find /tmp/foo /tmp -delete",
+            "find /var/tmp -delete",
+            "find /tmp -exec rm {} \\;",
+            "find /private/tmp -exec rm -f {} +",
+            "find /var/tmp/ -exec rm {} \\;",
+        ] {
+            assert_blocks(&pack, cmd, "find");
         }
     }
 
@@ -6795,11 +6824,9 @@ mod tests {
         // invocation. This is the intended trade-off (see
         // find_temp_compound_blocks_conservatively for rationale).
         for cmd in [
-            "find /tmp -delete",
             "find /tmp/foo -delete",
-            "find /tmp -name '*.log' -delete",
             "find /tmp/foo -name '*.tmp' -delete",
-            "find /var/tmp -delete",
+            "find /var/tmp/foo -delete",
         ] {
             assert_safe_pattern_matches(&pack, cmd);
         }
