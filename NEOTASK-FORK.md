@@ -226,7 +226,7 @@ and drop an entry once upstream passes it (bead dev-2gdcxq).
 
 These 44 upstream v0.16.0 tests fail only on Windows, in upstream's own path and dialect handling; the fork rule produces none of their verdicts. `.config/nextest.toml` excludes them by exact name in a `cfg(windows)` override of the `ci` profile (which keeps the 9 above as well); Linux and macOS still run them. Retire them on intake or upstream (bead dev-32i0o2).
 
-The `cli_e2e` allow-once tests (`allow_once_flow_tests::*_issue_599`) also need their temporary directory outside every Git repository: a grant made inside a repository is scoped to its root (`project`), so with a `.git` above `TMPDIR` (a stray `/tmp/.git`, for example) they report `project` where they expect `cwd`. That is the designed scope, not a loosening; run them with `TMPDIR` outside any repository (dev-igbgn.7).
+The `cli_e2e` allow-once tests (`allow_once_flow_tests::*_issue_599`) also need their temporary directory outside every Git repository: a grant made inside a repository is scoped to its root (`project`), so with a `.git` above `TMPDIR` (a stray `/tmp/.git`, for example) they report `project` where they expect `cwd`. That is the designed scope, not a loosening. Their fixture therefore creates its directory under the first of the system temp directory, `/dev/shm` and `/var/tmp` that has no `.git` above it, and stops with a clear message when none qualifies (dev-igbgn.7).
 
 | Reason | Tests |
 |---|---|

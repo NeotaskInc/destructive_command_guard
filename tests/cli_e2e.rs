@@ -1472,6 +1472,23 @@ mod allow_once_flow_tests {
     const UNQUOTED_UNLINK: &str =
         "python3 -c 'import pathlib; pathlib.Path(\"important.txt\").unlink()'";
 
+    /// A scratch root with no Git repository above it. A grant made inside a
+    /// repository is scoped to that repository, so a stray `.git` above the
+    /// system temp directory (such as `/tmp/.git` debris) would change the
+    /// scope these tests assert (dev-igbgn.7).
+    fn temp_root_outside_any_repository() -> std::path::PathBuf {
+        let candidates = [
+            std::env::temp_dir(),
+            std::path::PathBuf::from("/dev/shm"),
+            std::path::PathBuf::from("/var/tmp"),
+        ];
+        candidates
+            .into_iter()
+            .filter_map(|root| root.canonicalize().ok())
+            .find(|root| root.is_dir() && !root.ancestors().any(|dir| dir.join(".git").exists()))
+            .expect("no temporary directory outside a Git repository; set TMPDIR to one")
+    }
+
     /// Dedicated test environment with control over all file paths.
     struct FlowTestEnv {
         temp: tempfile::TempDir,
@@ -1488,7 +1505,7 @@ mod allow_once_flow_tests {
         }
 
         fn with_repository(repository: bool) -> Self {
-            let temp = tempfile::tempdir().expect("tempdir");
+            let temp = tempfile::tempdir_in(temp_root_outside_any_repository()).expect("tempdir");
             let home_dir = temp.path().join("home");
             let xdg_config_dir = temp.path().join("xdg_config");
             std::fs::create_dir_all(&home_dir).expect("HOME dir");
