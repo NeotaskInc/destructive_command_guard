@@ -32,6 +32,10 @@ fn a_temp_root_delete_or_an_unbounded_perl_unlink_is_denied() {
         "perl -i.bak -e \"unlink glob('*')\"",
         "perl '-e' \"unlink glob('*')\"",
         "perl -e 'unlink $f'",
+        "find /tmp/* -delete",
+        "rm -rf /tmp/*",
+        "rm -rf /tmp/.*",
+        "echo done; rm -rf /tmp/*",
     ] {
         assert!(!allowed(cmd), "must deny: {cmd}");
     }
@@ -45,6 +49,8 @@ fn temp_scratch_below_the_root_stays_allowed() {
         "find /tmp/.cache -name '*.log' -delete",
         "perl -e 'unlink \"/tmp/x/scratch\"'",
         "echo done; unlink /tmp/scratch",
+        "rm -rf /tmp/build/*",
+        "rm -rf /tmp/sigtest* 2>/dev/null",
         "perl -e 'use File::Temp qw(tempfile); my ($fh, $n) = tempfile(UNLINK => 1)'",
     ] {
         assert!(allowed(cmd), "must allow: {cmd}");

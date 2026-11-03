@@ -4278,6 +4278,7 @@ pub(crate) fn windows_literal_user_temp_subpath(path: &str) -> bool {
         && components[2].eq_ignore_ascii_case("AppData")
         && components[3].eq_ignore_ascii_case("Local")
         && components[4].eq_ignore_ascii_case("Temp")
+        && !names_any_child_by_glob(components[5])
 }
 
 fn temp_path_suffix_is_static_unquoted(path: &str) -> bool {
@@ -4321,9 +4322,22 @@ fn temp_path_suffix_is_static_double_quoted(path: &str) -> bool {
     true
 }
 
+/// The path names an entry below the temp root by its own name. Its first real
+/// component is that entry, so one that starts with a glob (`*`, `.*`, `?x`,
+/// `[a-z]*`) names any child of the shared root and empties it just as the root
+/// itself would (dev-hs30uj). A literal prefix (`/tmp/sigtest*`) or a glob deeper
+/// down (`/tmp/build/*`) stays inside names the caller chose.
 fn temp_path_suffix_has_real_component(path: &str) -> bool {
     path.split('/')
-        .any(|component| !component.is_empty() && component != ".")
+        .find(|component| !component.is_empty() && *component != ".")
+        .is_some_and(|first| !names_any_child_by_glob(first))
+}
+
+fn names_any_child_by_glob(component: &str) -> bool {
+    component
+        .strip_prefix('.')
+        .unwrap_or(component)
+        .starts_with(['*', '?', '['])
 }
 
 fn has_dotdot_segment(path: &str) -> bool {
@@ -4740,18 +4754,21 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // `/tmp/.`, `/tmp//./`) empties the whole shared temp directory, every
         // other process's files and sockets included, so it is not scratch the
         // caller owns (dev-qgoxf1). Redundant `/` and `.` components do not
-        // count as the descendant.
+        // count as the descendant, and neither does a first component that
+        // starts with a glob (`/tmp/*`, `/tmp/.*`, `/tmp/[a-z]*`): it names
+        // any child of the root (dev-hs30uj). `/tmp/build-*` names only the
+        // caller's own prefix and stays exempt.
         //
         // `-delete` must terminate the command (followed by end-of-string
         // or only more non-path flags).
         // -----------------------------------------------------------------
         safe_pattern!(
             "find-delete-tmp",
-            r"^(?![^|;&]*[\\$`])find\s+(?:--\s+)?/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))[^/\s]\S*(?:\s+(?:/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
+            r"^(?![^|;&]*[\\$`])find\s+(?:--\s+)?/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*(?:\s+(?:/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
         ),
         safe_pattern!(
             "find-delete-var-tmp",
-            r"^(?![^|;&]*[\\$`])find\s+(?:--\s+)?/var/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))[^/\s]\S*(?:\s+(?:/var/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
+            r"^(?![^|;&]*[\\$`])find\s+(?:--\s+)?/var/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*(?:\s+(?:/var/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
         ),
         // The `-exec rm … {}` spelling of the same temp-only delete. Since
         // `find-delete-*` learned that action it denied here while `-delete`
@@ -4759,11 +4776,11 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // the terminating `\;`.
         safe_pattern!(
             "find-exec-rm-tmp",
-            r"^(?![^|;&]*[$`])(?![^|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))[^/\s]\S*(?:\s+(?:(?:/private)?/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-zA-Z]+)*\s+\{\}\s+(?:\\;|\+)\s*$"
+            r"^(?![^|;&]*[$`])(?![^|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*(?:\s+(?:(?:/private)?/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-zA-Z]+)*\s+\{\}\s+(?:\\;|\+)\s*$"
         ),
         safe_pattern!(
             "find-exec-rm-var-tmp",
-            r"^(?![^|;&]*[$`])(?![^|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/var/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))[^/\s]\S*(?:\s+(?:(?:/private)?/var/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-zA-Z]+)*\s+\{\}\s+(?:\\;|\+)\s*$"
+            r"^(?![^|;&]*[$`])(?![^|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/var/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*(?:\s+(?:(?:/private)?/var/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-zA-Z]+)*\s+\{\}\s+(?:\\;|\+)\s*$"
         ),
         // -----------------------------------------------------------------
         // `unlink <file>` safe whitelist for temp directories.
@@ -6665,6 +6682,41 @@ mod tests {
             "find /tmp/foo -exec rm {} \\;",
         ] {
             assert_safe_pattern_matches(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn a_glob_of_a_temp_roots_children_blocks() {
+        let pack = create_pack();
+        // dev-hs30uj: a first component that starts with a glob names any child
+        // of the shared temp root.
+        for cmd in [
+            "find /tmp/* -delete",
+            "find /tmp/.* -delete",
+            "find /var/tmp/[a-z]* -delete",
+            "find /tmp/*-cache -delete",
+            "find /tmp/* -exec rm {} \\;",
+            "rm -rf /tmp/*",
+            "rm -rf /tmp/.*",
+            "rm -rf /tmp/?",
+            "rm -rf /tmp/[a-z]*",
+            "rm -rf /private/tmp/*",
+            "rm -rf /var/tmp/*",
+            "rm -rf /tmp/build /tmp/*",
+        ] {
+            assert!(
+                pack.check(cmd).is_some(),
+                "{cmd} must not pass the temp exemption"
+            );
+        }
+        for cmd in [
+            "find /tmp/build/* -delete",
+            "find /tmp/build-* -delete",
+            "rm -rf /tmp/build/*",
+            "rm -rf /tmp/sigtest*",
+            "rm -rf /tmp/.cache-x*",
+        ] {
+            assert!(pack.check(cmd).is_none(), "{cmd} stays exempt");
         }
     }
 
