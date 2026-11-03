@@ -130,6 +130,23 @@ retired `dist.yml` (see the CI plumbing below).
     intake until upstream treats a temp root as non-scratch and weighs Perl
     `unlink` targets itself.
 
+- **Database carrier pack order** (dev-igbgn.6, dcg#8). Upstream's
+  `database_carrier_first` reorders the enabled packs for heredoc and
+  here-string commands, but the keyword index stayed positional over the old
+  order, so a database client's own pack could be skipped. The reordered list
+  now builds its own index. Intended difference from v0.6.7: with
+  `database.sqlite` enabled, a here-string into `sqlite3` (even a literal
+  SELECT) is denied by upstream's own `stdin-unverified` rule, which v0.6.7
+  allowed (RedPuma N1). Drop when upstream builds the index after reordering.
+- **Runtime-expanded heredoc bodies** (dev-qh9n29, dcg#9). A protected
+  database client reading an unquoted-delimiter heredoc receives the body
+  after shell expansion, so a body with a parameter, command or arithmetic
+  expansion is `stdin-unverified` for that client's pack; the cat-pipeline
+  producer reads its body by the same heredoc rules. Quoted delimiters and
+  literal bodies are unchanged. Intended difference from v0.6.7, which
+  allowed these (RedPuma N1). Drop when upstream treats expanding heredoc
+  bodies as unverified input.
+
 The rest of this fork's changes are release/CI plumbing and this doc:
 
 - **Added** `.github/workflows/release.yml` — builds our four ship targets
