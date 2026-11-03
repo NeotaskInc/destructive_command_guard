@@ -50952,6 +50952,29 @@ mod tests {
     }
 
     #[test]
+    fn an_env_option_cluster_ending_in_s_hands_over_its_command_dev_lh7en3() {
+        // `env -vS 'cmd'` splits and runs `cmd` exactly as `env -S 'cmd'` does.
+        for command in [
+            "env -vS 'python3 -c \"__import__(\\\"os\\\").system(\\\"echo x > /etc/hosts\\\")\"'",
+            "env -ivS 'bash -c \"echo x > /etc/hosts\"'",
+            "env -vS'bash -c \"echo x > /etc/hosts\"'",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(
+                command,
+                &["core.filesystem"],
+                ShellDialect::Posix,
+            );
+            assert!(result.is_denied(), "{command:?} must deny");
+        }
+        let result = evaluate_with_pack_ids_in_dialect(
+            "env -vS 'python3 -c \"print(1)\"'",
+            &["core.filesystem"],
+            ShellDialect::Posix,
+        );
+        assert!(!result.is_denied());
+    }
+
+    #[test]
     fn the_wrapper_walk_reports_its_own_bound_issue_424() {
         // The bound itself is reported, so a caller can tell "this is the
         // executable" from "the walk gave up before finding it".
