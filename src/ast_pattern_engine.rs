@@ -3982,6 +3982,11 @@ fn perl_code_view(code: &str) -> String {
                 }
                 regex_can_start = false;
             }
+            b'+' | b'-' if bytes.get(index + 1) == Some(&byte) => {
+                // `$x++ / 2`: a postfix increment ends the operand, so `/` divides.
+                index += 2;
+                regex_can_start = false;
+            }
             _ => {
                 regex_can_start = !(byte.is_ascii_digit()
                     || matches!(byte, b')' | b']' | b'}' | b'$' | b'@' | b'%' | b'.'));
@@ -4217,8 +4222,9 @@ fn scan_perl_unlink_rmdir(
         let literals_only = !targets.is_empty()
             && ANY_STRING_LITERAL
                 .replace_all(region, "")
+                .replace("=>", ",")
                 .chars()
-                .all(|c| c.is_whitespace() || matches!(c, ',' | '(' | ')' | '=' | '>'));
+                .all(|c| c.is_whitespace() || matches!(c, ',' | '(' | ')'));
         let (rule_id, reason, severity) = if targets.iter().any(|path| is_catastrophic_path(path)) {
             (
                 "heredoc.perl.unlink.catastrophic",
@@ -9140,6 +9146,8 @@ mod tests {
                 "CORE::unlink glob('*')",
                 "$a = 4 / 2; unlink glob('*'); $b = 6 / 3",
                 "$x / 2; unlink glob('*'); $y / 3",
+                "$x++ / 2; unlink '/etc/passwd'; $y / 3",
+                "unlink('/tmp/a' == '/tmp/b')",
             ] {
                 assert!(blocks(code), "must block: {code}");
             }
