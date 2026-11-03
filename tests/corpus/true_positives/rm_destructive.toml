@@ -85,3 +85,19 @@ description = "interactive never does not make recursive deletion safe"
 command = "rm -r --interactive=never ./build"
 expected = "deny"
 rule_id = "core.filesystem:rm-recursive-general"
+
+# Neotask fork (dcg#7, dev-hs30uj; MON #85806): a glob that empties a whole temp
+# root deletes other sessions' files on a shared host, so it is denied. A named
+# /tmp/<subdir> stays allowed (false_positives/rm_safe.toml). NEOTASK-FORK.md
+# records this difference from upstream and v0.6.7.
+[[case]]
+description = "rm -rf /tmp/* empties the whole temp root"
+command = "rm -rf /tmp/*"
+expected = "deny"
+rule_id = "core.filesystem:rm-rf-root-home"
+
+[[case]]
+description = "rm -rf /var/tmp/* empties the whole temp root"
+command = "rm -rf /var/tmp/*"
+expected = "deny"
+rule_id = "core.filesystem:rm-rf-root-home"

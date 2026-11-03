@@ -12,11 +12,6 @@ command = "rm -rf /tmp/build"
 expected = "allow"
 
 [[case]]
-description = "rm -rf /tmp/* is safe"
-command = "rm -rf /tmp/*"
-expected = "allow"
-
-[[case]]
 description = "rm -rf /tmp with trailing slash is safe"
 command = "rm -rf /tmp/foo/"
 expected = "allow"
@@ -33,11 +28,6 @@ expected = "allow"
 [[case]]
 description = "rm -rf in /var/tmp is safe"
 command = "rm -rf /var/tmp/build"
-expected = "allow"
-
-[[case]]
-description = "rm -rf /var/tmp/* is safe"
-command = "rm -rf /var/tmp/*"
 expected = "allow"
 
 # ============================================================================
