@@ -278,7 +278,8 @@ jobs:
                  else { cargo build --bin dcg; 'target/debug/dcg.exe' }
           Write-Host "Using binary: $exe"
 
-          # Stage + zip in the dist.yml layout: dcg-<target>/dcg.exe
+          # Stage + zip in the layout install.ps1 accepts: one root-level dcg.exe
+          # (v0.16's installer refuses any other archive shape).
           $target = 'x86_64-pc-windows-msvc'
           $work = Join-Path $env:RUNNER_TEMP ('smoke_' + [Guid]::NewGuid().ToString('N'))
           $stageRoot = Join-Path $work 'stage'
@@ -287,7 +288,7 @@ jobs:
           Copy-Item $exe (Join-Path $stage 'dcg.exe') -Force
           $zip = Join-Path $work "dcg-$target.zip"
           Add-Type -AssemblyName System.IO.Compression.FileSystem
-          [System.IO.Compression.ZipFile]::CreateFromDirectory($stageRoot, $zip)
+          [System.IO.Compression.ZipFile]::CreateFromDirectory($stage, $zip)
           $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLower()
           $fileUri = ([System.Uri]("file://" + $zip)).AbsoluteUri
           Write-Host "zip=$zip"

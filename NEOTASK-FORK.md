@@ -186,6 +186,18 @@ These 44 upstream v0.16.0 tests fail only on Windows, in upstream's own path and
 | separators: `\` against `/` in reported paths (4) | `cli_e2e` `config_tests::doctor_audits_project_user_and_system_allowlists_from_nested_cwd`<br>`cli_e2e` `config_tests::doctor_reports_untrusted_project_allowlist_as_inactive`<br>`cli_e2e` `config_tests::doctor_warns_about_global_indefinite_user_rule_issue_545`<br>`repro_541_active_config_edge_cases` `absolute_relative_and_home_paths_share_the_active_install_lifecycle` |
 | suggest_allowlist_e2e: `dcg suggest-allowlist` exits non-zero on Windows (21) | `suggest_allowlist_e2e` `apply_flag_out_of_range_index`<br>`suggest_allowlist_e2e` `apply_flag_refuses_require_confirmation_without_accept_risk`<br>`suggest_allowlist_e2e` `apply_flag_writes_require_confirmation_with_accept_risk`<br>`suggest_allowlist_e2e` `apply_flag_writes_to_allowlist`<br>`suggest_allowlist_e2e` `test_suggest_allowlist_ci_forces_non_interactive_mode`<br>`suggest_allowlist_e2e` `test_suggest_allowlist_cli_parsing_confidence_filter`<br>`suggest_allowlist_e2e` `test_suggest_allowlist_cli_parsing_format`<br>`suggest_allowlist_e2e` `test_suggest_allowlist_cli_parsing_risk_filter`<br>`suggest_allowlist_e2e` `test_suggest_allowlist_empty_history`<br>`suggest_allowlist_e2e` `test_suggest_allowlist_interactive_accept_writes_allowlist`<br>`suggest_allowlist_e2e` `test_suggest_allowlist_interactive_quit_early`<br>`suggest_allowlist_e2e` `test_suggest_allowlist_interactive_shows_action_prompts`<br>`suggest_allowlist_e2e` `test_suggest_allowlist_interactive_skip_no_write`<br>`suggest_allowlist_e2e` `test_suggest_allowlist_json_output_non_empty`<br>`suggest_allowlist_e2e` `test_suggest_allowlist_json_output_structure`<br>`suggest_allowlist_e2e` `test_suggest_allowlist_limit_filter`<br>`suggest_allowlist_e2e` `test_suggest_allowlist_min_frequency_filter`<br>`suggest_allowlist_e2e` `test_suggest_allowlist_non_interactive_no_writes`<br>`suggest_allowlist_e2e` `test_suggest_allowlist_output_diagnostics`<br>`suggest_allowlist_e2e` `test_suggest_allowlist_robot_env_forces_json_non_interactive_mode`<br>`suggest_allowlist_e2e` `test_suggest_allowlist_runs_without_crash` |
 
+### Known upstream red outside the test suites
+
+- `bench.yml`'s `benchmark` job (not required, not in the CI Gate): upstream's
+  `benches/heredoc_perf.rs` asserts its `commit_message_300` case (a
+  destructive substitution as quoted heredoc data inside `git commit -m`) is
+  allowed; plain upstream v0.16.0 denies it, as the fork does (the
+  conservative direction), so the bench panics before timing. Recheck on
+  intake with dev-2gdcxq.
+- `ci.yml`'s Windows installer smoke zipped `dcg-<target>/dcg.exe`, a layout
+  v0.16's own `install.ps1` refuses; the fork zips one root-level `dcg.exe`,
+  the shape the installer accepts.
+
 ### PR-diff scan exclusions (MON rulings #81420 and #81517, dev-igbgn)
 
 `dcg scan` reads `.dcg/hooks.toml` from the repository root; its
