@@ -85,13 +85,15 @@ impl TestEnv {
         }
 
         // Create config that points to our history database
-        // The CLI reads database_path from config file via DCG_CONFIG env var
+        // The CLI reads database_path from config file via DCG_CONFIG env var.
+        // Neotask fork (dev-32i0o2): a TOML literal string, so a Windows path's
+        // backslashes are not read as escapes.
         fs::write(
             &self.config_path,
             format!(
                 r#"[history]
 enabled = true
-database_path = "{}"
+database_path = '{}'
 "#,
                 self.history_path.display()
             ),

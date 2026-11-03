@@ -476,21 +476,20 @@ fn omp_history_attempt() -> Result<(), history_test::IncompleteHistoryFlush> {
     // creation remains covered by history_integration. Close before spawning.
     drop(HistoryDb::open(Some(history_path.clone())).expect("initialize robot history"));
 
-    // macOS resolves /var to /private/var in the child's current_dir().
-    // Windows canonicalization adds the `\\?\` extended-length prefix, which
-    // `current_dir()` does not report.
+    // The child's current_dir() names the temp dir as the OS reports it: macOS
+    // resolves /var to /private/var, and Windows keeps the 8.3 short form the
+    // temp path was given in. Compare both sides canonically (Neotask fork,
+    // dev-32i0o2).
     let recorded_cwd = temp
         .path()
         .canonicalize()
         .expect("canonicalize history cwd");
-    let recorded_cwd = recorded_cwd.to_string_lossy();
-    let recorded_cwd = recorded_cwd
-        .strip_prefix(r"\\?\")
-        .unwrap_or(&recorded_cwd)
-        .to_string();
     let assert_omp_row = |values: &[SqliteValue]| {
         assert_eq!(history_text(&values[0]), "omp");
-        assert_eq!(history_text(&values[1]), recorded_cwd);
+        assert_eq!(
+            std::fs::canonicalize(history_text(&values[1])).expect("canonicalize recorded cwd"),
+            recorded_cwd
+        );
         assert_eq!(history_text(&values[2]), "git reset --hard HEAD");
         assert_eq!(history_text(&values[3]), "deny");
         assert_eq!(history_text(&values[4]), "core.git");
@@ -596,7 +595,10 @@ fn omp_history_attempt() -> Result<(), history_test::IncompleteHistoryFlush> {
     assert_omp_row(rows[0].values());
     let codex_values = rows[1].values();
     assert_eq!(history_text(&codex_values[0]), "codex-cli");
-    assert_eq!(history_text(&codex_values[1]), recorded_cwd);
+    assert_eq!(
+        std::fs::canonicalize(history_text(&codex_values[1])).expect("canonicalize recorded cwd"),
+        recorded_cwd
+    );
     assert_eq!(history_text(&codex_values[2]), "git status");
     assert_eq!(history_text(&codex_values[3]), "allow");
     assert_eq!(codex_values[4], SqliteValue::Null);
