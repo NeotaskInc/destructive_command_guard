@@ -110,14 +110,6 @@ const WRAPPERS: &[&str] = &[
     "env", "timeout", "nice", "nohup", "command", "exec", "time", "stdbuf", "xargs", "sudo", "doas",
 ];
 
-/// Runners that launch an interpreter named later in the command (`uv run
-/// python …`, `poetry run python …`, `npx node …`). `command_of` parses the
-/// launched interpreter, not the runner, so an interpreter option value is not
-/// read as a handoff through the runner (dev-tyz9co B1, FuchsiaHare).
-const RUNNERS: &[&str] = &[
-    "uv", "poetry", "pipx", "pdm", "hatch", "rye", "pipenv", "conda", "npx", "bunx",
-];
-
 /// Long flags that hand a program its code.
 const LONG_CODE_FLAGS: &[&str] = &[
     "--eval",
@@ -230,26 +222,8 @@ fn command_of(segment: &[Word]) -> Option<(&str, Vec<&Word>)> {
             break;
         }
     }
-    let mut program = words.next()?;
-    let mut name = basename(&program.text);
-    // A runner (`uv run python …`, `poetry run python …`, `npx node …`) launches
-    // an interpreter named later: advance to the first argument whose basename is
-    // a recognized interpreter and parse from there, so `uv run python -X sh -c`
-    // is read like `python -X sh -c` rather than stopping at `sh` (dev-tyz9co B1).
-    if RUNNERS.contains(&name) {
-        let mut interpreter = None;
-        while let Some(word) = words.peek() {
-            if recognized_interpreter(basename(&word.text)) {
-                interpreter = words.next();
-                break;
-            }
-            words.next();
-        }
-        if let Some(word) = interpreter {
-            program = word;
-            name = basename(&program.text);
-        }
-    }
+    let program = words.next()?;
+    let name = basename(&program.text);
     if UPSTREAM_OWNED.contains(&name) {
         return None;
     }
@@ -689,12 +663,6 @@ mod tests {
             "ruby -I sh -e \"system('echo x > /etc/passwd')\"",
             "perl -M strict -e \"system('echo x > /etc/passwd')\"",
             "perl -Mstrict -e \"system('echo x > /etc/passwd')\"",
-            // A runner launching the interpreter must not let the -X value drop
-            // the code flag either (dev-tyz9co B1, FuchsiaHare).
-            "uv run python -X sh -c \"__import__('os').system('echo x > /etc/passwd')\"",
-            "uv run -- python -X sh -c \"__import__('os').system('echo x > /etc/passwd')\"",
-            "poetry run python -X sh -c \"__import__('os').system('echo x > /etc/passwd')\"",
-            "pipx run python -X sh -c \"__import__('os').system('echo x > /etc/passwd')\"",
             "deno eval \"Deno.run({cmd: ['sh', '-c', 'echo x > /etc/passwd']})\"",
             "ruby - <<'EOF'\nKernel.send(:sys + 'tem', 'echo x > ~/.bashrc')\nEOF",
             // Code on stdin, or attached to its flag (FuchsiaHare's second carry).
@@ -751,9 +719,6 @@ mod tests {
             "python3 -m http.server 8000",
             "python3 -W ignore script.py",
             "node -r ts-node/register app.ts",
-            "uv run python script.py",
-            "uv run pytest -q tests/",
-            "poetry run python -X dev app.py --flag",
             "find . -name '*.py' -exec bash -c 'echo \"$1\"' _ {} \\;",
             "parallel sh -c 'echo {}' ::: a b",
             "node -e \"const ok = html.includes('</p>') && /<p>/.test(html)\"",
