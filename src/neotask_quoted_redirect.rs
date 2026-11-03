@@ -46,14 +46,17 @@ macro_rules! protected_target {
 /// were allowed; FuchsiaHare's REV on PR #5 found `tee -- /etc/passwd`,
 /// `/usr/bin/tee`, `tee ./log /etc/passwd`, the `=value` flag and a quoted
 /// earlier file). An operand is one shell word in any quoting: unquoted
-/// characters, `\x` escapes, `'...'`, `"..."` and `$'...'` in any mix. An
-/// unquoted separator or redirect ends it, so a later command's path and a `<`
-/// input are not targets. `dd of=` is upstream's (`dd-overwrite-*` already
-/// denies it).
+/// characters, `\x` escapes (an escaped newline continues the line), `'...'`,
+/// `"..."` and `$'...'` in any mix. Operands are separated by spaces or tabs
+/// only; an unquoted separator, redirect, newline or a word opening a `#`
+/// comment ends the command, so a later command's path, a `<` input and a
+/// commented-out path are not targets (Greptile on PR #5). `dd of=` is
+/// upstream's (`dd-overwrite-*` already denies it, indirect calls included).
 static PROTECTED_WRITE: LazyCompiledRegex = LazyCompiledRegex::new(concat!(
     r#"(?:(?<![<>=-])(?:&>>?|>&|[0-9]*>>?\|?)\s*"#,
     r#"|(?:^|[\s;&|(`'"])(?:[^\s;&|()<>`'"]*/)?tee"#,
-    r#"(?:\s+(?:[^\s;&|()<>`'"\\]|\\.|'[^']*'|"(?:[^"\\]|\\.)*")+)*?\s+"#,
+    r#"(?:[ \t]+(?:[^\s;&|()<>`'"\\#]|\\[\s\S]|'[^']*'|"(?:[^"\\]|\\[\s\S])*")"#,
+    r#"(?:[^\s;&|()<>`'"\\]|\\[\s\S]|'[^']*'|"(?:[^"\\]|\\[\s\S])*")*)*?[ \t]+"#,
     r")",
     protected_target!(),
 ));
@@ -546,6 +549,8 @@ mod tests {
             r#"python3 -c "__import__('os').system('tee my\\ log \"-a\" ~/.bashrc < /dev/null')""#,
             r#"python3 -c "__import__('os').system('tee ./a\"b c\"d /etc/passwd < /dev/null')""#,
             r#"python3 -c "__import__('os').system(\"tee ./log $'/etc/passwd' < /dev/null\")""#,
+            // An escaped newline continues the command (Greptile on PR #5).
+            "python3 -c \"__import__('os').system('tee ./log \\\\\n /etc/passwd < /dev/null')\"",
         ] {
             assert!(matches(command), "{command}");
         }
@@ -607,6 +612,9 @@ mod tests {
             // Quoted text after a tee that is not one of its operands.
             r#"python3 -c "print('tee x', '/etc/passwd')""#,
             r#"python3 -c "__import__('os').system('echo x | tee \"./a b\"; cat /etc/hosts')""#,
+            // A comment, or a newline ending the command, after a tee (Greptile on PR #5).
+            "python3 -c \"__import__('os').system('printf x | tee ./log # /etc/hosts')\"",
+            "python3 -c \"__import__('os').system('printf x | tee ./log\n cat /etc/hosts')\"",
             "python3 -c \"__import__('os').system('cat /etc/hosts | tee out.txt')\"",
         ] {
             assert!(!matches(command), "{command}");
