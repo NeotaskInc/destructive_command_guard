@@ -25304,6 +25304,21 @@ fn evaluate_packs_with_allowlists_at_depth(
     // the one named.
     let selection_phase = phase(ProfilePhase::PatternSelection);
     let carrier_ordered_packs = database_carrier_first(ordered_packs, input_command);
+    // The keyword index answers with positional bits over the order it was built
+    // for. Decoded against the reordered list, a bit names whichever pack now sits
+    // in that slot: with `database.mongodb` ahead of `database.mysql`,
+    // `mysql <<< 'DROP DATABASE prod'` made mongodb the only candidate and mysql's
+    // rules never ran (dev-igbgn.6). A reordered list gets an index of its own;
+    // without one the per-pack scan below is used, which reads pack ids directly.
+    let carrier_keyword_index = carrier_ordered_packs
+        .as_deref()
+        .filter(|_| keyword_index.is_some())
+        .and_then(|packs| REGISTRY.build_enabled_keyword_index(packs));
+    let keyword_index = if carrier_ordered_packs.is_some() {
+        carrier_keyword_index.as_ref()
+    } else {
+        keyword_index
+    };
     let ordered_packs = carrier_ordered_packs.as_deref().unwrap_or(ordered_packs);
 
     // Pre-compute which packs might match.
@@ -50775,6 +50790,47 @@ mod tests {
             assert!(
                 result.is_denied(),
                 "{command:?} must still deny under some dialect's rule"
+            );
+        }
+    }
+
+    /// dev-igbgn.6: moving the carrier's pack forward (#428) reorders the pack
+    /// list, and the keyword index's candidate bits are positional. Decoded
+    /// against the reordered list they named the wrong packs, so with
+    /// `database.mongodb` enabled beside `database.mysql` a here-string into
+    /// `mysql` reached no database rule at all and was allowed.
+    #[test]
+    fn a_reordered_carrier_keeps_its_own_keyword_candidates_dev_igbgn_6() {
+        let packs = [
+            "database.mongodb".to_string(),
+            "database.mysql".to_string(),
+            "database.postgresql".to_string(),
+            "database.sqlite".to_string(),
+        ];
+        let packs: Vec<&str> = packs.iter().map(String::as_str).collect();
+        for command in [
+            "mysql <<< 'DROP DATABASE prod'",
+            "mysql prod <<< \"DELETE FROM users\"",
+            "mysql db <<SQL\nDROP DATABASE prod;\nSQL",
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Posix);
+            assert!(result.is_denied(), "{command:?} must deny");
+        }
+        // Input known only at runtime has one rule, the carrier's own.
+        for (command, expected) in [
+            ("mysql <<< \"$SQL\"", "database.mysql"),
+            ("psql <<< \"$SQL\"", "database.postgresql"),
+            ("sqlite3 app.db <<< \"$SQL\"", "database.sqlite"),
+        ] {
+            let result = evaluate_with_pack_ids_in_dialect(command, &packs, ShellDialect::Posix);
+            assert!(result.is_denied(), "{command:?} must deny");
+            assert_eq!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pack_id.as_deref()),
+                Some(expected),
+                "{command:?} must be decided by its own client's pack"
             );
         }
     }
