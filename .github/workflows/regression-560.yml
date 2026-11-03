@@ -28,7 +28,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # v1 series 2026-09-03
         with:
           toolchain: nightly-2026-08-31
-        with:
           components: rustfmt, clippy
       - name: Build the actual classifier
         id: build
