@@ -31,10 +31,11 @@ pub(crate) const PACK_ID: &str = "core.filesystem";
 pub(crate) const PATTERN_NAME: &str = "neotask-quoted-redirect";
 
 /// A system or home path, or a path held in a named variable (`$1`, an awk
-/// field, is not one), after an optional opening quote or escape.
+/// field, is not one), after an optional opening quote (`'`, `"`, `$'`) or
+/// escape.
 macro_rules! protected_target {
     () => {
-        r#"['"\\]?(?!/dev/(?:null|zero|full|tty|stdout|stderr)\b)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|\b)|~|\$\{?[A-Za-z_])"#
+        r#"(?:\$?['"]|\\)?(?!/dev/(?:null|zero|full|tty|stdout|stderr)\b)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|\b)|~|\$\{?[A-Za-z_])"#
     };
 }
 
@@ -43,13 +44,16 @@ macro_rules! protected_target {
 /// (`-a`, `--output-error=warn`) and other files may come before the protected
 /// one (dev-65yunv: `echo x >> /etc/passwd` and `tee /etc/passwd` inside code
 /// were allowed; FuchsiaHare's REV on PR #5 found `tee -- /etc/passwd`,
-/// `/usr/bin/tee`, `tee ./log /etc/passwd` and the `=value` flag). An operand
-/// stops at a quote, separator or redirect, so a later command's path is not
-/// one. `dd of=` is upstream's (`dd-overwrite-*` already denies it).
+/// `/usr/bin/tee`, `tee ./log /etc/passwd`, the `=value` flag and a quoted
+/// earlier file). An operand is one shell word in any quoting: unquoted
+/// characters, `\x` escapes, `'...'`, `"..."` and `$'...'` in any mix. An
+/// unquoted separator or redirect ends it, so a later command's path and a `<`
+/// input are not targets. `dd of=` is upstream's (`dd-overwrite-*` already
+/// denies it).
 static PROTECTED_WRITE: LazyCompiledRegex = LazyCompiledRegex::new(concat!(
     r#"(?:(?<![<>=-])(?:&>>?|>&|[0-9]*>>?\|?)\s*"#,
     r#"|(?:^|[\s;&|(`'"])(?:[^\s;&|()<>`'"]*/)?tee"#,
-    r#"(?:\s+(?:--|-{1,2}[A-Za-z][A-Za-z-]*(?:=[^\s;&|()<>`'"]*)?|[^\s;&|()<>`'"-][^\s;&|()<>`'"]*))*?\s+"#,
+    r#"(?:\s+(?:[^\s;&|()<>`'"\\]|\\.|'[^']*'|"(?:[^"\\]|\\.)*")+)*?\s+"#,
     r")",
     protected_target!(),
 ));
@@ -535,6 +539,13 @@ mod tests {
             "python3 -c \"__import__('os').system('tee ./log /etc/passwd < /dev/null')\"",
             "python3 -c \"__import__('os').system('tee -a ./log ~/.bashrc < /dev/null')\"",
             "python3 -c \"__import__('os').system('echo x | tee --output-error=warn /etc/passwd')\"",
+            // An earlier operand, or the target, in any quoting (FuchsiaHare's C3 on PR #5).
+            r#"python3 -c "__import__('os').system('tee \"./log\" /etc/passwd < /dev/null')""#,
+            r#"python3 -c "__import__('os').system(\"tee './log' /etc/passwd < /dev/null\")""#,
+            r#"python3 -c 'import os; os.system("tee \"./my log\" -a /etc/passwd < /dev/null")'"#,
+            r#"python3 -c "__import__('os').system('tee my\\ log \"-a\" ~/.bashrc < /dev/null')""#,
+            r#"python3 -c "__import__('os').system('tee ./a\"b c\"d /etc/passwd < /dev/null')""#,
+            r#"python3 -c "__import__('os').system(\"tee ./log $'/etc/passwd' < /dev/null\")""#,
         ] {
             assert!(matches(command), "{command}");
         }
@@ -593,6 +604,9 @@ mod tests {
             "python3 -c \"__import__('os').system('echo x | tee ./log; cat /etc/hosts')\"",
             "python3 -c \"__import__('os').system('tee ./log < /etc/hosts')\"",
             "python3 -c \"__import__('os').system('coffee /etc/passwd; guarantee /etc/x')\"",
+            // Quoted text after a tee that is not one of its operands.
+            r#"python3 -c "print('tee x', '/etc/passwd')""#,
+            r#"python3 -c "__import__('os').system('echo x | tee \"./a b\"; cat /etc/hosts')""#,
             "python3 -c \"__import__('os').system('cat /etc/hosts | tee out.txt')\"",
         ] {
             assert!(!matches(command), "{command}");
