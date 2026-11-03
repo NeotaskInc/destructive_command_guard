@@ -4278,8 +4278,8 @@ pub(crate) fn windows_literal_user_temp_subpath(path: &str) -> bool {
         && components[2].eq_ignore_ascii_case("AppData")
         && components[3].eq_ignore_ascii_case("Local")
         && components[4].eq_ignore_ascii_case("Temp")
-        // cmd and PowerShell wildcards; brackets are literal to cmd.
-        && !starts_with_glob(components[5], &['*', '?'])
+        // PowerShell expands `*`, `?` and `[…]` in -Path, quoted or not.
+        && !starts_with_glob(components[5], &['*', '?', '['])
 }
 
 fn temp_path_suffix_is_static_unquoted(path: &str) -> bool {
@@ -4772,7 +4772,10 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // v0.6.7 allowed: the `-filtered-root` patterns below. A selector after
         // the action, a bare `-name '*'`, `-mindepth`/`-type` alone, or any
         // `-o`/`!`/`,` that could undo the selection leaves the whole root
-        // reviewed (dcg#7 REV C2).
+        // reviewed (dcg#7 REV C2). A name selector needs a literal character
+        // past any glob (`'?*'`, `'[a-z]*'` select everything), and the `-exec
+        // rm` forms take no recursive flag, since a selector can name the root
+        // itself.
         //
         // `-delete` must terminate the command (followed by end-of-string
         // or only more non-path flags).
@@ -4783,7 +4786,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         ),
         safe_pattern!(
             "find-delete-tmp-filtered-root",
-            r"^(?![^|;&]*[\\$`])find\s+(?:--\s+)?/tmp(?:/+\.?)*(?=\s)(?![^|;&]*\s(?:-o|-or|-not|!|,)(?:\s|$))(?=(?:(?!\s-(?:delete|exec|execdir)(?:\s|$))[^|;&])*\s-(?:empty(?:\s|$)|(?:i?name|i?path|i?wholename|i?regex|i?lname|[acm]min|[acm]time|newer[a-zA-Z]*|anewer|cnewer|size|user|uid|group|gid|perm|links|inum|samefile|used)\s+(?!['\x22]?\.?\*+['\x22]?(?:\s|$))[^\s|;&]))(?:\s+(?:/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
+            r"^(?![^|;&]*[\\$`])find\s+(?:--\s+)?/tmp(?:/+\.?)*(?=\s)(?![^|;&]*\s(?:-o|-or|-not|!|,)(?:\s|$))(?=(?:(?!\s-(?:delete|exec|execdir)(?:\s|$))[^|;&])*\s-(?:empty(?:\s|$)|(?:i?name|i?path|i?wholename|i?regex|i?lname|[acm]min|[acm]time|newer[a-zA-Z]*|anewer|cnewer|size|user|uid|group|gid|perm|links|inum|samefile|used)\s+['\x22]?(?:[*?.]|\[[^\]\s]*\])*[^*?.\[\]\s'\x22|;&]))(?:\s+(?:/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
         ),
         safe_pattern!(
             "find-delete-var-tmp",
@@ -4791,7 +4794,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         ),
         safe_pattern!(
             "find-delete-var-tmp-filtered-root",
-            r"^(?![^|;&]*[\\$`])find\s+(?:--\s+)?/var/tmp(?:/+\.?)*(?=\s)(?![^|;&]*\s(?:-o|-or|-not|!|,)(?:\s|$))(?=(?:(?!\s-(?:delete|exec|execdir)(?:\s|$))[^|;&])*\s-(?:empty(?:\s|$)|(?:i?name|i?path|i?wholename|i?regex|i?lname|[acm]min|[acm]time|newer[a-zA-Z]*|anewer|cnewer|size|user|uid|group|gid|perm|links|inum|samefile|used)\s+(?!['\x22]?\.?\*+['\x22]?(?:\s|$))[^\s|;&]))(?:\s+(?:/var/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
+            r"^(?![^|;&]*[\\$`])find\s+(?:--\s+)?/var/tmp(?:/+\.?)*(?=\s)(?![^|;&]*\s(?:-o|-or|-not|!|,)(?:\s|$))(?=(?:(?!\s-(?:delete|exec|execdir)(?:\s|$))[^|;&])*\s-(?:empty(?:\s|$)|(?:i?name|i?path|i?wholename|i?regex|i?lname|[acm]min|[acm]time|newer[a-zA-Z]*|anewer|cnewer|size|user|uid|group|gid|perm|links|inum|samefile|used)\s+['\x22]?(?:[*?.]|\[[^\]\s]*\])*[^*?.\[\]\s'\x22|;&]))(?:\s+(?:/var/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
         ),
         // The `-exec rm … {}` spelling of the same temp-only delete. Since
         // `find-delete-*` learned that action it denied here while `-delete`
@@ -4803,7 +4806,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         ),
         safe_pattern!(
             "find-exec-rm-tmp-filtered-root",
-            r"^(?![^|;&]*[$`])(?![^|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/tmp(?:/+\.?)*(?=\s)(?![^|;&]*\s(?:-o|-or|-not|!|,)(?:\s|$))(?=(?:(?!\s-(?:delete|exec|execdir)(?:\s|$))[^|;&])*\s-(?:empty(?:\s|$)|(?:i?name|i?path|i?wholename|i?regex|i?lname|[acm]min|[acm]time|newer[a-zA-Z]*|anewer|cnewer|size|user|uid|group|gid|perm|links|inum|samefile|used)\s+(?!['\x22]?\.?\*+['\x22]?(?:\s|$))[^\s|;&]))(?:\s+(?:(?:/private)?/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-zA-Z]+)*\s+\{\}\s+(?:\\;|\+)\s*$"
+            r"^(?![^|;&]*[$`])(?![^|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/tmp(?:/+\.?)*(?=\s)(?![^|;&]*\s(?:-o|-or|-not|!|,)(?:\s|$))(?=(?:(?!\s-(?:delete|exec|execdir)(?:\s|$))[^|;&])*\s-(?:empty(?:\s|$)|(?:i?name|i?path|i?wholename|i?regex|i?lname|[acm]min|[acm]time|newer[a-zA-Z]*|anewer|cnewer|size|user|uid|group|gid|perm|links|inum|samefile|used)\s+['\x22]?(?:[*?.]|\[[^\]\s]*\])*[^*?.\[\]\s'\x22|;&]))(?:\s+(?:(?:/private)?/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-qs-zA-QS-Z]+)*\s+\{\}\s+(?:\\;|\+)\s*$"
         ),
         safe_pattern!(
             "find-exec-rm-var-tmp",
@@ -4811,7 +4814,7 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         ),
         safe_pattern!(
             "find-exec-rm-var-tmp-filtered-root",
-            r"^(?![^|;&]*[$`])(?![^|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/var/tmp(?:/+\.?)*(?=\s)(?![^|;&]*\s(?:-o|-or|-not|!|,)(?:\s|$))(?=(?:(?!\s-(?:delete|exec|execdir)(?:\s|$))[^|;&])*\s-(?:empty(?:\s|$)|(?:i?name|i?path|i?wholename|i?regex|i?lname|[acm]min|[acm]time|newer[a-zA-Z]*|anewer|cnewer|size|user|uid|group|gid|perm|links|inum|samefile|used)\s+(?!['\x22]?\.?\*+['\x22]?(?:\s|$))[^\s|;&]))(?:\s+(?:(?:/private)?/var/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-zA-Z]+)*\s+\{\}\s+(?:\\;|\+)\s*$"
+            r"^(?![^|;&]*[$`])(?![^|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/var/tmp(?:/+\.?)*(?=\s)(?![^|;&]*\s(?:-o|-or|-not|!|,)(?:\s|$))(?=(?:(?!\s-(?:delete|exec|execdir)(?:\s|$))[^|;&])*\s-(?:empty(?:\s|$)|(?:i?name|i?path|i?wholename|i?regex|i?lname|[acm]min|[acm]time|newer[a-zA-Z]*|anewer|cnewer|size|user|uid|group|gid|perm|links|inum|samefile|used)\s+['\x22]?(?:[*?.]|\[[^\]\s]*\])*[^*?.\[\]\s'\x22|;&]))(?:\s+(?:(?:/private)?/var/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-qs-zA-QS-Z]+)*\s+\{\}\s+(?:\\;|\+)\s*$"
         ),
         // -----------------------------------------------------------------
         // `unlink <file>` safe whitelist for temp directories.
@@ -6771,6 +6774,8 @@ mod tests {
     #[test]
     fn find_delete_of_a_temp_root_blocks() {
         let pack = create_pack();
+        // A selector can name the root itself; a recursive rm then removes it.
+        assert_blocks(&pack, "find /tmp -name tmp -exec rm -rf {} +", "rm -rf");
         // dev-qgoxf1: the temp root itself is every process's temp directory, not
         // scratch the caller owns, so it never matches the temp exemption, however
         // the root is spelled.
@@ -6787,6 +6792,8 @@ mod tests {
             "find /tmp -name keep -o -delete",
             "find /tmp ! -name keep -delete",
             "find /tmp -name '*.o' -o -exec rm {} \\;",
+            "find /tmp -name '?*' -delete",
+            "find /tmp -name '[a-z]*' -delete",
             "find /var/tmp -delete",
             "find /tmp -exec rm {} \\;",
             "find /private/tmp -exec rm -f {} +",
