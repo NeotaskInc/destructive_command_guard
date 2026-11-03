@@ -50,13 +50,17 @@ macro_rules! protected_target {
 /// `"..."` and `$'...'` in any mix. Operands are separated by spaces or tabs
 /// only; an unquoted separator, redirect, newline or a word opening a `#`
 /// comment ends the command, so a later command's path, a `<` input and a
-/// commented-out path are not targets (Greptile on PR #5). `dd of=` is
+/// commented-out path are not targets (Greptile on PR #5). An escaped newline
+/// also separates (N4), and the command's name is `tee` however it is quoted:
+/// bare or backslashed letters, `'...'`, `"..."`, `$'...'` or an interpreter
+/// string's escaped quotes, over any split of the name, with empty quotes
+/// between, or a quoted full path (N3, FuchsiaHare on PR #5). `dd of=` is
 /// upstream's (`dd-overwrite-*` already denies it, indirect calls included).
 static PROTECTED_WRITE: LazyCompiledRegex = LazyCompiledRegex::new(concat!(
     r#"(?:(?<![<>=-])(?:&>>?|>&|[0-9]*>>?\|?)\s*"#,
-    r#"|(?:^|[\s;&|(`'"])(?:[^\s;&|()<>`'"]*/)?tee"#,
-    r#"(?:[ \t]+(?:[^\s;&|()<>`'"\\#]|\\[\s\S]|'[^']*'|"(?:[^"\\]|\\[\s\S])*")"#,
-    r#"(?:[^\s;&|()<>`'"\\]|\\[\s\S]|'[^']*'|"(?:[^"\\]|\\[\s\S])*")*)*?[ \t]+"#,
+    r#"|(?:^|[\s;&|(`'"])(?:(?:[^\s;&|()<>`'"]*/)?(?:''|""|\\''\\'|\\"\\")*(?:(?:\\?t\\?e\\?e|'tee'|"tee"|\$'tee'|\\"tee\\"|\\'tee\\')|(?:\\?t\\?e|'te'|"te"|\$'te'|\\"te\\"|\\'te\\')(?:''|""|\\''\\'|\\"\\")*(?:\\?e|'e'|"e"|\$'e'|\\"e\\"|\\'e\\')|(?:\\?t|'t'|"t"|\$'t'|\\"t\\"|\\'t\\')(?:''|""|\\''\\'|\\"\\")*(?:\\?e\\?e|'ee'|"ee"|\$'ee'|\\"ee\\"|\\'ee\\')|(?:\\?t|'t'|"t"|\$'t'|\\"t\\"|\\'t\\')(?:''|""|\\''\\'|\\"\\")*(?:\\?e|'e'|"e"|\$'e'|\\"e\\"|\\'e\\')(?:''|""|\\''\\'|\\"\\")*(?:\\?e|'e'|"e"|\$'e'|\\"e\\"|\\'e\\'))(?:''|""|\\''\\'|\\"\\")*|'[^'\s]*/tee'|"[^"\s]*/tee")"#,
+    r#"(?:(?:[ \t]|\\\r?\n)+(?:[^\s;&|()<>`'"\\#]|\\[\s\S]|'[^']*'|"(?:[^"\\]|\\[\s\S])*")"#,
+    r#"(?:[^\s;&|()<>`'"\\]|\\[\s\S]|'[^']*'|"(?:[^"\\]|\\[\s\S])*")*)*?(?:[ \t]|\\\r?\n)+"#,
     r")",
     protected_target!(),
 ));
@@ -549,6 +553,16 @@ mod tests {
             r#"python3 -c "__import__('os').system('tee my\\ log \"-a\" ~/.bashrc < /dev/null')""#,
             r#"python3 -c "__import__('os').system('tee ./a\"b c\"d /etc/passwd < /dev/null')""#,
             r#"python3 -c "__import__('os').system(\"tee ./log $'/etc/passwd' < /dev/null\")""#,
+            // N3 and N4 on dev-65yunv: the name in any quoting, and a continuation glued to the target.
+            "python3 -c \"__import__('os').system('tee \\\\\n/etc/passwd < /dev/null')\"",
+            r#"python3 -c "__import__('os').system('\"tee\" /etc/passwd < /dev/null')""#,
+            r#"python3 -c "__import__('os').system(\"'tee' /etc/passwd < /dev/null\")""#,
+            r#"python3 -c "__import__('os').system(\"t''ee /etc/passwd < /dev/null\")""#,
+            r#"python3 -c "__import__('os').system('\\tee /etc/passwd < /dev/null')""#,
+            r#"python3 -c "__import__('os').system('t\"ee\" /etc/passwd < /dev/null')""#,
+            r#"python3 -c "__import__('os').system(\"te'e' -a ./log /etc/passwd < /dev/null\")""#,
+            r#"python3 -c "__import__('os').system('\"/usr/bin/tee\" /etc/passwd < /dev/null')""#,
+            r#"python3 -c 'import os; os.system("\"tee\" /etc/passwd < /dev/null")'"#,
             // An escaped newline continues the command (Greptile on PR #5).
             "python3 -c \"__import__('os').system('tee ./log \\\\\n /etc/passwd < /dev/null')\"",
         ] {
@@ -609,6 +623,10 @@ mod tests {
             "python3 -c \"__import__('os').system('echo x | tee ./log; cat /etc/hosts')\"",
             "python3 -c \"__import__('os').system('tee ./log < /etc/hosts')\"",
             "python3 -c \"__import__('os').system('coffee /etc/passwd; guarantee /etc/x')\"",
+            // A quoted word that is not tee (N3).
+            r#"python3 -c "__import__('os').system('\"teething\" /etc/passwd')""#,
+            r#"python3 -c "__import__('os').system('\"tee\"x /etc/passwd')""#,
+            r#"python3 -c "print('tee', '/etc/passwd')""#,
             // Quoted text after a tee that is not one of its operands.
             r#"python3 -c "print('tee x', '/etc/passwd')""#,
             r#"python3 -c "__import__('os').system('echo x | tee \"./a b\"; cat /etc/hosts')""#,
