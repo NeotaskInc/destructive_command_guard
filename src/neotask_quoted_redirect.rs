@@ -110,12 +110,16 @@ const WRAPPERS: &[&str] = &[
     "env", "timeout", "nice", "nohup", "command", "exec", "time", "stdbuf", "xargs", "sudo", "doas",
 ];
 
-/// Long flags that hand a program its code.
+/// Long flags that hand a program its code. `--print` is Node/Bun/Deno's
+/// evaluate-and-print flag (the long form of `-p`), carried here so its spaced
+/// (`--print "<code>"`) and glued (`--print="<code>"`) forms are scanned like
+/// `--eval`; only those interpreters define it.
 const LONG_CODE_FLAGS: &[&str] = &[
     "--eval",
     "--exec",
     "--execute",
     "--command",
+    "--print",
     "--run",
     "--script",
 ];
@@ -310,6 +314,7 @@ fn interpreter_code_rest<'a>(name: &str, words: &[&'a Word]) -> Vec<&'a Word> {
             continue;
         }
         if names_code_flag(word)
+            || names_print_flag(name, word)
             || is_attached_code(word)
             || word.text == "eval"
             || word.text == "<<<"
@@ -368,7 +373,10 @@ fn plain_code_words<'a>(name: &str, rest: &[&'a Word]) -> Vec<&'a Word> {
     }
     let mut code: Vec<&Word> = rest
         .windows(2)
-        .filter(|pair| (names_code_flag(pair[0]) || pair[0].text == "<<<") && pair[1].was_quoted)
+        .filter(|pair| {
+            (names_code_flag(pair[0]) || names_print_flag(name, pair[0]) || pair[0].text == "<<<")
+                && pair[1].was_quoted
+        })
         .map(|pair| pair[1])
         .collect();
     code.extend(
@@ -376,7 +384,20 @@ fn plain_code_words<'a>(name: &str, rest: &[&'a Word]) -> Vec<&'a Word> {
             .copied()
             .filter(|word| word.was_quoted && is_attached_code(word)),
     );
-    if rest.first().is_some_and(|word| word.text == "eval") {
+    // Deno runs the next word as code through its `eval` subcommand wherever it
+    // sits: `deno eval "<code>"`, or after `run [opts] <script>`
+    // (`deno run app.ts eval "<code>"`), which the script path would otherwise
+    // end option parsing at. A quoted `eval` is data, not the subcommand. Other
+    // interpreters keep the first-word `eval` form only.
+    if name.starts_with("deno") {
+        code.extend(
+            rest.windows(2)
+                .filter(|pair| {
+                    pair[0].text == "eval" && !pair[0].was_quoted && pair[1].was_quoted
+                })
+                .map(|pair| pair[1]),
+        );
+    } else if rest.first().is_some_and(|word| word.text == "eval") {
         code.extend(rest.get(1).copied().filter(|word| word.was_quoted));
     }
     code
@@ -435,6 +456,18 @@ fn names_code_flag(word: &Word) -> bool {
         was_quoted: false,
         ..Word::default()
     })
+}
+
+/// Node, Bun and Deno evaluate the next word as code with `-p` (and the long
+/// `--print`, which `LONG_CODE_FLAGS`/`names_code_flag` already cover). `-p`
+/// ends in `p`, outside `is_code_flag`'s `c`/`e`/`r`/`E` cluster set, and it is
+/// inline code only for these three interpreters — perl's and ruby's `-p` are
+/// line-loop flags that take no code operand — so it is judged with the
+/// interpreter name in hand. Like `names_code_flag`, the flag is judged by its
+/// text: quoting it (`node '-p' '<code>'`) does not change what runs.
+fn names_print_flag(name: &str, word: &Word) -> bool {
+    (name.starts_with("node") || name.starts_with("bun") || name.starts_with("deno"))
+        && word.text == "-p"
 }
 
 fn is_assignment(word: &Word) -> bool {
@@ -699,6 +732,22 @@ mod tests {
             "poetry run python -X sh -c \"__import__('os').system('echo x > /etc/passwd')\"",
             "pipx run python -X sh -c \"__import__('os').system('echo x > /etc/passwd')\"",
             "deno eval \"Deno.run({cmd: ['sh', '-c', 'echo x > /etc/passwd']})\"",
+            // Node/Bun evaluate the next word with -p/--print (and glued
+            // --print=), wherever it sits — direct, after another flag, after a
+            // script path, or after `--` — exactly as -e/--eval already do; Deno
+            // runs it with an `eval` subcommand after `run [opts] <script>`. The
+            // release evaluator missed these 15 (dev-tyz9co print/deno half;
+            // PinkSpire probe:interp-args #85279).
+            "node --print \"require('child_process').execSync('echo x > /etc/passwd')\"",
+            "node --print=\"require('child_process').execSync('echo x > /etc/passwd')\"",
+            "node --no-warnings --print \"require('child_process').execSync('echo x > /etc/passwd')\"",
+            "node app.js -p \"require('child_process').execSync('echo x > /etc/passwd')\"",
+            "node -- app.js --print \"require('child_process').execSync('echo x > /etc/passwd')\"",
+            "bun --print \"require('child_process').execSync('echo x > /etc/passwd')\"",
+            "bun run app.ts -p \"require('child_process').execSync('echo x > /etc/passwd')\"",
+            "bun app.ts --print \"require('child_process').execSync('echo x > /etc/passwd')\"",
+            "deno run app.ts eval \"Deno.run({cmd: ['sh', '-c', 'echo x > /etc/passwd']})\"",
+            "deno run --allow-all app.ts eval \"Deno.run({cmd: ['sh', '-c', 'echo x > /etc/passwd']})\"",
             "ruby - <<'EOF'\nKernel.send(:sys + 'tem', 'echo x > ~/.bashrc')\nEOF",
             // Code on stdin, or attached to its flag (FuchsiaHare's second carry).
             "echo \"__import__('os').system('echo x > /etc/passwd')\" | python3",
@@ -751,6 +800,12 @@ mod tests {
             // Interpreter options and script paths carry no inline write, and a
             // non-interpreter handoff keeps its own logic (dev-tyz9co -X half).
             "python3 -X sh -c 'print(1)'",
+            // -p/--print and deno eval are code flags, but a benign payload that
+            // writes no protected path is still left alone (dev-tyz9co print/deno).
+            "node -p 'console.log(1)'",
+            "node --print 'process.version'",
+            "bun run app.ts -p 'ok'",
+            "deno run app.ts eval 'console.log(1)'",
             "python3 -m http.server 8000",
             "python3 -W ignore script.py",
             "node -r ts-node/register app.ts",
