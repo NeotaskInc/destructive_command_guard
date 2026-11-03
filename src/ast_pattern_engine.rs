@@ -3900,8 +3900,28 @@ fn perl_code_view(code: &str) -> String {
     let mut out = bytes.to_vec();
     let mut index = 0usize;
     let mut regex_can_start = true;
+    // The last code byte (a word counts as `a`, a string as `"`), and the last
+    // bareword when it was the last token: a heredoc or POD reads as one only
+    // where Perl expects a term or a statement.
+    let mut last_code: Option<u8> = None;
+    let mut last_word = String::new();
+    let mut heredocs: Vec<PerlHeredoc> = Vec::new();
     while index < bytes.len() {
         let byte = bytes[index];
+        if index == 0 || bytes[index - 1] == b'\n' {
+            let statement_start = matches!(last_code, None | Some(b';' | b'{' | b'}'));
+            if let Some((end, blank)) = perl_line_region(bytes, index, statement_start) {
+                if blank {
+                    blank_perl_body(&mut out, index, end);
+                }
+                index = end;
+                continue;
+            }
+        }
+        if byte == b'\n' && !heredocs.is_empty() {
+            index = perl_heredoc_bodies(bytes, &mut out, index + 1, std::mem::take(&mut heredocs));
+            continue;
+        }
         if byte.is_ascii_whitespace() {
             index += 1;
             continue;
@@ -3917,13 +3937,21 @@ fn perl_code_view(code: &str) -> String {
                     bytes[start - 1],
                     b'$' | b'@' | b'%' | b'&' | b'*' | b'-' | b'>' | b':'
                 );
+            last_code = Some(b'a');
             if !glued && matches!(word, "q" | "qq" | "qw" | "qr" | "m" | "s" | "tr" | "y") {
                 if let Some(end) = blank_perl_quote_like(bytes, &mut out, index, word) {
                     index = end;
                     regex_can_start = false;
+                    last_code = Some(b'"');
+                    last_word.clear();
                     continue;
                 }
             }
+            last_word = if glued {
+                String::new()
+            } else {
+                word.to_string()
+            };
             regex_can_start = !glued
                 && matches!(
                     word,
@@ -3950,10 +3978,33 @@ fn perl_code_view(code: &str) -> String {
                 );
             continue;
         }
+        if byte == b'<' && bytes.get(index + 1) == Some(&b'<') {
+            if let Some((heredoc, end)) = perl_heredoc_tag(bytes, index + 2) {
+                // A term position makes `<<TAG` a heredoc; elsewhere (`1 <<EOT`)
+                // Perl may read a shift, so its body is only skipped, not blanked.
+                let definite = regex_can_start
+                    || matches!(
+                        last_code,
+                        Some(b'=' | b'(' | b',' | b'.' | b'{' | b'[' | b';')
+                    )
+                    || PERL_LIST_OPERATORS.contains(&last_word.as_str());
+                heredocs.push(PerlHeredoc {
+                    definite,
+                    ..heredoc
+                });
+                index = end;
+                regex_can_start = false;
+                last_code = Some(b'"');
+                last_word.clear();
+                continue;
+            }
+        }
+        last_word.clear();
         match byte {
             b'\'' if index > 0 && is_perl_identifier_byte(bytes[index - 1]) => {
                 index += 1;
                 regex_can_start = false;
+                last_code = Some(b'a');
             }
             b'\'' | b'"' | b'`' => {
                 match perl_delimited_end(bytes, index + 1, byte, byte) {
@@ -3966,6 +4017,7 @@ fn perl_code_view(code: &str) -> String {
                     None => index += 1,
                 }
                 regex_can_start = false;
+                last_code = Some(b'"');
             }
             b'/' if regex_can_start => {
                 match perl_delimited_end(bytes, index + 1, b'/', b'/') {
@@ -3981,20 +4033,194 @@ fn perl_code_view(code: &str) -> String {
                     None => index += 1,
                 }
                 regex_can_start = false;
+                last_code = Some(b'"');
             }
             b'+' | b'-' if bytes.get(index + 1) == Some(&byte) => {
                 // `$x++ / 2`: a postfix increment ends the operand, so `/` divides.
                 index += 2;
                 regex_can_start = false;
+                last_code = Some(b'a');
             }
             _ => {
                 regex_can_start = !(byte.is_ascii_digit()
                     || matches!(byte, b')' | b']' | b'}' | b'$' | b'@' | b'%' | b'.'));
+                last_code = Some(byte);
                 index += 1;
             }
         }
     }
     String::from_utf8(out).unwrap_or_else(|_| code.to_string())
+}
+
+/// Builtins after which `<<TAG` starts a heredoc (`print <<EOT;`).
+const PERL_LIST_OPERATORS: &[&str] = &[
+    "print", "printf", "say", "return", "die", "warn", "push", "unshift", "join", "sprintf",
+    "eval", "system", "exec", "open", "my", "our", "local", "chomp", "lc", "uc", "length", "split",
+    "qx",
+];
+
+struct PerlHeredoc {
+    tag: String,
+    indented: bool,
+    interpolates: bool,
+    definite: bool,
+}
+
+/// The heredoc a `<<` opens (`<<TAG`, `<<"TAG"`, `<<'TAG'`, `<<~TAG`, `<< "TAG"`),
+/// and the index after its tag; `None` for a shift or `<<=`.
+fn perl_heredoc_tag(bytes: &[u8], after_marks: usize) -> Option<(PerlHeredoc, usize)> {
+    let mut at = after_marks;
+    let indented = bytes.get(at) == Some(&b'~');
+    if indented {
+        at += 1;
+    }
+    let mut quote_at = at;
+    while bytes
+        .get(quote_at)
+        .is_some_and(|b| *b == b' ' || *b == b'\t')
+    {
+        quote_at += 1;
+    }
+    match bytes.get(quote_at) {
+        Some(&quote @ (b'"' | b'\'' | b'`')) => {
+            let close =
+                (quote_at + 1..bytes.len()).find(|&i| bytes[i] == quote || bytes[i] == b'\n')?;
+            if bytes[close] != quote {
+                return None;
+            }
+            let tag = std::str::from_utf8(&bytes[quote_at + 1..close])
+                .ok()?
+                .to_string();
+            Some((
+                PerlHeredoc {
+                    tag,
+                    indented,
+                    interpolates: quote != b'\'',
+                    definite: false,
+                },
+                close + 1,
+            ))
+        }
+        Some(&first) if quote_at == at && (first.is_ascii_alphabetic() || first == b'_') => {
+            let end = (at..bytes.len())
+                .find(|&i| !is_perl_identifier_byte(bytes[i]))
+                .unwrap_or(bytes.len());
+            let tag = std::str::from_utf8(&bytes[at..end]).ok()?.to_string();
+            Some((
+                PerlHeredoc {
+                    tag,
+                    indented,
+                    interpolates: true,
+                    definite: false,
+                },
+                end,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Reads the bodies of the heredocs opened on the line that just ended, from
+/// `from`, and returns the index after the last terminator. A definite body is
+/// blanked unless it interpolates code; any other body is passed over unlexed,
+/// so its text stays visible but its quotes open nothing. An unterminated one
+/// leaves the rest as code.
+fn perl_heredoc_bodies(
+    bytes: &[u8],
+    out: &mut [u8],
+    from: usize,
+    heredocs: Vec<PerlHeredoc>,
+) -> usize {
+    let mut at = from;
+    for heredoc in heredocs {
+        let mut line_start = at;
+        let mut body_end = None;
+        while line_start <= bytes.len() {
+            let line_end = (line_start..bytes.len())
+                .find(|&i| bytes[i] == b'\n')
+                .unwrap_or(bytes.len());
+            let line = &bytes[line_start..line_end];
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let line = if heredoc.indented {
+                line.trim_ascii_start()
+            } else {
+                line
+            };
+            if line == heredoc.tag.as_bytes() {
+                body_end = Some((line_start, (line_end + 1).min(bytes.len())));
+                break;
+            }
+            if line_end == bytes.len() {
+                break;
+            }
+            line_start = line_end + 1;
+        }
+        let Some((end, after)) = body_end else {
+            return at;
+        };
+        if heredoc.definite && !(heredoc.interpolates && perl_body_runs_code(&bytes[at..end])) {
+            blank_perl_body(out, at, end);
+        }
+        at = after;
+    }
+    at
+}
+
+/// A line-started region Perl does not parse as code, and whether to blank it:
+/// POD (`=word` … `=cut`), a `format` body (`format NAME =` … `.`), or the rest
+/// after `__END__`/`__DATA__`. Where a statement may start it is blanked; elsewhere
+/// (`$x\n=foo();` may be an assignment) it is passed over unlexed instead.
+fn perl_line_region(bytes: &[u8], at: usize, statement_start: bool) -> Option<(usize, bool)> {
+    let line_end = (at..bytes.len())
+        .find(|&i| bytes[i] == b'\n')
+        .unwrap_or(bytes.len());
+    let line = &bytes[at..line_end];
+    let next_line = (line_end + 1).min(bytes.len());
+    if line.first() == Some(&b'=') && line.get(1).is_some_and(u8::is_ascii_alphabetic) {
+        let mut line_start = next_line;
+        while line_start < bytes.len() {
+            let end = (line_start..bytes.len())
+                .find(|&i| bytes[i] == b'\n')
+                .unwrap_or(bytes.len());
+            let candidate = &bytes[line_start..end];
+            if candidate.starts_with(b"=cut")
+                && !candidate
+                    .get(4)
+                    .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            {
+                return Some(((end + 1).min(bytes.len()), statement_start));
+            }
+            line_start = end + 1;
+        }
+        return Some((bytes.len(), statement_start));
+    }
+    let trimmed = line.trim_ascii();
+    if trimmed == b"__END__" || trimmed == b"__DATA__" {
+        return Some((bytes.len(), statement_start));
+    }
+    let rest = trimmed.strip_prefix(b"format")?;
+    if !rest.first().is_some_and(u8::is_ascii_whitespace) && rest.first() != Some(&b'=') {
+        return None;
+    }
+    let name = rest.trim_ascii();
+    let name = name.strip_suffix(b"=")?.trim_ascii();
+    if !name
+        .iter()
+        .all(|b| is_perl_identifier_byte(*b) || *b == b':')
+    {
+        return None;
+    }
+    let mut line_start = next_line;
+    while line_start < bytes.len() {
+        let end = (line_start..bytes.len())
+            .find(|&i| bytes[i] == b'\n')
+            .unwrap_or(bytes.len());
+        if bytes[line_start..end].trim_ascii_end() == b"." {
+            return Some(((end + 1).min(bytes.len()), statement_start));
+        }
+        line_start = end + 1;
+    }
+    None
 }
 
 /// Blanks a quote-like operator's bodies, starting after its name; the index
@@ -9148,6 +9374,13 @@ mod tests {
                 "$x / 2; unlink glob('*'); $y / 3",
                 "$x++ / 2; unlink '/etc/passwd'; $y / 3",
                 "unlink('/tmp/a' == '/tmp/b')",
+                "print <<EOT;\na ' b\nEOT\nunlink glob(\"*\");\nprint \"'\\n\";\n",
+                "print <<EOT;\na \" b\nEOT\nunlink glob(\"*\");\nprint '\"';\n",
+                "\n=pod\n\na ' b\n\n=cut\n\nunlink glob(\"*\");\nprint \"'\\n\";\n",
+                "format STDOUT =\na ' b\n.\nunlink glob(\"*\");\nprint \"'\";\n",
+                "$a = 1 <<EOT;\nunlink glob(\"*\");\nEOT\n",
+                "my $u = 1\n=b(); unlink glob(\"*\");\n",
+                "print <<~EOT;\n  it's\n  EOT\nunlink glob(\"*\");\n",
             ] {
                 assert!(blocks(code), "must block: {code}");
             }
@@ -9168,6 +9401,9 @@ mod tests {
                 "s/unlink/remove/g",
                 "my @w = qw(unlink rmdir)",
                 "print m{unlink}",
+                "=pod\n\nunlink everything here\n\n=cut\nprint 1;\n",
+                "print <<'EOT';\nthen unlink glob('*')\nEOT\n",
+                "print 1;\n__END__\nunlink glob('*')\n",
             ] {
                 assert!(!blocks(code), "must not block: {code}");
             }
