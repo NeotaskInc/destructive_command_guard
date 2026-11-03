@@ -169,7 +169,10 @@ fn project_config_cannot_disable_packs_the_caller_enabled() {
         let output = fixture.run(switch, "dropdb prod");
         let json = decision(&output);
         assert_eq!(output.status.code(), Some(1), "{switch:?}: {json}");
-        assert_eq!(json["rule_id"], "database.postgresql:dropdb-cli", "{switch:?}: {json}");
+        assert_eq!(
+            json["rule_id"], "database.postgresql:dropdb-cli",
+            "{switch:?}: {json}"
+        );
     }
 }
 
@@ -283,7 +286,10 @@ fn allow_once_grant_is_ignored() {
     }
     let baseline = fixture.run(Switch::Off, command);
     assert_eq!(
-        (baseline.status.code(), decision(&baseline)["decision"].clone()),
+        (
+            baseline.status.code(),
+            decision(&baseline)["decision"].clone()
+        ),
         (Some(0), serde_json::json!("allow")),
         "the grant must allow `{command}` without the switch, or this case proves nothing"
     );

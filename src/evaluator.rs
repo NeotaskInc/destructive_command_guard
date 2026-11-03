@@ -15159,6 +15159,48 @@ fn dialect_view_may_expose_hidden_execution(
             || names_powershell_word(command, &POWERSHELL_ALIAS_DEFINERS))
 }
 
+/// The evaluation, then the fork's dynamic-exec rule for the outermost command
+/// (see [`crate::neotask_dynamic_exec`]); it only turns an allow into a deny.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_command_with_pack_order_deadline_at_path_inner(
+    command: &str,
+    enabled_keywords: &[&str],
+    ordered_packs: &[String],
+    keyword_index: Option<&crate::packs::EnabledKeywordIndex>,
+    compiled_overrides: &crate::config::CompiledOverrides,
+    allowlists: &LayeredAllowlist,
+    heredoc_settings: &crate::config::HeredocSettings,
+    allow_once_audit: Option<&crate::pending_exceptions::AllowOnceAuditConfig<'_>>,
+    project_path: Option<&Path>,
+    deadline: Option<&Deadline>,
+    shell_dialect: crate::normalize::ShellDialect,
+    nested_command_depth: usize,
+    inherited_automated_stdin: bool,
+) -> EvaluationResult {
+    let result = evaluate_command_with_pack_order_deadline_at_path_core(
+        command,
+        enabled_keywords,
+        ordered_packs,
+        keyword_index,
+        compiled_overrides,
+        allowlists,
+        heredoc_settings,
+        allow_once_audit,
+        project_path,
+        deadline,
+        shell_dialect,
+        nested_command_depth,
+        inherited_automated_stdin,
+    );
+    if nested_command_depth == 0
+        && result.is_allowed()
+        && crate::neotask_dynamic_exec::matches(command)
+    {
+        return crate::neotask_dynamic_exec::denial();
+    }
+    result
+}
+
 /// Evaluate a command, fanning out across dialects when the caller could not
 /// prove one (dcg#294).
 ///
@@ -15191,7 +15233,7 @@ fn dialect_view_may_expose_hidden_execution(
 /// substitutions — keep their existing single-view behavior under whichever
 /// dialect the enclosing view established.
 #[allow(clippy::too_many_arguments)]
-fn evaluate_command_with_pack_order_deadline_at_path_inner(
+fn evaluate_command_with_pack_order_deadline_at_path_core(
     command: &str,
     enabled_keywords: &[&str],
     ordered_packs: &[String],

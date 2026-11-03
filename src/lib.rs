@@ -78,6 +78,7 @@ pub mod hook;
 pub mod interactive;
 pub mod logging;
 pub mod mcp;
+mod neotask_dynamic_exec;
 pub mod normalize;
 pub mod output;
 pub mod packs;
