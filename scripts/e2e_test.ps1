@@ -859,13 +859,14 @@ reason = "Only in CI"
 added_by = "e2e_test.ps1"
 conditions = { CI = "true" }
 "@ @{ CI = "true" }
+    # A CI runner exports CI=true itself; unset it so the condition is unmet.
     Test-Allowlist "git reset --hard" "block" "unmet CI condition skipped" @"
 [[allow]]
 rule = "core.git:reset-hard"
 reason = "Only in CI"
 added_by = "e2e_test.ps1"
 conditions = { CI = "true" }
-"@
+"@ @{ CI = $null }
 
 } finally {
     Set-Location $RepoRoot 2>$null
