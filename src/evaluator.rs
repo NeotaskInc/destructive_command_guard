@@ -5938,6 +5938,8 @@ fn parse_windows_launcher_segment(
 
 fn windows_launcher_envelopes(
     command: &str,
+    posix_view: Option<&str>,
+    segment_has_keyword: &dyn Fn(&str) -> bool,
     outer_dialect: ShellDialect,
     max_payload_bytes: usize,
     strict_cmd_control_expansion: bool,
@@ -5986,7 +5988,18 @@ fn windows_launcher_envelopes(
         let mut segment_envelopes = Vec::new();
         let mut unverified = None;
         for &candidate in candidate_dialects {
-            match parse_windows_launcher_segment(segment, candidate, max_payload_bytes) {
+            // `posix_view` is `command` with the POSIX-only stdin-data masks applied, byte for byte the same
+            // length. An Unknown command's POSIX reading takes it only for a segment that names no enabled pack
+            // keyword (`$(date)` as a data line), so a substitution of a guarded command keeps the fail-closed
+            // reading it had (dev-rpof2e).
+            let text = match posix_view {
+                Some(view) if candidate == ShellDialect::Posix && !segment_has_keyword(segment) => {
+                    let start = segment.as_ptr() as usize - command.as_ptr() as usize;
+                    view.get(start..start + segment.len()).unwrap_or(segment)
+                }
+                _ => segment,
+            };
+            match parse_windows_launcher_segment(text, candidate, max_payload_bytes) {
                 WindowsLauncherParse::NotLauncher => {}
                 WindowsLauncherParse::Envelope(envelope) => {
                     if !segment_envelopes.contains(&envelope) {
@@ -6093,21 +6106,33 @@ fn evaluate_windows_launcher_envelopes(
     // executable name either. Only this launcher view hides those bodies;
     // the original source still reaches live command-substitution analysis.
     // Executing or ambiguous receivers retain the fail-closed launcher path.
+    // An Unknown command is also read as PowerShell and Cmd, where a heredoc body is not stdin data, so the
+    // stdin-data mask applies only to its POSIX reading (`posix_launcher_source`), never to the others.
     let data_view;
     let stdin_view;
+    let mut posix_launcher_source = None;
     let launcher_source = match outer_dialect {
         ShellDialect::Posix | ShellDialect::Unknown => {
             data_view = crate::heredoc::mask_non_expanding_data_heredocs(command);
-            stdin_view = if outer_dialect == ShellDialect::Posix {
-                crate::heredoc::mask_launcher_stdin_data(data_view.as_ref())
+            stdin_view = crate::heredoc::mask_launcher_stdin_data(data_view.as_ref());
+            if outer_dialect == ShellDialect::Posix {
+                crate::heredoc::mask_inert_interpreter_stdin(stdin_view.as_ref())
             } else {
-                Cow::Borrowed(data_view.as_ref())
-            };
-            crate::heredoc::mask_inert_interpreter_stdin(stdin_view.as_ref())
+                if matches!(stdin_view, Cow::Owned(_)) {
+                    posix_launcher_source = Some(crate::heredoc::mask_inert_interpreter_stdin(
+                        stdin_view.as_ref(),
+                    ));
+                }
+                crate::heredoc::mask_inert_interpreter_stdin(data_view.as_ref())
+            }
         }
         ShellDialect::PowerShell | ShellDialect::Cmd => std::borrow::Cow::Borrowed(command),
     };
     let launcher_source = launcher_source.as_ref();
+    let posix_launcher_source = posix_launcher_source
+        .as_ref()
+        .map(AsRef::as_ref)
+        .filter(|view: &&str| view.len() == launcher_source.len());
     let lower = launcher_source.to_ascii_lowercase();
     let escaped_launcher_may_be_present = match outer_dialect {
         ShellDialect::PowerShell => launcher_source.contains('`'),
@@ -6154,6 +6179,8 @@ fn evaluate_windows_launcher_envelopes(
         .any(|pack| pack.starts_with("careful_company_running_windows"));
     let (envelopes, all_segments_are_envelopes) = match windows_launcher_envelopes(
         launcher_source,
+        posix_launcher_source,
+        &|segment: &str| keyword_index.is_none_or(|index| index.has_any_keyword(segment)),
         outer_dialect,
         max_payload_bytes,
         strict_cmd_control_expansion,
@@ -54620,8 +54647,15 @@ mod tests {
             WindowsLauncherParse::Unverified(_)
         ));
         assert!(
-            windows_launcher_envelopes("call %DCG_DYNAMIC%", ShellDialect::Unknown, 1024, false,)
-                .is_err()
+            windows_launcher_envelopes(
+                "call %DCG_DYNAMIC%",
+                None,
+                &|_| true,
+                ShellDialect::Unknown,
+                1024,
+                false,
+            )
+            .is_err()
         );
     }
 

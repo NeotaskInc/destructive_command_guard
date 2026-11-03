@@ -11859,6 +11859,32 @@ pub fn mask_non_expanding_data_heredocs(command: &str) -> std::borrow::Cow<'_, s
     mask_non_executing_heredocs_with_policy(command, true)
 }
 
+/// Whether a quoted body handed to a SQL client reaches no shell. The outer shell does not expand it and the
+/// client runs it as SQL; only the client's own shell-capable commands would hand text to a shell (`mysql`'s
+/// `\!`, `system`, `pager` and `edit`, any `psql` backslash command or backtick, a `sqlite3` dot-command such as
+/// `.shell`). A body holding any of them, or a client not named here, keeps the launcher scan (dev-rpof2e).
+fn sql_client_body_reaches_no_shell(target: &str, body: &str) -> bool {
+    let name = target.rsplit(['/', '\\']).next().unwrap_or(target);
+    match name {
+        "mysql" | "mariadb" => {
+            !body.contains('\\')
+                && body.lines().all(|line| {
+                    let first = line
+                        .trim_start()
+                        .split(|c: char| c.is_whitespace() || c == ';')
+                        .next()
+                        .unwrap_or_default();
+                    !["system", "pager", "edit"]
+                        .iter()
+                        .any(|command| first.eq_ignore_ascii_case(command))
+                })
+        }
+        "psql" => !body.contains('\\') && !body.contains('`'),
+        "sqlite3" => body.lines().all(|line| !line.trim_start().starts_with('.')),
+        _ => false,
+    }
+}
+
 /// The output of a substitution inside stdin data is not an outer-shell
 /// executable name. This view is only for launcher discovery: callers must
 /// still inspect the original source's live substitutions independently.
@@ -11882,19 +11908,48 @@ pub(crate) fn mask_launcher_stdin_data(command: &str) -> Cow<'_, str> {
         })
         .collect();
     let mut output_executed = None;
+    let mut output_may_run = None;
     let masked: Vec<_> = heredocs
         .iter()
         .filter_map(|heredoc| {
             let ActiveHeredocBody::Heredoc {
                 body_start,
                 body_end,
-                ..
+                delimiter_quoted,
             } = heredoc.body
             else {
                 return None;
             };
             if discarded.contains(&heredoc.operator_start) {
                 return Some(body_start..body_end);
+            }
+            // A SQL client's output is its query results, not the body, so it is judged by what the command does
+            // with that output (the masker's own fallback), never by a pass-through proof.
+            if delimiter_quoted && heredoc.output != Some(HeredocOutput::Executes) {
+                let sql_data = extract_heredoc_target_command(command, heredoc.operator_start)
+                    .is_some_and(|target| {
+                        sql_client_body_reaches_no_shell(
+                            &target,
+                            command.get(body_start..body_end).unwrap_or_default(),
+                        ) && !stdin_data_sink_may_be_overridden(
+                            command,
+                            heredoc.operator_start,
+                            &target,
+                        )
+                    });
+                if sql_data
+                    && !*output_may_run.get_or_insert_with(|| {
+                        let quoted = quoted_bodies_by_operator(&heredocs);
+                        command_may_run_heredoc_output(
+                            &blank_ranges(command, &bodies),
+                            &|operator| quoted_body_for_operator(command, &quoted, operator),
+                        )
+                    })
+                    && !*output_executed
+                        .get_or_insert_with(|| written_file_is_executed(command, &bodies))
+                {
+                    return Some(body_start..body_end);
+                }
             }
             if heredoc.output != Some(HeredocOutput::Contained)
                 || heredoc.live_spans.is_none()
