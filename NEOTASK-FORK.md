@@ -75,11 +75,15 @@ retired `dist.yml` (see the CI plumbing below).
   names neither: it judges each segment of a command by its shape. A program
   given code through a code flag (`-c`, `-e`, `-r`, `-E`, a short cluster
   ending in one, `--eval`/`--exec`/`--execute`/`--command`, or an `eval`
-  subcommand) followed by a quoted word, or an awk program, whose quoted text
-  spells a truncating write to a system, home or variable path, is denied, as
-  v0.6.7 denied it; an unlisted program counts, as does a command word in a
-  variable. Upstream keeps the decision for what it parses itself: shell and
-  remote scripts (`sh`/`bash`/... `-c`, `ssh`, `su`; the evaluator hands their
+  subcommand) followed by a quoted word, a value attached to a code flag
+  (`--eval="..."`, `-e'...'`), a here-string, an awk program, or quoted text
+  piped into a program that reads its code from stdin (no operand, or `-`;
+  text filters such as `cat`, `tee` and `sort` read it as data), whose quoted
+  text spells a truncating write to a system, home or variable path, is
+  denied, as v0.6.7 denied it; an unlisted program counts, as does a command
+  word in a variable. Upstream keeps the decision for what it parses itself:
+  shell and remote scripts (`sh`/`bash`/... `-c`, `ssh`, `su`, and GNU
+  `parallel`, which runs its input lines as commands; the evaluator hands their
   nested commands back to this rule one depth down, so `sh -c 'ruby -e ...'`
   is judged at `ruby -e`), the `-c`/`-e` text of SQL clients and search tools,
   quoted data handed to any other program (`echo '...'`, `--note "..."`), and

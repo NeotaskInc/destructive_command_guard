@@ -55,6 +55,7 @@ const UPSTREAM_OWNED: &[&str] = &[
     "powershell",
     "ssh",
     "su",
+    "parallel",
     "psql",
     "mysql",
     "mariadb",
@@ -96,30 +97,86 @@ const AWKS: &[&str] = &["awk", "gawk", "mawk", "nawk"];
 /// cannot be assembled across pieces.
 const WORD_BREAK: char = '\u{1f}';
 
-/// One shell word: its text with quotes removed, its quoted parts alone, and
-/// whether any of it was quoted.
+/// Programs that read stdin as data, never as code.
+const TEXT_FILTERS: &[&str] = &[
+    "cat",
+    "tac",
+    "wc",
+    "sort",
+    "uniq",
+    "head",
+    "tail",
+    "tr",
+    "cut",
+    "less",
+    "more",
+    "tee",
+    "base64",
+    "gzip",
+    "xxd",
+    "od",
+    "sha256sum",
+    "sha1sum",
+    "md5sum",
+    "nl",
+    "fold",
+    "column",
+];
+
+/// One shell word: its text with quotes removed, its quoted parts alone, the
+/// unquoted text before its first quote, and whether any of it was quoted.
 #[derive(Default)]
 struct Word {
     text: String,
     quoted: String,
+    prefix: String,
     was_quoted: bool,
 }
 
+/// A segment's words, and whether a `|` feeds it the previous segment's output.
+struct Segment {
+    words: Vec<Word>,
+    piped: bool,
+}
+
 /// Whether some segment of `command` gives a program inline code whose quoted
-/// text writes a protected or variable path, or a Ruby heredoc does.
+/// text writes a protected or variable path (through a code flag, as an awk
+/// program, as a here-string, or piped into a program that reads its code from
+/// stdin), or a Ruby heredoc does.
 #[must_use]
 pub(crate) fn matches(command: &str) -> bool {
     let (shell, ruby_bodies) = split_heredocs(command);
-    segments(&shell).iter().any(|segment| {
-        code_words(segment)
-            .iter()
-            .any(|word| PROTECTED_WRITE.is_match(&word.quoted))
-    }) || PROTECTED_WRITE.is_match(&ruby_bodies)
+    let mut piped_write = false;
+    for segment in segments(&shell) {
+        if !segment.piped {
+            piped_write = false;
+        }
+        let command = command_of(&segment.words);
+        if let Some((name, rest)) = &command {
+            if code_words(name, rest)
+                .iter()
+                .any(|word| writes_protected(word))
+            {
+                return true;
+            }
+            if segment.piped && piped_write && reads_code_from_stdin(name, rest) {
+                return true;
+            }
+        }
+        piped_write |= segment.words.iter().any(writes_protected);
+    }
+    PROTECTED_WRITE.is_match(&ruby_bodies)
 }
 
-/// The quoted words a segment hands a program as code: the word after each
-/// code flag (or an `eval` subcommand), or an awk program's quoted words.
-fn code_words(segment: &[Word]) -> Vec<&Word> {
+fn writes_protected(word: &Word) -> bool {
+    word.was_quoted && PROTECTED_WRITE.is_match(&word.quoted)
+}
+
+/// The command word's basename and the words after it, past leading
+/// assignments and wrappers; `None` for a shell or another upstream-owned
+/// program. A later word naming such a program (`parallel sh -c`,
+/// `find -exec bash -c`) owns everything from there on.
+fn command_of(segment: &[Word]) -> Option<(&str, Vec<&Word>)> {
     let mut words = segment.iter().peekable();
     // Leading assignments and wrappers (with their options) precede the command word.
     while let Some(word) = words.peek() {
@@ -135,30 +192,67 @@ fn code_words(segment: &[Word]) -> Vec<&Word> {
             break;
         }
     }
-    let Some(program) = words.next() else {
-        return Vec::new();
-    };
+    let program = words.next()?;
     let name = basename(&program.text);
     if UPSTREAM_OWNED.contains(&name) {
-        return Vec::new();
+        return None;
     }
-    // A later word naming a shell or another upstream-owned program
-    // (`parallel sh -c`, `find -exec bash -c`) owns the code that follows it.
-    let rest: Vec<&Word> = words
+    let rest = words
         .take_while(|word| word.was_quoted || !UPSTREAM_OWNED.contains(&basename(&word.text)))
         .collect();
+    Some((name, rest))
+}
+
+/// The quoted words a command hands its program as code: the word after each
+/// code flag or an `eval` subcommand, a value attached to a code flag
+/// (`--eval="..."`, `-e'...'`), a here-string (`<<< "..."`), or an awk
+/// program's quoted words.
+fn code_words<'a>(name: &str, rest: &[&'a Word]) -> Vec<&'a Word> {
     if AWKS.contains(&name) {
-        return rest.into_iter().filter(|word| word.was_quoted).collect();
+        return rest
+            .iter()
+            .copied()
+            .filter(|word| word.was_quoted)
+            .collect();
     }
     let mut code: Vec<&Word> = rest
         .windows(2)
-        .filter(|pair| is_code_flag(pair[0]) && pair[1].was_quoted)
+        .filter(|pair| (is_code_flag(pair[0]) || pair[0].text == "<<<") && pair[1].was_quoted)
         .map(|pair| pair[1])
         .collect();
+    code.extend(
+        rest.iter()
+            .copied()
+            .filter(|word| word.was_quoted && is_attached_code(word)),
+    );
     if rest.first().is_some_and(|word| word.text == "eval") {
-        code.extend(rest.get(1).filter(|word| word.was_quoted));
+        code.extend(rest.get(1).copied().filter(|word| word.was_quoted));
     }
     code
+}
+
+/// A word whose unquoted prefix is a code flag or a here-string operator, with
+/// the code attached: `--eval="..."`, `-e'...'`, `<<<"..."`.
+fn is_attached_code(word: &Word) -> bool {
+    let prefix = word.prefix.as_str();
+    prefix == "<<<"
+        || prefix
+            .strip_suffix('=')
+            .is_some_and(|flag| LONG_CODE_FLAGS.contains(&flag))
+        || is_code_flag(&Word {
+            text: prefix.to_owned(),
+            ..Word::default()
+        })
+}
+
+/// Whether a piped-into program reads its code from stdin: no operand, or `-`.
+/// Text filters read stdin as data.
+fn reads_code_from_stdin(name: &str, rest: &[&Word]) -> bool {
+    !TEXT_FILTERS.contains(&name)
+        && !AWKS.contains(&name)
+        && rest
+            .iter()
+            .all(|word| word.text == "-" || (!word.was_quoted && word.text.starts_with('-')))
 }
 
 /// A flag that hands a program its code: `-c`, `-e`, `-r`, `-E`, a short
@@ -192,8 +286,9 @@ fn basename(word: &str) -> &str {
 }
 
 /// The command's shell lines split into segments at unquoted `;`, `&`, `|`,
-/// newlines, parentheses and backticks, each a list of words.
-fn segments(shell: &str) -> Vec<Vec<Word>> {
+/// newlines, parentheses and backticks, each a list of words and whether a
+/// pipe (`|` or `|&`, not `||`) feeds it.
+fn segments(shell: &str) -> Vec<Segment> {
     #[derive(PartialEq, Eq, Clone, Copy)]
     enum Quote {
         None,
@@ -203,6 +298,7 @@ fn segments(shell: &str) -> Vec<Vec<Word>> {
     }
     let mut segments = Vec::new();
     let mut segment: Vec<Word> = Vec::new();
+    let mut piped = false;
     let mut word = Word::default();
     let mut in_word = false;
     let mut quote = Quote::None;
@@ -211,6 +307,12 @@ fn segments(shell: &str) -> Vec<Vec<Word>> {
         if *in_word {
             segment.push(std::mem::take(word));
             *in_word = false;
+        }
+    };
+    let open_quote = |word: &mut Word| {
+        if !word.was_quoted {
+            word.prefix.clone_from(&word.text);
+            word.was_quoted = true;
         }
     };
     while let Some(c) = chars.next() {
@@ -223,24 +325,31 @@ fn segments(shell: &str) -> Vec<Vec<Word>> {
             }
             (Quote::None, '\'') => {
                 quote = Quote::Single;
-                word.was_quoted = true;
+                open_quote(&mut word);
                 in_word = true;
             }
             (Quote::None, '"') => {
                 quote = Quote::Double;
-                word.was_quoted = true;
+                open_quote(&mut word);
                 in_word = true;
             }
             (Quote::None, '$') if chars.peek() == Some(&'\'') => {
                 chars.next();
                 quote = Quote::AnsiC;
-                word.was_quoted = true;
+                open_quote(&mut word);
                 in_word = true;
             }
             (Quote::None, ';' | '&' | '|' | '\n' | '(' | ')' | '`') => {
                 end_word(&mut segment, &mut word, &mut in_word);
                 if !segment.is_empty() {
-                    segments.push(std::mem::take(&mut segment));
+                    segments.push(Segment {
+                        words: std::mem::take(&mut segment),
+                        piped,
+                    });
+                }
+                piped = c == '|' && chars.next_if_eq(&'|').is_none();
+                if piped {
+                    chars.next_if_eq(&'&');
                 }
             }
             (Quote::None, c) if c.is_whitespace() => {
@@ -268,7 +377,10 @@ fn segments(shell: &str) -> Vec<Vec<Word>> {
     }
     end_word(&mut segment, &mut word, &mut in_word);
     if !segment.is_empty() {
-        segments.push(segment);
+        segments.push(Segment {
+            words: segment,
+            piped,
+        });
     }
     segments
 }
@@ -383,6 +495,15 @@ mod tests {
             "true && sudo python3 -Ic \"__import__('os').system('echo x > /etc/passwd')\"",
             "deno eval \"Deno.run({cmd: ['sh', '-c', 'echo x > /etc/passwd']})\"",
             "ruby - <<'EOF'\nKernel.send(:sys + 'tem', 'echo x > ~/.bashrc')\nEOF",
+            // Code on stdin, or attached to its flag (FuchsiaHare's second carry).
+            "echo \"__import__('os').system('echo x > /etc/passwd')\" | python3",
+            "echo \"__builtins__.__dict__['__imp'+'ort__']('os').system('echo x > /etc/passwd')\" | python3",
+            "echo \"do.call(paste0('sys','tem'), list('echo x > /etc/passwd'))\" | Rscript -",
+            "echo \"globalThis['req'+'uire']('child_process').execSync('echo x > /etc/passwd')\" | node",
+            "node --eval=\"globalThis['req'+'uire']('child_process').execSync('echo x > /etc/passwd')\"",
+            "perl -e'my $f = \"sys\".\"tem\"; &$f(\"echo x > /etc/passwd\")'",
+            "python3 <<< \"__import__('os').system('echo x > ~/.bashrc')\"",
+            "printf '%s' \"Kernel.send(:sys + 'tem', 'echo x > $T')\" | timeout 5 ruby",
         ] {
             assert!(matches(command), "{command}");
         }
@@ -423,6 +544,15 @@ mod tests {
             // SQL and search patterns are not shell.
             "psql -c 'SELECT 1 where a>/etc/x'",
             "grep -e 'a > /etc/x' notes.txt",
+            // Stdin read as data, or a program that reads a script file.
+            "echo 'x > ~/note' | cat",
+            "echo 'x > ~/note' | tee log.txt",
+            "echo 'a > /etc/x' | grep a",
+            "echo 'x > ~/note' | python3 tool.py",
+            "echo 'x > ~/note' || python3",
+            // GNU parallel runs each stdin line as a shell command, which upstream parses.
+            "printf '%s\\n' 'echo x > ~/new-note' | parallel",
+            "sudo printf '%s\\n' 'echo x > ~/new-note' | parallel",
         ] {
             assert!(!matches(command), "{command}");
         }
