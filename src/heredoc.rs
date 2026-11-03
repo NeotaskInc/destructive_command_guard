@@ -6982,15 +6982,18 @@ fn command_string_runner_payloads(
                     break;
                 }
                 let unquoted = word.trim_matches(['\'', '"']);
-                if matches!(unquoted, "-S" | "--split-string") {
+                if unquoted == "--split-string"
+                    || env_split_cluster_len(unquoted) == Some(unquoted.len())
+                {
                     payloads.extend(span(index + 1, index + 2));
                     payloads
                         .extend(span(index + 1, words.len()).filter(|_| index + 2 < words.len()));
                     break;
                 }
-                let value = ["--split-string=", "-S"]
-                    .iter()
-                    .find_map(|prefix| word.strip_prefix(prefix).map(|rest| (prefix.len(), rest)));
+                let value = word
+                    .strip_prefix("--split-string=")
+                    .map(|rest| ("--split-string=".len(), rest))
+                    .or_else(|| env_split_cluster_len(word).map(|len| (len, &word[len..])));
                 if let Some((prefix_len, rest)) = value
                     && !rest.is_empty()
                 {
@@ -7018,6 +7021,17 @@ fn command_string_runner_payloads(
         }
     }
     payloads
+}
+
+/// The length of an `env` short-option cluster through its `S` (`-S`, `-vS`,
+/// `-i0S`): options that take no value, then split-string, whose value is the
+/// rest of the word or the next word.
+fn env_split_cluster_len(word: &str) -> Option<usize> {
+    let flags = word
+        .strip_prefix('-')
+        .filter(|rest| !rest.starts_with('-'))?;
+    let at = flags.find(|flag: char| !matches!(flag, 'i' | '0' | 'v'))?;
+    (flags.as_bytes()[at] == b'S').then_some(at + 2)
 }
 
 /// The runner label of a command word the shell assembles at run time
