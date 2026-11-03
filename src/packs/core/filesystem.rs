@@ -4278,10 +4278,13 @@ pub(crate) fn windows_literal_user_temp_subpath(path: &str) -> bool {
         && components[2].eq_ignore_ascii_case("AppData")
         && components[3].eq_ignore_ascii_case("Local")
         && components[4].eq_ignore_ascii_case("Temp")
+        // PowerShell expands `*`, `?` and `[…]` in -Path, quoted or not.
+        && !starts_with_glob(components[5], &['*', '?', '['])
 }
 
 fn temp_path_suffix_is_static_unquoted(path: &str) -> bool {
     temp_path_suffix_has_real_component(path)
+        && !temp_path_first_component_globs_children(path)
         && !has_dotdot_segment(path)
         && !path
             .bytes()
@@ -4324,6 +4327,25 @@ fn temp_path_suffix_is_static_double_quoted(path: &str) -> bool {
 fn temp_path_suffix_has_real_component(path: &str) -> bool {
     path.split('/')
         .any(|component| !component.is_empty() && component != ".")
+}
+
+/// An unquoted path's first real component under the temp root is the entry it
+/// names, so one that starts with a glob (`*`, `.*`, `?x`, `[a-z]*`) names any
+/// child of the shared root and empties it just as the root itself would
+/// (dev-hs30uj). A literal prefix (`/tmp/sigtest*`) or a glob deeper down
+/// (`/tmp/build/*`) stays inside names the caller chose; inside double quotes the
+/// shell expands no glob at all (`"/tmp/[build]"`).
+fn temp_path_first_component_globs_children(path: &str) -> bool {
+    path.split('/')
+        .find(|component| !component.is_empty() && *component != ".")
+        .is_some_and(|first| starts_with_glob(first, &['*', '?', '[']))
+}
+
+fn starts_with_glob(component: &str, wildcards: &[char]) -> bool {
+    component
+        .strip_prefix('.')
+        .unwrap_or(component)
+        .starts_with(wildcards)
 }
 
 fn has_dotdot_segment(path: &str) -> bool {
@@ -4735,16 +4757,44 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         //   find /tmp/foo /etc -delete
         // from short-circuiting through (the `/etc` would also be deleted).
         //
+        // Every <tmp-path> names something BELOW the temp root, as the
+        // `rm -rf` temp exemption does: `find /tmp -delete` (also `/tmp/`,
+        // `/tmp/.`, `/tmp//./`) empties the whole shared temp directory, every
+        // other process's files and sockets included, so it is not scratch the
+        // caller owns (dev-qgoxf1). Redundant `/` and `.` components do not
+        // count as the descendant, and neither does a first component that
+        // starts with a glob (`/tmp/*`, `/tmp/.*`, `/tmp/[a-z]*`): it names
+        // any child of the root (dev-hs30uj). `/tmp/build-*` names only the
+        // caller's own prefix and stays exempt.
+        //
+        // The root itself stays exempt when the expression selects what goes
+        // before it deletes (`find /tmp -name '*.log' -delete`, `-mtime +7`), as
+        // v0.6.7 allowed: the `-filtered-root` patterns below. A selector after
+        // the action, a bare `-name '*'`, `-mindepth`/`-type` alone, or any
+        // `-o`/`!`/`,` that could undo the selection leaves the whole root
+        // reviewed (dcg#7 REV C2). A name selector needs a literal character
+        // past any glob (`'?*'`, `'[a-z]*'` select everything), and the `-exec
+        // rm` forms take no recursive flag, since a selector can name the root
+        // itself.
+        //
         // `-delete` must terminate the command (followed by end-of-string
         // or only more non-path flags).
         // -----------------------------------------------------------------
         safe_pattern!(
             "find-delete-tmp",
-            r"^(?![^|;&]*[\\$`])find\s+(?:--\s+)?/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
+            r"^(?![^|;&]*[\\$`])find\s+(?:--\s+)?/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*(?:\s+(?:/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
+        ),
+        safe_pattern!(
+            "find-delete-tmp-filtered-root",
+            r"^(?![^|;&]*[\\$`])find\s+(?:--\s+)?/tmp(?:/+\.?)*(?=\s)(?![^|;&]*\s(?:-o|-or|-not|!|,)(?:\s|$))(?=(?:(?!\s-(?:delete|exec|execdir)(?:\s|$))[^|;&])*\s-(?:empty(?:\s|$)|(?:i?name|i?path|i?wholename|i?regex|i?lname|[acm]min|[acm]time|newer[a-zA-Z]*|anewer|cnewer|size|user|uid|group|gid|perm|links|inum|samefile|used)\s+['\x22]?(?:[*?.]|\[[^\]\s]*\])*[^*?.\[\]\s'\x22|;&]))(?:\s+(?:/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
         ),
         safe_pattern!(
             "find-delete-var-tmp",
-            r"^(?![^|;&]*[\\$`])find\s+(?:--\s+)?/var/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:/var/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
+            r"^(?![^|;&]*[\\$`])find\s+(?:--\s+)?/var/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*(?:\s+(?:/var/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
+        ),
+        safe_pattern!(
+            "find-delete-var-tmp-filtered-root",
+            r"^(?![^|;&]*[\\$`])find\s+(?:--\s+)?/var/tmp(?:/+\.?)*(?=\s)(?![^|;&]*\s(?:-o|-or|-not|!|,)(?:\s|$))(?=(?:(?!\s-(?:delete|exec|execdir)(?:\s|$))[^|;&])*\s-(?:empty(?:\s|$)|(?:i?name|i?path|i?wholename|i?regex|i?lname|[acm]min|[acm]time|newer[a-zA-Z]*|anewer|cnewer|size|user|uid|group|gid|perm|links|inum|samefile|used)\s+['\x22]?(?:[*?.]|\[[^\]\s]*\])*[^*?.\[\]\s'\x22|;&]))(?:\s+(?:/var/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
         ),
         // The `-exec rm … {}` spelling of the same temp-only delete. Since
         // `find-delete-*` learned that action it denied here while `-delete`
@@ -4752,11 +4802,19 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // the terminating `\;`.
         safe_pattern!(
             "find-exec-rm-tmp",
-            r"^(?![^|;&]*[$`])(?![^|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:(?:/private)?/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-zA-Z]+)*\s+\{\}\s+(?:\\;|\+)\s*$"
+            r"^(?![^|;&]*[$`])(?![^|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*(?:\s+(?:(?:/private)?/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-zA-Z]+)*\s+\{\}\s+(?:\\;|\+)\s*$"
+        ),
+        safe_pattern!(
+            "find-exec-rm-tmp-filtered-root",
+            r"^(?![^|;&]*[$`])(?![^|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/tmp(?:/+\.?)*(?=\s)(?![^|;&]*\s(?:-o|-or|-not|!|,)(?:\s|$))(?=(?:(?!\s-(?:delete|exec|execdir)(?:\s|$))[^|;&])*\s-(?:empty(?:\s|$)|(?:i?name|i?path|i?wholename|i?regex|i?lname|[acm]min|[acm]time|newer[a-zA-Z]*|anewer|cnewer|size|user|uid|group|gid|perm|links|inum|samefile|used)\s+['\x22]?(?:[*?.]|\[[^\]\s]*\])*[^*?.\[\]\s'\x22|;&]))(?:\s+(?:(?:/private)?/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-qs-zA-QS-Z]+)*\s+\{\}\s+(?:\\;|\+)\s*$"
         ),
         safe_pattern!(
             "find-exec-rm-var-tmp",
-            r"^(?![^|;&]*[$`])(?![^|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/var/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:(?:/private)?/var/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-zA-Z]+)*\s+\{\}\s+(?:\\;|\+)\s*$"
+            r"^(?![^|;&]*[$`])(?![^|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/var/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*(?:\s+(?:(?:/private)?/var/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-zA-Z]+)*\s+\{\}\s+(?:\\;|\+)\s*$"
+        ),
+        safe_pattern!(
+            "find-exec-rm-var-tmp-filtered-root",
+            r"^(?![^|;&]*[$`])(?![^|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/var/tmp(?:/+\.?)*(?=\s)(?![^|;&]*\s(?:-o|-or|-not|!|,)(?:\s|$))(?=(?:(?!\s-(?:delete|exec|execdir)(?:\s|$))[^|;&])*\s-(?:empty(?:\s|$)|(?:i?name|i?path|i?wholename|i?regex|i?lname|[acm]min|[acm]time|newer[a-zA-Z]*|anewer|cnewer|size|user|uid|group|gid|perm|links|inum|samefile|used)\s+['\x22]?(?:[*?.]|\[[^\]\s]*\])*[^*?.\[\]\s'\x22|;&]))(?:\s+(?:(?:/private)?/var/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-qs-zA-QS-Z]+)*\s+\{\}\s+(?:\\;|\+)\s*$"
         ),
         // -----------------------------------------------------------------
         // `unlink <file>` safe whitelist for temp directories.
@@ -6651,13 +6709,97 @@ mod tests {
         // path argument matters; safe pattern must NOT short-circuit if
         // a second argument is sensitive (test below).
         for cmd in [
-            "find /tmp -delete",
             "find /tmp/foo -delete",
             "find /tmp/foo -name '*.log' -delete",
-            "find /var/tmp -delete",
+            "find /tmp/.cache -delete",
             "find /var/tmp/dir -type f -delete",
+            "find /tmp/foo -exec rm {} \\;",
         ] {
             assert_safe_pattern_matches(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn a_glob_of_a_temp_roots_children_blocks() {
+        let pack = create_pack();
+        // dev-hs30uj: a first component that starts with a glob names any child
+        // of the shared temp root.
+        for cmd in [
+            "find /tmp/* -delete",
+            "find /tmp/.* -delete",
+            "find /var/tmp/[a-z]* -delete",
+            "find /tmp/*-cache -delete",
+            "find /tmp/* -exec rm {} \\;",
+            "rm -rf /tmp/*",
+            "rm -rf /tmp/.*",
+            "rm -rf /tmp/?",
+            "rm -rf /tmp/[a-z]*",
+            "rm -rf /private/tmp/*",
+            "rm -rf /var/tmp/*",
+            "rm -rf /tmp/build /tmp/*",
+        ] {
+            assert!(
+                pack.check(cmd).is_some(),
+                "{cmd} must not pass the temp exemption"
+            );
+        }
+        for cmd in [
+            "find /tmp/build/* -delete",
+            "find /tmp/build-* -delete",
+            "rm -rf /tmp/build/*",
+            "rm -rf /tmp/sigtest*",
+            "rm -rf /tmp/.cache-x*",
+            "rm -rf \"/tmp/[build]\"",
+        ] {
+            assert!(pack.check(cmd).is_none(), "{cmd} stays exempt");
+        }
+    }
+
+    #[test]
+    fn a_filtered_find_under_a_temp_root_stays_exempt() {
+        let pack = create_pack();
+        // v0.6.7 allowed these; only the unfiltered root is the whole-/tmp wipe
+        // (dcg#7 REV C2).
+        for cmd in [
+            "find /tmp -name '*.log' -delete",
+            "find /tmp -mindepth 1 -mtime +7 -delete",
+            "find /var/tmp -user bob -delete",
+            "find /tmp/ -empty -delete",
+            "find /tmp -name '*.o' -exec rm {} \\;",
+        ] {
+            assert_safe_pattern_matches(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn find_delete_of_a_temp_root_blocks() {
+        let pack = create_pack();
+        // A selector can name the root itself; a recursive rm then removes it.
+        assert_blocks(&pack, "find /tmp -name tmp -exec rm -rf {} +", "rm -rf");
+        // dev-qgoxf1: the temp root itself is every process's temp directory, not
+        // scratch the caller owns, so it never matches the temp exemption, however
+        // the root is spelled.
+        for cmd in [
+            "find /tmp -delete",
+            "find /tmp/ -delete",
+            "find /tmp/. -delete",
+            "find /tmp//./ -delete",
+            "find /tmp/foo /tmp -delete",
+            "find /tmp -mindepth 1 -delete",
+            "find /tmp -type f -delete",
+            "find /tmp -name '*' -delete",
+            "find /tmp -delete -name keep",
+            "find /tmp -name keep -o -delete",
+            "find /tmp ! -name keep -delete",
+            "find /tmp -name '*.o' -o -exec rm {} \\;",
+            "find /tmp -name '?*' -delete",
+            "find /tmp -name '[a-z]*' -delete",
+            "find /var/tmp -delete",
+            "find /tmp -exec rm {} \\;",
+            "find /private/tmp -exec rm -f {} +",
+            "find /var/tmp/ -exec rm {} \\;",
+        ] {
+            assert_blocks(&pack, cmd, "find");
         }
     }
 
@@ -6795,11 +6937,9 @@ mod tests {
         // invocation. This is the intended trade-off (see
         // find_temp_compound_blocks_conservatively for rationale).
         for cmd in [
-            "find /tmp -delete",
             "find /tmp/foo -delete",
-            "find /tmp -name '*.log' -delete",
             "find /tmp/foo -name '*.tmp' -delete",
-            "find /var/tmp -delete",
+            "find /var/tmp/foo -delete",
         ] {
             assert_safe_pattern_matches(&pack, cmd);
         }

@@ -1001,9 +1001,11 @@ mod tests {
             .iter()
             .filter(|pattern| needs_backtracking_engine(pattern.regex.as_str()))
             .collect();
+        // +4: the temp-root `find` patterns that a selecting predicate keeps
+        // exempt (`find-delete-tmp-filtered-root` and its three siblings, dcg#7).
         assert_eq!(
             backtracking.len(),
-            32,
+            36,
             "audited anchored safe-pattern corpus"
         );
         for pattern in &backtracking {
@@ -1118,7 +1120,7 @@ mod tests {
                     for reference in [sample % 2 == 0, sample % 2 != 0] {
                         let (elapsed, results, compiled) = run(reference);
                         assert_eq!(results, vec![false; lines]);
-                        assert_eq!(compiled, if reference { 32 } else { 0 });
+                        assert_eq!(compiled, if reference { 36 } else { 0 });
                         if reference {
                             reference_times.push(elapsed);
                         } else {
@@ -1129,7 +1131,7 @@ mod tests {
                 reference_times.sort_unstable();
                 candidate_times.sort_unstable();
                 eprintln!(
-                    "safe_regex_prefix/{}/{lines}: raw_p50_ms={:.3} candidate_p50_ms={:.3} speedup={:.2}x raw_compiled=32 candidate_compiled=0",
+                    "safe_regex_prefix/{}/{lines}: raw_p50_ms={:.3} candidate_p50_ms={:.3} speedup={:.2}x raw_compiled=36 candidate_compiled=0",
                     if cold { "cold" } else { "warm" },
                     reference_times[3].as_secs_f64() * 1_000.0,
                     candidate_times[3].as_secs_f64() * 1_000.0,
