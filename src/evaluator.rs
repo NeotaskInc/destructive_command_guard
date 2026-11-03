@@ -18307,6 +18307,7 @@ fn collect_indirect_input_flows_from_node<D: Doc>(
                 }
             } else if matches!(input_redirect(&text), Some(RedirectInput::HandledByHeredoc)) {
                 collect_runtime_heredoc_flows(command, &node, flows);
+                collect_literal_heredoc_flows(command, &node, flows);
                 collect_heredoc_pipeline_flows(command, &node, flows);
             }
         }
@@ -18434,6 +18435,36 @@ fn collect_runtime_heredoc_flows<D: Doc>(
                 &reader,
             ),
         );
+    }
+}
+
+/// A protected database client reading a non-expanding heredoc gets that body as its input, exactly as the shell
+/// hands it over, so its statements and its own shell escapes (`\!`, `system`, `.shell`) are judged like any other
+/// input it reads (dev-hi855w). An expanding body is runtime input ([`collect_runtime_heredoc_flows`]).
+fn collect_literal_heredoc_flows<D: Doc>(
+    command: &str,
+    statement: &ast_grep_core::Node<'_, D>,
+    flows: &mut Vec<IndirectInputFlow>,
+) {
+    let range = statement.range();
+    let Some(reader) = statement.field("body") else {
+        return;
+    };
+    let reader = reader.text();
+    let Some(pack_id) = protected_consumer_pack(&reader) else {
+        return;
+    };
+    for (operator, body) in crate::heredoc::literal_heredoc_bodies(command) {
+        if range.contains(&operator) {
+            push_indirect_flow(
+                flows,
+                indirect_flow_for_consumer(
+                    pack_id,
+                    IndirectInputSource::StaticProducer(body),
+                    &reader,
+                ),
+            );
+        }
     }
 }
 
@@ -24189,7 +24220,7 @@ fn database_shell_commands(pack_id: &str, payload: &str) -> Result<Vec<String>, 
     for candidate in candidates {
         let command = match pack_id {
             "database.postgresql" => psql_shell_meta_command(candidate)?,
-            "database.mysql" => mysql_shell_meta_command(candidate),
+            "database.mysql" => mysql_shell_meta_command(candidate)?,
             "database.sqlite" => sqlite_shell_meta_command(candidate)?,
             _ => None,
         };
@@ -24302,14 +24333,14 @@ fn psql_shell_meta_command(line: &str) -> Result<Option<String>, String> {
     for meta in ["\\gx", "\\g"] {
         if let Some(remainder) = pipe_meta_remainder(line, meta) {
             if let Some(command) = psql_pipe_after_options(remainder)? {
-                return Ok(Some(command));
+                return database_output_pipe_command(command).map(Some);
             }
         }
     }
     for meta in ["\\o", "\\out", "\\w"] {
         if let Some(remainder) = pipe_meta_remainder(line, meta) {
             if let Some(command) = remainder.trim_start().strip_prefix('|') {
-                return Ok(Some(command.trim().to_string()));
+                return database_output_pipe_command(command.trim().to_string()).map(Some);
             }
         }
     }
@@ -24576,18 +24607,32 @@ fn parse_postgres_program_operand(
     Err("a PostgreSQL COPY PROGRAM command has an unterminated operand".to_string())
 }
 
-fn mysql_shell_meta_command(line: &str) -> Option<String> {
-    for meta in ["\\!", "\\P"] {
-        if let Some(command) = punctuation_meta_remainder(line, meta) {
-            return Some(command.trim().to_string());
-        }
+fn mysql_shell_meta_command(line: &str) -> Result<Option<String>, String> {
+    if let Some(command) = punctuation_meta_remainder(line, "\\!") {
+        return Ok(Some(command.trim().to_string()));
     }
-    for meta in ["system", "pager"] {
-        if let Some(command) = meta_command_remainder(line, meta) {
-            return Some(command.trim().to_string());
-        }
+    if let Some(command) = meta_command_remainder(line, "system") {
+        return Ok(Some(command.trim().to_string()));
     }
-    None
+    if let Some(command) = punctuation_meta_remainder(line, "\\P") {
+        return database_output_pipe_command(command.trim().to_string()).map(Some);
+    }
+    if let Some(command) = meta_command_remainder(line, "pager") {
+        return database_output_pipe_command(command.trim().to_string()).map(Some);
+    }
+    Ok(None)
+}
+
+/// A client output pipe (`\o |`, `\g |`, `.once |`, `pager`) feeds the client's results to the command's standard
+/// input. A command that runs its input as code would run those results, which no static reading can prove
+/// (dev-hi855w).
+fn database_output_pipe_command(command: String) -> Result<String, String> {
+    match pipeline_shell_input_mode(&command) {
+        PipelineShellInputMode::NotShell | PipelineShellInputMode::DoesNotReadStdin => Ok(command),
+        _ => Err(
+            "a database client pipes its output into a program that runs it as code".to_string(),
+        ),
+    }
 }
 
 fn sqlite_shell_meta_command(line: &str) -> Result<Option<String>, String> {
@@ -24599,7 +24644,7 @@ fn sqlite_shell_meta_command(line: &str) -> Result<Option<String>, String> {
     for meta in [".once", ".output"] {
         if let Some(remainder) = meta_command_remainder(line, meta) {
             if let Some(command) = remainder.trim_start().strip_prefix('|') {
-                return Ok(Some(command.trim().to_string()));
+                return database_output_pipe_command(command.trim().to_string()).map(Some);
             }
         }
     }

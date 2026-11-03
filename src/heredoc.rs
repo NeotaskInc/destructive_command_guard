@@ -12434,6 +12434,54 @@ pub(crate) fn runtime_expanding_heredoc_operators(command: &str) -> Vec<usize> {
         .collect()
 }
 
+/// The text each non-expanding heredoc hands its reader, by operator offset: a quoted body verbatim, and an
+/// unquoted body with no expansion after the shell's body escapes (`\$`, `` \` ``, `\\`, `\<newline>`). The
+/// reader receives exactly this text, so it can be judged as that reader's input (dev-hi855w). An expanding body
+/// is runtime input instead ([`runtime_expanding_heredoc_operators`]).
+pub(crate) fn literal_heredoc_bodies(command: &str) -> Vec<(usize, String)> {
+    active_heredocs(command)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|heredoc| match heredoc.body {
+            ActiveHeredocBody::Heredoc {
+                body_start,
+                body_end,
+                delimiter_quoted,
+            } => {
+                let body = command.get(body_start..body_end)?;
+                if delimiter_quoted {
+                    Some((heredoc.operator_start, body.to_string()))
+                } else if body_expands_at_runtime(body) {
+                    None
+                } else {
+                    Some((heredoc.operator_start, unescape_heredoc_body(body)))
+                }
+            }
+            ActiveHeredocBody::HereString => None,
+        })
+        .collect()
+}
+
+/// An unquoted heredoc body as the shell delivers it: a backslash escapes only `$`, `` ` ``, `\` and a newline.
+fn unescape_heredoc_body(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.peek() {
+                Some('$' | '`' | '\\') => out.extend(chars.next()),
+                Some('\n') => {
+                    chars.next();
+                }
+                _ => out.push(ch),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Whether an unquoted-delimiter heredoc body contains a parameter expansion,
 /// a command substitution or an arithmetic expansion. Body rules, not command
 /// rules: quotes are literal text, globs do not expand, and a backslash
