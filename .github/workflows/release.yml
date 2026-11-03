@@ -1,0 +1,174 @@
+# Neotask release pipeline for the vendored dcg fork.
+#
+# This is the ONLY release workflow Neotask uses. It builds our active ship
+# targets from THIS fork's pinned source, then publishes binaries + a
+# sha256 checksums file + the unmodified LICENSE (MIT + OpenAI/Anthropic
+# rider) as release assets. Those assets are the sole distribution channel
+# consumed by the Electron build (scripts/download-dcg.cjs, sha256-verified).
+#
+# It does NOT publish to crates.io and does NOT sign with upstream's keys.
+#
+# Trigger: pushing a neotask release tag (e.g. v0.6.7-neotask.1). Danny
+# triggers releases (house rule); no auto-run on upstream tag mirrors.
+#
+# Toolchain: the repo pins channel = "nightly-2026-08-31" in
+# rust-toolchain.toml (bare nightly cannot compile rustix 1.1.4). We install
+# that EXACT nightly and add the per-target std to it, so cross-std targets
+# (linux-musl, and any future win-arm) find `core`.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*-neotask.*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS Apple Silicon (native arm64 runner)
+          - os: blacksmith-6vcpu-macos-15
+            target: aarch64-apple-darwin
+            asset: dcg_darwin_arm64
+          # Intel Mac builds paused on 2026-09-19; retain the native lane for
+          # explicit reactivation with an approved non-GitHub Intel runner.
+          # - os: [self-hosted, macOS, X64, neotask-intel]
+          #   target: x86_64-apple-darwin
+          #   asset: dcg_darwin_amd64
+          # Linux x86_64 — musl for glibc-independence (runs on old distros)
+          - os: blacksmith-4vcpu-ubuntu-2404
+            target: x86_64-unknown-linux-musl
+            asset: dcg_linux_amd64
+            apt_install: musl-tools
+          # Windows x64 (MSVC)
+          - os: blacksmith-4vcpu-windows-2025
+            target: x86_64-pc-windows-msvc
+            asset: dcg_windows_amd64.exe
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust nightly + target std
+        # rust-toolchain.toml pins nightly-2026-08-31; install THAT nightly and
+        # add the matrix target's std to it (a floating @nightly would install
+        # the cross-std against the wrong nightly and fail with can't-find-core).
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
+        with:
+          toolchain: nightly-2026-08-31
+          targets: ${{ matrix.target }}
+
+      - name: Install apt build deps (Linux musl)
+        if: matrix.apt_install != ''
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ${{ matrix.apt_install }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Verify musl binary has no glibc symbols
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/dcg"
+          if [ ! -f "$binary" ]; then
+            echo "::error::expected built binary not found at $binary"
+            exit 1
+          fi
+          if objdump -T "$binary" 2>&1 | grep -q "GLIBC_"; then
+            echo "::error::musl binary unexpectedly contains GLIBC symbols"
+            objdump -T "$binary" | grep "GLIBC_" || true
+            exit 1
+          fi
+          echo "musl binary is glibc-free"
+
+      - name: Stage asset (posix)
+        if: runner.os != 'Windows'
+        run: |
+          cp "target/${{ matrix.target }}/release/dcg" "${{ matrix.asset }}"
+          strip "${{ matrix.asset }}" || true
+          chmod 755 "${{ matrix.asset }}"
+
+      - name: Stage asset (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: cp "target/${{ matrix.target }}/release/dcg.exe" "${{ matrix.asset }}"
+
+      - name: Smoke test (version + allow/deny decision)
+        shell: bash
+        env:
+          SMOKE_ASSET: ${{ matrix.asset }}
+        run: |
+          set -euo pipefail
+          "./${{ matrix.asset }}" --version
+          # A benign command must be allowed (exit 0).
+          "./${{ matrix.asset }}" --robot test "ls -la" >/dev/null
+          # A catastrophic command must return the documented denial code (1).
+          # Use the scanner-recognized diagnostic entrypoint, with the staged
+          # artifact's exact bytes. The quoted command is data for dcg test.
+          smoke_dir="$(mktemp -d "${RUNNER_TEMP}/dcg-smoke.XXXXXX")"
+          smoke_binary="$smoke_dir/dcg"
+          if [[ "$SMOKE_ASSET" == *.exe ]]; then
+            smoke_binary="$smoke_binary.exe"
+          fi
+          cp "${{ matrix.asset }}" "$smoke_binary"
+          chmod 755 "$smoke_binary"
+          "$smoke_binary" --version
+          "$smoke_binary" --robot test "ls -la" >/dev/null
+          set +e
+          "$smoke_binary" --robot test "rm -rf /"
+          deny_status=$?
+          set -e
+          if [ "$deny_status" -ne 1 ]; then
+            echo "::error::expected denial exit 1; received $deny_status"
+            exit 1
+          fi
+          echo "smoke ok: allowed benign, denied rm -rf /"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: blacksmith-4vcpu-ubuntu-2204
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd assets
+          shasum -a 256 dcg_* > checksums.txt
+          cat checksums.txt
+
+      - name: Stage unmodified LICENSE as a release asset
+        # Byte-identical to the repo LICENSE (MIT + OpenAI/Anthropic rider).
+        # The rider requires distribution to include it unmodified.
+        run: cp LICENSE assets/LICENSE
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" assets/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "dcg ${GITHUB_REF_NAME}" \
+            --notes "Neotask build of destructive_command_guard (dcg), MIT + OpenAI/Anthropic rider. Static per-platform binaries for the Neotask gateway destructive-command guard. LICENSE ships unmodified beside every distribution. Upstream: Dicklesworthstone/destructive_command_guard v0.16.0 @ 665fcd8f, plus the two carried source patches recorded in NEOTASK-FORK.md (--no-policy-files and the neotask-dynamic-exec-redirect deny). Self-update is disabled downstream via DCG_NO_UPDATE_CHECK=1."

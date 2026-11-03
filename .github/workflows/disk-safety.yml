@@ -24,21 +24,21 @@ concurrency:
 
 jobs:
   disk-safety:
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 45
     env:
       CARGO_INCREMENTAL: 0
       CARGO_BUILD_JOBS: 2
       RCH_ENABLED: 0
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Activate the repository-pinned Rust toolchain
         run: |
           toolchain=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
           rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -75,7 +75,7 @@ jobs:
           cargo fmt --check 2>&1 | tee target/disk-safety/fmt.log
       - name: Retain revision-bound evidence
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: disk-safety-${{ github.sha }}
           path: |

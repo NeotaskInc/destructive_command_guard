@@ -2,10 +2,18 @@ name: ci
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
   workflow_dispatch:
-    # Allow manual triggering for deep suite
+    # Manual trigger runs the deep fuzz suite in addition to the PR jobs
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,23 +21,30 @@ env:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    if: github.event.pull_request.draft != true
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Validate Dependabot config
         run: |
           ruby -e 'require "yaml"; config = YAML.load_file(".github/dependabot.yml"); puts "Dependabot config:"; puts config.inspect'
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # v1 series 2026-09-03
         with:
+          toolchain: nightly
           components: rustfmt, clippy
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+        with:
+          tool: nextest
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -47,10 +62,17 @@ jobs:
 
       - name: Install UBS
         run: |
-          curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/main/install.sh" \
-            | bash -s -- --easy-mode
+          installer_dir="$(mktemp -d "${RUNNER_TEMP}/ubs-install.XXXXXX")"
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            "https://raw.githubusercontent.com/Dicklesworthstone/ultimate_bug_scanner/0af10c926d6fbb14a1f589326d75c03f610207f0/install.sh" \
+            -o "$installer_dir/install.sh"
+          echo "b79a7a38fae28988f0c555d29a8cabd229a4245aa7071cd1c81102a8ae21fbd1  $installer_dir/install.sh" | sha256sum --check --strict
+          # The verified installer reads VERSION beside itself and verifies the
+          # matching release artifacts; never resolve an unpinned latest release.
+          printf '%s\n' '5.3.13' >> "$installer_dir/VERSION"
+          bash "$installer_dir/install.sh" --easy-mode
           # Add UBS to PATH for this job
-          echo "$HOME/.ubs" >> $GITHUB_PATH
+          echo "$HOME/.ubs" >> "$GITHUB_PATH"
 
       - name: Run UBS on changed files
         if: always()
@@ -112,7 +134,7 @@ jobs:
 
       - name: Upload UBS output
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ubs-output
           path: ubs-output.log
@@ -158,7 +180,7 @@ jobs:
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: test-results-check
           path: target/nextest/ci/junit.xml
@@ -171,23 +193,30 @@ jobs:
   # with the MSVC target because rust-toolchain.toml pins nightly / edition 2024.
   check-windows:
     name: check (windows)
-    runs-on: windows-latest
+    runs-on: blacksmith-4vcpu-windows-2025
+    if: github.event.pull_request.draft != true
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Enable git long paths
         run: git config --global core.longpaths true
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # v1 series 2026-09-03
         with:
+          toolchain: nightly
           targets: x86_64-pc-windows-msvc
           components: rustfmt, clippy
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+        with:
+          tool: nextest
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -272,8 +301,11 @@ jobs:
           $installed1 = Join-Path $dest1 'dcg.exe'
           if (-not (Test-Path $installed1)) { throw "Pass 1: binary not installed at $installed1" }
           # The installed real binary must run and DENY a destructive command...
-          $deny = '{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}' | & $installed1
-          if ($deny -notmatch 'permissionDecision') { throw "Pass 1: installed dcg.exe did not deny 'git reset --hard'" }
+          # The fixture is inert hook input, never a PowerShell command.
+          $denyInput = Get-Content -Raw -LiteralPath 'tests/fixtures/installer-deny-input.json'
+          $deny = $denyInput | & $installed1
+          $decision = $deny | ConvertFrom-Json
+          if ($decision.hookSpecificOutput.permissionDecision -ne 'deny') { throw "Pass 1: installed dcg.exe did not deny the destructive fixture" }
           # ...and ALLOW (silent) a safe one.
           $allow = '{"tool_name":"Bash","tool_input":{"command":"git status"}}' | & $installed1
           if (-not [string]::IsNullOrWhiteSpace($allow)) { throw "Pass 1: 'git status' should be allowed (silent), got: $allow" }
@@ -390,7 +422,7 @@ jobs:
 
       - name: Upload Windows e2e artifacts
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-artifacts-windows
           path: ${{ runner.temp }}/e2e-artifacts
@@ -399,7 +431,7 @@ jobs:
 
       - name: Upload Windows test results
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: test-results-windows
           path: target/nextest/ci/junit.xml
@@ -407,13 +439,17 @@ jobs:
           if-no-files-found: ignore
 
   fuzz-smoke:
-    runs-on: ubuntu-latest
-    needs: check
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    if: github.event.pull_request.draft != true
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # v1 series 2026-09-03
+        with:
+          toolchain: nightly
           # cargo-fuzz defaults to building under x86_64-unknown-linux-musl
           # because libFuzzer + AddressSanitizer require statically-linked
           # libc; without this target installed, the build fails with
@@ -422,12 +458,12 @@ jobs:
           targets: x86_64-unknown-linux-musl
 
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
         with:
           tool: cargo-fuzz
 
       - name: Cache cargo registry and fuzz target
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -448,20 +484,26 @@ jobs:
           cargo fuzz run heredoc_fuzz --target x86_64-unknown-linux-gnu -- -max_total_time=30
 
   coverage:
-    runs-on: ubuntu-latest
-    needs: check
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    if: github.event.pull_request.draft != true
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # v1 series 2026-09-03
+        with:
+          toolchain: nightly
           components: llvm-tools-preview
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+        with:
+          tool: cargo-llvm-cov
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -504,7 +546,7 @@ jobs:
           echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v7
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: lcov.info
           fail_ci_if_error: false
@@ -530,7 +572,7 @@ jobs:
           echo "Dashboard: https://codecov.io/gh/Dicklesworthstone/destructive_command_guard" >> $GITHUB_STEP_SUMMARY
 
       - name: Upload coverage artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-report
           path: |
@@ -602,15 +644,20 @@ jobs:
 
   # Memory leak detection tests
   memory-tests:
-    runs-on: ubuntu-latest
-    needs: check
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    if: github.event.pull_request.draft != true
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # v1 series 2026-09-03
+        with:
+          toolchain: nightly
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -707,7 +754,7 @@ jobs:
 
       - name: Upload memory test artifacts
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: memory-test-output
           path: |
@@ -718,17 +765,21 @@ jobs:
   # Performance benchmark enforcement (push to main only)
   # Runs benchmarks and checks against performance budgets defined in src/perf.rs
   benchmarks:
-    runs-on: ubuntu-latest
-    needs: check
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     # Only run on push to main, not on PRs (benchmarks are noisy)
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # v1 series 2026-09-03
+        with:
+          toolchain: nightly
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -785,7 +836,7 @@ jobs:
           fi
 
       - name: Upload benchmark results
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: benchmark-results
           path: benchmark_output.txt
@@ -793,15 +844,20 @@ jobs:
 
   # End-to-end shell script tests
   e2e:
-    runs-on: ubuntu-latest
-    needs: check
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    if: github.event.pull_request.draft != true
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # v1 series 2026-09-03
+        with:
+          toolchain: nightly
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -850,7 +906,7 @@ jobs:
 
       - name: Upload E2E artifacts
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-artifacts
           path: |
@@ -867,15 +923,20 @@ jobs:
 
   # Bats install/uninstall/agent-config tests
   bats:
-    runs-on: ubuntu-latest
-    needs: check
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    if: github.event.pull_request.draft != true
+    timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # v1 series 2026-09-03
+        with:
+          toolchain: nightly
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -909,7 +970,7 @@ jobs:
 
       - name: Upload bats output
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: bats-output
           path: bats-output.log
@@ -925,17 +986,20 @@ jobs:
   # Real Codex CLI smoke tests. This runs only on pushes to main because it
   # requires networked Codex API calls and consumes quota.
   codex-e2e:
-    runs-on: ubuntu-latest
-    needs: check
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # v1 series 2026-09-03
+        with:
+          toolchain: nightly
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -1047,7 +1111,7 @@ jobs:
 
       - name: Upload Codex E2E artifacts
         if: steps.codex_e2e.outputs.exit_code != '0'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: codex-e2e-artifacts
           path: |
@@ -1064,15 +1128,20 @@ jobs:
 
   # Scan-mode regression fixtures (ensures scan output stays stable)
   scan-regression:
-    runs-on: ubuntu-latest
-    needs: check
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    if: github.event.pull_request.draft != true
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # v1 series 2026-09-03
+        with:
+          toolchain: nightly
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -1123,7 +1192,7 @@ jobs:
 
       - name: Upload scan regression artifacts
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: scan-regression-artifacts
           path: |
@@ -1138,44 +1207,98 @@ jobs:
           echo "::error::Scan regression mismatch (exit code ${{ steps.scan_regression.outputs.exit_code }}). See the 'scan-regression-artifacts' artifact and the step summary for details."
           exit 1
 
-  # Process-per-invocation perf regression gate (compares against committed baseline JSON)
+  # Compare base and candidate on the same runner; historical timings from
+  # another CPU class cannot establish a code regression after runner migration.
   perf-regression:
-    runs-on: ubuntu-latest
-    needs: check
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    if: github.event.pull_request.draft != true
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The absolute gate binds the binary's full Git object id to this
           # checkout and retains `git describe` as supplemental diagnostics.
           # Full history keeps that description reproducible.
           fetch-depth: 0
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # v1 series 2026-09-03
+        with:
+          toolchain: nightly
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-perf-regression-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          key: blacksmith-4vcpu-ubuntu-2404-cargo-perf-regression-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            blacksmith-4vcpu-ubuntu-2404-cargo-perf-regression-
 
       - name: Build release binary
         run: cargo build --release
 
-      - name: Run perf baseline + compare to repo baseline
+      - name: Resolve comparison revision
+        id: comparison
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          comparison_sha="$PR_BASE_SHA"
+          if [ -z "$comparison_sha" ]; then
+            comparison_sha="$PUSH_BEFORE_SHA"
+          fi
+          if [ -z "$comparison_sha" ] || [ "$comparison_sha" = "0000000000000000000000000000000000000000" ]; then
+            # Scheduled/manual runs compare against the previous commit,
+            # never against the candidate itself.
+            comparison_sha="$(git rev-parse HEAD^)"
+          fi
+          if [[ ! "$comparison_sha" =~ ^[0-9a-f]{40}$ ]] || [ "$comparison_sha" = "$(git rev-parse HEAD)" ]; then
+            echo "::error::a distinct comparison commit is required"
+            exit 1
+          fi
+          echo "sha=$comparison_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout comparison revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.comparison.outputs.sha }}
+          path: perf-base
+          persist-credentials: false
+
+      - name: Build comparison binary
+        run: cargo build --manifest-path perf-base/Cargo.toml --target-dir perf-base-target --release --locked
+
+      - name: Run base and candidate perf on this runner
         id: perf
         run: |
           set +e
 
-          BASELINE_JSON="perf/baselines/2026-01-11-after-lazy.json"
-          PERF_ARTIFACT_DIR="$RUNNER_TEMP/dcg-perf-relative"
-          mkdir -p "$PERF_ARTIFACT_DIR"
-          CURRENT_JSON="$PERF_ARTIFACT_DIR/perf-current.json"
-          REPORT_MD="$PERF_ARTIFACT_DIR/perf-regression-report.md"
+          BASELINE_JSON="perf-base.json"
+          CURRENT_JSON="perf-current.json"
+          REPORT_MD="perf-regression-report.md"
+
+          python3 scripts/perf_baseline.py \
+            --bin perf-base-target/release/dcg \
+            --output "$BASELINE_JSON" \
+            --warmup 10 \
+            --runs 80 \
+            --skip-trace
+          BASE_EXIT=$?
+          if [ "$BASE_EXIT" -ne 0 ]; then
+            echo "exit_code=$BASE_EXIT" >> "$GITHUB_OUTPUT"
+            echo "::error::comparison baseline generation failed (exit code $BASE_EXIT)"
+            exit 0
+          fi
+
+          {
+            echo "runner_class=blacksmith-4vcpu-ubuntu-2404"
+            echo "base_sha=$(git -C perf-base rev-parse HEAD)"
+            echo "candidate_sha=$(git rev-parse HEAD)"
+            lscpu
+          } >> perf-runner.txt
 
           python3 scripts/perf_baseline.py \
             --bin target/release/dcg \
@@ -1369,12 +1492,14 @@ jobs:
 
       - name: Upload perf regression artifacts
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: perf-regression-artifacts
           path: |
-            ${{ runner.temp }}/dcg-perf-relative/perf-current.json
-            ${{ runner.temp }}/dcg-perf-relative/perf-regression-report.md
+            perf-base.json
+            perf-current.json
+            perf-regression-report.md
+            perf-runner.txt
           retention-days: 14
           if-no-files-found: ignore
 
@@ -1417,7 +1542,7 @@ jobs:
 
       - name: Upload absolute latency gate certificate
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: perf-latency-gate-certificate
           path: ${{ runner.temp }}/dcg-perf-latency/perf-latency-gate.json
@@ -1429,44 +1554,30 @@ jobs:
           command -v jq >/dev/null 2>&1 || sudo apt-get install -y jq
           bash scripts/e2e_harness_matrix.sh --binary target/release/dcg
 
-      - name: Local installer + hook e2e (public release path)
-        # Verifies the LATEST PUBLISHED artifact for this runner's platform
-        # still installs and guards commands. Non-blocking: it exercises the
-        # published release, not this PR's code, so a release-side problem must
-        # not block unrelated PRs — it surfaces as a warning annotation.
-        # GH_TOKEN is required or `gh release view` cannot resolve the version
-        # and the step would silently no-op.
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if bash scripts/e2e_fleet_install.sh --local-only; then
-            echo "Published-release install path verified on this runner."
-          else
-            echo "::warning::local installer e2e failed against the published release — check release assets, installer target triples, and checksum/signature sidecars"
-          fi
-
-  # Deep suite: fuzzing (scheduled or manual only)
+  # Deep suite: fuzzing (manual only)
   fuzz:
-    runs-on: ubuntu-latest
-    # Only run on schedule or manual trigger, not on every PR
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # Only run on manual trigger, not on every PR
+    if: github.event_name == 'workflow_dispatch'
+    timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # v1 series 2026-09-03
+        with:
+          toolchain: nightly
           components: llvm-tools-preview
-          # See fuzz-smoke job above — cargo-fuzz needs the musl target to
-          # link libFuzzer + AddressSanitizer with a statically-linked libc.
           targets: x86_64-unknown-linux-musl
 
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
         with:
           tool: cargo-fuzz
 
       - name: Cache cargo registry and fuzz corpus
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -1481,117 +1592,61 @@ jobs:
         run: |
           cd fuzz
           echo "## Fuzzing Results" >> $GITHUB_STEP_SUMMARY
+          failed=0
           for target in fuzz_context fuzz_evaluate fuzz_hook_input fuzz_normalize fuzz_heredoc_trigger fuzz_heredoc_extract fuzz_heredoc_language fuzz_shell_extract heredoc_fuzz ast_matcher_fuzz; do
             echo "Fuzzing $target (~60s runtime + build)..."
-            timeout 10m cargo fuzz run "$target" -- -max_total_time=60 || true
-            echo "- $target: completed" >> $GITHUB_STEP_SUMMARY
+            if timeout 10m cargo fuzz run "$target" --target x86_64-unknown-linux-gnu -- -max_total_time=60; then
+              echo "- $target: completed" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- $target: FAILED (crash, build failure or timeout)" >> $GITHUB_STEP_SUMMARY
+              failed=1
+            fi
           done
+          exit "$failed"
 
       - name: Upload fuzz artifacts
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fuzz-artifacts
           path: fuzz/artifacts/
           retention-days: 30
           if-no-files-found: ignore
 
-  # ---------------------------------------------------------------------------
-  # Published-release install matrix.
-  #
-  # Every other job tests THIS tree. Nothing verifies that the artifact users
-  # actually download still exists, installs, and guards commands on a clean
-  # machine of each supported OS. That is how #238 happened: macOS artifacts
-  # were missing for six releases while `dcg update` reported no update
-  # available, so Mac users silently sat on a pre-0.7.0 build with a known
-  # security fix missing.
-  #
-  # These runners are stock, unconfigured machines — the closest thing to a
-  # real new user that CI can offer. Scheduled + manual only: it exercises the
-  # published release, not the commit under test.
-  # ---------------------------------------------------------------------------
-  published-release-matrix:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            shell: bash
-          - os: macos-latest        # Apple Silicon
-            shell: bash
-          - os: macos-15-intel      # x86_64 macOS
-            shell: bash
-          - os: windows-latest
-            shell: pwsh
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+  # Single required status for the whole workflow. Skipped jobs (push-only,
+  # manual-only or draft-skipped) are fine; failures and cancellations fail it.
+  ci-gate:
+    name: CI Gate
+    if: always()
+    needs:
+      - check
+      - check-windows
+      - fuzz-smoke
+      - coverage
+      - memory-tests
+      - benchmarks
+      - e2e
+      - bats
+      - codex-e2e
+      - scan-regression
+      - perf-regression
+      - fuzz
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7
-
-      - name: Install from the published release and verify it guards (Unix)
-        if: matrix.shell == 'bash'
+      - name: Require every CI job to succeed
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: bash scripts/e2e_fleet_install.sh --local-only
-
-      # The Windows path uses the README's scriptblock invocation, which is
-      # what users actually run (and what a default Restricted ExecutionPolicy
-      # requires). Assertions mirror the Unix probe.
-      - name: Install from the published release and verify it guards (Windows)
-        if: matrix.shell == 'pwsh'
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
+          IS_DRAFT: ${{ github.event.pull_request.draft == true }}
+          RESULTS: ${{ join(needs.*.result, ' ') }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          Get-ChildItem Env: | Where-Object { $_.Name -like 'DCG_*' } | ForEach-Object {
-            Remove-Item "Env:$($_.Name)" -ErrorAction SilentlyContinue
-          }
-          $env:DCG_SELF_HEAL_HOOK = '0'
-          $env:DCG_HISTORY_DISABLED = '1'
-
-          $version = (gh release view -R ${{ github.repository }} --json tagName --jq .tagName)
-          if (-not $version) { throw "could not resolve the latest published release" }
-          Write-Output "Testing published release $version"
-
-          $dest = Join-Path $env:RUNNER_TEMP 'dcg-bin'
-          New-Item -ItemType Directory -Force -Path $dest | Out-Null
-          $src = Invoke-RestMethod -Uri "https://raw.githubusercontent.com/${{ github.repository }}/main/install.ps1"
-          & ([scriptblock]::Create($src)) -Version $version -Dest $dest -Verify -NoConfigure
-
-          $bin = Join-Path $dest 'dcg.exe'
-          if (-not (Test-Path $bin)) { throw "installer produced no dcg.exe" }
-          $got = (& $bin --version 2>&1 | Select-Object -First 1) -join ''
-          if ($got -notlike "*$($version.TrimStart('v'))*") {
-            throw "installed binary reports '$got', expected $version"
-          }
-
-          # The guard must actually deny, and must stay silent on safe input.
-          $deny = '{"tool_name":"Bash","tool_input":{"command":"git reset --hard"}}'
-          $out = ($deny | & $bin 2>$null | Out-String)
-          if ($out -notmatch '"permissionDecision"\s*:\s*"deny"') {
-            throw "published Windows binary did NOT deny 'git reset --hard'"
-          }
-          $allow = '{"tool_name":"Bash","tool_input":{"command":"git status"}}'
-          $out = ($allow | & $bin 2>$null | Out-String).Trim()
-          if (-not [string]::IsNullOrEmpty($out)) {
-            throw "published Windows binary emitted output for a safe command"
-          }
-
-          # Native-Windows packs must be default-ON (docs/windows.md).
-          $ps = '{"tool_name":"PowerShell","tool_input":{"command":"Remove-Item -Recurse -Force C:\\data"}}'
-          $out = ($ps | & $bin 2>$null | Out-String)
-          if ($out -notmatch 'deny|block') {
-            throw "windows.filesystem is not default-on in the published build"
-          }
-
-          # #245 guard: ordinary commands must reach a verdict on the stock budget.
-          foreach ($c in @('echo hi 2>NUL', 'cp report.txt backup.txt', 'rm ./scratch.txt')) {
-            $p = '{"tool_name":"Bash","tool_input":{"command":"' + $c.Replace('\','\\').Replace('"','\"') + '"}}'
-            $o = ($p | & $bin 2>$null | Out-String)
-            if ($o -match 'could not complete safety evaluation' -or $o -match '"ask"') {
-              throw "published build returned an indeterminate verdict for '$c' on the stock budget (#245 class)"
-            }
-          }
-          Write-Output "Published release verified on native Windows."
+          if [ "$IS_DRAFT" = "true" ]; then
+            echo "::error::Draft PR: full CI runs when marked ready for review"
+            exit 1
+          fi
+          for result in $RESULTS; do
+            if [ "$result" = "failure" ] || [ "$result" = "cancelled" ]; then
+              echo "::error::A CI job finished with result: $result"
+              exit 1
+            fi
+          done
+          echo "All CI jobs passed or were intentionally skipped: $RESULTS"
