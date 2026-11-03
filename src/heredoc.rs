@@ -12345,6 +12345,61 @@ pub(crate) fn quoted_heredoc_body_at(command: &str, operator_start: usize) -> Op
         })
 }
 
+/// The operators of the unquoted-delimiter heredocs whose bodies the shell
+/// expands into text known only at runtime (see [`body_expands_at_runtime`]).
+/// The reading command receives that runtime text, not the body as written.
+pub(crate) fn runtime_expanding_heredoc_operators(command: &str) -> Vec<usize> {
+    active_heredocs(command)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|heredoc| match heredoc.body {
+            ActiveHeredocBody::Heredoc {
+                body_start,
+                body_end,
+                delimiter_quoted: false,
+            } if body_expands_at_runtime(&command[body_start..body_end]) => {
+                Some(heredoc.operator_start)
+            }
+            ActiveHeredocBody::HereString | ActiveHeredocBody::Heredoc { .. } => None,
+        })
+        .collect()
+}
+
+/// Whether an unquoted-delimiter heredoc body contains a parameter expansion,
+/// a command substitution or an arithmetic expansion. Body rules, not command
+/// rules: quotes are literal text, globs do not expand, and a backslash
+/// escapes only `$`, `` ` ``, `\` and a newline. `$$`, `$?`, `$!`, `$#` and
+/// `$-` expand to shell bookkeeping values, not to supplied text.
+pub(crate) fn body_expands_at_runtime(body: &str) -> bool {
+    let bytes = body.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if matches!(bytes.get(index + 1), Some(b'$' | b'`' | b'\\' | b'\n')) => {
+                index += 2;
+                continue;
+            }
+            b'`' => return true,
+            b'$' => match bytes.get(index + 1) {
+                Some(next)
+                    if next.is_ascii_alphanumeric()
+                        || matches!(next, b'_' | b'{' | b'(' | b'@' | b'*') =>
+                {
+                    return true;
+                }
+                Some(b'$' | b'?' | b'!' | b'#' | b'-') => {
+                    index += 2;
+                    continue;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
 /// The quoted-delimiter bodies among `heredocs`, with their operator
 /// positions, for [`command_may_run_heredoc_output`].
 fn quoted_bodies_by_operator(heredocs: &[ActiveHeredoc]) -> Vec<(usize, Range<usize>)> {

@@ -18265,6 +18265,7 @@ fn collect_indirect_input_flows_from_node<D: Doc>(
                     push_indirect_flow(flows, indirect_flow_for_consumer(pack_id, source, &text));
                 }
             } else if matches!(input_redirect(&text), Some(RedirectInput::HandledByHeredoc)) {
+                collect_runtime_heredoc_flows(command, &node, flows);
                 collect_heredoc_pipeline_flows(command, &node, flows);
             }
         }
@@ -18360,6 +18361,39 @@ fn has_database_cli_hint(command: &str) -> bool {
 
 fn has_indirect_input_cli_hint(command: &str) -> bool {
     has_database_cli_hint(command) || command.to_ascii_lowercase().contains("nsupdate")
+}
+
+/// A protected client reading an unquoted heredoc receives the body after the
+/// shell expands it, so a body built from `$SQL` or `$(…)` is not the text dcg
+/// can inspect.
+fn collect_runtime_heredoc_flows<D: Doc>(
+    command: &str,
+    statement: &ast_grep_core::Node<'_, D>,
+    flows: &mut Vec<IndirectInputFlow>,
+) {
+    let range = statement.range();
+    if !crate::heredoc::runtime_expanding_heredoc_operators(command)
+        .into_iter()
+        .any(|operator| range.contains(&operator))
+    {
+        return;
+    }
+    let Some(reader) = statement.field("body") else {
+        return;
+    };
+    let reader = reader.text();
+    if let Some(pack_id) = protected_consumer_pack(&reader) {
+        push_indirect_flow(
+            flows,
+            indirect_flow_for_consumer(
+                pack_id,
+                IndirectInputSource::Unverified(
+                    "an unquoted heredoc body expands at runtime".to_string(),
+                ),
+                &reader,
+            ),
+        );
+    }
 }
 
 fn collect_heredoc_pipeline_flows<D: Doc>(
@@ -20301,7 +20335,11 @@ fn literal_heredoc_producer_source(command: &str) -> Option<IndirectInputSource>
             "heredoc producer is not a plain cat stdin copy; file operands, transforms or redirections may change its output".to_string(),
         ));
     }
-    if !content.quoted && contains_dynamic_shell_output(&content.content) {
+    // Quotes in a body are text, so the command-text scan alone misses `'$ID'`.
+    if !content.quoted
+        && (contains_dynamic_shell_output(&content.content)
+            || crate::heredoc::body_expands_at_runtime(&content.content))
+    {
         return Some(IndirectInputSource::Unverified(
             "unquoted heredoc input contains shell expansion or globbing".to_string(),
         ));
@@ -50832,6 +50870,36 @@ mod tests {
                 Some(expected),
                 "{command:?} must be decided by its own client's pack"
             );
+        }
+    }
+
+    #[test]
+    fn an_unquoted_heredoc_body_expanded_at_runtime_is_unverified_dev_qh9n29() {
+        for (client, pack) in [
+            ("mysql", "database.mysql"),
+            ("psql", "database.postgresql"),
+            ("sqlite3 app.db", "database.sqlite"),
+        ] {
+            for command in [
+                format!("{client} <<EOF\n$SQL\nEOF"),
+                format!("{client} <<EOF\n${{SQL}}\nEOF"),
+                format!("{client} <<EOF\nUSE prod; $1\nEOF"),
+                format!("cat <<EOF | {client}\nDELETE FROM t WHERE id = '$ID';\nEOF"),
+            ] {
+                let result =
+                    evaluate_with_pack_ids_in_dialect(&command, &[pack], ShellDialect::Posix);
+                assert!(result.is_denied(), "{command:?} must deny");
+            }
+            // The shell hands these bodies over as written.
+            for command in [
+                format!("{client} <<'EOF'\n$SQL\nEOF"),
+                format!("{client} <<EOF\nSELECT \\$1, '*';\nEOF"),
+                format!("{client} <<EOF\nSELECT $$;\nEOF"),
+            ] {
+                let result =
+                    evaluate_with_pack_ids_in_dialect(&command, &[pack], ShellDialect::Posix);
+                assert!(!result.is_denied(), "{command:?} must allow");
+            }
         }
     }
 
