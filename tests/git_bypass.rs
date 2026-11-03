@@ -39,6 +39,58 @@ fn run_hook(command: &str) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
+fn run_robot_test(command: &str) -> String {
+    let home = tempfile::tempdir().expect("tempdir");
+    let output = Command::new(dcg_binary())
+        .args(["--robot", "--no-policy-files", "test", command])
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
+        .output()
+        .expect("failed to run dcg test");
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+/// dev-igbgn.5: v0.6.7-neotask.3 denied these on both surfaces, while v0.16
+/// allowed them on the hook. The posix analysis resolves the executable after
+/// stripping wrappers and never stripped `builtin`, so `core.git` never saw
+/// `git` in executable position. `builtin command git …` runs git in bash.
+#[test]
+fn builtin_wrapper_cannot_hide_git() {
+    for cmd in [
+        "builtin command git reset --hard",
+        "builtin command git push --force",
+        "builtin -- command git push --force",
+        "builtin command -p git reset --hard",
+        "command builtin command git reset --hard",
+    ] {
+        let hook = run_hook(cmd);
+        assert!(hook.contains("deny"), "hook allowed {cmd} -> {hook}");
+        let robot = run_robot_test(cmd);
+        assert!(
+            robot.contains("\"decision\": \"deny\""),
+            "dcg test allowed {cmd} -> {robot}"
+        );
+    }
+}
+
+#[test]
+fn builtin_wrapped_non_destructive_commands_stay_allowed() {
+    for cmd in [
+        "builtin command git status",
+        "builtin command git clean -n",
+        "builtin command -v git",
+        "command -v git",
+        "builtin echo hi",
+    ] {
+        let output = run_hook(cmd);
+        assert!(
+            !output.contains("deny"),
+            "a non-destructive wrapped command was denied: {cmd} -> {output}"
+        );
+    }
+}
+
 #[test]
 fn git_global_flag_bypass() {
     // This command is destructive but currently bypassed because regex expects "git reset" directly

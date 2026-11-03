@@ -131,6 +131,12 @@ pub fn strip_wrapper_prefixes(command: &str) -> NormalizedCommand<'_> {
             continue;
         }
 
+        if let Some((remaining, wrapper)) = strip_builtin_wrapper(&current) {
+            stripped_wrappers.push(wrapper);
+            current = remaining;
+            continue;
+        }
+
         if let Some((remaining, wrapper)) = strip_posix_assignment_prefix(&current) {
             stripped_wrappers.push(wrapper);
             current = remaining;
@@ -909,6 +915,36 @@ fn strip_command_wrapper(command: &str) -> Option<(String, StrippedWrapper)> {
         remaining.to_string(),
         StrippedWrapper {
             wrapper_type: "command",
+            stripped_text,
+        },
+    ))
+}
+
+/// Strip the `builtin` wrapper: `builtin command git reset --hard` runs
+/// `command git reset --hard`. `builtin` takes no options besides `--`, so any
+/// other option word is left for the callers' fail-closed handling.
+fn strip_builtin_wrapper(command: &str) -> Option<(String, StrippedWrapper)> {
+    let trimmed = command.trim_start();
+    let rest = trimmed.strip_prefix("builtin")?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let mut rest = rest.trim_start();
+    if let Some(after) = rest.strip_prefix("--") {
+        if !after.is_empty() && !after.starts_with(char::is_whitespace) {
+            return None;
+        }
+        rest = after.trim_start();
+    }
+    if rest.is_empty() || rest.starts_with('-') || starts_with_shell_redirection(rest) {
+        return None;
+    }
+
+    let stripped_text = trimmed[..trimmed.len() - rest.len()].trim_end().to_string();
+    Some((
+        rest.to_string(),
+        StrippedWrapper {
+            wrapper_type: "builtin",
             stripped_text,
         },
     ))
