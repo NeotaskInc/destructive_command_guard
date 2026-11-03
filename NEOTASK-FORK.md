@@ -220,11 +220,13 @@ and drop an entry once upstream passes it (bead dev-2gdcxq).
 | `repro_313_powershell_read_only_false_positives` | `global_options_preserve_inspection_and_argument_data` | Same family: over-block. |
 | `repro_313_powershell_read_only_false_positives` | `native_agent_argument_boundaries_are_dialect_specific` | Denies `GIT RESET --HARD` under PowerShell with another rule id than the test expects. |
 | `repro_558_ifs_destinations` | `literal_command_queries_and_quoted_wrapper_operands_remain_harmless` | Over-blocks an IFS literal query (a false positive). |
-| `cli_e2e` | `custom_pack_loading_tests::exact_command_grants_do_not_reappear_after_detection_rewrites` | Allow-once grant scope (`project` vs `cwd`); the Gateway ignores allow-once grants (`--no-policy-files`). |
+| `cli_e2e` | `custom_pack_loading_tests::exact_command_grants_do_not_reappear_after_detection_rewrites` | Denies `GIT RESET --HARD` (PowerShell and unknown dialects, as everywhere) with `core.git:git-alias-semantic-unverified` instead of the `core.git:reset-hard` the test expects: a Git subcommand is case-sensitive while alias names are not, so the alias rule decides. Still a deny (dev-igbgn.7). |
 
 ### Upstream tests excluded on Windows only (MON ruling #82548, dev-igbgn)
 
 These 44 upstream v0.16.0 tests fail only on Windows, in upstream's own path and dialect handling; the fork rule produces none of their verdicts. `.config/nextest.toml` excludes them by exact name in a `cfg(windows)` override of the `ci` profile (which keeps the 9 above as well); Linux and macOS still run them. Retire them on intake or upstream (bead dev-32i0o2).
+
+The `cli_e2e` allow-once tests (`allow_once_flow_tests::*_issue_599`) also need their temporary directory outside every Git repository: a grant made inside a repository is scoped to its root (`project`), so with a `.git` above `TMPDIR` (a stray `/tmp/.git`, for example) they report `project` where they expect `cwd`. That is the designed scope, not a loosening; run them with `TMPDIR` outside any repository (dev-igbgn.7).
 
 | Reason | Tests |
 |---|---|
