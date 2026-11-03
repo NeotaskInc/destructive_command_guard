@@ -227,108 +227,10 @@ fn command_of(segment: &[Word]) -> Option<(&str, Vec<&Word>)> {
     if UPSTREAM_OWNED.contains(&name) {
         return None;
     }
-    let remaining: Vec<&Word> = words.collect();
-    // A recognized interpreter keeps every argument (no handoff stop): it does
-    // not hand a later upstream-owned word off to a shell the way `find -exec`
-    // or `parallel` do, and `reads_code_from_stdin` needs the script operand so
-    // `python3 tool.py` is not read as stdin-code (dev-tyz9co). `code_words`
-    // then walks the interpreter's own options to the real inline payload.
-    // Every other program keeps the handoff rule.
-    let rest: Vec<&Word> = if recognized_interpreter(name) {
-        remaining
-    } else {
-        remaining
-            .into_iter()
-            .take_while(|word| word.was_quoted || !UPSTREAM_OWNED.contains(&basename(&word.text)))
-            .collect()
-    };
+    let rest = words
+        .take_while(|word| word.was_quoted || !UPSTREAM_OWNED.contains(&basename(&word.text)))
+        .collect();
     Some((name, rest))
-}
-
-/// A recognized interpreter whose own options we parse with an arity table
-/// ([`takes_value_operand`]) so a value like `sh` in `python3 -X sh -c …` is
-/// never read as a script or a handoff.
-fn recognized_interpreter(name: &str) -> bool {
-    [
-        "python", "node", "nodejs", "bun", "deno", "ruby", "irb", "perl", "php",
-    ]
-    .iter()
-    .any(|prefix| name.starts_with(prefix))
-}
-
-/// Whether `flag`, as a bare option word for `name`, takes the next word as its
-/// value. Glued forms (`-Xdev`, `-Mstrict`, `--require=x`) carry their value
-/// already and match none of these, so they consume nothing extra. Parse-only;
-/// never a deny decision (keeps judge-by-shape, dev-igbgn C1 carry).
-fn takes_value_operand(name: &str, flag: &str) -> bool {
-    if name.starts_with("python") {
-        matches!(flag, "-X" | "-W" | "--check-hash-based-pycs")
-    } else if name.starts_with("node") || name.starts_with("bun") || name.starts_with("deno") {
-        matches!(
-            flag,
-            "-r" | "--require" | "--import" | "--loader" | "--input-type" | "-C" | "--conditions"
-        )
-    } else if name.starts_with("ruby") || name.starts_with("irb") {
-        matches!(flag, "-I" | "-r" | "-E" | "-C")
-    } else if name.starts_with("perl") {
-        matches!(flag, "-I" | "-M" | "-m")
-    } else {
-        false
-    }
-}
-
-/// An option that ends the interpreter's own option parsing with no inline code
-/// to scan: `--`, a lone `-`, or python's module runner `-m`.
-fn terminates_options(name: &str, flag: &str) -> bool {
-    flag == "--" || flag == "-" || (name.starts_with("python") && flag == "-m")
-}
-
-/// The words a recognized interpreter hands to [`code_words`], found by walking
-/// its own options: the slice from the first code flag onward, or empty when a
-/// script path or terminating option comes first. The value-option check runs
-/// before the code-flag check so a value flag that looks like a code flag
-/// (node/ruby `-r`, ruby `-E`) consumes its value instead of being scanned.
-/// After an UNKNOWN option we keep walking to a code flag rather than treating
-/// the next word as a script or handoff (fail closed, FuchsiaHare on
-/// dev-tyz9co), so `python3 -Q sh -c '<writes a protected path>'` is still read.
-fn interpreter_code_rest<'a>(name: &str, words: &[&'a Word]) -> Vec<&'a Word> {
-    let mut index = 0;
-    let mut lenient = false;
-    while index < words.len() {
-        let word = words[index];
-        if takes_value_operand(name, &word.text) {
-            index += 2;
-            continue;
-        }
-        if names_code_flag(word)
-            || is_attached_code(word)
-            || word.text == "eval"
-            || word.text == "<<<"
-        {
-            // A code flag, an attached-code word, an `eval` subcommand
-            // (`deno eval "<code>"`), or a here-string (`python3 <<< "<code>"`):
-            // hand the slice to the shared extractor.
-            return words[index..].to_vec();
-        }
-        if terminates_options(name, &word.text) {
-            return Vec::new();
-        }
-        if word.text.starts_with('-') {
-            // An unknown option (including a glued value form): keep scanning for
-            // a code flag instead of stopping at a following upstream-owned word.
-            lenient = true;
-            index += 1;
-            continue;
-        }
-        // A bare word is the script path (terminating) in normal parsing; after
-        // an unknown option it may be that option's value, so keep scanning.
-        if lenient {
-            index += 1;
-            continue;
-        }
-        return Vec::new();
-    }
-    Vec::new()
 }
 
 /// The quoted words a command hands its program as code: the word after each
@@ -336,17 +238,6 @@ fn interpreter_code_rest<'a>(name: &str, words: &[&'a Word]) -> Vec<&'a Word> {
 /// (`--eval="..."`, `-e'...'`), a here-string (`<<< "..."`), or an awk
 /// program's quoted words.
 fn code_words<'a>(name: &str, rest: &[&'a Word]) -> Vec<&'a Word> {
-    // For a recognized interpreter, walk its own options to the inline-code
-    // slice first (so `-X sh` isn't read as a handoff), then extract the code
-    // from that slice with the shared logic.
-    if recognized_interpreter(name) {
-        let slice = interpreter_code_rest(name, rest);
-        return plain_code_words(name, &slice);
-    }
-    plain_code_words(name, rest)
-}
-
-fn plain_code_words<'a>(name: &str, rest: &[&'a Word]) -> Vec<&'a Word> {
     if AWKS.contains(&name) {
         return rest
             .iter()
@@ -649,20 +540,6 @@ mod tests {
             // must not bypass the scan (dev-tyz9co / dev-igbgn.2 bucket-1).
             "python3 '-c' \"__import__('os').system('echo x > /etc/passwd')\"",
             "python3 '-c' '__import__(\"os\").system(\"echo x > /etc/passwd\")'",
-            // An interpreter option value (-X sh), a glued option (-Xdev), an
-            // unknown option (-Q), quoted options, and node/ruby/perl value
-            // options must not drop the following code flag's payload
-            // (dev-tyz9co -X <name> -c half; FuchsiaHare #84603).
-            "python3 -X sh -c \"__import__('os').system('echo x > /etc/passwd')\"",
-            "python3 -W ignore -X dev -c \"__import__('os').system('echo x > /etc/passwd')\"",
-            "python3 -Xdev -c \"__import__('os').system('echo x > /etc/passwd')\"",
-            "python3 -Q sh -c \"__import__('os').system('echo x > /etc/passwd')\"",
-            "python3 '-X' sh '-c' \"__import__('os').system('echo x > /etc/passwd')\"",
-            "node -r sh -e \"require('child_process').execSync('echo x > /etc/passwd')\"",
-            "node --require=x -e \"require('child_process').execSync('echo x > /etc/passwd')\"",
-            "ruby -I sh -e \"system('echo x > /etc/passwd')\"",
-            "perl -M strict -e \"system('echo x > /etc/passwd')\"",
-            "perl -Mstrict -e \"system('echo x > /etc/passwd')\"",
             "deno eval \"Deno.run({cmd: ['sh', '-c', 'echo x > /etc/passwd']})\"",
             "ruby - <<'EOF'\nKernel.send(:sys + 'tem', 'echo x > ~/.bashrc')\nEOF",
             // Code on stdin, or attached to its flag (FuchsiaHare's second carry).
@@ -713,14 +590,6 @@ mod tests {
     #[test]
     fn leaves_literal_data_and_parsed_scripts_to_upstream() {
         for command in [
-            // Interpreter options and script paths carry no inline write, and a
-            // non-interpreter handoff keeps its own logic (dev-tyz9co -X half).
-            "python3 -X sh -c 'print(1)'",
-            "python3 -m http.server 8000",
-            "python3 -W ignore script.py",
-            "node -r ts-node/register app.ts",
-            "find . -name '*.py' -exec bash -c 'echo \"$1\"' _ {} \\;",
-            "parallel sh -c 'echo {}' ::: a b",
             "node -e \"const ok = html.includes('</p>') && /<p>/.test(html)\"",
             "python3 -c \"print('a>b')\"",
             "python3 -c 'print(\"<td>/</td>\")'",
