@@ -25445,6 +25445,9 @@ fn evaluate_packs_with_allowlists_at_depth(
             .get_or_init(|| command_executable_identities(gating_command, shell_dialect))
             .selects(pack)
     };
+    // An index built for another pack order would decode its bits to the wrong
+    // packs; the per-pack scan reads pack ids directly.
+    let keyword_index = keyword_index.filter(|index| index.built_for(ordered_packs));
     let candidate_pack_ids: Vec<&String> = keyword_index.map_or_else(
         || {
             ordered_packs
@@ -50851,6 +50854,38 @@ mod tests {
     /// against the reordered list they named the wrong packs, so with
     /// `database.mongodb` enabled beside `database.mysql` a here-string into
     /// `mysql` reached no database rule at all and was allowed.
+    #[test]
+    fn an_index_built_for_another_pack_order_is_not_decoded_dev_h3yib1() {
+        let enabled: std::collections::HashSet<String> = ["database.mysql", "database.mongodb"]
+            .iter()
+            .map(|id| (*id).to_string())
+            .collect();
+        let ordered_packs = crate::packs::REGISTRY.expand_enabled_ordered(&enabled);
+        let reversed: Vec<String> = ordered_packs.iter().rev().cloned().collect();
+        assert_ne!(ordered_packs, reversed);
+        let stale_index = crate::packs::REGISTRY.build_enabled_keyword_index(&reversed);
+        let enabled_keywords = crate::packs::REGISTRY.collect_enabled_keywords(&enabled);
+        let mut config = default_config();
+        config.heredoc.timeout_ms = Some(5_000);
+        let result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+            "mysql -e 'DROP DATABASE prod'",
+            enabled_keywords.as_slice(),
+            ordered_packs.as_slice(),
+            stale_index.as_ref(),
+            &default_compiled_overrides(),
+            &default_allowlists(),
+            &config.heredoc_settings(),
+            None,
+            None,
+            None,
+            ShellDialect::Posix,
+        );
+        assert!(
+            result.is_denied(),
+            "a stale index must not hide the client's own pack"
+        );
+    }
+
     #[test]
     fn a_reordered_carrier_keeps_its_own_keyword_candidates_dev_igbgn_6() {
         let packs = [
