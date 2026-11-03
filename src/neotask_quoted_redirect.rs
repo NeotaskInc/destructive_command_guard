@@ -392,9 +392,7 @@ fn plain_code_words<'a>(name: &str, rest: &[&'a Word]) -> Vec<&'a Word> {
     if name.starts_with("deno") {
         code.extend(
             rest.windows(2)
-                .filter(|pair| {
-                    pair[0].text == "eval" && !pair[0].was_quoted && pair[1].was_quoted
-                })
+                .filter(|pair| pair[0].text == "eval" && !pair[0].was_quoted && pair[1].was_quoted)
                 .map(|pair| pair[1]),
         );
     } else if rest.first().is_some_and(|word| word.text == "eval") {

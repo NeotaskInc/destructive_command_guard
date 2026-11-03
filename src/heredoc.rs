@@ -19838,8 +19838,16 @@ mod tests {
         #[test]
         fn extracts_inline_script_behind_a_glued_value_option_r1() {
             let cases = [
-                ("python3 -W0 -c 'import os'", "import os", ScriptLanguage::Python),
-                ("python3 -Xutf8 -c 'import os'", "import os", ScriptLanguage::Python),
+                (
+                    "python3 -W0 -c 'import os'",
+                    "import os",
+                    ScriptLanguage::Python,
+                ),
+                (
+                    "python3 -Xutf8 -c 'import os'",
+                    "import os",
+                    ScriptLanguage::Python,
+                ),
                 ("ruby -W0 -e 'puts 1'", "puts 1", ScriptLanguage::Ruby),
                 ("ruby -Eutf-8 -e 'puts 1'", "puts 1", ScriptLanguage::Ruby),
                 ("ruby -0777 -e 'puts 1'", "puts 1", ScriptLanguage::Ruby),
