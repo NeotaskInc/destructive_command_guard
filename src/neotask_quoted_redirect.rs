@@ -1,6 +1,6 @@
 //! Neotask fork rule (dev-igbgn): inline code whose quoted text spells a
-//! write (a truncating or appending redirect, `tee` or `dd of=`) to a system,
-//! home or variable path.
+//! write (a truncating or appending redirect, or `tee`) to a system, home or
+//! variable path.
 //!
 //! Upstream reads inline interpreter code in its own language, which is what
 //! keeps `node -e "x.match(/<p>/)"` from reading as a redirect. It cannot see
@@ -38,12 +38,18 @@ macro_rules! protected_target {
     };
 }
 
-/// A write to a protected target: a truncating or appending redirect, or a
-/// sink that writes the path it is given, `tee` (with any flags) and `dd`'s
-/// `of=` (dev-65yunv: `echo x >> /etc/passwd` and `tee /etc/passwd` inside
-/// code were allowed).
+/// A write to a protected target: a truncating or appending redirect, or
+/// `tee` by any path, whose every operand is a file it writes: `--`, flags
+/// (`-a`, `--output-error=warn`) and other files may come before the protected
+/// one (dev-65yunv: `echo x >> /etc/passwd` and `tee /etc/passwd` inside code
+/// were allowed; FuchsiaHare's REV on PR #5 found `tee -- /etc/passwd`,
+/// `/usr/bin/tee`, `tee ./log /etc/passwd` and the `=value` flag). An operand
+/// stops at a quote, separator or redirect, so a later command's path is not
+/// one. `dd of=` is upstream's (`dd-overwrite-*` already denies it).
 static PROTECTED_WRITE: LazyCompiledRegex = LazyCompiledRegex::new(concat!(
-    r#"(?:(?<![<>=-])(?:&>>?|>&|[0-9]*>>?\|?)\s*|(?:^|[\s;&|(`'"])tee(?:\s+-{1,2}[A-Za-z][A-Za-z-]*)*\s+|\bof="#,
+    r#"(?:(?<![<>=-])(?:&>>?|>&|[0-9]*>>?\|?)\s*"#,
+    r#"|(?:^|[\s;&|(`'"])(?:[^\s;&|()<>`'"]*/)?tee"#,
+    r#"(?:\s+(?:--|-{1,2}[A-Za-z][A-Za-z-]*(?:=[^\s;&|()<>`'"]*)?|[^\s;&|()<>`'"-][^\s;&|()<>`'"]*))*?\s+"#,
     r")",
     protected_target!(),
 ));
@@ -523,7 +529,12 @@ mod tests {
             "python3 -c \"__import__('os').system('tee /etc/passwd < /dev/null')\"",
             "node -e \"globalThis['req'+'uire']('child_process').execSync('echo x | tee -a /etc/sudoers')\"",
             "ruby -e \"Kernel.send(:sys + 'tem', 'echo x | tee --append \\\"$HOME/.profile\\\"')\"",
-            "perl -e \"my \\$f = 'sys'.'tem'; &\\$f('dd if=/dev/zero of=/etc/hosts count=1')\"",
+            // tee by its path, after `--`, an `=value` flag or another output file (FuchsiaHare's REV on PR #5).
+            "python3 -c \"__import__('os').system('tee -- /etc/passwd < /dev/null')\"",
+            "python3 -c \"__import__('os').system('/usr/bin/tee /etc/passwd < /dev/null')\"",
+            "python3 -c \"__import__('os').system('tee ./log /etc/passwd < /dev/null')\"",
+            "python3 -c \"__import__('os').system('tee -a ./log ~/.bashrc < /dev/null')\"",
+            "python3 -c \"__import__('os').system('echo x | tee --output-error=warn /etc/passwd')\"",
         ] {
             assert!(matches(command), "{command}");
         }
@@ -573,10 +584,15 @@ mod tests {
             // GNU parallel runs each stdin line as a shell command, which upstream parses.
             "printf '%s\\n' 'echo x > ~/new-note' | parallel",
             "sudo printf '%s\\n' 'echo x > ~/new-note' | parallel",
-            // A shift, a tee or dd into the working directory, and reading a protected path are not writes to one.
+            // A shift, a tee into the working directory, and reading a protected path are not writes to one.
             "python3 -c 'print(1 >> 2)'",
             "node -e \"require('child_process').execSync('echo x | tee -a ./build.log')\"",
-            "python3 -c \"__import__('os').system('dd if=/etc/hostname of=./copy')\"",
+            // dd is upstream's: `of=` in code is data here (FuchsiaHare's REV on PR #5).
+            "python3 -c \"print('of=/etc/hosts')\"",
+            // A tee into the working directory, then a later command that names a protected path.
+            "python3 -c \"__import__('os').system('echo x | tee ./log; cat /etc/hosts')\"",
+            "python3 -c \"__import__('os').system('tee ./log < /etc/hosts')\"",
+            "python3 -c \"__import__('os').system('coffee /etc/passwd; guarantee /etc/x')\"",
             "python3 -c \"__import__('os').system('cat /etc/hosts | tee out.txt')\"",
         ] {
             assert!(!matches(command), "{command}");
