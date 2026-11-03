@@ -25526,34 +25526,37 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
     /// `./~/...` under the current directory.
     #[test]
     fn reasonix_home_override_is_normalized_like_reasonix() {
-        use std::path::{Path, PathBuf};
+        use std::path::Path;
         let home = Path::new("/home/jane");
         let lookup = |name: &str| match name {
             "BASE" => Some("/srv/base".to_string()),
             _ => None,
         };
         let normalize = |raw: &str| normalize_reasonix_home_override(raw, home, lookup);
+        // The normalizer ends with std::path::absolute, which on Windows adds the
+        // current drive to a rooted path (Neotask fork, dev-32i0o2).
+        let abs = |path: &dyn AsRef<Path>| Some(std::path::absolute(path).expect("absolute"));
 
         // Blank is unset.
         assert_eq!(normalize(""), None);
         assert_eq!(normalize("   "), None);
         // Absolute values pass through, trimmed.
-        assert_eq!(normalize("  /iso  "), Some(PathBuf::from("/iso")));
+        assert_eq!(normalize("  /iso  "), abs(&"/iso"));
         // A leading tilde is the user's home.
-        assert_eq!(normalize("~"), Some(PathBuf::from("/home/jane")));
-        assert_eq!(normalize("~/rx"), Some(PathBuf::from("/home/jane/rx")));
-        assert_eq!(normalize("~\\rx"), Some(home.join("rx")));
+        assert_eq!(normalize("~"), abs(&"/home/jane"));
+        assert_eq!(normalize("~/rx"), abs(&"/home/jane/rx"));
+        assert_eq!(normalize("~\\rx"), abs(&home.join("rx")));
         // `${VAR}` and `${VAR:-default}`; an unset reference without a default
         // expands to nothing, and non-references stay literal.
-        assert_eq!(normalize("${BASE}/rx"), Some(PathBuf::from("/srv/base/rx")));
+        assert_eq!(normalize("${BASE}/rx"), abs(&"/srv/base/rx"));
         assert_eq!(
             normalize("${MISSING:-/fallback}/rx"),
-            Some(PathBuf::from("/fallback/rx"))
+            abs(&"/fallback/rx")
         );
-        assert_eq!(normalize("/a${MISSING}/rx"), Some(PathBuf::from("/a/rx")));
-        assert_eq!(normalize("/a/${1}/rx"), Some(PathBuf::from("/a/${1}/rx")));
-        assert_eq!(normalize("/a/$BASE"), Some(PathBuf::from("/a/$BASE")));
-        assert_eq!(normalize("/a/${BASE"), Some(PathBuf::from("/a/${BASE")));
+        assert_eq!(normalize("/a${MISSING}/rx"), abs(&"/a/rx"));
+        assert_eq!(normalize("/a/${1}/rx"), abs(&"/a/${1}/rx"));
+        assert_eq!(normalize("/a/$BASE"), abs(&"/a/$BASE"));
+        assert_eq!(normalize("/a/${BASE"), abs(&"/a/${BASE"));
         // A relative value is made absolute, never left relative.
         assert!(normalize("rel/dir").is_some_and(|path| path.is_absolute()));
     }
@@ -25624,7 +25627,10 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
     }
 
     fn reasonix_entry_for(path: &str) -> serde_json::Value {
-        reasonix_dcg_hook_entry_for_executable(std::path::Path::new(path), false)
+        reasonix_dcg_hook_entry_for_executable(
+            std::path::Path::new(&muse_test_absolute(path)),
+            false,
+        )
             .expect("absolute path")
     }
 
@@ -25650,7 +25656,7 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
         );
         let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0]["command"], "/opt/dcg");
+        assert_eq!(entries[0]["command"], muse_test_absolute("/opt/dcg"));
         assert_eq!(entries[0]["match"], "bash|pwsh");
         assert_eq!(entries[0]["timeout"], 5000);
         assert_eq!(entries[1]["command"], "node check.js");
@@ -25679,7 +25685,10 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
         );
         let entries = settings["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(entries.len(), 2, "{settings}");
-        assert_eq!(entries[0]["command"], "\"/new place/dcg\"");
+        assert_eq!(
+            entries[0]["command"],
+            format!("\"{}\"", muse_test_absolute("/new place/dcg"))
+        );
         assert_eq!(entries[0]["timeout"], 9000);
 
         assert!(uninstall_dcg_hook_from_reasonix_settings(&mut settings).unwrap());
@@ -25862,10 +25871,11 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
     /// own on reinstall and uninstall.
     #[test]
     fn reasonix_windows_entry_is_quoted_and_recognized() {
+        let executable = muse_test_absolute("/opt/my tools/dcg");
         let entry =
-            reasonix_dcg_hook_entry_for_executable(std::path::Path::new("/opt/my tools/dcg"), true)
+            reasonix_dcg_hook_entry_for_executable(std::path::Path::new(&executable), true)
                 .unwrap();
-        assert_eq!(entry["command"], "\"/opt/my tools/dcg\"");
+        assert_eq!(entry["command"], format!("\"{executable}\""));
         assert!(reasonix_hook_entry_is_dcg(&entry));
         assert!(
             reasonix_dcg_hook_entry_for_executable(std::path::Path::new("dcg"), false).is_err(),
