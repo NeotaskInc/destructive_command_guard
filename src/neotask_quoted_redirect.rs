@@ -1,5 +1,6 @@
 //! Neotask fork rule (dev-igbgn): inline code whose quoted text spells a
-//! truncating write to a system, home or variable path.
+//! write (a truncating or appending redirect, or `tee`) to a system, home or
+//! variable path.
 //!
 //! Upstream reads inline interpreter code in its own language, which is what
 //! keeps `node -e "x.match(/<p>/)"` from reading as a redirect. It cannot see
@@ -29,11 +30,36 @@ use crate::packs::regex_engine::LazyCompiledRegex;
 pub(crate) const PACK_ID: &str = "core.filesystem";
 pub(crate) const PATTERN_NAME: &str = "neotask-quoted-redirect";
 
-/// A truncating write to a system or home path, or to a path held in a named
-/// variable (`$1`, an awk field, is not one).
-static PROTECTED_WRITE: LazyCompiledRegex = LazyCompiledRegex::new(
-    r#"(?<![<>=-])(?:&>|>&|[0-9]*>\|?)\s*['"\\]?(?!/dev/(?:null|zero|full|tty|stdout|stderr)\b)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|\b)|~|\$\{?[A-Za-z_])"#,
-);
+/// A system or home path, or a path held in a named variable (`$1`, an awk
+/// field, is not one), after an optional opening quote (`'`, `"`, `$'`) or
+/// escape.
+macro_rules! protected_target {
+    () => {
+        r#"(?:\$?['"]|\\)?(?!/dev/(?:null|zero|full|tty|stdout|stderr)\b)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|\b)|~|\$\{?[A-Za-z_])"#
+    };
+}
+
+/// A write to a protected target: a truncating or appending redirect, or
+/// `tee` by any path, whose every operand is a file it writes: `--`, flags
+/// (`-a`, `--output-error=warn`) and other files may come before the protected
+/// one (dev-65yunv: `echo x >> /etc/passwd` and `tee /etc/passwd` inside code
+/// were allowed; FuchsiaHare's REV on PR #5 found `tee -- /etc/passwd`,
+/// `/usr/bin/tee`, `tee ./log /etc/passwd`, the `=value` flag and a quoted
+/// earlier file). An operand is one shell word in any quoting: unquoted
+/// characters, `\x` escapes (an escaped newline continues the line), `'...'`,
+/// `"..."` and `$'...'` in any mix. Operands are separated by spaces or tabs
+/// only; an unquoted separator, redirect, newline or a word opening a `#`
+/// comment ends the command, so a later command's path, a `<` input and a
+/// commented-out path are not targets (Greptile on PR #5). `dd of=` is
+/// upstream's (`dd-overwrite-*` already denies it, indirect calls included).
+static PROTECTED_WRITE: LazyCompiledRegex = LazyCompiledRegex::new(concat!(
+    r#"(?:(?<![<>=-])(?:&>>?|>&|[0-9]*>>?\|?)\s*"#,
+    r#"|(?:^|[\s;&|(`'"])(?:[^\s;&|()<>`'"]*/)?tee"#,
+    r#"(?:[ \t]+(?:[^\s;&|()<>`'"\\#]|\\[\s\S]|'[^']*'|"(?:[^"\\]|\\[\s\S])*")"#,
+    r#"(?:[^\s;&|()<>`'"\\]|\\[\s\S]|'[^']*'|"(?:[^"\\]|\\[\s\S])*")*)*?[ \t]+"#,
+    r")",
+    protected_target!(),
+));
 
 /// A line that runs Ruby, whose heredoc bodies the rule reads.
 static RUBY: LazyCompiledRegex =
@@ -504,6 +530,27 @@ mod tests {
             "perl -e'my $f = \"sys\".\"tem\"; &$f(\"echo x > /etc/passwd\")'",
             "python3 <<< \"__import__('os').system('echo x > ~/.bashrc')\"",
             "printf '%s' \"Kernel.send(:sys + 'tem', 'echo x > $T')\" | timeout 5 ruby",
+            // An append, or a sink that writes the path it is given (dev-65yunv, FuchsiaHare on dev-igbgn).
+            "python3 -c \"__import__('os').system('echo x>>/etc/passwd')\"",
+            "python3 -c \"__import__('os').system('echo x &>> ~/.bashrc')\"",
+            "python3 -c \"__import__('os').system('tee /etc/passwd < /dev/null')\"",
+            "node -e \"globalThis['req'+'uire']('child_process').execSync('echo x | tee -a /etc/sudoers')\"",
+            "ruby -e \"Kernel.send(:sys + 'tem', 'echo x | tee --append \\\"$HOME/.profile\\\"')\"",
+            // tee by its path, after `--`, an `=value` flag or another output file (FuchsiaHare's REV on PR #5).
+            "python3 -c \"__import__('os').system('tee -- /etc/passwd < /dev/null')\"",
+            "python3 -c \"__import__('os').system('/usr/bin/tee /etc/passwd < /dev/null')\"",
+            "python3 -c \"__import__('os').system('tee ./log /etc/passwd < /dev/null')\"",
+            "python3 -c \"__import__('os').system('tee -a ./log ~/.bashrc < /dev/null')\"",
+            "python3 -c \"__import__('os').system('echo x | tee --output-error=warn /etc/passwd')\"",
+            // An earlier operand, or the target, in any quoting (FuchsiaHare's C3 on PR #5).
+            r#"python3 -c "__import__('os').system('tee \"./log\" /etc/passwd < /dev/null')""#,
+            r#"python3 -c "__import__('os').system(\"tee './log' /etc/passwd < /dev/null\")""#,
+            r#"python3 -c 'import os; os.system("tee \"./my log\" -a /etc/passwd < /dev/null")'"#,
+            r#"python3 -c "__import__('os').system('tee my\\ log \"-a\" ~/.bashrc < /dev/null')""#,
+            r#"python3 -c "__import__('os').system('tee ./a\"b c\"d /etc/passwd < /dev/null')""#,
+            r#"python3 -c "__import__('os').system(\"tee ./log $'/etc/passwd' < /dev/null\")""#,
+            // An escaped newline continues the command (Greptile on PR #5).
+            "python3 -c \"__import__('os').system('tee ./log \\\\\n /etc/passwd < /dev/null')\"",
         ] {
             assert!(matches(command), "{command}");
         }
@@ -553,6 +600,22 @@ mod tests {
             // GNU parallel runs each stdin line as a shell command, which upstream parses.
             "printf '%s\\n' 'echo x > ~/new-note' | parallel",
             "sudo printf '%s\\n' 'echo x > ~/new-note' | parallel",
+            // A shift, a tee into the working directory, and reading a protected path are not writes to one.
+            "python3 -c 'print(1 >> 2)'",
+            "node -e \"require('child_process').execSync('echo x | tee -a ./build.log')\"",
+            // dd is upstream's: `of=` in code is data here (FuchsiaHare's REV on PR #5).
+            "python3 -c \"print('of=/etc/hosts')\"",
+            // A tee into the working directory, then a later command that names a protected path.
+            "python3 -c \"__import__('os').system('echo x | tee ./log; cat /etc/hosts')\"",
+            "python3 -c \"__import__('os').system('tee ./log < /etc/hosts')\"",
+            "python3 -c \"__import__('os').system('coffee /etc/passwd; guarantee /etc/x')\"",
+            // Quoted text after a tee that is not one of its operands.
+            r#"python3 -c "print('tee x', '/etc/passwd')""#,
+            r#"python3 -c "__import__('os').system('echo x | tee \"./a b\"; cat /etc/hosts')""#,
+            // A comment, or a newline ending the command, after a tee (Greptile on PR #5).
+            "python3 -c \"__import__('os').system('printf x | tee ./log # /etc/hosts')\"",
+            "python3 -c \"__import__('os').system('printf x | tee ./log\n cat /etc/hosts')\"",
+            "python3 -c \"__import__('os').system('cat /etc/hosts | tee out.txt')\"",
         ] {
             assert!(!matches(command), "{command}");
         }
