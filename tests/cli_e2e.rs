@@ -5296,6 +5296,7 @@ mod config_tests {
         assert_eq!(entries[0]["match"], "bash|pwsh");
         assert_eq!(entries[0]["timeout"], 5000);
         assert_eq!(entries[1]["command"], "node check.js");
+        #[cfg(unix)]
         let command = entries[0]["command"].as_str().expect("command").to_string();
 
         // Idempotent, and a user's timeout survives a forced reinstall.
