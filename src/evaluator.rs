@@ -24328,7 +24328,7 @@ fn psql_shell_meta_command(line: &str) -> Result<Option<String>, String> {
         );
     }
     if let Some(command) = punctuation_meta_remainder(line, "\\!") {
-        return Ok(Some(command.to_string()));
+        return database_escape_command(command.to_string()).map(Some);
     }
     for meta in ["\\gx", "\\g"] {
         if let Some(remainder) = pipe_meta_remainder(line, meta) {
@@ -24609,10 +24609,10 @@ fn parse_postgres_program_operand(
 
 fn mysql_shell_meta_command(line: &str) -> Result<Option<String>, String> {
     if let Some(command) = punctuation_meta_remainder(line, "\\!") {
-        return Ok(Some(command.trim().to_string()));
+        return database_escape_command(command.trim().to_string()).map(Some);
     }
     if let Some(command) = meta_command_remainder(line, "system") {
-        return Ok(Some(command.trim().to_string()));
+        return database_escape_command(command.trim().to_string()).map(Some);
     }
     if let Some(command) = punctuation_meta_remainder(line, "\\P") {
         return database_output_pipe_command(command.trim().to_string()).map(Some);
@@ -24635,10 +24635,23 @@ fn database_output_pipe_command(command: String) -> Result<String, String> {
     }
 }
 
+/// A shell escape (`\!`, `system`, `.shell`) starts its command with the client's own standard input. A command
+/// that runs its input as code (a bare `bash`) would run what the client had not yet read, which no static reading
+/// can prove (dev-hi855w).
+fn database_escape_command(command: String) -> Result<String, String> {
+    match pipeline_shell_input_mode(&command) {
+        PipelineShellInputMode::NotShell | PipelineShellInputMode::DoesNotReadStdin => Ok(command),
+        _ => Err(
+            "a database client's shell escape starts a program that runs its input as code"
+                .to_string(),
+        ),
+    }
+}
+
 fn sqlite_shell_meta_command(line: &str) -> Result<Option<String>, String> {
     for meta in [".shell", ".system"] {
         if let Some(command) = meta_command_remainder(line, meta) {
-            return Ok(Some(command.trim().to_string()));
+            return database_escape_command(command.trim().to_string()).map(Some);
         }
     }
     for meta in [".once", ".output"] {
@@ -24658,8 +24671,13 @@ fn sqlite_shell_meta_command(line: &str) -> Result<Option<String>, String> {
     Ok(None)
 }
 
+/// A client command's long form, matched case-insensitively as mysql reads `SYSTEM` and `Pager` (dev-hi855w).
 fn meta_command_remainder<'a>(line: &'a str, command: &str) -> Option<&'a str> {
-    let remainder = line.strip_prefix(command)?;
+    let head = line.get(..command.len())?;
+    if !head.eq_ignore_ascii_case(command) {
+        return None;
+    }
+    let remainder = &line[command.len()..];
     (remainder.is_empty() || remainder.chars().next().is_some_and(char::is_whitespace))
         .then(|| remainder.trim_start())
 }

@@ -12448,6 +12448,7 @@ pub(crate) fn literal_heredoc_bodies(command: &str) -> Vec<(usize, String)> {
                 body_end,
                 delimiter_quoted,
             } => {
+                let body_start = delivered_body_start(command, heredoc.operator_start, body_start);
                 let body = command.get(body_start..body_end)?;
                 if delimiter_quoted {
                     Some((heredoc.operator_start, body.to_string()))
@@ -12460,6 +12461,31 @@ pub(crate) fn literal_heredoc_bodies(command: &str) -> Vec<(usize, String)> {
             ActiveHeredocBody::HereString => None,
         })
         .collect()
+}
+
+/// Where the shell starts the body it hands over: the line after the operator's. tree-sitter-bash starts its
+/// `heredoc_body` one line late when that first line opens with a backslash (`\P bash`), so with one heredoc
+/// operator on the operator's line the body starts after that line. A line with several operators keeps the
+/// parsed start, since its first body is not this one's.
+fn delivered_body_start(command: &str, operator_start: usize, parsed_start: usize) -> usize {
+    let line_start = command[..operator_start]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    let Some(line_end) = command[operator_start..]
+        .find('\n')
+        .map(|index| operator_start + index + 1)
+    else {
+        return parsed_start;
+    };
+    let operators = command[line_start..line_end]
+        .match_indices("<<")
+        .filter(|(index, _)| !command[line_start + index..].starts_with("<<<"))
+        .count();
+    if operators == 1 && line_end < parsed_start {
+        line_end
+    } else {
+        parsed_start
+    }
 }
 
 /// An unquoted heredoc body as the shell delivers it: a backslash escapes only `$`, `` ` ``, `\` and a newline.
