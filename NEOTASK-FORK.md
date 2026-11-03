@@ -41,7 +41,8 @@ Electron build downloads these release assets and sha256-verifies each one.
 ## Source patches
 
 This fork carries exactly two source patches. Everything else in the Rust
-source is byte-identical to upstream.
+source is byte-identical to upstream, except one upstream test about the
+retired `dist.yml` (see the CI plumbing below).
 
 - **`--no-policy-files` / `DCG_NO_POLICY_FILES=1`** (dev-f31aw, recorded
   decision). With the switch, dcg reads no policy from disk: config files
@@ -102,6 +103,20 @@ The rest of this fork's changes are release/CI plumbing and this doc:
   tree and run under `ci.yml`. `ci.yml` also drops upstream's
   `published-release-matrix` and published-release installer step: they
   install upstream-shaped release archives this fork does not publish.
+  `notify-acfs.yml` is retired too: it dispatches to upstream's
+  `agentic_coding_flywheel_setup` repository when the installer changes, and
+  its shellcheck job validates an installer this fork does not ship. Upstream's
+  `dist_gate_checks_exact_embedded_tag_before_packaging` test in
+  `src/perf.rs` reads `dist.yml`, so it goes with that workflow (a test-only
+  removal; `release.yml` smoke-tests every artifact it publishes). `ci.yml`
+  measures the comparison revision with that revision's own
+  `perf_baseline.py`, since a newer harness can require probes an older binary
+  does not answer, and builds it in a `git worktree` under `$RUNNER_TEMP` so
+  the absolute gate's clean-checkout binding still holds.
+  `tests/fixtures/scan/expected_output.json` counts 25 extracted commands, not
+  upstream's 22: v0.16 extracts one more command from each scan fixture with
+  identical findings, and upstream (which runs no Actions CI on `main`) never
+  refreshed the count; plain upstream v0.16.0 fails its own golden the same way.
 - **Kept** upstream's source-verification workflows
   (`credential-policy-verification.yml`, `disk-safety.yml`,
   `opencode-security-regression.yml`, `regression-560.yml`,

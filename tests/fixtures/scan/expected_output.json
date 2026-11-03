@@ -9,7 +9,7 @@
         "reason": "no_extractor"
       }
     ],
-    "commands_extracted": 22,
+    "commands_extracted": 25,
     "findings_total": 18,
     "decisions": {
       "allow": 0,

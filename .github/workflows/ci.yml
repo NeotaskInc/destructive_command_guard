@@ -1261,27 +1261,35 @@ jobs:
           fi
           echo "sha=$comparison_sha" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout comparison revision
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ steps.comparison.outputs.sha }}
-          path: perf-base
-          persist-credentials: false
-
+      # The comparison revision is built outside the checkout: the absolute
+      # gate below refuses to certify a binary from a worktree with untracked
+      # files, and actions/checkout can only write inside the workspace.
       - name: Build comparison binary
-        run: cargo build --manifest-path perf-base/Cargo.toml --target-dir perf-base-target --release --locked
+        env:
+          COMPARISON_SHA: ${{ steps.comparison.outputs.sha }}
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/perf-base" "$COMPARISON_SHA"
+          cargo build --manifest-path "$RUNNER_TEMP/perf-base/Cargo.toml" \
+            --target-dir "$RUNNER_TEMP/perf-base-target" --release --locked
 
-      - name: Run base and candidate perf on this runner
+      # "Repo baseline" here is the comparison revision, measured on this
+      # runner: timings recorded on another CPU class cannot establish a
+      # regression after the runner migration.
+      - name: Run perf baseline + compare to repo baseline
         id: perf
         run: |
           set +e
 
-          BASELINE_JSON="perf-base.json"
-          CURRENT_JSON="perf-current.json"
-          REPORT_MD="perf-regression-report.md"
+          PERF_ARTIFACT_DIR="$RUNNER_TEMP/dcg-perf-relative"
+          mkdir -p "$PERF_ARTIFACT_DIR"
+          BASELINE_JSON="$PERF_ARTIFACT_DIR/perf-base.json"
+          CURRENT_JSON="$PERF_ARTIFACT_DIR/perf-current.json"
+          REPORT_MD="$PERF_ARTIFACT_DIR/perf-regression-report.md"
 
-          python3 scripts/perf_baseline.py \
-            --bin perf-base-target/release/dcg \
+          # Each revision is measured by its own harness: a newer harness can
+          # require probes an older binary does not answer.
+          python3 "$RUNNER_TEMP/perf-base/scripts/perf_baseline.py" \
+            --bin "$RUNNER_TEMP/perf-base-target/release/dcg" \
             --output "$BASELINE_JSON" \
             --warmup 10 \
             --runs 80 \
@@ -1295,10 +1303,10 @@ jobs:
 
           {
             echo "runner_class=blacksmith-4vcpu-ubuntu-2404"
-            echo "base_sha=$(git -C perf-base rev-parse HEAD)"
+            echo "base_sha=$(git -C "$RUNNER_TEMP/perf-base" rev-parse HEAD)"
             echo "candidate_sha=$(git rev-parse HEAD)"
             lscpu
-          } >> perf-runner.txt
+          } >> "$PERF_ARTIFACT_DIR/perf-runner.txt"
 
           python3 scripts/perf_baseline.py \
             --bin target/release/dcg \
@@ -1496,10 +1504,10 @@ jobs:
         with:
           name: perf-regression-artifacts
           path: |
-            perf-base.json
-            perf-current.json
-            perf-regression-report.md
-            perf-runner.txt
+            ${{ runner.temp }}/dcg-perf-relative/perf-base.json
+            ${{ runner.temp }}/dcg-perf-relative/perf-current.json
+            ${{ runner.temp }}/dcg-perf-relative/perf-regression-report.md
+            ${{ runner.temp }}/dcg-perf-relative/perf-runner.txt
           retention-days: 14
           if-no-files-found: ignore
 
