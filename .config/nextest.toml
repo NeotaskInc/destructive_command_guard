@@ -32,6 +32,21 @@ final-status-level = "all"
 retries = 1
 # Longer timeout for CI (may be slower)
 slow-timeout = { period = "60s", terminate-after = 2 }
+# Neotask fork (dev-igbgn, MON ruling): upstream v0.16.0's own tests that fail on the tag, on upstream main and here,
+# excluded by exact name. NEOTASK-FORK.md lists each with its evidence; drop an entry once upstream passes it.
+default-filter = """
+not (
+    (binary(=cli_e2e) & test(=custom_pack_loading_tests::exact_command_grants_do_not_reappear_after_detection_rewrites))
+  | (binary(=cross_pack_corpus) & test(=cross_pack_true_positive_controls_still_deny))
+  | (binary(=repro_277_git_stdin_sink_fallback) & test(=unquoted_delimiter_with_command_substitution_stays_denied))
+  | (binary(=repro_313_powershell_read_only_false_positives) & test(=escaped_dcg_options_keep_agent_values_and_inspection_arguments_as_data))
+  | (binary(=repro_313_powershell_read_only_false_positives) & test(=escaped_dcg_syntax_cannot_hide_guardrail_changes))
+  | (binary(=repro_313_powershell_read_only_false_positives) & test(=global_options_preserve_inspection_and_argument_data))
+  | (binary(=repro_313_powershell_read_only_false_positives) & test(=native_agent_argument_boundaries_are_dialect_specific))
+  | (binary(=repro_393_heredoc_boundary_data_sink) & test(=executing_receivers_and_expanding_bodies_stay_denied))
+  | (binary(=repro_558_ifs_destinations) & test(=literal_command_queries_and_quoted_wrapper_operands_remain_harmless))
+)
+"""
 
 # JUnit XML output for CI integration
 [profile.ci.junit]

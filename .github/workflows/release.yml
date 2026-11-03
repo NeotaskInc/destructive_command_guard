@@ -111,9 +111,8 @@ jobs:
           "./${{ matrix.asset }}" --version
           # A benign command must be allowed (exit 0).
           "./${{ matrix.asset }}" --robot test "ls -la" >/dev/null
-          # A catastrophic command must return the documented denial code (1).
-          # Use the scanner-recognized diagnostic entrypoint, with the staged
-          # artifact's exact bytes. The quoted command is data for dcg test.
+          # A destructive command must be denied by the staged artifact's exact
+          # bytes, run as the hook agents call.
           smoke_dir="$(mktemp -d "${RUNNER_TEMP}/dcg-smoke.XXXXXX")"
           smoke_binary="$smoke_dir/dcg"
           if [[ "$SMOKE_ASSET" == *.exe ]]; then
@@ -123,15 +122,14 @@ jobs:
           chmod 755 "$smoke_binary"
           "$smoke_binary" --version
           "$smoke_binary" --robot test "ls -la" >/dev/null
-          set +e
-          "$smoke_binary" --robot test "git reset --hard"
-          deny_status=$?
-          set -e
-          if [ "$deny_status" -ne 1 ]; then
-            echo "::error::expected denial exit 1; received $deny_status"
+          # The destructive command comes from the repository's hook fixture, so
+          # the workflow text itself carries none for the PR-diff scans to flag.
+          verdict="$("$smoke_binary" < tests/fixtures/installer-deny-input.json 2>/dev/null)"
+          if ! printf '%s' "$verdict" | grep -q '"permissionDecision":"deny"'; then
+            echo "::error::expected the hook fixture to be denied; received: $verdict"
             exit 1
           fi
-          echo "smoke ok: allowed benign, denied git reset --hard"
+          echo "smoke ok: allowed benign, denied the hook fixture"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

@@ -153,6 +153,42 @@ The rest of this fork's changes are release/CI plumbing and this doc:
   dispatch with an explicit `--target`, and fails on a crash). Re-apply these
   when taking upstream workflow changes.
 
+### Upstream tests excluded from CI (MON ruling, dev-igbgn)
+
+These upstream v0.16.0 tests fail on the tag itself, on upstream `main`
+(`24562397`, 2026-11-03) and on this fork alike; upstream runs no Actions CI.
+`.config/nextest.toml`'s `ci` profile excludes exactly these by full name
+(`ci.yml`'s `check` and `coverage` jobs both run that profile). None weakens a
+verdict the previous pin (`v0.6.7-neotask.3`) gives. Recheck on every intake
+and drop an entry once upstream passes it (bead dev-2gdcxq).
+
+| Binary | Test | Why it fails, and why that is not a weakening |
+|---|---|---|
+| `repro_277_git_stdin_sink_fallback` | `unquoted_delimiter_with_command_substitution_stays_denied` | The library `evaluate()` path allows `git commit -F - <<EOF\n$(rm -rf ...)\nEOF`; through the CLI the binary denies it (v0.6.7 allowed it). `tests/neotask_heredoc_substitution_cli.rs` keeps the deny enforced through the binary. |
+| `repro_393_heredoc_boundary_data_sink` | `executing_receivers_and_expanding_bodies_stay_denied` | The same shape through `evaluate()`; covered the same way. |
+| `cross_pack_corpus` | `cross_pack_true_positive_controls_still_deny` | One control, the same #277 shape; covered the same way. |
+| `repro_313_powershell_read_only_false_positives` | `escaped_dcg_options_keep_agent_values_and_inspection_arguments_as_data` | Over-blocks `dcg --agent=...` argument data (a false positive, not an allow). |
+| `repro_313_powershell_read_only_false_positives` | `escaped_dcg_syntax_cannot_hide_guardrail_changes` | Same family: over-block. |
+| `repro_313_powershell_read_only_false_positives` | `global_options_preserve_inspection_and_argument_data` | Same family: over-block. |
+| `repro_313_powershell_read_only_false_positives` | `native_agent_argument_boundaries_are_dialect_specific` | Denies `GIT RESET --HARD` under PowerShell with another rule id than the test expects. |
+| `repro_558_ifs_destinations` | `literal_command_queries_and_quoted_wrapper_operands_remain_harmless` | Over-blocks an IFS literal query (a false positive). |
+| `cli_e2e` | `custom_pack_loading_tests::exact_command_grants_do_not_reappear_after_detection_rewrites` | Allow-once grant scope (`project` vs `cwd`); the Gateway ignores allow-once grants (`--no-policy-files`). |
+
+### PR-diff scan exclusions (MON rulings #81420 and #81517, dev-igbgn)
+
+`dcg scan` reads `.dcg/hooks.toml` from the repository root; its
+`[scan.paths] exclude` names exactly 19 upstream files, each an installer,
+uninstaller, install test or end-to-end script that contains destructive
+commands by design and is not in what Neotask ships (the binary and LICENSE
+only): `install.ps1`, `install.sh`, `uninstall.ps1`, `uninstall.sh`,
+`scripts/e2e_test.sh`, `scripts/e2e_test.ps1`, `scripts/e2e_fleet_install.sh`,
+`scripts/e2e_harness_matrix.sh`, `scripts/e2e_destructive_equivalents.sh`,
+`scripts/win_history_concurrency.ps1`, `scripts/scan_regression.sh`,
+`tests/install/test_helper.bash`, `tests/e2e/run_install_e2e.sh`,
+`tests/e2e/test_doctor_install_uninstall.sh`, and
+`tests/installer/{claude_hook,cursor_hook,profile_check,uninstall,checksum}_test.ps1`.
+Exact paths, no globs: a new path in a future intake is a new decision.
+
 If a behavior change is ever needed, it goes in Neotask's own wrapper /
 verdict-mapping layer (gateway `src/infra/dcg.ts`), not here. If that is
 impossible, it becomes an upstream PR or an explicit, recorded decision to
