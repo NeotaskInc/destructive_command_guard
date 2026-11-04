@@ -1411,12 +1411,22 @@ pub struct EnabledKeywordIndex {
     keyword_pack_masks: Vec<u128>,
     whitespace_keywords: Vec<&'static str>,
     whitespace_pack_masks: Vec<u128>,
+    /// The packs, in order, that the mask bits stand for.
+    pack_ids: Vec<String>,
 }
 
 impl EnabledKeywordIndex {
     #[must_use]
     pub const fn pack_count(&self) -> usize {
         self.pack_count
+    }
+
+    /// Whether the mask bits stand for exactly `ordered_packs`, in this order.
+    /// Bit `i` names `ordered_packs[i]` only then; a list reordered after the
+    /// index was built would decode its bits to the wrong packs (dev-igbgn.6).
+    #[must_use]
+    pub fn built_for(&self, ordered_packs: &[String]) -> bool {
+        self.pack_ids == ordered_packs
     }
 
     /// Fast check: does the command contain any AC-indexed keyword at all?
@@ -3191,6 +3201,7 @@ impl PackRegistry {
             keyword_pack_masks,
             whitespace_keywords,
             whitespace_pack_masks,
+            pack_ids: ordered_packs.to_vec(),
         })
     }
 }
