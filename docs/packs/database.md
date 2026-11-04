@@ -337,6 +337,7 @@ These patterns match potentially destructive commands:
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
 | `stdin-unverified` | sqlite3 receives indirect input that dcg cannot statically verify. | high |
+| `load-extension` | load_extension() / .load runs a native shared library inside sqlite3. | high |
 | `drop-table` | DROP TABLE permanently deletes the table (even with IF EXISTS). Verify it is intended. | critical |
 | `delete-without-where` | DELETE without WHERE deletes ALL rows. Add a WHERE clause. | critical |
 | `update-without-where` | UPDATE without WHERE overwrites the column in ALL rows. Add a WHERE clause. | high |
