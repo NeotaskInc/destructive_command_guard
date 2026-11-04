@@ -49,3 +49,55 @@ description = "rm with recursive and force flags separate"
 command = "rm -r -f ./build"
 expected = "deny"
 rule_id = "core.filesystem:rm-r-f-separate"
+
+[[case]]
+description = "bare recursive rm on an ordinary tree is blocked"
+command = "rm -r ./build"
+expected = "deny"
+rule_id = "core.filesystem:rm-recursive-general"
+
+[[case]]
+description = "uppercase recursive flag on an ordinary tree is blocked"
+command = "rm -R Desktop"
+expected = "deny"
+rule_id = "core.filesystem:rm-recursive-general"
+
+[[case]]
+description = "long recursive rm on an absolute system tree is critical"
+command = "rm --recursive /etc"
+expected = "deny"
+rule_id = "core.filesystem:rm-recursive-root-home"
+
+[[case]]
+description = "home recursive deletion is critical without force"
+command = "rm -r $HOME"
+expected = "deny"
+rule_id = "core.filesystem:rm-recursive-root-home"
+
+[[case]]
+description = "a trailing force overrides earlier interactive mode"
+command = "rm -r -i -f ./build"
+expected = "deny"
+rule_id = "core.filesystem:rm-r-f-separate"
+
+[[case]]
+description = "interactive never does not make recursive deletion safe"
+command = "rm -r --interactive=never ./build"
+expected = "deny"
+rule_id = "core.filesystem:rm-recursive-general"
+
+# Neotask fork (dcg#7, dev-hs30uj; MON #85806): a glob that empties a whole temp
+# root deletes other sessions' files on a shared host, so it is denied. A named
+# /tmp/<subdir> stays allowed (false_positives/rm_safe.toml). NEOTASK-FORK.md
+# records this difference from upstream and v0.6.7.
+[[case]]
+description = "rm -rf /tmp/* empties the whole temp root"
+command = "rm -rf /tmp/*"
+expected = "deny"
+rule_id = "core.filesystem:rm-rf-root-home"
+
+[[case]]
+description = "rm -rf /var/tmp/* empties the whole temp root"
+command = "rm -rf /var/tmp/*"
+expected = "deny"
+rule_id = "core.filesystem:rm-rf-root-home"

@@ -34,6 +34,7 @@ Commands containing these keywords are checked against this pack:
 - `gradle`
 - `gradlew`
 - `publish`
+- `nuget`
 
 ### Safe Patterns (Allowed)
 
@@ -54,11 +55,11 @@ These patterns match safe commands that are always allowed:
 | `cargo-safe` | `\bcargo\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:build\|test\|check\|clippy\|fmt\|doc\|bench)\b` |
 | `apt-list` | `\bapt\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:list\|show\|search)(?=\s\|$)` |
 | `apt-get-list` | `\bapt-get\b(?:\s+--?\S+(?:\s+\S+)?)*\s+(?:update\|upgrade)(?!\s+.*-y)` |
-| `npm-dry-run` | `\bnpm\b.*--dry-run(?:=true)?(?:\s\|$)` |
-| `yarn-dry-run` | `\byarn\b.*--dry-run(?:=true)?(?:\s\|$)` |
-| `pnpm-dry-run` | `\bpnpm\b.*--dry-run(?:=true)?(?:\s\|$)` |
-| `cargo-dry-run` | `\bcargo\b.*--dry-run(?:=true)?(?:\s\|$)` |
-| `poetry-dry-run` | `\bpoetry\b.*--dry-run(?:=true)?(?:\s\|$)` |
+| `npm-dry-run` | `\bnpm\b[^;\|&\n]*--dry-run(?:=true)?(?:\s\|$)` |
+| `yarn-dry-run` | `\byarn\b[^;\|&\n]*--dry-run(?:=true)?(?:\s\|$)` |
+| `pnpm-dry-run` | `\bpnpm\b[^;\|&\n]*--dry-run(?:=true)?(?:\s\|$)` |
+| `cargo-dry-run` | `\bcargo\b[^;\|&\n]*--dry-run(?:=true)?(?:\s\|$)` |
+| `poetry-dry-run` | `\bpoetry\b[^;\|&\n]*--dry-run(?:=true)?(?:\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 
@@ -78,6 +79,8 @@ These patterns match potentially destructive commands:
 | `cargo-publish` | cargo publish releases a crate to crates.io. Use --dry-run first. | high |
 | `cargo-yank` | cargo yank marks a version as unavailable. This can break dependent projects. | high |
 | `gem-push` | gem push releases a gem to rubygems.org. Verify before publishing. | high |
+| `gem-yank` | gem yank removes a published version from rubygems.org. This can break dependent projects. | high |
+| `nuget-delete` | nuget delete removes or unlists a published package version. This can break dependent projects. | high |
 | `brew-uninstall` | brew uninstall removes packages. Verify no dependent packages are affected. | high |
 | `poetry-publish` | poetry publish releases a package. Use --dry-run first. | high |
 | `poetry-remove` | poetry remove uninstalls a dependency. Verify no critical packages are affected. | high |

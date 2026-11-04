@@ -147,8 +147,8 @@ These patterns match safe commands that are always allowed:
 | Pattern Name | Pattern |
 |--------------|----------|
 | `dns-dig-safe` | `\bdig\b(?!.*(?i:\b(?:axfr\|ixfr)\b))` |
-| `dns-host-safe` | `\bhost\b` |
-| `dns-nslookup-safe` | `\bnslookup\b` |
+| `dns-host-safe` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?host\b` |
+| `dns-nslookup-safe` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?nslookup\b` |
 
 ### Destructive Patterns (Blocked)
 
@@ -156,6 +156,7 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
+| `stdin-unverified` | nsupdate receives indirect input that dcg cannot statically verify. | high |
 | `dns-nsupdate-delete` | nsupdate delete commands remove DNS records. | high |
 | `dns-nsupdate-local` | nsupdate -l applies local updates which can modify DNS records. | medium |
 | `dns-dig-zone-transfer` | dig AXFR/IXFR zone transfers can exfiltrate full zone data. | medium |

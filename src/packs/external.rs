@@ -35,7 +35,7 @@
 //!     description: Non-production deployments are allowed
 //! ```
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io;
@@ -52,6 +52,9 @@ const ID_PATTERN: &str = r"^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$";
 
 /// Version format regex pattern (semantic versioning).
 const VERSION_PATTERN: &str = r"^\d+\.\d+\.\d+$";
+
+/// Windows executable suffixes removed by runtime argv0 resolution.
+const WINDOWS_EXECUTABLE_SUFFIXES: [&str; 4] = [".exe", ".cmd", ".bat", ".com"];
 
 /// An external pack definition loaded from YAML.
 #[derive(Debug, Clone, Deserialize)]
@@ -86,6 +89,40 @@ pub struct ExternalPack {
     /// Safe patterns that explicitly allow commands.
     #[serde(default)]
     pub safe_patterns: Vec<ExternalSafePattern>,
+
+    /// Replaces "Destructive Command Detected" in the human-facing denial
+    /// banner for this pack's rules (#416). The `BLOCKED` marker, rule id and
+    /// decision are never pack-authored. A rule's own `denial_banner` wins.
+    #[serde(default)]
+    pub denial_banner: Option<String>,
+
+    /// Replaces the closing instruction of the agent-facing denial reason (by
+    /// default "ask the user … run the command manually"), for rules whose
+    /// right recovery is something else, such as a redirect to a sanctioned
+    /// tool (#416). A rule's own `denial_trailer` wins.
+    #[serde(default)]
+    pub denial_trailer: Option<String>,
+}
+
+/// Longest accepted `denial_banner`, in characters.
+pub const MAX_DENIAL_BANNER_CHARS: usize = 80;
+/// Longest accepted `denial_trailer`, in characters.
+pub const MAX_DENIAL_TRAILER_CHARS: usize = 400;
+
+/// Validate pack-authored denial text: agent-facing, so bounded and free of
+/// control characters (a newline or escape could forge structure in the
+/// reason the agent parses).
+fn validate_denial_text(field: &str, text: &str, max_chars: usize) -> Result<(), String> {
+    if text.trim().is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    if text.chars().count() > max_chars {
+        return Err(format!("{field} exceeds {max_chars} characters"));
+    }
+    if text.chars().any(char::is_control) {
+        return Err(format!("{field} must not contain control characters"));
+    }
+    Ok(())
 }
 
 /// Default schema version for packs that don't specify one.
@@ -95,6 +132,7 @@ const fn default_schema_version() -> u32 {
 
 /// A destructive pattern from an external pack file.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalDestructivePattern {
     /// Stable pattern identifier within the pack.
     pub name: String,
@@ -117,6 +155,42 @@ pub struct ExternalDestructivePattern {
     /// Safer command alternatives to suggest when this pattern matches.
     #[serde(default)]
     pub suggestions: Vec<ExternalSuggestion>,
+
+    /// Executables this rule is about (issue #289).
+    ///
+    /// Omit the key to keep the rule unscoped. When present, the list must be
+    /// non-empty and the rule only fires on command segments whose resolved
+    /// argv0 is one of these canonical names — written lowercase ASCII,
+    /// without a path or a `.exe`/`.cmd`/`.bat`/`.com` extension.
+    #[serde(default, deserialize_with = "deserialize_present_executables")]
+    pub executables: Option<Vec<String>>,
+
+    /// Per-rule override of the pack's `denial_banner` (#416).
+    #[serde(default)]
+    pub denial_banner: Option<String>,
+
+    /// Per-rule override of the pack's `denial_trailer` (#416).
+    #[serde(default)]
+    pub denial_trailer: Option<String>,
+}
+
+/// Deserialize an explicitly present `executables` key.
+///
+/// Serde does not call this function when the key is omitted because the field
+/// has a default. A present YAML null (including a blank `executables:` value)
+/// reaches this function as `None` and is rejected rather than silently
+/// becoming an unscoped rule.
+fn deserialize_present_executables<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<Vec<String>>::deserialize(deserializer)?
+        .map(Some)
+        .ok_or_else(|| {
+            <D::Error as serde::de::Error>::custom(
+                "`executables` must be a non-null sequence; omit the key for an unscoped rule",
+            )
+        })
 }
 
 /// A safer command suggestion from an external pack file.
@@ -131,6 +205,13 @@ pub struct ExternalSuggestion {
     /// Platform this suggestion applies to (default: all).
     #[serde(default)]
     pub platform: ExternalPlatform,
+
+    /// Whether dcg also gates this suggestion (default: false). A gated
+    /// suggestion is a less-destructive form that still requires explicit
+    /// approval; rendering marks it so agents do not retry it expecting an
+    /// allow (#316).
+    #[serde(default)]
+    pub gated: bool,
 }
 
 /// Platform specifier for external pack suggestions.
@@ -200,6 +281,12 @@ pub enum PackParseError {
     /// IO error reading the file.
     Io(io::Error),
 
+    /// Pack file exceeds the size cap (issue #293).
+    ///
+    /// External packs load on every hook invocation; a runaway file must not
+    /// be read (let alone YAML-parsed) inside the hook budget.
+    FileTooLarge { size: u64, max: u64 },
+
     /// YAML parsing error.
     Yaml(serde_yaml::Error),
 
@@ -222,8 +309,21 @@ pub enum PackParseError {
     /// Duplicate pattern name within a pack.
     DuplicatePattern { name: String },
 
+    /// An `executables` key was present with no names.
+    EmptyExecutables { pattern_name: String },
+
+    /// An executable scope name was not in canonical form.
+    InvalidExecutable {
+        pattern_name: String,
+        executable: String,
+        reason: String,
+    },
+
     /// Empty pack (no patterns defined).
     EmptyPack,
+
+    /// A `denial_banner` / `denial_trailer` failed validation (#416).
+    InvalidDenialText { location: String, reason: String },
 
     /// Pack ID collides with a built-in pack.
     ///
@@ -236,6 +336,9 @@ impl fmt::Display for PackParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(e) => write!(f, "IO error: {e}"),
+            Self::FileTooLarge { size, max } => {
+                write!(f, "Pack file is {size} bytes; exceeds {max}-byte cap")
+            }
             Self::Yaml(e) => write!(f, "YAML parse error: {e}"),
             Self::InvalidId { id, reason } => {
                 write!(f, "Invalid pack ID '{id}': {reason}")
@@ -261,6 +364,25 @@ impl fmt::Display for PackParseError {
             }
             Self::DuplicatePattern { name } => {
                 write!(f, "Duplicate pattern name: {name}")
+            }
+            Self::InvalidDenialText { location, reason } => {
+                write!(f, "Invalid denial text in {location}: {reason}")
+            }
+            Self::EmptyExecutables { pattern_name } => {
+                write!(
+                    f,
+                    "Invalid executables for pattern '{pattern_name}': list must not be empty"
+                )
+            }
+            Self::InvalidExecutable {
+                pattern_name,
+                executable,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "Invalid executable '{executable}' for pattern '{pattern_name}': {reason}"
+                )
             }
             Self::EmptyPack => write!(f, "Pack has no patterns defined"),
             Self::IdCollision { id, builtin_name } => {
@@ -307,8 +429,27 @@ impl From<serde_yaml::Error> for PackParseError {
 /// - The YAML is malformed
 /// - The pack fails validation (invalid ID, version, patterns, etc.)
 pub fn parse_pack_file(path: &Path) -> Result<ExternalPack, PackParseError> {
-    let content = std::fs::read_to_string(path)?;
+    let content = read_pack_file_capped(path)?;
     parse_pack_string(&content)
+}
+
+/// Maximum size of a single external pack YAML file (issue #293).
+///
+/// Real pack files are a few KiB; 1 MiB leaves generous headroom while
+/// keeping a mistakenly-globbed large file from being read and YAML-parsed
+/// inside the hook budget on every command.
+pub const MAX_PACK_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Read a pack file, refusing files over [`MAX_PACK_FILE_BYTES`].
+fn read_pack_file_capped(path: &Path) -> Result<String, PackParseError> {
+    let size = std::fs::metadata(path)?.len();
+    if size > MAX_PACK_FILE_BYTES {
+        return Err(PackParseError::FileTooLarge {
+            size,
+            max: MAX_PACK_FILE_BYTES,
+        });
+    }
+    Ok(std::fs::read_to_string(path)?)
 }
 
 /// Parse an external pack from a YAML string.
@@ -324,6 +465,113 @@ pub fn parse_pack_string(content: &str) -> Result<ExternalPack, PackParseError> 
     Ok(pack)
 }
 
+/// Return why an external executable scope name is not canonical.
+fn external_executable_name_error(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("name must not be empty");
+    }
+    if !name.is_ascii() {
+        return Some("name must contain only ASCII characters");
+    }
+    if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return Some("name must be lowercase");
+    }
+    if name.contains(['/', '\\']) {
+        return Some("name must be a basename without path separators");
+    }
+    if name.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return Some("name must not contain whitespace");
+    }
+    if name.contains(['$', '`', '%']) {
+        return Some("name must not contain dynamic shell characters (`$`, backtick, or `%`)");
+    }
+    if WINDOWS_EXECUTABLE_SUFFIXES
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
+    {
+        return Some("name must omit Windows executable suffixes (.exe/.cmd/.bat/.com)");
+    }
+
+    let mut bytes = name.bytes();
+    if !bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+    {
+        return Some("name must start with a lowercase ASCII letter or digit");
+    }
+    if !bytes.all(|byte| {
+        byte.is_ascii_lowercase()
+            || byte.is_ascii_digit()
+            || matches!(byte, b'.' | b'_' | b'-' | b'+')
+    }) {
+        return Some(
+            "name may contain only lowercase ASCII letters, digits, '.', '_', '-', or '+'",
+        );
+    }
+
+    None
+}
+
+/// Prove that a parsed regex contains only non-consuming expressions.
+///
+/// A byte-level heuristic cannot distinguish group syntax from literal `:`,
+/// `=`, or `-`, and rejecting one valid rule drops the entire external pack.
+/// Use the same parser as the regex engine, which owns inline flags, comments,
+/// character classes and captures. Nullable expressions with consuming atoms
+/// remain valid; this is deliberately not a general match-width analysis.
+///
+/// An unfamiliar expression or exhausted proof budget is not evidence that a
+/// pack is inert. Keep ordinary validation/matching in those cases instead of
+/// disabling a possibly effective protection pack. No regex is executed here.
+fn pattern_is_zero_width_only(pattern: &str) -> bool {
+    use fancy_regex::Expr;
+
+    const MAX_PATTERN_BYTES: usize = 8 * 1024;
+    const MAX_NODES: usize = 4096;
+    if pattern.len() > MAX_PATTERN_BYTES {
+        return false;
+    }
+    let Ok(tree) = Expr::parse_tree(pattern) else {
+        return false;
+    };
+    let mut pending = vec![(&tree.expr, false)];
+    let mut remaining = MAX_NODES;
+    while let Some((expression, in_lookaround)) = pending.pop() {
+        if remaining == 0 {
+            return false;
+        }
+        remaining -= 1;
+        match expression {
+            Expr::Empty | Expr::Assertion(_) => {}
+            // Inspect the body too: match-boundary operations such as \K,
+            // subroutines and control verbs are not an ordinary assertion
+            // proof just because they are nested inside a lookaround.
+            Expr::LookAround(child, _) => pending.push((child.as_ref(), true)),
+            Expr::Concat(children) | Expr::Alt(children) => {
+                // Bound the work list before extending it, not only when
+                // visiting it. The iterative walk also avoids recursion.
+                if children.len() > remaining.saturating_sub(pending.len()) {
+                    return false;
+                }
+                pending.extend(children.iter().map(|child| (child, in_lookaround)));
+            }
+            Expr::Group(child) => pending.push((child.as_ref(), in_lookaround)),
+            Expr::AtomicGroup(child) | Expr::Repeat { child, .. } => {
+                pending.push((child.as_ref(), in_lookaround));
+            }
+            Expr::Literal { .. } | Expr::Any { .. } | Expr::Delegate { .. } => {
+                if !in_lookaround {
+                    return false;
+                }
+            }
+            // Backreferences, subroutines, control verbs and future node
+            // kinds need proofs we do not make here.
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Validate an external pack structure.
 ///
 /// Checks:
@@ -331,6 +579,7 @@ pub fn parse_pack_string(content: &str) -> Result<ExternalPack, PackParseError> 
 /// - ID matches the required format
 /// - Version matches semantic versioning format
 /// - All pattern regex compiles successfully
+/// - Executable scopes are non-empty and contain canonical basenames
 /// - No duplicate pattern names
 /// - At least one pattern is defined
 fn validate_pack(pack: &ExternalPack) -> Result<(), PackParseError> {
@@ -365,6 +614,31 @@ fn validate_pack(pack: &ExternalPack) -> Result<(), PackParseError> {
         return Err(PackParseError::EmptyPack);
     }
 
+    // Pack-authored denial text is agent-facing (#416), so it is bounded and
+    // free of control characters, at pack level and per rule.
+    let denial_texts = std::iter::once((
+        format!("pack '{}'", pack.id),
+        pack.denial_banner.as_deref(),
+        pack.denial_trailer.as_deref(),
+    ))
+    .chain(pack.destructive_patterns.iter().map(|pattern| {
+        (
+            format!("pattern '{}'", pattern.name),
+            pattern.denial_banner.as_deref(),
+            pattern.denial_trailer.as_deref(),
+        )
+    }));
+    for (location, banner, trailer) in denial_texts {
+        let checks = [
+            banner.map(|text| validate_denial_text("denial_banner", text, MAX_DENIAL_BANNER_CHARS)),
+            trailer
+                .map(|text| validate_denial_text("denial_trailer", text, MAX_DENIAL_TRAILER_CHARS)),
+        ];
+        if let Some(Err(reason)) = checks.into_iter().flatten().find(Result::is_err) {
+            return Err(PackParseError::InvalidDenialText { location, reason });
+        }
+    }
+
     // Collect all pattern names for duplicate checking
     let mut seen_names = std::collections::HashSet::new();
 
@@ -377,12 +651,36 @@ fn validate_pack(pack: &ExternalPack) -> Result<(), PackParseError> {
             });
         }
 
+        if let Some(executables) = pattern.executables.as_deref() {
+            if executables.is_empty() {
+                return Err(PackParseError::EmptyExecutables {
+                    pattern_name: pattern.name.clone(),
+                });
+            }
+            for executable in executables {
+                if let Some(reason) = external_executable_name_error(executable) {
+                    return Err(PackParseError::InvalidExecutable {
+                        pattern_name: pattern.name.clone(),
+                        executable: executable.clone(),
+                        reason: reason.to_string(),
+                    });
+                }
+            }
+        }
+
         // Validate regex compiles
         if let Err(e) = fancy_regex::Regex::new(&pattern.pattern) {
             return Err(PackParseError::InvalidPattern {
                 name: pattern.name.clone(),
                 pattern: pattern.pattern.clone(),
                 error: e.to_string(),
+            });
+        }
+        if pattern_is_zero_width_only(&pattern.pattern) {
+            return Err(PackParseError::InvalidPattern {
+                name: pattern.name.clone(),
+                pattern: pattern.pattern.clone(),
+                error: "pattern contains no consuming match; add matched text (for example a consuming tail) so the rule cannot validate while remaining operationally inert".to_string(),
             });
         }
     }
@@ -402,6 +700,13 @@ fn validate_pack(pack: &ExternalPack) -> Result<(), PackParseError> {
                 name: pattern.name.clone(),
                 pattern: pattern.pattern.clone(),
                 error: e.to_string(),
+            });
+        }
+        if pattern_is_zero_width_only(&pattern.pattern) {
+            return Err(PackParseError::InvalidPattern {
+                name: pattern.name.clone(),
+                pattern: pattern.pattern.clone(),
+                error: "pattern contains no consuming match; zero-width safe rules cannot safely authorize command text".to_string(),
             });
         }
     }
@@ -467,7 +772,7 @@ pub fn validate_pack_with_collision_check(pack: &ExternalPack) -> Result<(), Pac
 /// - The pack fails validation
 /// - The pack ID collides with a built-in pack
 pub fn parse_pack_file_checked(path: &Path) -> Result<ExternalPack, PackParseError> {
-    let content = std::fs::read_to_string(path)?;
+    let content = read_pack_file_capped(path)?;
     parse_pack_string_checked(&content)
 }
 
@@ -554,10 +859,22 @@ impl ExternalPack {
                             command: Box::leak(s.command.into_boxed_str()),
                             description: Box::leak(s.description.into_boxed_str()),
                             platform: s.platform.into(),
+                            gated: s.gated,
                         })
                         .collect();
                     Box::leak(suggestion_vec.into_boxed_slice())
                 };
+
+                // Validated packs contain a non-empty canonical list here.
+                // Preserve `Some([])` for directly constructed, unvalidated
+                // values rather than broadening an invalid scope to unscoped.
+                let executables: Option<&'static [&'static str]> = p.executables.map(|names| {
+                    let leaked: Vec<&'static str> = names
+                        .into_iter()
+                        .map(|n| Box::leak(n.into_boxed_str()) as &'static str)
+                        .collect();
+                    Box::leak(leaked.into_boxed_slice()) as &'static [&'static str]
+                });
 
                 DestructivePattern {
                     regex: LazyCompiledRegex::new(Box::leak(p.pattern.into_boxed_str())),
@@ -566,6 +883,7 @@ impl ExternalPack {
                     severity: p.severity.into(),
                     explanation,
                     suggestions,
+                    executables,
                 }
             })
             .collect();
@@ -827,6 +1145,152 @@ impl ExternalPackLoader {
 mod tests {
     use super::*;
 
+    fn width_test_pack(pattern: &str, safe: bool) -> String {
+        let section = if safe {
+            "safe_patterns"
+        } else {
+            "destructive_patterns"
+        };
+        // JSON string syntax is valid YAML and preserves regex backslashes.
+        let quoted = serde_json::to_string(pattern).unwrap();
+        format!(
+            "id: test.width\nname: Width\nversion: 1.0.0\n{section}:\n  - name: width\n    pattern: {quoted}\n"
+        )
+    }
+
+    #[test]
+    fn zero_width_analysis_keeps_consuming_punctuation_and_nullable_rules() {
+        for (pattern, witness) in [
+            (":", ":"),
+            ("=", "="),
+            ("-", "-"),
+            (",", ","),
+            ("!", "!"),
+            ("<", "<"),
+            (">", ">"),
+            ("#", "#"),
+            ("^:$", ":"),
+            ("(?:=)", "="),
+            ("(?i:-)", "-"),
+            ("(?=:)[:]+", ":"),
+            ("[[:punct:]]", "="),
+            ("(?:(?=x)|:)", ":"),
+            (":?", ":"),
+            ("(?:tee|)", "tee"),
+            (r"\btee\b", "tee"),
+            (r"(?=(a))\1", "a"),
+            ("(?=λ)λ", "λ"),
+        ] {
+            let regex = fancy_regex::Regex::new(pattern).unwrap();
+            let matched = regex.find(witness).unwrap().expect("consuming witness");
+            assert!(matched.end() > matched.start(), "{pattern}: {witness}");
+            assert!(!pattern_is_zero_width_only(pattern), "{pattern}");
+            for safe in [false, true] {
+                let pack = parse_pack_string(&width_test_pack(pattern, safe))
+                    .unwrap_or_else(|error| panic!("{pattern}, safe={safe}: {error}"))
+                    .into_pack();
+                if safe {
+                    assert!(pack.matches_safe(witness), "{pattern}");
+                } else {
+                    assert!(pack.matches_destructive(witness).is_some(), "{pattern}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_width_analysis_uses_parsed_flags_comments_groups_and_lookarounds() {
+        for pattern in [
+            "",
+            "^",
+            "$",
+            r"\A\z",
+            r"\b",
+            "(?=tee)",
+            "(?!tee)",
+            "(?<=tee)",
+            "(?<!tee)",
+            "(?im:^$)",
+            "(?P<empty>^)",
+            "(?>(?=tee))",
+            "(?:(?=tee)|$)",
+            "((?=tee)){2}",
+            "(?x:\n# ignored literal text\n^ (?=tee)\n)",
+        ] {
+            fancy_regex::Regex::new(pattern).expect("valid zero-width regex");
+            assert!(pattern_is_zero_width_only(pattern), "{pattern}");
+            for safe in [false, true] {
+                let error = parse_pack_string(&width_test_pack(pattern, safe))
+                    .expect_err("zero-width-only rule must be diagnosed");
+                assert!(
+                    matches!(&error, PackParseError::InvalidPattern { name, .. } if name == "width"),
+                    "{pattern}, safe={safe}: {error}"
+                );
+                assert!(error.to_string().contains("no consuming match"));
+            }
+        }
+    }
+
+    #[test]
+    fn zero_width_reporter_repair_has_a_real_nonempty_runtime_match() {
+        let source = "S=/tmp/scratch/a@/etc/profile; IFS=@; echo x | tee $S";
+        let pattern = r"(?s)(?=.*IFS=@)(?=.*tee)[\s\S]*";
+        let pack = parse_pack_string(&width_test_pack(pattern, false))
+            .unwrap()
+            .into_pack();
+        // Parsing alone would not catch accidentally doubled backslashes in
+        // the character class: assert the actual runtime regex spans source.
+        assert_eq!(
+            pack.destructive_patterns[0].regex.find(source),
+            Some((0, source.len()))
+        );
+        assert!(pack.matches_destructive(source).is_some());
+    }
+
+    #[test]
+    fn zero_width_proof_limits_and_unknown_expressions_do_not_disable_packs() {
+        assert!(!pattern_is_zero_width_only("("));
+        assert!(!pattern_is_zero_width_only(&"^".repeat(8 * 1024 + 1)));
+        assert!(!pattern_is_zero_width_only(&"^".repeat(4097)));
+        // A lookahead can capture a value that a later backreference consumes.
+        assert!(!pattern_is_zero_width_only(r"(?=(a))\1"));
+        assert!(!pattern_is_zero_width_only(r"(a)\1"));
+        // Unsupported nodes cannot be hidden inside a lookaround either.
+        assert!(!pattern_is_zero_width_only(r"(?=(a)\1)"));
+        assert!(!pattern_is_zero_width_only(r"(?<=\Ka)"));
+    }
+
+    #[test]
+    fn punctuation_rule_cannot_drop_other_protections_from_loaded_pack() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("guard.yaml");
+        for section in ["safe_patterns", "destructive_patterns"] {
+            let yaml = format!(
+                "id: test.guarded\nname: Guarded\nversion: 1.0.0\n{section}:\n  - name: punctuation\n    pattern: '^:$'\n"
+            );
+            let yaml = if section == "safe_patterns" {
+                format!("{yaml}destructive_patterns:\n  - name: danger\n    pattern: danger\n")
+            } else {
+                format!("{yaml}  - name: danger\n    pattern: danger\n")
+            };
+            std::fs::write(&path, yaml).unwrap();
+            let loader = ExternalPackLoader::from_paths(&[path.to_string_lossy().into_owned()]);
+            for loaded in [loader.load_all(), loader.load_all_deduped()] {
+                assert!(
+                    loaded.warnings.is_empty(),
+                    "{section}: {:?}",
+                    loaded.warnings
+                );
+                assert_eq!(loaded.packs.len(), 1, "{section}");
+                let pack = loaded.packs.into_iter().next().unwrap().pack.into_pack();
+                let hit = pack
+                    .check("danger")
+                    .expect("other protection must remain active");
+                assert_eq!(hit.name, Some("danger"));
+            }
+        }
+    }
+
     #[test]
     fn test_parse_valid_pack() {
         let yaml = r#"
@@ -1083,6 +1547,178 @@ safe_patterns:
         assert_eq!(pack.safe_patterns.len(), 1);
         assert_eq!(pack.destructive_patterns.len(), 1);
         assert_eq!(pack.destructive_patterns[0].severity, Severity::Critical);
+    }
+
+    /// Issue #289: canonical executable basenames survive validation and
+    /// conversion unchanged; omitting the key leaves the rule unscoped.
+    #[test]
+    fn external_executables_round_trip_issue_289() {
+        let yaml = r#"
+id: test.executables
+name: Executable Scoped
+version: 1.0.0
+description: Testing executable scoping
+keywords:
+  - chmod
+destructive_patterns:
+  - name: scoped
+    pattern: dangerous
+    executables:
+      - chmod
+      - git-lfs
+      - python3.12
+      - g++
+  - name: unscoped
+    pattern: dangerous
+"#;
+        let external = parse_pack_string(yaml).unwrap();
+        assert_eq!(
+            external.destructive_patterns[0].executables.as_deref(),
+            Some(
+                &[
+                    "chmod".to_string(),
+                    "git-lfs".to_string(),
+                    "python3.12".to_string(),
+                    "g++".to_string(),
+                ][..]
+            )
+        );
+        assert!(external.destructive_patterns[1].executables.is_none());
+
+        let pack = external.into_pack();
+        assert_eq!(
+            pack.destructive_patterns[0].executables,
+            Some(&["chmod", "git-lfs", "python3.12", "g++"][..])
+        );
+        assert!(pack.destructive_patterns[1].executables.is_none());
+    }
+
+    #[test]
+    fn external_executables_reject_empty_list_issue_289() {
+        let yaml = r#"
+id: test.executables
+name: Executable Scoped
+version: 1.0.0
+destructive_patterns:
+  - name: empty-list
+    pattern: dangerous
+    executables: []
+"#;
+        let error = parse_pack_string(yaml).expect_err("an empty scope must be rejected");
+        assert!(matches!(
+            &error,
+            PackParseError::EmptyExecutables { pattern_name }
+                if pattern_name == "empty-list"
+        ));
+        assert!(error.to_string().contains("list must not be empty"));
+    }
+
+    #[test]
+    fn external_executables_reject_explicit_null_issue_289() {
+        for yaml in [
+            r#"
+id: test.executables
+name: Executable Scoped
+version: 1.0.0
+destructive_patterns:
+  - name: null-list
+    pattern: dangerous
+    executables: null
+"#,
+            r#"
+id: test.executables
+name: Executable Scoped
+version: 1.0.0
+destructive_patterns:
+  - name: blank-list
+    pattern: dangerous
+    executables:
+"#,
+        ] {
+            let error = parse_pack_string(yaml)
+                .expect_err("an explicitly null executable scope must be rejected");
+            let PackParseError::Yaml(source) = error else {
+                panic!("explicit null must fail during YAML deserialization: {error}");
+            };
+            assert!(
+                source.to_string().contains(
+                    "`executables` must be a non-null sequence; omit the key for an unscoped rule"
+                ),
+                "wrong explicit-null diagnostic: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn external_executables_reject_singular_key_typo_issue_289() {
+        let yaml = r#"
+id: test.executables
+name: Executable Scoped
+version: 1.0.0
+destructive_patterns:
+  - name: singular-key
+    pattern: dangerous
+    executable:
+      - chmod
+"#;
+        let error =
+            parse_pack_string(yaml).expect_err("an unknown singular scope key must be rejected");
+        let PackParseError::Yaml(source) = error else {
+            panic!("unknown scope key must fail during YAML deserialization: {error}");
+        };
+        let message = source.to_string();
+        assert!(
+            message.contains("unknown field") && message.contains("executable"),
+            "wrong unknown-field diagnostic: {message}"
+        );
+    }
+
+    #[test]
+    fn external_executables_reject_noncanonical_names_issue_289() {
+        for executable in [
+            "",
+            "Chown",
+            "Chown.exe",
+            "chown.exe",
+            "chown.cmd",
+            "chown.bat",
+            "chown.com",
+            "/usr/bin/chown",
+            r"C:\bin\chown",
+            "chown helper",
+            "chown\t",
+            "$TOOL",
+            "`which chown`",
+            "%TOOL%",
+            "chown;echo",
+            "chown🔥",
+        ] {
+            let yaml = format!(
+                r#"
+id: test.executables
+name: Executable Scoped
+version: 1.0.0
+destructive_patterns:
+  - name: noncanonical
+    pattern: dangerous
+    executables:
+      - {executable:?}
+"#
+            );
+            let error = parse_pack_string(&yaml)
+                .expect_err("a noncanonical executable scope must be rejected");
+            assert!(
+                matches!(
+                    &error,
+                    PackParseError::InvalidExecutable {
+                        pattern_name,
+                        executable: rejected,
+                        ..
+                    } if pattern_name == "noncanonical" && rejected == executable
+                ),
+                "wrong validation result for {executable:?}: {error}"
+            );
+        }
     }
 
     #[test]

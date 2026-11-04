@@ -6,7 +6,11 @@ use std::collections::{HashMap, HashSet};
 #[allow(clippy::too_many_lines)]
 fn test_audit_backtracking_requirements() {
     // Map of PackID -> Set of Pattern Names that require backtracking.
-    // Based on docs/pattern_audit.md
+    //
+    // This map, not `docs/pattern_audit.md`, is the source of truth: the test
+    // below derives the actual answer from `needs_backtracking_engine` and
+    // fails on any mismatch in either direction. The doc predates several packs
+    // and is not kept in sync.
     let expected_backtracking: HashMap<&str, HashSet<&str>> = HashMap::from([
         (
             "apigateway.apigee",
@@ -207,12 +211,20 @@ fn test_audit_backtracking_requirements() {
         (
             "cloud.azure",
             HashSet::from([
-                "az-account",
-                "az-configure",
+                "az-help",
+                "az-help-short",
                 "az-list",
-                "az-login",
                 "az-show",
-                "az-version",
+                // `az account` descendants and the management-group guard
+                // on `group-delete` (#384).
+                "group-delete",
+                "account-alias-delete",
+                "account-clear",
+                "account-lock-delete",
+                "account-management-group-delete",
+                "account-management-group-hierarchy-settings-delete",
+                "account-management-group-subscription-remove",
+                "account-subscription-cancel",
             ]),
         ),
         (
@@ -244,6 +256,11 @@ fn test_audit_backtracking_requirements() {
                 "docker-pull",
                 "docker-run",
                 "docker-stats",
+                // #548: the force flag must be an option word of this docker
+                // command. Atomic groups keep each shell word whole, and a
+                // lookahead ends the flag at a word boundary.
+                "rm-force",
+                "rmi-force",
             ]),
         ),
         (
@@ -257,11 +274,21 @@ fn test_audit_backtracking_requirements() {
                 "podman-ps",
                 "podman-pull",
                 "podman-run",
+                // #548: scoped to podman's own option words, as in docker.
+                "rm-force",
+                "rmi-force",
             ]),
         ),
         (
             "core.filesystem",
             HashSet::from([
+                // Neotask fork (dcg#7, dev-igbgn.2): a filtered find under a
+                // temp root is exempt only when no operator can widen it, which
+                // these patterns check with lookaheads.
+                "find-delete-tmp-filtered-root",
+                "find-delete-var-tmp-filtered-root",
+                "find-exec-rm-tmp-filtered-root",
+                "find-exec-rm-var-tmp-filtered-root",
                 "rm-f-r-tmp",
                 "rm-f-r-tmpdir",
                 "rm-f-r-tmpdir-brace",
@@ -302,16 +329,37 @@ fn test_audit_backtracking_requirements() {
                 "find-delete-tmpdir",
                 "find-delete-tmpdir-brace",
                 "find-delete-var-tmp",
+                // Same `$`/backtick guard as find-delete-tmp, plus "no
+                // backslash except the terminating `\;`": lookaheads.
+                "find-exec-rm-tmp",
+                "find-exec-rm-var-tmp",
                 "ln-symlink-sensitive-then-delete",
+                // #550: `mv` must be a whole shell word, which takes a
+                // lookbehind and a lookahead around the command word.
+                "mv-dynamic-path",
+                "mv-relative-into-home",
                 "mv-sensitive-source-root-home",
                 "mv-tmp",
                 "mv-tmpdir",
                 "mv-tmpdir-brace",
+                "mv-to-trash",
+                "mv-to-trash-quoted",
                 "mv-var-tmp",
+                "mv-within-home",
+                // Shares the `(?<![<>])` lookbehind its siblings use, so the
+                // second `>` of `>>` cannot start a second match of its own.
+                "redirect-append-git-internals-relative",
                 "redirect-truncate-dynamic-path",
+                // Shares the `(?<![<>])` lookbehind its siblings use, so a
+                // read redirect (`<`) or an append (`>>`) is not read as a
+                // truncating one.
+                "redirect-truncate-git-internals-relative",
                 "redirect-truncate-root-home",
+                // Needs a negative lookahead (no `--dry-run`/`-n` in the
+                // segment) and a positive one (`--delete*` present anywhere
+                // before the destination), neither of which is linear.
+                "rsync-delete-sensitive-dest",
                 "rsync-sensitive-then-delete",
-                "sed-exec-unverified",
                 "shred-root-home",
                 "shred-tmp",
                 "shred-tmpdir",
@@ -333,16 +381,52 @@ fn test_audit_backtracking_requirements() {
                 "unlink-tmpdir",
                 "unlink-tmpdir-brace",
                 "unlink-var-tmp",
+                // Backreferences enforce that the fork-bomb's three
+                // identifiers are the same token (issue #302).
+                "fork-bomb",
             ]),
         ),
         (
             "core.git",
             HashSet::from([
+                // `git rm --force` must not fire on `--cached`, `--dry-run`
+                // or `-n`, and "none of these appear in this segment" is a
+                // negative lookahead.
+                "rm-force",
+                // `git checkout .` must not fire on `checkout -b .` or
+                // `checkout --orphan .`, and "not one of these subcommands" is
+                // a pair of negative lookaheads, so this rule is on the
+                // backtracking engine like its `checkout-ref-discard` sibling.
+                "checkout-discard-cwd",
                 "checkout-ref-discard",
+                // `git rm -f` must not fire with `--cached` (worktree kept) or
+                // a dry run anywhere in the segment: a negative lookahead.
+                "rm-force",
+                // The clean rules walk from the subcommand to their flag over
+                // git's real option-parsing window, which ends at a bare `--`
+                // (#429, #434). "Not a bare `--`" is a negative lookahead, so
+                // these three moved off the linear engine.
+                "clean-dry-run-long",
+                "clean-dry-run-short",
+                "clean-force",
                 "push-force-long",
                 "restore-staged-long",
                 "restore-staged-short",
                 "restore-worktree",
+                // Backreference pins redirect target == shown path (#373).
+                "show-redirect-overwrite-source",
+                // `--reset` and `-u` may appear in either order, so each is
+                // a positive lookahead from the subcommand.
+                "read-tree-reset",
+                // Git LFS verb guards (Refs PR #383). `lfs-prune-dry-run` ran
+                // on the linear engine after 91715d5 replaced its trailing
+                // `(?![\w-])` lookahead with `(?:\s|$)`; it is back here
+                // because its walk to `--dry-run` now stops at a bare `--`
+                // (#429), which is a negative lookahead.
+                "lfs-migrate-rewrite",
+                "lfs-prune-dry-run",
+                "lfs-prune",
+                "lfs-uninstall",
             ]),
         ),
         (
@@ -353,16 +437,36 @@ fn test_audit_backtracking_requirements() {
                 "mongo-explain",
                 "mongo-find",
                 "mongodump-no-drop",
-                "stdin-unverified",
+            ]),
+        ),
+        // `truncate-table` needs the backtracking engine on purpose: separating
+        // SQL DDL from Tailwind's `truncate` utility class costs a
+        // punctuation-aware lookbehind and a "not followed by a hyphenated
+        // token" lookahead (issue #403). These packs are opt-in and the
+        // expression is anchored on a literal keyword, so the cost is bounded.
+        (
+            "database.mysql",
+            // drop-column / update-without-where: the shared SQL expressions
+            // (database::DROP_COLUMN_PATTERN, UPDATE_WITHOUT_WHERE_PATTERN).
+            HashSet::from([
+                "drop-column",
+                "mysqldump-no-drop",
+                "truncate-table",
+                "update-without-where",
             ]),
         ),
         (
-            "database.mysql",
-            HashSet::from(["mysqldump-no-drop", "stdin-unverified"]),
-        ),
-        (
             "database.postgresql",
-            HashSet::from(["pg-dump-no-clean", "stdin-unverified"]),
+            HashSet::from([
+                // `DROP` not followed by a metadata-only target (DEFAULT,
+                // NOT NULL, CONSTRAINT, …): a negative lookahead.
+                "drop-column",
+                "pg-dump-no-clean",
+                "truncate-table",
+                // `SET` with no `WHERE` before the statement ends: a tempered
+                // negative lookahead.
+                "update-without-where",
+            ]),
         ),
         (
             "database.redis",
@@ -373,10 +477,12 @@ fn test_audit_backtracking_requirements() {
                 "redis-info",
                 "redis-keys",
                 "redis-scan",
-                "stdin-unverified",
             ]),
         ),
-        ("database.sqlite", HashSet::from(["stdin-unverified"])),
+        (
+            "database.sqlite",
+            HashSet::from(["drop-column", "update-without-where"]),
+        ),
         ("dns.generic", HashSet::from(["dns-dig-safe"])),
         (
             "dns.cloudflare",
@@ -548,6 +654,9 @@ fn test_audit_backtracking_requirements() {
         ),
         (
             "kubernetes.helm",
+            // Destructive uninstall/rollback no longer contain preview
+            // vetoes (#435). Only the read-only verb-boundary lookaheads
+            // need backtracking; the argument-aware preview proof is linear.
             HashSet::from([
                 "helm-diff",
                 "helm-get",
@@ -560,13 +669,22 @@ fn test_audit_backtracking_requirements() {
                 "helm-show",
                 "helm-status",
                 "helm-template",
-                "rollback",
-                "uninstall",
             ]),
         ),
         (
             "kubernetes.kubectl",
             HashSet::from([
+                // The `api-delete-*` rules (#449) use lookahead to require the
+                // DELETE method and the resource path independently of the
+                // order `curl` happens to put them in, so they need the
+                // backtracking engine.
+                "api-delete-collection",
+                "api-delete-namespace",
+                "api-delete-persistent-storage",
+                "api-delete-workload",
+                // `--prune` without a `--dry-run` anywhere in the command: a
+                // negative lookahead.
+                "apply-prune",
                 "delete-from-stdin",
                 "kubectl-api",
                 "kubectl-config",
@@ -579,16 +697,9 @@ fn test_audit_backtracking_requirements() {
                 "kubectl-version",
             ]),
         ),
-        (
-            "kubernetes.kustomize",
-            HashSet::from([
-                "kubectl-delete-k",
-                "kubectl-kustomize",
-                "kubectl-kustomize-delete",
-                "kustomize-build",
-                "kustomize-delete",
-            ]),
-        ),
+        // #435 removes redundant render exemptions and destructive preview
+        // vetoes. The remaining positive proof and delete rules are linear.
+        ("kubernetes.kustomize", HashSet::new()),
         (
             "loadbalancer.traefik",
             HashSet::from([
@@ -707,11 +818,44 @@ fn test_audit_backtracking_requirements() {
             HashSet::from(["stripe-api-delete", "stripe-api-get"]),
         ),
         (
+            // Azure DevOps CLI extension (#385): every rule uses `(?<![\w-])`
+            // / `(?![\w-])` verb guards, so the whole pack backtracks.
+            "platform.azure_devops",
+            HashSet::from([
+                "az-devops-help",
+                "az-devops-help-short",
+                "boards-classification-node-delete",
+                "boards-work-item-delete",
+                "devops-extension-uninstall",
+                "devops-invoke-delete",
+                "devops-invoke-write",
+                "devops-logout",
+                "devops-project-delete",
+                "devops-security-group-delete",
+                "devops-security-group-membership-remove",
+                "devops-security-permission-reset",
+                "devops-security-permission-reset-all",
+                "devops-service-endpoint-delete",
+                "devops-team-delete",
+                "devops-user-remove",
+                "devops-wiki-delete",
+                "devops-wiki-page-delete",
+                "pipelines-delete",
+                "pipelines-folder-delete",
+                "pipelines-variable-delete",
+                "pipelines-variable-group-delete",
+                "repos-delete",
+                "repos-policy-delete",
+                "repos-ref-delete",
+            ]),
+        ),
+        (
             "platform.github",
             HashSet::from([
                 "gh-api-delete-actions-secret",
                 "gh-api-delete-actions-variable",
                 "gh-api-delete-deploy-key",
+                "gh-api-delete-generic",
                 "gh-api-delete-hook",
                 "gh-api-delete-release",
                 "gh-api-delete-repo",
@@ -719,15 +863,20 @@ fn test_audit_backtracking_requirements() {
                 "gh-auth-status",
                 "gh-gist-delete",
                 "gh-gist-list-view",
+                "gh-help",
+                "gh-help-short",
+                "gh-help-topic",
                 "gh-issue-delete",
                 "gh-issue-list-view",
                 "gh-release-delete",
+                "gh-release-delete-asset",
                 "gh-release-list-view",
                 "gh-repo-archive",
                 "gh-repo-delete",
                 "gh-repo-deploy-key-delete",
                 "gh-repo-list-view",
                 "gh-run-cancel",
+                "gh-repo-visibility-change",
                 "gh-secret-delete",
                 "gh-secret-list",
                 "gh-ssh-key-delete",
@@ -1023,25 +1172,71 @@ fn test_audit_backtracking_requirements() {
         ),
         (
             "system.disk",
+            // #448 moved this set in both directions at once.
+            //
+            // The eight `btrfs-*` and five `dmsetup-*` read-only patterns were
+            // here and are gone: anchoring them to command position replaced
+            // the unbounded prefix that forced the backtracking engine, so
+            // they now run on the linear one. That is a straight win, and
+            // leaving them listed would have kept a stale claim in a file
+            // whose whole job is to be exact.
+            //
+            // The three that arrived need it for reasons the linear engine
+            // cannot express: `dd-discard` uses lookaround for the `/dev/`
+            // carve-out, and `tee-device`/`copy-to-device` additionally
+            // capture the opening quote and match it with a `\1`
+            // backreference.
+            //
+            // The two GPT rules (#456) join them for the same reason as
+            // `fdisk-edit`: `gdisk-edit` excludes `-l` with a lookahead, and
+            // `sgdisk-modify` is built out of three of them — the dry-run
+            // withdrawal, the device requirement, and the "this option is not
+            // one of the read-only ones" test.
+            //
+            // `sfdisk-modify` is `sgdisk-modify`'s shape inverted: sfdisk writes
+            // even with no option (a layout on stdin), so it is denied unless a
+            // read-only option is present, which only a negative lookahead can
+            // say, plus the same `/dev/` requirement.
+            //
+            // `ddrescue-device` needs `-f`/`--force` anywhere in the segment
+            // AND a `/dev/` operand, in either order: a positive lookahead.
             HashSet::from([
-                "btrfs-device-stats",
-                "btrfs-filesystem-df",
-                "btrfs-filesystem-show",
-                "btrfs-filesystem-usage",
-                "btrfs-property-get",
-                "btrfs-scrub-status",
-                "btrfs-subvolume-list",
-                "btrfs-subvolume-show",
-                "dmsetup-deps",
-                "dmsetup-info",
-                "dmsetup-ls",
-                "dmsetup-status",
-                "dmsetup-table",
+                "copy-to-device",
+                "dd-discard",
+                "ddrescue-device",
                 "fdisk-edit",
+                "gdisk-edit",
                 "parted-modify",
+                "sfdisk-modify",
+                "sgdisk-modify",
+                "tee-device",
+                // #548: the force flag must be an option word of this umount
+                // command; atomic word groups and a word-end lookahead.
+                "umount-force",
             ]),
         ),
-        ("system.permissions", HashSet::from(["chmod-non-recursive"])),
+        (
+            "system.permissions",
+            HashSet::from([
+                "chmod-non-recursive",
+                // The Windows rules select the backtracking engine on purpose.
+                // `icacls <path> … /t` and `takeown /f <path> /r` put the
+                // recursion switch on either side of the path, so the switch is
+                // proven with a lookahead over the segment while the path is
+                // matched in place; ordering them positionally would need one
+                // alternative per permutation and would still miss a new one.
+                // `icacls-grant-everyone` uses a trailing lookahead so
+                // `Everyone:(F)` and `Everyone:(OI)(CI)F` both end the match
+                // without consuming the closing paren.
+                //
+                // The cost is bounded: all three are gated behind the
+                // `icacls`/`cacls`/`takeown` keywords, so they never run on an
+                // ordinary POSIX command, and this pack is opt-in.
+                "icacls-recursive-system",
+                "takeown-recursive-system",
+                "icacls-grant-everyone",
+            ]),
+        ),
         (
             "system.services",
             HashSet::from([
@@ -1056,7 +1251,14 @@ fn test_audit_backtracking_requirements() {
         ),
         (
             "windows.filesystem",
-            HashSet::from(["whatif-preview", "remove-item-recurse-force"]),
+            HashSet::from([
+                "whatif-preview",
+                "remove-item-recurse",
+                "remove-item-recurse-force",
+                // Added by a9edb9a (direct-CLI .NET delete coverage) without a
+                // corresponding audit entry, which left this test red on main.
+                "dotnet-directory-delete-recursive",
+            ]),
         ),
         ("windows.misc", HashSet::from(["robocopy-mirror"])),
         (
@@ -1067,6 +1269,57 @@ fn test_audit_backtracking_requirements() {
         (
             "strict_git",
             HashSet::from(["push-force-any", "push-mirror"]),
+        ),
+        // The egress preset keeps lookarounds to a minimum. `read-only-data-context`
+        // is the shared safe pattern in every sub-pack (it excludes `code tunnel`
+        // from the editor whitelist); the rest are rules that must distinguish
+        // an upload from a download by operand order, or an external
+        // destination from an internal one.
+        (
+            "careful_company_running_windows.chat",
+            HashSet::from(["read-only-data-context", "generic-incoming-webhook"]),
+        ),
+        (
+            "careful_company_running_windows.email",
+            // Outlook/CDO activation must be tied to a later `.Send()` while
+            // rejecting quoted constructor examples. The negative lookbehind
+            // and lazy bounded-input traversal therefore intentionally use
+            // fancy-regex; the engine's 100K-step ceiling and the pack's
+            // matching-budget regression bound pathological inputs.
+            HashSet::from(["read-only-data-context", "outlook-com-send"]),
+        ),
+        (
+            "careful_company_running_windows.guardrails",
+            HashSet::from([
+                "read-only-data-context",
+                // Destination-position detection needs lookaheads to keep a
+                // named -Destination value from running into later
+                // parameters (issue #313).
+                "agent-hook-config-overwrite",
+            ]),
+        ),
+        (
+            "careful_company_running_windows.tunnel",
+            HashSet::from([
+                "read-only-data-context",
+                "network-diagnostics",
+                "netcat-zero-io-probe",
+            ]),
+        ),
+        (
+            "careful_company_running_windows.upload",
+            HashSet::from(["read-only-data-context", "internal-http-target"]),
+        ),
+        (
+            "careful_company_running_windows.transfer",
+            HashSet::from([
+                "read-only-data-context",
+                "aws-s3-upload",
+                "azure-blob-upload",
+                "gcs-upload",
+                "opaque-transfer-script",
+                "rsync-to-remote",
+            ]),
         ),
     ]);
 

@@ -2,11 +2,17 @@
 //!
 //! Supports layered configuration from multiple sources:
 //! 1. Environment variables (highest priority)
-//! 2. Project config (.dcg.toml in repo root)
+//! 2. Explicit config (`DCG_CONFIG`)
 //! 3. User config ($XDG_CONFIG_HOME/dcg/config.toml, ~/.config/dcg/config.toml, or
 //!    platform-native config dir)
 //! 4. System config (/etc/dcg/config.toml)
 //! 5. Compiled defaults (lowest priority)
+//!
+//! A repository's automatically discovered `.dcg.toml` is an untrusted policy
+//! contribution, not a normal precedence layer. It may add protection, but it
+//! cannot add allow rules, disable packs, select custom code/data paths, or
+//! otherwise weaken settings chosen by a trusted source. Users who deliberately
+//! trust the entire file can opt in explicitly with `DCG_CONFIG=.dcg.toml`.
 
 use crate::interactive::{InteractiveConfig, VerificationMethod};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
@@ -14,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -26,117 +32,461 @@ use std::str::FromStr;
 /// data above this cap is rejected.
 pub(crate) const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
-/// Trust class for a config-file source. Controls symlink handling.
+/// Trust class for a config-file source. Controls symlink handling and, for an
+/// automatically discovered project config, which settings may take effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConfigSource {
-    /// User/project layer (or any caller-controlled path). Symlinks are
-    /// followed normally; the only enforcement is the size cap.
+    /// User-selected layer (user config or an explicit `DCG_CONFIG` path).
+    /// Symlinks are followed normally; the read helper enforces only the size
+    /// cap. Selecting an explicit path is itself the trust decision.
     Untrusted,
-    /// System-wide config layer (`/etc/dcg/config.toml`). Refuses to load
-    /// when the path is a symlink to a target the current user can write
-    /// to — that combination would let a non-root user influence the
-    /// privileged config layer by planting a symlink.
+    /// Automatically discovered repository `.dcg.toml`. On Unix, the leaf
+    /// must be a direct regular file: symlinks, FIFOs, devices, and
+    /// descriptor-backed pseudo-files are rejected before any bytes are read.
+    /// Other platforms fail closed until native handle/reparse validation is
+    /// available.
+    AutoProject,
+    /// System-wide config layer (`/etc/dcg/config.toml`). Unix accepts only a
+    /// direct root-owned regular file with no group/world write access beneath
+    /// a direct, equally trusted directory chain. Other platforms fail closed
+    /// until native ACL and reparse-point validation is available.
     System,
 }
 
-/// Read a config file with a size cap and (for system layer) a symlink
-/// safety check. Returns `None` and logs a warning on any failure.
+/// Read a config file with a size cap and source-specific path policy.
+///
+/// Restricted Unix sources are opened with `O_NOFOLLOW | O_NONBLOCK |
+/// O_CLOEXEC`, validated through the opened descriptor, and then read through
+/// that same descriptor. This ordering prevents a path swap from redirecting
+/// the subsequent read and prevents a FIFO from wedging the hook before its
+/// file type can be rejected.
 pub(crate) fn read_config_file_bounded(path: &Path, source: ConfigSource) -> Option<String> {
-    if source == ConfigSource::System {
-        // Symlink defense: refuse to follow if the link target is in a
-        // user-writable location. We use `symlink_metadata` so the call
-        // does not traverse the link itself.
-        match fs::symlink_metadata(path) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                if symlink_target_is_user_writable(path) {
-                    eprintln!(
-                        "Warning: refusing to load system config '{}' — symlink to user-writable target",
-                        path.display()
-                    );
-                    return None;
-                }
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-            Err(e) => {
-                eprintln!(
-                    "Warning: Failed to stat config file '{}': {}",
-                    path.display(),
-                    e
-                );
-                return None;
-            }
-        }
-    }
-
-    let mut file = match fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(e) => {
-            eprintln!(
-                "Warning: Failed to read config file '{}': {}",
-                path.display(),
-                e
-            );
-            return None;
-        }
-    };
-
-    // `take(MAX_CONFIG_BYTES + 1)` lets us tell "exactly cap" (allowed) from
-    // "more than cap" (rejected) without reading unbounded bytes either way.
-    let mut buf = String::new();
-    if let Err(e) = file
-        .by_ref()
-        .take(MAX_CONFIG_BYTES + 1)
-        .read_to_string(&mut buf)
-    {
-        eprintln!(
-            "Warning: Failed to read config file '{}': {}",
-            path.display(),
-            e
-        );
-        return None;
-    }
-    if buf.len() as u64 > MAX_CONFIG_BYTES {
-        eprintln!(
-            "Warning: refusing to load config '{}' — exceeds {}-byte cap",
-            path.display(),
-            MAX_CONFIG_BYTES
-        );
-        return None;
-    }
-
-    Some(buf)
+    read_config_file_result(path, source).ok()
 }
 
-fn symlink_target_is_user_writable(path: &Path) -> bool {
-    // Resolve the link target and check if its parent directory is owned
-    // by a non-root user / writable by non-root. The conservative answer
-    // ("yes, user-writable") on any error keeps the safety check biased
-    // toward refusing to load.
-    let Ok(target) = fs::canonicalize(path) else {
-        return true;
+/// Preserve the outcome of the actual open/read. A later filesystem restat is
+/// useful for diagnostics, but must not decide whether required policy vanished.
+#[derive(Debug)]
+enum ConfigReadFailure {
+    Missing,
+    #[cfg_attr(unix, allow(dead_code))]
+    Unsupported,
+    Rejected(String),
+    Content(String),
+}
+
+impl ConfigReadFailure {
+    fn blocks_trusted_layer(&self, source: ConfigSource, layer: ConfigFileLayer) -> bool {
+        if source == ConfigSource::AutoProject {
+            return false;
+        }
+        match self {
+            Self::Missing => layer == ConfigFileLayer::Explicit,
+            Self::Unsupported => false,
+            // A system path that failed its ownership/path trust checks is not
+            // administrator policy. Keep ignoring it, including on Windows.
+            Self::Rejected(_) => source == ConfigSource::Untrusted,
+            // Content failures occur AFTER the source's handle was validated.
+            Self::Content(_) => true,
+        }
+    }
+
+    fn detail(&self) -> &str {
+        match self {
+            Self::Missing => "the explicitly selected configuration file does not exist",
+            Self::Unsupported => "this configuration source is unsupported on this platform",
+            Self::Rejected(detail) | Self::Content(detail) => detail,
+        }
+    }
+}
+
+fn read_config_file_result(path: &Path, source: ConfigSource) -> Result<String, ConfigReadFailure> {
+    #[cfg(not(unix))]
+    if non_unix_source_is_unsupported(source) {
+        warn_and_ignore_non_unix_restricted_config(path, source);
+        return Err(ConfigReadFailure::Unsupported);
+    }
+
+    let mut file = match open_config_file_for_source(path, source) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(ConfigReadFailure::Missing);
+        }
+        Err(error) => {
+            crate::emit_stderr!(
+                "Warning: refusing to load config file '{}': {}",
+                path.display(),
+                error
+            );
+            return Err(ConfigReadFailure::Rejected(error.to_string()));
+        }
     };
+    let mut content = String::new();
+    if let Err(error) = file
+        .by_ref()
+        .take(MAX_CONFIG_BYTES + 1)
+        .read_to_string(&mut content)
+    {
+        crate::emit_stderr!(
+            "Warning: Failed to read config file '{}': {}",
+            path.display(),
+            error
+        );
+        return Err(ConfigReadFailure::Content(error.to_string()));
+    }
+    if content.len() as u64 > MAX_CONFIG_BYTES {
+        let detail = format!("configuration exceeds the {MAX_CONFIG_BYTES}-byte limit");
+        crate::emit_stderr!(
+            "Warning: refusing to load config '{}': {}",
+            path.display(),
+            detail
+        );
+        return Err(ConfigReadFailure::Content(detail));
+    }
+    Ok(content)
+}
+
+/// Render a TOML error from an automatically discovered repository config
+/// without reflecting any attacker-controlled source bytes.
+///
+/// `toml::de::Error`'s normal `Display` output embeds a source excerpt. That is
+/// useful for a config path the user selected, but unsafe for repository-owned
+/// `.dcg.toml`: the excerpt can contain terminal control sequences or an
+/// arbitrarily long line. Only a bounded numeric location is reported here.
+pub(crate) fn safe_auto_project_toml_error(input: &str, error: &toml::de::Error) -> String {
+    let Some(span) = error.span() else {
+        return "Invalid TOML in automatic project config (location unavailable)".to_string();
+    };
+
+    let offset = span.start.min(input.len());
+    let mut line = 1usize;
+    let mut column = 1usize;
+    for byte in input.as_bytes().iter().take(offset) {
+        if *byte == b'\n' {
+            line = line.saturating_add(1);
+            column = 1;
+        } else {
+            column = column.saturating_add(1);
+        }
+    }
+
+    format!("Invalid TOML in automatic project config at line {line}, column {column}")
+}
+
+fn open_config_file_for_source(path: &Path, source: ConfigSource) -> io::Result<fs::File> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
-        use std::os::unix::fs::PermissionsExt;
-        let parent = target.parent().unwrap_or(&target);
-        let Ok(meta) = fs::metadata(parent) else {
-            return true;
-        };
-        // Anything not owned by root (uid 0) is treated as user-writable.
-        // Group/world-writable directories are also user-writable even when
-        // owned by root.
-        meta.uid() != 0 || (meta.permissions().mode() & 0o022) != 0
+        if source != ConfigSource::Untrusted {
+            return open_restricted_unix_config_file(path, source);
+        }
     }
+
+    #[cfg(windows)]
+    if source == ConfigSource::AutoProject {
+        return open_restricted_windows_project_config(path);
+    }
+
     #[cfg(not(unix))]
+    if source != ConfigSource::Untrusted {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "restricted config source requires native handle and reparse-point validation",
+        ));
+    }
+
+    fs::File::open(path)
+}
+
+/// Restricted sources a non-Unix build cannot validate and therefore ignores.
+///
+/// Windows validates the automatic project config (see
+/// [`open_restricted_windows_project_config`]); the system layer stays
+/// ignored there because trusting `%ProgramData%\dcg` needs an ACL check std
+/// cannot express, and standard users may create folders under `ProgramData`.
+#[cfg(not(unix))]
+const fn non_unix_source_is_unsupported(source: ConfigSource) -> bool {
+    match source {
+        ConfigSource::System => true,
+        ConfigSource::AutoProject => !cfg!(windows),
+        ConfigSource::Untrusted => false,
+    }
+}
+
+/// Open an automatic project config on Windows with the Unix policy's
+/// guarantees: never follow a symlink or junction at the leaf, accept only a
+/// regular file, and read from the handle whose identity was checked.
+///
+/// `FILE_FLAG_OPEN_REPARSE_POINT` opens a reparse point as itself rather than
+/// its target (the `O_NOFOLLOW` analogue), so a symlinked `.dcg.toml` shows the
+/// reparse attribute on the opened handle and is rejected. The path is then
+/// re-inspected and must still name a non-reparse regular file with the same
+/// size and timestamps as the handle, which binds the reported path to the
+/// bytes read. Project config is enforcement-only (#218), so this validation
+/// guards what dcg reports and reads, not what the file may authorize.
+#[cfg(windows)]
+fn open_restricted_windows_project_config(path: &Path) -> io::Result<fs::File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let denied = |message: &str| io::Error::new(io::ErrorKind::PermissionDenied, message);
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let opened = file.metadata()?;
+    if opened.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(denied(
+            "symlinks and reparse points are not permitted for this config source",
+        ));
+    }
+    if !opened.is_file() {
+        return Err(denied("config source is not a regular file"));
+    }
+
+    let at_path = fs::symlink_metadata(path)?;
+    if at_path.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || !at_path.is_file()
+        || at_path.file_size() != opened.file_size()
+        || at_path.creation_time() != opened.creation_time()
+        || at_path.last_write_time() != opened.last_write_time()
     {
-        // No portable way to express "user-writable" cross-platform.
-        // On non-unix the symlink-into-system-config attack does not
-        // apply the same way; default to allowing the load.
-        let _ = target;
-        false
+        return Err(denied("config path changed while it was being validated"));
+    }
+
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn open_restricted_unix_config_file(path: &Path, source: ConfigSource) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    debug_assert_ne!(source, ConfigSource::Untrusted);
+
+    if source == ConfigSource::System {
+        // Preserve the normal "missing optional config" behavior without
+        // opening the path. For an existing path, validate every lexical
+        // ancestor before traversal; the same chain is checked again after the
+        // descriptor/path identity check to close replacement races.
+        fs::symlink_metadata(path)?;
+        validate_unix_system_ancestor_chain(path).map_err(unix_config_trust_io_error)?;
+    }
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+
+    validate_opened_unix_config_file(path, &file, source).map_err(unix_config_trust_io_error)?;
+
+    if source == ConfigSource::System {
+        validate_unix_system_ancestor_chain(path).map_err(unix_config_trust_io_error)?;
+    }
+
+    Ok(file)
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnixConfigTrustError {
+    PathMustBeAbsoluteAndNormalized,
+    MetadataUnavailable,
+    Symlink,
+    NotRegularFile,
+    NotDirectory,
+    UntrustedOwnerOrMode,
+    PathIdentityChanged,
+}
+
+#[cfg(unix)]
+const fn unix_config_trust_error_message(error: UnixConfigTrustError) -> &'static str {
+    match error {
+        UnixConfigTrustError::PathMustBeAbsoluteAndNormalized => {
+            "system config path must be absolute and contain no '.' or '..' components"
+        }
+        UnixConfigTrustError::MetadataUnavailable => "unable to inspect config path safely",
+        UnixConfigTrustError::Symlink => "symlinks are not permitted for this config source",
+        UnixConfigTrustError::NotRegularFile => "config source is not a regular file",
+        UnixConfigTrustError::NotDirectory => "system config ancestor is not a directory",
+        UnixConfigTrustError::UntrustedOwnerOrMode => {
+            "system config path is not root-owned or is group/world writable"
+        }
+        UnixConfigTrustError::PathIdentityChanged => {
+            "config path changed while it was being validated"
+        }
+    }
+}
+
+#[cfg(unix)]
+fn unix_config_trust_io_error(error: UnixConfigTrustError) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        unix_config_trust_error_message(error),
+    )
+}
+
+#[cfg(unix)]
+fn validate_opened_unix_config_file(
+    path: &Path,
+    file: &fs::File,
+    source: ConfigSource,
+) -> Result<(), UnixConfigTrustError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let opened_metadata = file
+        .metadata()
+        .map_err(|_| UnixConfigTrustError::MetadataUnavailable)?;
+    if !opened_metadata.is_file() {
+        return Err(UnixConfigTrustError::NotRegularFile);
+    }
+    if source == ConfigSource::System
+        && unix_owner_or_mode_is_user_writable(opened_metadata.uid(), opened_metadata.mode())
+    {
+        return Err(UnixConfigTrustError::UntrustedOwnerOrMode);
+    }
+
+    // `symlink_metadata` describes the leaf itself. Combined with O_NOFOLLOW,
+    // this rejects a symlink both before and after open. Comparing dev/inode
+    // binds the current path to the already-open descriptor, so a concurrent
+    // rename cannot redirect the bytes read below.
+    let path_metadata =
+        fs::symlink_metadata(path).map_err(|_| UnixConfigTrustError::MetadataUnavailable)?;
+    if path_metadata.file_type().is_symlink() {
+        return Err(UnixConfigTrustError::Symlink);
+    }
+    if !path_metadata.is_file() {
+        return Err(UnixConfigTrustError::NotRegularFile);
+    }
+    if !unix_metadata_refers_to_same_file(&opened_metadata, &path_metadata) {
+        return Err(UnixConfigTrustError::PathIdentityChanged);
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_unix_system_ancestor_chain(path: &Path) -> Result<(), UnixConfigTrustError> {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Component;
+
+    let mut components = path.components();
+    if !matches!(components.next(), Some(Component::RootDir))
+        || components.any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(UnixConfigTrustError::PathMustBeAbsoluteAndNormalized);
+    }
+
+    let parent = path
+        .parent()
+        .ok_or(UnixConfigTrustError::PathMustBeAbsoluteAndNormalized)?;
+    for ancestor in parent.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor)
+            .map_err(|_| UnixConfigTrustError::MetadataUnavailable)?;
+        if metadata.file_type().is_symlink() {
+            return Err(UnixConfigTrustError::Symlink);
+        }
+        if !metadata.is_dir() {
+            return Err(UnixConfigTrustError::NotDirectory);
+        }
+        if unix_owner_or_mode_is_user_writable(metadata.uid(), metadata.mode()) {
+            return Err(UnixConfigTrustError::UntrustedOwnerOrMode);
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn unix_metadata_refers_to_same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(unix)]
+const fn unix_owner_or_mode_is_user_writable(uid: u32, mode: u32) -> bool {
+    // A non-root owner can restore owner-write permission with chmod even when
+    // the current mode is read-only, so ownership alone makes the object
+    // untrusted. Group/world write bits are rejected regardless of membership;
+    // this is intentionally a conservative privileged-config policy.
+    uid != 0 || (mode & 0o022) != 0
+}
+
+#[cfg(not(unix))]
+fn warn_and_ignore_non_unix_restricted_config(path: &Path, source: ConfigSource) {
+    let source_name = match source {
+        ConfigSource::AutoProject => "automatic project",
+        ConfigSource::System => "system",
+        ConfigSource::Untrusted => return,
+    };
+
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            crate::emit_stderr!(
+                "Warning: ignoring {source_name} config '{}' — native ACL and reparse-point validation is unavailable",
+                path.display()
+            );
+        }
+        Err(error) => {
+            crate::emit_stderr!(
+                "Warning: ignoring {source_name} config '{}' — unable to inspect path safely: {}",
+                path.display(),
+                error
+            );
+        }
+    }
+}
+
+/// Classify a failed bounded read using the same platform/source semantics as
+/// [`read_config_file_bounded`]. The read helper has already emitted the
+/// detailed warning; this bounded, source-safe summary is retained for config
+/// and doctor output.
+fn failed_config_read_outcome(
+    path: &Path,
+    source: ConfigSource,
+) -> (ConfigFileStatus, Option<String>) {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (ConfigFileStatus::Missing, None),
+        Err(error) => (
+            ConfigFileStatus::Rejected,
+            Some(format!("unable to inspect path safely: {error}")),
+        ),
+        Ok(_) => {
+            #[cfg(not(unix))]
+            if non_unix_source_is_unsupported(source) {
+                return (
+                    ConfigFileStatus::IgnoredUnsupported,
+                    Some(
+                        "native ACL, reparse-point, and file-identity validation is unavailable"
+                            .to_string(),
+                    ),
+                );
+            }
+
+            let detail = match source {
+                ConfigSource::AutoProject => {
+                    "automatic project config failed direct-regular-file validation"
+                }
+                ConfigSource::System => {
+                    "system config failed privileged path, ownership, mode, or regular-file validation"
+                }
+                ConfigSource::Untrusted => {
+                    "config could not be read safely or exceeded the configured size cap"
+                }
+            };
+            (ConfigFileStatus::Rejected, Some(detail.to_string()))
+        }
+    }
+}
+
+fn record_config_outcome(
+    target: &mut Option<Vec<ConfigSourceOutcome>>,
+    outcome: Option<ConfigSourceOutcome>,
+) {
+    if let (Some(target), Some(outcome)) = (target.as_mut(), outcome) {
+        target.push(outcome);
     }
 }
 
@@ -181,6 +531,14 @@ pub fn policy_files_disabled() -> bool {
 ///
 /// This bounds filesystem work in deeply nested directories.
 pub(crate) const REPO_ROOT_SEARCH_MAX_HOPS: usize = 50;
+
+/// Maximum number of external pack files a `packs.custom_paths` glob
+/// expansion may yield (issue #293).
+///
+/// External packs load on every hook invocation, so an over-broad glob must
+/// not turn each Bash command into an unbounded file-parsing pass. Files
+/// beyond the cap are skipped with a stderr warning.
+pub const MAX_CUSTOM_PACK_FILES: usize = 64;
 
 /// Main configuration structure.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
@@ -236,6 +594,124 @@ pub struct Config {
     /// Project-specific configurations (keyed by absolute path).
     #[serde(default)]
     pub projects: std::collections::HashMap<String, ProjectConfig>,
+
+    /// Per-rule settings keyed by `"<pack_id>:<pattern_name>"` (#284).
+    ///
+    /// Currently carries `exempt_target_globs`, the rule-scoped target-path
+    /// exemption. See [`RuleConfig`].
+    #[serde(default)]
+    pub rules: std::collections::HashMap<String, RuleConfig>,
+}
+
+/// Identity of a file-backed configuration layer.
+///
+/// This is intentionally separate from [`ConfigSource`]: `ConfigSource`
+/// controls how a path is opened, while this enum describes the layer users
+/// see in `dcg config` and `dcg doctor`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ConfigFileLayer {
+    System,
+    User,
+    AutomaticProject,
+    Explicit,
+}
+
+impl ConfigFileLayer {
+    #[must_use]
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::User => "user",
+            Self::AutomaticProject => "automatic project",
+            Self::Explicit => "DCG_CONFIG",
+        }
+    }
+}
+
+/// Whether a file layer has full config authority or the automatic-project
+/// enforcement-only subset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ConfigFileAuthority {
+    Full,
+    EnforcementOnly,
+}
+
+impl ConfigFileAuthority {
+    #[must_use]
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::EnforcementOnly => "enforcement-only",
+        }
+    }
+}
+
+/// Result of considering one file path during configuration loading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ConfigFileStatus {
+    Loaded,
+    Missing,
+    Skipped,
+    #[cfg_attr(unix, allow(dead_code))]
+    IgnoredUnsupported,
+    Rejected,
+    Invalid,
+}
+
+impl ConfigFileStatus {
+    #[must_use]
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Loaded => "loaded",
+            Self::Missing => "missing",
+            Self::Skipped => "skipped",
+            Self::IgnoredUnsupported => "ignored-unsupported",
+            Self::Rejected => "rejected",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
+/// Auditable outcome for a single config-file candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ConfigSourceOutcome {
+    pub(crate) layer: ConfigFileLayer,
+    pub(crate) authority: ConfigFileAuthority,
+    pub(crate) status: ConfigFileStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) path: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) detail: Option<String>,
+}
+
+impl ConfigSourceOutcome {
+    fn new(
+        layer: ConfigFileLayer,
+        authority: ConfigFileAuthority,
+        status: ConfigFileStatus,
+        path: Option<PathBuf>,
+        detail: Option<String>,
+    ) -> Self {
+        Self {
+            layer,
+            authority,
+            status,
+            path,
+            detail,
+        }
+    }
+}
+
+/// Effective configuration plus the exact file-source outcomes that produced
+/// it. Keeping these together prevents diagnostics from guessing based on
+/// `Path::exists()` after the security-aware loader has made its decision.
+#[derive(Debug, Clone)]
+pub(crate) struct ConfigLoadReport {
+    pub(crate) config: Config,
+    pub(crate) sources: Vec<ConfigSourceOutcome>,
 }
 
 /// Canonical published location of dcg's committed JSON Schema. Editors point
@@ -294,8 +770,9 @@ pub fn config_json_schema_string() -> String {
 // The public `Config` structs use `#[serde(default)]` to provide ergonomic
 // defaults when loading a *single* config file.
 //
-// For layered config precedence (system → user → project → env), we must also
-// preserve whether a field was present in TOML. Otherwise we lose information
+// For layered config precedence (system → user → restricted project policy →
+// explicit config → env), we must also preserve whether a field was present in
+// TOML. Otherwise we lose information
 // about "explicitly set to default" vs "not set at all", which breaks the
 // "higher precedence wins" mental model (e.g. you could not set
 // `general.verbose=false` if a lower layer set it to true).
@@ -321,6 +798,130 @@ struct ConfigLayer {
     agents: Option<AgentsConfig>,
     response: Option<ResponseConfigLayer>,
     projects: Option<std::collections::HashMap<String, ProjectConfig>>,
+    rules: Option<std::collections::HashMap<String, RuleConfig>>,
+}
+
+impl ConfigLayer {
+    /// Reduce an automatically discovered repository config to settings that
+    /// can only add enforcement.
+    ///
+    /// Repository contents are attacker-controlled at the point dcg first
+    /// evaluates a command in a newly cloned checkout. Treating `.dcg.toml` as
+    /// a normal high-priority layer would let the repository disable the guard
+    /// that is meant to protect the user from that repository. Keep this
+    /// allowlist deliberately small and explicit: new config fields are denied
+    /// by default until their monotonic safety has been reviewed.
+    fn into_restricted_project_policy(self) -> Self {
+        let Self {
+            general,
+            packs,
+            policy,
+            heredoc,
+            ..
+        } = self;
+
+        let general = general.and_then(|general| {
+            // Only monotonic tightenings survive: a repository may opt the
+            // session INTO fail-closed or deny-on-unverified, never out.
+            let fail_closed = (general.fail_closed == Some(true)).then_some(true);
+            let unverified_decision = (general.unverified_decision
+                == Some(UnverifiedDecision::Deny))
+            .then_some(UnverifiedDecision::Deny);
+            (fail_closed.is_some() || unverified_decision.is_some()).then(|| GeneralConfigLayer {
+                fail_closed,
+                unverified_decision,
+                ..GeneralConfigLayer::default()
+            })
+        });
+
+        let packs = packs.and_then(|packs| {
+            // External packs require a custom path, which an untrusted
+            // repository may not supply. Keep only known built-in pack IDs or
+            // their registry categories so arbitrary strings cannot inflate
+            // the effective configuration or masquerade as enforcement.
+            let known_pack_ids = crate::packs::REGISTRY
+                .all_pack_ids()
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>();
+            let known_categories = crate::packs::REGISTRY
+                .all_categories()
+                .into_iter()
+                .map(String::as_str)
+                .collect::<std::collections::HashSet<_>>();
+            let enabled = packs
+                .enabled
+                .into_iter()
+                .filter(|candidate| {
+                    known_pack_ids.contains(candidate.as_str())
+                        || known_categories.contains(candidate.as_str())
+                })
+                .collect::<Vec<_>>();
+
+            (!enabled.is_empty()).then(|| PacksConfig {
+                enabled,
+                // An untrusted repository may not turn protections off or
+                // point dcg at repository-controlled external pack data.
+                disabled: Vec::new(),
+                custom_paths: Vec::new(),
+            })
+        });
+
+        let policy = policy.and_then(|policy| {
+            let default_mode =
+                (policy.default_mode == Some(PolicyMode::Deny)).then_some(PolicyMode::Deny);
+            let packs = policy
+                .packs
+                .into_iter()
+                .filter(|(_, mode)| *mode == PolicyMode::Deny)
+                .collect::<std::collections::HashMap<_, _>>();
+            let rules = policy
+                .rules
+                .into_iter()
+                .filter(|(_, mode)| *mode == PolicyMode::Deny)
+                .collect::<std::collections::HashMap<_, _>>();
+
+            (default_mode.is_some() || !packs.is_empty() || !rules.is_empty()).then_some({
+                PolicyConfig {
+                    default_mode,
+                    observe_until: None,
+                    packs,
+                    rules,
+                }
+            })
+        });
+
+        let heredoc = heredoc.and_then(|heredoc| {
+            let enabled = (heredoc.enabled == Some(true)).then_some(true);
+            let fallback_on_parse_error =
+                (heredoc.fallback_on_parse_error == Some(false)).then_some(false);
+            let fallback_on_timeout = (heredoc.fallback_on_timeout == Some(false)).then_some(false);
+
+            (enabled.is_some()
+                || fallback_on_parse_error.is_some()
+                || fallback_on_timeout.is_some())
+            .then(|| HeredocConfig {
+                enabled,
+                fallback_on_parse_error,
+                fallback_on_timeout,
+                // Limits and language filters can reduce analysis coverage;
+                // a content allowlist is an explicit trust grant.
+                ..HeredocConfig::default()
+            })
+        });
+
+        // `rules` (per-rule `exempt_target_globs`, #284) is intentionally
+        // absent from the reconstruction below. A target exemption reduces
+        // coverage, so a repository must never be able to grant itself one;
+        // the setting is honored only from the system, user, and explicit
+        // `DCG_CONFIG` layers.
+        Self {
+            general,
+            packs,
+            policy,
+            heredoc,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -335,6 +936,8 @@ struct GeneralConfigLayer {
     max_command_bytes: Option<usize>,
     max_findings_per_command: Option<usize>,
     fail_closed: Option<bool>,
+    unverified_decision: Option<UnverifiedDecision>,
+    update_pin: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -358,6 +961,7 @@ struct LoggingConfigLayer {
     format: Option<crate::logging::LogFormat>,
     redaction: Option<RedactionConfigLayer>,
     events: Option<LogEventFilterLayer>,
+    caller_env: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -367,6 +971,10 @@ struct HistoryConfigLayer {
     retention_days: Option<u32>,
     max_size_mb: Option<u32>,
     database_path: Option<String>,
+    auto_prune: Option<bool>,
+    prune_check_interval_hours: Option<u32>,
+    batch_size: Option<u32>,
+    batch_flush_interval_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -419,8 +1027,11 @@ struct GitAwarenessConfigLayer {
 
 /// The system-wide (machine-level) dcg configuration directory.
 ///
-/// On Unix this is `/etc/dcg`. Native Windows has no `/etc`, so the system
-/// layer lives under `%ProgramData%\dcg` (resolved from the `ProgramData`
+/// On Linux and other Unix platforms this is `/etc/dcg`. macOS exposes `/etc`
+/// through a symlink, while privileged config rejects every symlinked ancestor,
+/// so macOS uses the equivalent direct path `/private/etc/dcg`. Native Windows
+/// has no `/etc`, so the nominal system layer lives under `%ProgramData%\dcg`
+/// (resolved from the `ProgramData`
 /// environment variable, falling back to `C:\ProgramData`) — the conventional
 /// location for machine-wide application configuration. The `dirs` crate does
 /// not expose `ProgramData`, hence the manual resolution. This is the single
@@ -433,15 +1044,97 @@ pub(crate) fn system_config_dir() -> PathBuf {
             .map_or_else(|| PathBuf::from(r"C:\ProgramData"), PathBuf::from)
             .join("dcg")
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        PathBuf::from("/private/etc/dcg")
+    }
+    #[cfg(all(not(windows), not(target_os = "macos")))]
     {
         PathBuf::from("/etc/dcg")
     }
 }
 
+// === Per-user directories =================================================
+//
+// Every per-user path dcg reads or writes resolves through these functions,
+// never through `dirs::*` directly (clippy.toml's `disallowed-methods` enforces
+// it). The reason is Windows: `dirs` resolves the profile and AppData through
+// `SHGetKnownFolderPath`, which ignores `USERPROFILE`/`APPDATA`/`LOCALAPPDATA`.
+// On POSIX `HOME=/tmp/x dcg ...` relocates every file dcg touches; on Windows
+// the same redirection was silently impossible, so a sandboxed test run or a
+// hermetic installer probe read and rewrote the operator's real
+// `~\.claude\settings.json`, allow-once grants and pending codes (bd-b2b1).
+// Honoring the environment first gives Windows the POSIX contract; the known
+// folder remains the fallback when the variable is unset or empty.
+
+/// The user's home directory: `HOME` on POSIX, `USERPROFILE` on Windows,
+/// falling back to the platform lookup when the variable is unset.
+#[must_use]
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::home_dir().filter(|path| !path.as_os_str().is_empty())
+}
+
+/// A Windows AppData directory: the environment variable when set, else the
+/// conventional location under [`home_dir`] (so `USERPROFILE` alone relocates
+/// it, as `HOME` does on POSIX), else `None` for the caller's known-folder
+/// fallback.
+#[cfg(windows)]
+fn windows_app_data_dir(env_name: &str, under_profile: &str) -> Option<PathBuf> {
+    std::env::var_os(env_name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(under_profile)))
+}
+
+/// The per-user roaming configuration directory: `%APPDATA%` on Windows,
+/// `$XDG_CONFIG_HOME` / `~/.config` on Linux, `~/Library/Application Support`
+/// on macOS.
+#[must_use]
+#[allow(clippy::disallowed_methods)] // the one sanctioned `dirs` call
+pub fn user_config_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(dir) = windows_app_data_dir("APPDATA", r"AppData\Roaming") {
+        return Some(dir);
+    }
+    dirs::config_dir()
+}
+
+/// The per-user roaming data directory (`%APPDATA%` on Windows).
+#[must_use]
+#[allow(clippy::disallowed_methods)] // the one sanctioned `dirs` call
+pub fn user_data_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(dir) = windows_app_data_dir("APPDATA", r"AppData\Roaming") {
+        return Some(dir);
+    }
+    dirs::data_dir()
+}
+
+/// The per-user machine-local data directory (`%LOCALAPPDATA%` on Windows).
+#[must_use]
+#[allow(clippy::disallowed_methods)] // the one sanctioned `dirs` call
+pub fn user_data_local_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(dir) = windows_app_data_dir("LOCALAPPDATA", r"AppData\Local") {
+        return Some(dir);
+    }
+    dirs::data_local_dir()
+}
+
+/// The per-user cache directory (`%LOCALAPPDATA%` on Windows).
+#[must_use]
+#[allow(clippy::disallowed_methods)] // the one sanctioned `dirs` call
+pub fn user_cache_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(dir) = windows_app_data_dir("LOCALAPPDATA", r"AppData\Local") {
+        return Some(dir);
+    }
+    dirs::cache_dir()
+}
+
 fn expand_tilde_path(value: &str) -> (PathBuf, bool) {
     if value == "~" {
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = home_dir() {
             return (home, true);
         }
         return (PathBuf::from(value), false);
@@ -453,7 +1146,7 @@ fn expand_tilde_path(value: &str) -> (PathBuf, bool) {
     else {
         return (PathBuf::from(value), false);
     };
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = home_dir() else {
         return (PathBuf::from(value), false);
     };
     (home.join(rest), true)
@@ -495,11 +1188,41 @@ pub(crate) fn find_repo_root(start_dir: &Path, max_hops: usize) -> Option<PathBu
     None
 }
 
+/// Return whether the user explicitly selected this repository's `.dcg.toml`
+/// through [`ENV_CONFIG_PATH`].
+///
+/// Automatic discovery is never a trust signal: the repository controls both
+/// `.dcg.toml` and `.dcg/allowlist.toml`. Selecting the root config through an
+/// environment variable is an out-of-repository action and therefore the
+/// narrow opt-in used by the runtime before activating the sibling project
+/// allowlist.
+pub(crate) fn explicitly_trusts_project_policy(start_dir: &Path) -> bool {
+    let Some(repo_root) = find_repo_root(start_dir, REPO_ROOT_SEARCH_MAX_HOPS) else {
+        return false;
+    };
+    let Ok(value) = env::var(ENV_CONFIG_PATH) else {
+        return false;
+    };
+    let Some(selected) = resolve_config_path_value(&value, Some(start_dir)) else {
+        return false;
+    };
+    let expected = repo_root.join(PROJECT_CONFIG_NAME);
+
+    // Resolve symlinks and `.`/`..` components. A missing path, directory, or
+    // failed canonicalization is not evidence of trust and must not activate a
+    // sibling repository allowlist.
+    let (Ok(selected), Ok(expected)) = (fs::canonicalize(selected), fs::canonicalize(expected))
+    else {
+        return false;
+    };
+    selected == expected && fs::metadata(expected).is_ok_and(|metadata| metadata.is_file())
+}
+
 /// Heredoc and inline-script scanning configuration.
 ///
 /// This configuration controls Tier 1/2/3 heredoc scanning behavior. Because the
-/// hook is performance- and UX-sensitive, defaults are conservative and fail-open
-/// on extraction/parse errors.
+/// hook is performance- and UX-sensitive, extraction/parse errors use a bounded
+/// fallback scanner by default.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct HeredocConfig {
@@ -534,10 +1257,12 @@ pub struct HeredocConfig {
     /// Special value "all" scans all languages (the default if omitted).
     pub languages: Option<Vec<String>>,
 
-    /// Fail-open when AST parsing fails for embedded code.
+    /// Use bounded fallback scanning when AST parsing fails for embedded code.
+    /// When false, block on the incomplete analysis instead.
     pub fallback_on_parse_error: Option<bool>,
 
-    /// Fail-open when extraction/parsing exceeds the timeout budget.
+    /// Use bounded fallback scanning when extraction/parsing exceeds its timeout.
+    /// When false, block on the incomplete analysis instead.
     pub fallback_on_timeout: Option<bool>,
 
     /// Content-based allowlist for heredocs (patterns, hashes, commands).
@@ -684,7 +1409,9 @@ pub struct ConfidenceConfig {
 
     /// Confidence threshold below which Deny is downgraded to Warn.
     ///
-    /// Values range from 0.0 (always warn) to 1.0 (never warn).
+    /// A match downgrades when its score is *below* this value, so 0.0 never
+    /// downgrades and 1.0 downgrades every match short of full confidence.
+    /// A direct invocation (`rm -rf ./build`) scores 1.0 and never downgrades.
     /// Recommended range: 0.3 - 0.7
     ///
     /// Default: 0.5
@@ -1205,7 +1932,9 @@ fn content_hash(content: &str) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct GeneralConfig {
-    /// Color output mode: "auto", "always", "never".
+    /// Color output mode: "auto", "always", "never". "never" turns color off;
+    /// "auto" and "always" both follow terminal detection (`NO_COLOR`, `CI`,
+    /// and a non-TTY stdout still disable it).
     pub color: String,
 
     /// Path to log file for blocked commands (optional).
@@ -1215,16 +1944,19 @@ pub struct GeneralConfig {
     pub verbose: bool,
 
     /// Hook evaluation budget override in milliseconds.
-    /// When set, overrides the default hook evaluation budget.
+    /// When set, overrides the default hook evaluation budget. Values below
+    /// 10 milliseconds are clamped to the minimum safe evaluation window.
     pub hook_timeout_ms: Option<u64>,
 
     /// Maximum bytes to read from stdin in hook mode.
-    /// Commands exceeding this limit are allowed (fail-open) with a warning.
+    /// Oversized hook envelopes are allowed with an audit warning by default;
+    /// `fail_closed` blocks them because their size is attacker-controlled.
     /// Default: 262144 (256 KiB).
     pub max_hook_input_bytes: Option<usize>,
 
     /// Maximum bytes for command string after extraction from JSON.
-    /// Commands exceeding this limit are allowed (fail-open) with a warning.
+    /// Commands exceeding this limit produce an explicit indeterminate result;
+    /// review-capable protocols ask and other protocols block.
     /// Default: 65536 (64 KiB).
     pub max_command_bytes: Option<usize>,
 
@@ -1241,8 +1973,10 @@ pub struct GeneralConfig {
     pub check_updates: bool,
 
     /// Whether to self-heal the hook registration in settings.json.
-    /// When enabled, every hook invocation checks that the dcg entry is still
-    /// present in `~/.claude/settings.json` and re-registers it if missing.
+    /// When enabled, each Claude hook invocation checks that the dcg entry is still
+    /// present in the active Claude settings (`CLAUDE_CONFIG_DIR/settings.json`,
+    /// default `~/.claude/settings.json`) and re-registers it if missing.
+    /// Other identified hosts keep their fixed Claude-compatible location.
     /// This protects against Claude Code silently overwriting settings.json
     /// mid-session.
     /// Default: true. Disable with `DCG_NO_SELF_HEAL` or `self_heal_hook = false`.
@@ -1257,6 +1991,53 @@ pub struct GeneralConfig {
     /// environments. Override at runtime with the `DCG_FAIL_CLOSED` env var
     /// (a truthy value forces fail-closed, a falsy value forces fail-open).
     pub fail_closed: bool,
+
+    /// Decision published when dcg cannot verify a command at all (#338):
+    /// the evaluation deadline expired, or the command exceeds
+    /// `max_command_bytes`.
+    ///
+    /// The default `ask` routes the command to an explicit operator decision
+    /// on review-capable protocols (Claude-compatible, Copilot); protocols
+    /// without an `ask` decision always block. Set `deny` for unattended or
+    /// autonomous sessions, where nobody is present to answer the prompt and
+    /// an auto-approver would otherwise wave through exactly the commands dcg
+    /// declined to inspect. Override at runtime with
+    /// `DCG_UNVERIFIED_DECISION=deny|ask`.
+    pub unverified_decision: UnverifiedDecision,
+
+    /// Pin the installed binary against `dcg update` (#320).
+    ///
+    /// When `true`, `dcg update` refuses to replace the installed binary
+    /// (before any network or installer work) unless `--replace-local-build`
+    /// is passed, and the background "update available" nudge is suppressed.
+    /// Intended for operators running a local build that is ahead of the
+    /// published release, where a routine update would silently downgrade
+    /// guard coverage. Override at runtime with `DCG_UPDATE_PIN`.
+    /// Default: false.
+    pub update_pin: bool,
+}
+
+/// Fallback decision for a command dcg could not verify (#338): evaluation
+/// deadline exhausted, or command over `general.max_command_bytes`.
+///
+/// This is deliberately a two-value enum rather than `PolicyMode`: an
+/// unverified command has no matched rule to warn or log about, so the only
+/// meaningful choices are routing it to an operator (`ask`) or refusing it
+/// (`deny`).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum UnverifiedDecision {
+    /// Route the unverified command to an explicit operator decision on
+    /// review-capable protocols. Protocols without an `ask` decision block.
+    #[default]
+    Ask,
+    /// Refuse the unverified command on every protocol. The right posture for
+    /// unattended sessions: the denial reason is actionable (shrink or split
+    /// the command), while an unanswered `ask` stalls or — worse — gets
+    /// auto-approved without inspection.
+    Deny,
 }
 
 /// Default limits for input size (used when not configured).
@@ -1277,6 +2058,8 @@ impl Default for GeneralConfig {
             check_updates: true,
             self_heal_hook: true,
             fail_closed: false,
+            unverified_decision: UnverifiedDecision::Ask,
+            update_pin: false,
         }
     }
 }
@@ -1384,20 +2167,59 @@ pub struct PacksConfig {
 }
 
 impl PacksConfig {
-    /// Get enabled pack IDs as a deduplicated set.
-    #[must_use]
-    pub fn enabled_pack_ids(&self) -> HashSet<String> {
-        let mut enabled: HashSet<String> = self.enabled.iter().cloned().collect();
+    /// Expand every known built-in category or preset to concrete pack IDs.
+    ///
+    /// Registry expansion deliberately retains the requested category ID so
+    /// metadata callers can tell what was requested. Configuration evaluation
+    /// cannot retain it, however: a later registry expansion would otherwise
+    /// reintroduce a leaf removed by `disabled` (for example, enabling
+    /// `database` while disabling `database.redis`). Keep real pack IDs,
+    /// external/unknown IDs, and the mandatory `core` marker; discard only
+    /// known category-only IDs after their leaves have been materialized.
+    fn expand_known_pack_groups(enabled: &HashSet<String>) -> HashSet<String> {
+        let mut expanded = crate::packs::REGISTRY.expand_enabled(enabled);
+        expanded.retain(|id| {
+            id == "core"
+                || crate::packs::REGISTRY.get_entry(id).is_some()
+                || crate::packs::REGISTRY.packs_in_category(id).is_empty()
+        });
+        expanded
+    }
 
-        // Remove explicitly disabled packs.
-        for disabled in &self.disabled {
-            enabled.remove(disabled);
-            // Also remove sub-packs if a category is disabled.
-            enabled.retain(|p| !p.starts_with(&format!("{disabled}.")));
+    /// Remove an explicitly disabled concrete pack or ordinary category.
+    ///
+    /// Presets are handled before expansion instead. Removing every expanded
+    /// preset member here would also remove packs enabled independently by a
+    /// platform default, a direct leaf, or another category.
+    fn remove_disabled_pack_group(enabled: &mut HashSet<String>, disabled: &str) {
+        enabled.remove(disabled);
+        enabled.retain(|pack_id| !pack_id.starts_with(&format!("{disabled}.")));
+    }
+
+    /// Remove disabled preset *sources* before expansion.
+    ///
+    /// A preset is an enablement contribution, not an ownership claim over its
+    /// member packs. If `cloud` and the careful-Windows preset are both enabled,
+    /// disabling only the preset must leave the independently requested cloud
+    /// packs enabled.
+    fn remove_disabled_preset_markers(requested: &mut HashSet<String>, disabled: &[String]) {
+        for disabled_id in disabled {
+            if crate::packs::preset_members(disabled_id).is_some() {
+                requested.remove(disabled_id);
+            }
         }
+    }
 
-        // Core is always enabled (cannot be disabled).
-        enabled.insert("core".to_string());
+    fn remove_disabled_non_preset_groups(enabled: &mut HashSet<String>, disabled: &[String]) {
+        for disabled_id in disabled {
+            if crate::packs::preset_members(disabled_id).is_none() {
+                Self::remove_disabled_pack_group(enabled, disabled_id);
+            }
+        }
+    }
+
+    fn requested_pack_ids(&self, include_windows_defaults: bool) -> HashSet<String> {
+        let mut enabled: HashSet<String> = self.enabled.iter().cloned().collect();
 
         // `system.disk` is default-on but opt-out-able. It guards
         // catastrophic, unrecoverable disk operations (`mkfs /dev/sda`,
@@ -1408,34 +2230,66 @@ impl PacksConfig {
         // genuinely need to run mkfs/dd-to-device unblocked can opt out
         // via `disabled = ["system.disk"]` (or `disabled = ["system"]`
         // to drop all system.* packs).
-        let system_disk_explicitly_disabled = self
-            .disabled
-            .iter()
-            .any(|d| d == "system.disk" || d == "system");
-        if !system_disk_explicitly_disabled {
-            enabled.insert("system.disk".to_string());
-        }
+        enabled.insert("system.disk".to_string());
 
-        // Windows-native packs are default-ON only on Windows: a fresh Windows
-        // install must block `del /s`, `rd /s`, `Remove-Item -Recurse -Force`,
-        // etc. with no config, while Unix pays no quick-reject cost for Windows
-        // verbs by default. The packs stay *registered* on every platform, so
-        // Unix users can still opt in (e.g. to scan committed `.ps1`/`.cmd`
-        // scripts) via `enabled = ["windows.filesystem"]`. Opt out on Windows
-        // with `disabled = ["windows.filesystem"]` (or `disabled = ["windows"]`).
-        #[cfg(windows)]
-        {
-            // Catastrophic Windows packs default-ON; each opt-out-able by its own
-            // id or by the `windows` category.
+        // Windows-native packs are default-ON on Windows and for recognized
+        // Cmd/PowerShell hook payloads on any host. Ordinary Unix POSIX requests
+        // keep these verbs out of quick rejection. The packs stay registered
+        // everywhere, so users can also select them explicitly (e.g. to scan
+        // committed `.ps1`/`.cmd` scripts) via `enabled = ["windows.filesystem"]`.
+        // `disabled = ["windows.filesystem"]` (or `disabled = ["windows"]`)
+        // still excludes them when defaults are expanded for a Windows payload.
+        if include_windows_defaults {
             for pack_id in ["windows.filesystem", "windows.system"] {
-                let disabled = self.disabled.iter().any(|d| d == pack_id || d == "windows");
-                if !disabled {
-                    enabled.insert(pack_id.to_string());
-                }
+                enabled.insert(pack_id.to_string());
             }
         }
+        enabled
+    }
+
+    fn resolve_requested_pack_ids(
+        mut requested: HashSet<String>,
+        disabled: &[String],
+    ) -> HashSet<String> {
+        // Cancel preset contributions before expansion so independently
+        // requested/default member packs retain their provenance.
+        Self::remove_disabled_preset_markers(&mut requested, disabled);
+
+        // Expand before applying exclusions. Filtering a requested category
+        // first is insufficient because the registry would expand the surviving
+        // parent later and silently put the excluded leaf back.
+        let mut enabled = Self::expand_known_pack_groups(&requested);
+
+        // Ordinary leaf/category exclusions remain last-wins after expansion.
+        Self::remove_disabled_non_preset_groups(&mut enabled, disabled);
+
+        // Core is always enabled (cannot be disabled). Keeping the category
+        // marker is intentional: registry callers expand it to both core packs.
+        enabled.insert("core".to_string());
 
         enabled
+    }
+
+    /// Get enabled pack IDs as a deduplicated set.
+    #[must_use]
+    pub fn enabled_pack_ids(&self) -> HashSet<String> {
+        self.enabled_pack_ids_for_payload(false)
+    }
+
+    /// As [`Self::enabled_pack_ids`], but for a caller that has seen the
+    /// payload and knows it is a Windows shell command (#451).
+    ///
+    /// The agent-aware sibling on `Config` takes the same flag. This one
+    /// exists for `dcg hook`'s JSONL reader, which builds its pack set before
+    /// reading any line and so could only ever ask the payload-blind question —
+    /// which is why the same command denied through the plain hook path and
+    /// was allowed through `dcg hook`.
+    #[must_use]
+    pub fn enabled_pack_ids_for_payload(&self, windows_payload: bool) -> HashSet<String> {
+        Self::resolve_requested_pack_ids(
+            self.requested_pack_ids(cfg!(windows) || windows_payload),
+            &self.disabled,
+        )
     }
 
     /// Expand custom_paths, resolving tilde, ${repo_root}, and glob patterns.
@@ -1464,7 +2318,27 @@ impl PacksConfig {
         let mut result = Vec::new();
         let mut repo_root: Option<Option<PathBuf>> = None; // memoize across patterns
 
+        // Bound the expansion so a pathological glob (e.g. `~/**/*.yaml`)
+        // cannot make every hook invocation open an unbounded number of
+        // files (issue #293). Files beyond the cap are skipped; each pack
+        // file itself is size-capped at parse time.
+        //
+        // The cap is CUMULATIVE across patterns, so the pattern that trips it
+        // is usually not the pattern the operator would blame — an early
+        // greedy glob can consume the whole budget and silently drop every
+        // later entry. Skips are therefore tallied per pattern and reported
+        // by name after expansion, instead of one anonymous warning.
+        let mut skipped_by_pattern: Vec<(String, usize)> = Vec::new();
+        let push_capped = |result: &mut Vec<String>, skipped: &mut usize, path: String| {
+            if result.len() < MAX_CUSTOM_PACK_FILES {
+                result.push(path);
+            } else {
+                *skipped += 1;
+            }
+        };
+
         for pattern in &self.custom_paths {
+            let mut skipped = 0usize;
             // Expand ${repo_root} first — if unresolved, skip the entry.
             let after_repo_root = if pattern.contains("${repo_root}") {
                 let resolved = repo_root.get_or_insert_with(|| {
@@ -1480,7 +2354,7 @@ impl PacksConfig {
 
             // Then expand tilde.
             let expanded = if after_repo_root.starts_with("~/") || after_repo_root == "~" {
-                if let Some(home) = dirs::home_dir() {
+                if let Some(home) = home_dir() {
                     if after_repo_root == "~" {
                         home.to_string_lossy().into_owned()
                     } else {
@@ -1500,7 +2374,11 @@ impl PacksConfig {
                 Ok(paths) => {
                     for entry in paths.flatten() {
                         if entry.is_file() {
-                            result.push(entry.to_string_lossy().into_owned());
+                            push_capped(
+                                &mut result,
+                                &mut skipped,
+                                entry.to_string_lossy().into_owned(),
+                            );
                         }
                     }
                 }
@@ -1508,10 +2386,27 @@ impl PacksConfig {
                     // Invalid glob pattern - treat as literal path
                     let path = std::path::Path::new(&expanded);
                     if path.is_file() {
-                        result.push(expanded);
+                        push_capped(&mut result, &mut skipped, expanded);
                     }
                 }
             }
+
+            if skipped > 0 {
+                skipped_by_pattern.push((pattern.clone(), skipped));
+            }
+        }
+
+        if !skipped_by_pattern.is_empty() {
+            let total: usize = skipped_by_pattern.iter().map(|(_, n)| n).sum();
+            let detail = skipped_by_pattern
+                .iter()
+                .map(|(pattern, n)| format!("{pattern} ({n} skipped)"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            crate::emit_stderr!(
+                "[dcg] Warning: packs.custom_paths hit the cumulative {MAX_CUSTOM_PACK_FILES}-file cap \
+                 (issue #293); {total} matching file(s) were NOT loaded from: {detail}"
+            );
         }
 
         result
@@ -1520,8 +2415,9 @@ impl PacksConfig {
 
 /// Decision mode policy configuration.
 ///
-/// Controls how matched patterns are handled: deny (block), warn (allow with warning),
-/// or log (silent allow with optional logging).
+/// Controls how matched patterns are handled: deny (block), ask (require
+/// operator review), warn (allow with warning), or log (silent allow with
+/// optional logging).
 ///
 /// Defaults respect severity: Critical/High → deny, Medium → warn, Low → log.
 /// This config allows overriding the default behavior per pack or per specific rule.
@@ -1572,6 +2468,8 @@ pub struct PolicyConfig {
 pub enum PolicyMode {
     /// Block the command (output JSON deny, print warning).
     Deny,
+    /// Require explicit operator review; fail closed if the client cannot ask.
+    Ask,
     /// Warn but allow (print warning to stderr, no JSON deny).
     Warn,
     /// Log only (silent allow, record for history).
@@ -1584,6 +2482,7 @@ impl PolicyMode {
     pub const fn to_decision_mode(self) -> crate::packs::DecisionMode {
         match self {
             Self::Deny => crate::packs::DecisionMode::Deny,
+            Self::Ask => crate::packs::DecisionMode::Ask,
             Self::Warn => crate::packs::DecisionMode::Warn,
             Self::Log => crate::packs::DecisionMode::Log,
         }
@@ -1616,24 +2515,27 @@ impl PolicyConfig {
         pattern_name: Option<&str>,
         severity: Option<crate::packs::Severity>,
     ) -> crate::packs::DecisionMode {
-        // 1. Rule-specific override
-        if let (Some(pack), Some(pattern)) = (pack_id, pattern_name) {
-            let rule_id = format!("{pack}:{pattern}");
-            if let Some(mode) = self.rules.get(&rule_id) {
-                return mode.to_decision_mode();
+        // 1. Rule-specific override. An entry for the rule's own id wins; an
+        //    entry for an id it was split out of still applies (#509).
+        if let (Some(pack), Some(pattern)) = (pack_id, pattern_name)
+            && !self.rules.is_empty()
+        {
+            let names = std::iter::once(pattern).chain(
+                crate::packs::legacy_rule_names(pack, pattern)
+                    .iter()
+                    .copied(),
+            );
+            for name in names {
+                if let Some(mode) = self.rules.get(&format!("{pack}:{name}")) {
+                    return mode.to_decision_mode();
+                }
             }
-        }
-
-        // Safety constraint: Critical rules may only be loosened via an explicit per-rule override.
-        // Pack-level/global defaults must never downgrade Critical to warn/log.
-        if matches!(severity, Some(crate::packs::Severity::Critical)) {
-            return crate::packs::DecisionMode::Deny;
         }
 
         // 2. Pack-specific override
         if let Some(pack) = pack_id {
             if let Some(mode) = self.packs.get(pack) {
-                return mode.to_decision_mode();
+                return constrain_critical_policy(mode.to_decision_mode(), severity);
             }
         }
 
@@ -1651,7 +2553,7 @@ impl PolicyConfig {
             });
 
         if let Some(mode) = effective_default_mode {
-            return mode.to_decision_mode();
+            return constrain_critical_policy(mode.to_decision_mode(), severity);
         }
 
         // 4. Severity-based default
@@ -1659,10 +2561,494 @@ impl PolicyConfig {
     }
 }
 
+/// Critical rules may use deny or the still-blocking ask mode from broad
+/// policy. Warn/log remain available only through an explicit per-rule
+/// override, preserving the existing safeguard against accidental global
+/// relaxation.
+const fn constrain_critical_policy(
+    mode: crate::packs::DecisionMode,
+    severity: Option<crate::packs::Severity>,
+) -> crate::packs::DecisionMode {
+    if matches!(severity, Some(crate::packs::Severity::Critical))
+        && matches!(
+            mode,
+            crate::packs::DecisionMode::Warn | crate::packs::DecisionMode::Log
+        )
+    {
+        crate::packs::DecisionMode::Deny
+    } else {
+        mode
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Per-rule target-path exemptions (#284)
+// -----------------------------------------------------------------------------
+
+/// Per-rule settings, keyed by `"<pack_id>:<pattern_name>"` in a
+/// `[rules."core.filesystem:rm-rf-general"]` table.
+///
+/// This is the rule-scoped sibling of `[policy.rules]`: `[policy.rules]` picks
+/// the *mode* a rule decides with, `[rules]` narrows the *targets* the rule
+/// decides about.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct RuleConfig {
+    /// Glob patterns naming target paths this rule must not fire on.
+    ///
+    /// The exemption is evaluated inside the rule's own target check, not as a
+    /// command-level bypass: every other rule still sees the whole command, so
+    /// `echo x > ~/.claude/jobs/a/tmp/log && git reset --hard` is still denied
+    /// by `core.git:reset-hard`.
+    ///
+    /// Only a **statically literal** target is ever eligible. A target built
+    /// from a variable, command substitution, glob, or quote splice is never
+    /// exempted — `core.filesystem:redirect-truncate-dynamic-path` exists for
+    /// exactly those and deliberately supports no exemptions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exempt_target_globs: Vec<String>,
+}
+
+/// Rule ids whose target is resolvable to a static literal path, and which
+/// therefore honor `exempt_target_globs`.
+///
+/// Keep this list explicit. A rule that is not listed here silently ignores
+/// the setting, which would leave the user still denied with no explanation —
+/// [`Config::rule_target_exemption_warnings`] reports that case instead.
+pub const RULE_TARGET_EXEMPTION_SUPPORTED_RULES: &[&str] = &[
+    "core.filesystem:redirect-truncate-root-home",
+    "core.filesystem:rm-rf-general",
+    "core.filesystem:rm-rf-root-home",
+    "core.filesystem:rm-r-f-separate",
+    "core.filesystem:rm-r-f-separate-root-home",
+    "core.filesystem:rm-recursive-force",
+    "core.filesystem:rm-recursive-force-root-home",
+    "core.filesystem:rm-recursive-general",
+    "core.filesystem:rm-recursive-root-home",
+];
+
+/// Match options for `exempt_target_globs`.
+///
+/// `require_literal_separator` gives the documented semantics: `*` stops at a
+/// path separator, `**` crosses them. Matching is case-sensitive on every
+/// platform, matching the scan include/exclude globs.
+const RULE_TARGET_GLOB_MATCH_OPTIONS: glob::MatchOptions = glob::MatchOptions {
+    case_sensitive: true,
+    require_literal_separator: true,
+    require_literal_leading_dot: false,
+};
+
+/// A compiled `[rules]` target-exemption table.
+///
+/// Compilation is done once per process (globs are user-supplied and must not
+/// be re-parsed per command).
+#[derive(Debug, Clone, Default)]
+pub struct RuleTargetExemptions {
+    rules: std::collections::HashMap<String, Vec<CompiledTargetGlob>>,
+}
+
+#[derive(Debug, Clone)]
+struct CompiledTargetGlob {
+    /// The glob exactly as the user wrote it, for audit output.
+    source: String,
+    pattern: glob::Pattern,
+}
+
+impl RuleTargetExemptions {
+    /// Whether any rule configured a target exemption.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+
+    /// Resolve `raw_target` for `rule_id` and return the glob that exempts it.
+    ///
+    /// Returns `None` when the rule has no exemptions, when the target is not
+    /// a static literal path, when it contains a `..` component, or when no
+    /// glob matches.
+    #[must_use]
+    pub fn matching_glob(&self, rule_id: &str, raw_target: &str) -> Option<&str> {
+        let globs = self.rules.get(rule_id)?;
+        let target = normalize_literal_target_path(raw_target)?;
+        globs
+            .iter()
+            .find(|glob| {
+                glob.pattern
+                    .matches_with(&target, RULE_TARGET_GLOB_MATCH_OPTIONS)
+            })
+            .map(|glob| glob.source.as_str())
+    }
+}
+
+/// Lexically normalize a candidate target path for glob matching.
+///
+/// This is deliberately filesystem-free: no `stat`, no symlink resolution, no
+/// canonicalization. A symlinked path is therefore matched by its literal
+/// spelling, exactly as written on the command line.
+///
+/// Returns `None` unless the text is a static literal path:
+/// - any shell expansion, quoting, or glob byte disqualifies it;
+/// - a leading `~` / `~/` expands to the user's home directory (any other
+///   tilde form, including `~user`, is rejected);
+/// - a `..` component is rejected outright rather than resolved, so
+///   `~/.claude/jobs/x/tmp/../../../Documents` can never match a glob rooted
+///   at the scratch directory;
+/// - `.` components and duplicate separators are collapsed.
+#[must_use]
+pub(crate) fn normalize_literal_target_path(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // Expansion, quoting, and glob syntax all mean the runtime target is not
+    // the text dcg is looking at.
+    if raw.bytes().any(|byte| {
+        matches!(
+            byte,
+            b'$' | b'`'
+                | b'\''
+                | b'"'
+                | b'*'
+                | b'?'
+                | b'['
+                | b']'
+                | b'{'
+                | b'}'
+                | b'%'
+                | b'!'
+                | b'('
+                | b')'
+                | b'\n'
+                | b'\r'
+        ) || byte.is_ascii_control()
+    }) {
+        return None;
+    }
+    // On Unix a backslash is a shell escape, never a separator.
+    #[cfg(not(windows))]
+    if raw.contains('\\') {
+        return None;
+    }
+
+    let expanded = if raw == "~" {
+        home_dir()?.to_string_lossy().into_owned()
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        let home = home_dir()?;
+        format!("{}/{rest}", home.to_string_lossy().trim_end_matches('/'))
+    } else if raw.starts_with('~') {
+        // `~user` needs the passwd database to resolve; never guess.
+        return None;
+    } else {
+        raw.to_string()
+    };
+
+    #[cfg(windows)]
+    let expanded = expanded.replace('\\', "/");
+
+    let rooted = expanded.starts_with('/');
+    let mut components: Vec<&str> = Vec::new();
+    for component in expanded.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => return None,
+            other => components.push(other),
+        }
+    }
+    if components.is_empty() {
+        return rooted.then(|| "/".to_string());
+    }
+    let joined = components.join("/");
+    Some(if rooted { format!("/{joined}") } else { joined })
+}
+
+/// Normalize the glob text itself so it is compared against the same shape
+/// [`normalize_literal_target_path`] produces (`~` expanded, `.` and duplicate
+/// separators collapsed). Glob metacharacters are preserved.
+fn normalize_target_glob(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("glob must not be empty".to_string());
+    }
+    if trimmed.split('/').any(|component| component == "..") {
+        return Err("glob must not contain a `..` component".to_string());
+    }
+
+    let expanded = if trimmed == "~" {
+        home_dir()
+            .ok_or_else(|| "`~` cannot be expanded: no home directory".to_string())?
+            .to_string_lossy()
+            .into_owned()
+    } else if let Some(rest) = trimmed.strip_prefix("~/") {
+        let home =
+            home_dir().ok_or_else(|| "`~` cannot be expanded: no home directory".to_string())?;
+        format!("{}/{rest}", home.to_string_lossy().trim_end_matches('/'))
+    } else if trimmed.starts_with('~') {
+        return Err("only `~` and `~/` are expanded; `~user` is not supported".to_string());
+    } else {
+        trimmed.to_string()
+    };
+
+    let rooted = expanded.starts_with('/');
+    let components: Vec<&str> = expanded
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect();
+    let joined = components.join("/");
+    Ok(if rooted { format!("/{joined}") } else { joined })
+}
+
+impl Config {
+    /// Compile the `[rules]` target-exemption globs.
+    ///
+    /// Invalid or empty globs are dropped here; they are reported separately by
+    /// [`Config::rule_target_exemption_warnings`] so a typo never silently
+    /// widens or narrows enforcement.
+    #[must_use]
+    pub fn rule_target_exemptions(&self) -> RuleTargetExemptions {
+        let mut rules = std::collections::HashMap::new();
+        for (rule_id, rule) in &self.rules {
+            if !RULE_TARGET_EXEMPTION_SUPPORTED_RULES.contains(&rule_id.as_str()) {
+                continue;
+            }
+            let compiled: Vec<CompiledTargetGlob> = rule
+                .exempt_target_globs
+                .iter()
+                .filter_map(|raw| {
+                    let normalized = normalize_target_glob(raw).ok()?;
+                    let pattern = glob::Pattern::new(&normalized).ok()?;
+                    Some(CompiledTargetGlob {
+                        source: raw.clone(),
+                        pattern,
+                    })
+                })
+                .collect();
+            if !compiled.is_empty() {
+                rules.insert(rule_id.clone(), compiled);
+            }
+        }
+        RuleTargetExemptions { rules }
+    }
+
+    /// Human-readable problems with the effective `[rules]` tables.
+    ///
+    /// Every entry here means the user configured an exemption that will NOT
+    /// take effect, so they keep getting the denial they tried to remove.
+    #[must_use]
+    pub fn rule_target_exemption_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let mut rule_ids: Vec<&String> = self.rules.keys().collect();
+        rule_ids.sort_unstable();
+        for rule_id in rule_ids {
+            let rule = &self.rules[rule_id];
+            if rule.exempt_target_globs.is_empty() {
+                continue;
+            }
+            if !RULE_TARGET_EXEMPTION_SUPPORTED_RULES.contains(&rule_id.as_str()) {
+                warnings.push(format!(
+                    "[rules.\"{rule_id}\"] exempt_target_globs is ignored: \
+                     that rule does not support target exemptions (supported: {})",
+                    RULE_TARGET_EXEMPTION_SUPPORTED_RULES.join(", ")
+                ));
+                continue;
+            }
+            for raw in &rule.exempt_target_globs {
+                match normalize_target_glob(raw) {
+                    Err(error) => warnings.push(format!(
+                        "[rules.\"{rule_id}\"] exempt_target_globs entry {raw:?} is invalid: {error}"
+                    )),
+                    Ok(normalized) => {
+                        if let Err(error) = glob::Pattern::new(&normalized) {
+                            warnings.push(format!(
+                                "[rules.\"{rule_id}\"] exempt_target_globs entry {raw:?} \
+                                 is not a valid glob: {error}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        warnings
+    }
+}
+
+/// A rule firing that a configured target exemption suppressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleTargetSuppression {
+    /// `"<pack_id>:<pattern_name>"` of the rule that matched.
+    pub rule_id: String,
+    /// The glob, exactly as configured, that exempted the target.
+    pub glob: String,
+    /// The target path as it appeared on the command line.
+    pub target: String,
+}
+
+#[derive(Clone, Default)]
+struct ActiveRuleTargetExemptions {
+    exemptions: std::sync::Arc<RuleTargetExemptions>,
+    verbose: bool,
+}
+
+/// Exemptions from the most recently loaded [`Config`].
+///
+/// The hook's hot path evaluates through `evaluate_command_with_pack_order_*`,
+/// which deliberately takes no `&Config`. Publishing the compiled table when a
+/// config is loaded keeps that path served without threading a parameter
+/// through every pack matcher. A repository `.dcg.toml` is already reduced to
+/// enforcement-only settings before it reaches here, so nothing published from
+/// this point can carry a repository-authored exemption.
+static PROCESS_RULE_TARGET_EXEMPTIONS: std::sync::RwLock<Option<ActiveRuleTargetExemptions>> =
+    std::sync::RwLock::new(None);
+
+thread_local! {
+    /// Exemptions explicitly scoped to the evaluation running on this thread.
+    ///
+    /// The pack matchers that own a rule's target check sit ten-plus frames
+    /// below the last function that holds a `&Config`, and several of them are
+    /// shared with the rm parser in `packs::core::filesystem`. A thread-local
+    /// scope keeps the plumbing out of those signatures while staying isolated
+    /// between parallel test threads, and takes precedence over the process
+    /// default above.
+    static RULE_TARGET_EXEMPTION_OVERRIDE: std::cell::RefCell<Option<ActiveRuleTargetExemptions>> =
+        const { std::cell::RefCell::new(None) };
+
+    /// Suppressions recorded during the evaluation running on this thread.
+    static RULE_TARGET_SUPPRESSIONS: std::cell::RefCell<Vec<RuleTargetSuppression>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn active_rule_target_exemptions() -> Option<ActiveRuleTargetExemptions> {
+    if let Some(active) = RULE_TARGET_EXEMPTION_OVERRIDE.with(|state| state.borrow().clone()) {
+        return Some(active);
+    }
+    PROCESS_RULE_TARGET_EXEMPTIONS
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone())
+}
+
+/// Publish `config`'s compiled `[rules]` exemptions as the process default.
+///
+/// Called once per loaded config. Idempotent and cheap to repeat.
+pub(crate) fn publish_rule_target_exemptions(config: &Config) {
+    let active = ActiveRuleTargetExemptions {
+        exemptions: std::sync::Arc::new(config.rule_target_exemptions()),
+        verbose: config.general.verbose,
+    };
+    if let Ok(mut guard) = PROCESS_RULE_TARGET_EXEMPTIONS.write() {
+        *guard = Some(active);
+    }
+}
+
+/// RAII guard installing a config's target exemptions for the current thread.
+///
+/// Restores the previous thread scope on drop, so nested evaluations are safe.
+/// This is the entry point for callers that hold a `&Config` directly (library
+/// API users and tests); the hook relies on the process default published at
+/// config load.
+pub struct RuleTargetExemptionScope {
+    previous: Option<ActiveRuleTargetExemptions>,
+}
+
+impl RuleTargetExemptionScope {
+    /// Install `config`'s compiled `[rules]` exemptions for this thread.
+    #[must_use]
+    pub fn install(config: &Config) -> Self {
+        let next = ActiveRuleTargetExemptions {
+            exemptions: std::sync::Arc::new(config.rule_target_exemptions()),
+            verbose: config.general.verbose,
+        };
+        let previous = RULE_TARGET_EXEMPTION_OVERRIDE.with(|state| state.replace(Some(next)));
+        Self { previous }
+    }
+}
+
+impl Drop for RuleTargetExemptionScope {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        RULE_TARGET_EXEMPTION_OVERRIDE.with(|state| {
+            *state.borrow_mut() = previous;
+        });
+    }
+}
+
+/// Whether `rule_id` has any target exemption configured for this evaluation.
+///
+/// Cheap gate so the supported rules skip target extraction entirely on the
+/// overwhelmingly common unconfigured path.
+#[must_use]
+pub fn rule_has_target_exemptions(rule_id: &str) -> bool {
+    active_rule_target_exemptions()
+        .is_some_and(|active| active.exemptions.rules.contains_key(rule_id))
+}
+
+/// Whether `rule_id`'s configured target exemptions cover `raw_target`.
+///
+/// This is the shared helper every supported rule calls at the point where its
+/// own target is already known. It returns the matching glob so callers can
+/// report *why* the rule did not fire.
+///
+/// The lookup is pure: an operation with several targets must prove *every*
+/// target exempt before it suppresses anything, so recording is a separate
+/// step ([`note_rule_target_suppression`]).
+#[must_use]
+pub fn rule_target_exemption(rule_id: &str, raw_target: &str) -> Option<String> {
+    let active = active_rule_target_exemptions()?;
+    if active.exemptions.is_empty() {
+        return None;
+    }
+    active
+        .exemptions
+        .matching_glob(rule_id, raw_target)
+        .map(ToString::to_string)
+}
+
+/// Boolean form of [`rule_target_exemption`].
+#[must_use]
+pub fn rule_target_exempted(rule_id: &str, raw_target: &str) -> bool {
+    rule_target_exemption(rule_id, raw_target).is_some()
+}
+
+/// Record that `rule_id` matched but did not fire because `glob` exempted
+/// `target`.
+///
+/// A suppressed rule is an allow, and an allow that came from configuration
+/// must be visible: the suppression is retained for the audit trail (see
+/// [`take_rule_target_suppressions`]) and echoed to stderr in verbose mode.
+pub fn note_rule_target_suppression(rule_id: &str, glob: &str, target: &str) {
+    if active_rule_target_exemptions().is_some_and(|active| active.verbose) {
+        crate::emit_stderr!(
+            "dcg: rule {rule_id} matched but target {target:?} is exempted by \
+             [rules.\"{rule_id}\"] exempt_target_globs entry {glob:?}"
+        );
+    }
+    RULE_TARGET_SUPPRESSIONS.with(|state| {
+        state.borrow_mut().push(RuleTargetSuppression {
+            rule_id: rule_id.to_string(),
+            glob: glob.to_string(),
+            target: target.to_string(),
+        });
+    });
+}
+
+/// Drain the target-exemption suppressions recorded during this evaluation.
+///
+/// Callers that render an audit trail (history rows, `dcg explain`) use this to
+/// state which rule matched and which glob suppressed it.
+#[must_use]
+pub fn take_rule_target_suppressions() -> Vec<RuleTargetSuppression> {
+    RULE_TARGET_SUPPRESSIONS.with(|state| std::mem::take(&mut *state.borrow_mut()))
+}
+
 /// Custom pattern overrides.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct OverridesConfig {
+    /// Runtime-only failure of a required trusted config layer (#568).
+    /// Neither TOML nor an automatic project policy can manufacture or clear it.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub configuration_error: Option<String>,
+
     /// Patterns to allow that would otherwise be blocked.
     #[serde(default)]
     pub allow: Vec<AllowOverride>,
@@ -1671,26 +3057,54 @@ pub struct OverridesConfig {
     #[serde(default)]
     pub block: Vec<BlockOverride>,
 
-    /// Simple allowlist format (backward compatible).
-    ///
-    /// Example in TOML:
-    /// ```toml
-    /// allowlist = ["npm run build", "cargo test"]
-    /// ```
-    #[serde(default)]
-    pub allowlist: Option<Vec<String>>,
+    /// REMOVED (#327): `overrides.allowlist` parsed, appeared in the schema,
+    /// and was never consulted during evaluation — the layer merge dropped it,
+    /// so a config using it silently had no effect. The key is now detected
+    /// only so `dcg config` / `dcg doctor` can warn and point at the surfaces
+    /// that work: `overrides.allow`, per-rule `exempt_target_globs`, and
+    /// `dcg allowlist add`.
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub allowlist: Option<toml::Value>,
 
-    /// Extended allowlist rules with path-specific conditions.
-    ///
-    /// Example in TOML:
-    /// ```toml
-    /// [[allowlist_rules]]
-    /// pattern = "rm -rf node_modules"
-    /// paths = ["/home/*/projects/*", "/workspace/*"]
-    /// comment = "Allow node_modules cleanup in project directories"
-    /// ```
-    #[serde(default)]
-    pub allowlist_rules: Option<Vec<AllowlistRule>>,
+    /// REMOVED (#327): `overrides.allowlist_rules` had the same silent-drop
+    /// fate as `allowlist` above, with the extra hazard that its documented
+    /// `paths` condition was ignored even by the dead compile path — wiring it
+    /// up as parsed would have granted path-scoped configs global allowances.
+    /// Detected only, to warn.
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub allowlist_rules: Option<toml::Value>,
+}
+
+impl OverridesConfig {
+    /// Warnings for config keys that parse but are no longer part of the
+    /// schema (#327). Surfaced through `dcg config` and `dcg doctor` so a
+    /// silently-ignored key is distinguishable from one that simply didn't
+    /// match.
+    #[must_use]
+    pub fn removed_key_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.allowlist.is_some() {
+            warnings.push(
+                "`overrides.allowlist` is not enforced (removed in #327; it was parsed but \
+                 never consulted). Use `overrides.allow` regex overrides, a per-rule \
+                 `[rules.\"<pack:rule>\"] exempt_target_globs` target exemption, or \
+                 `dcg allowlist add`."
+                    .to_string(),
+            );
+        }
+        if self.allowlist_rules.is_some() {
+            warnings.push(
+                "`overrides.allowlist_rules` is not enforced (removed in #327; it was parsed \
+                 but never consulted, and its `paths` condition was never implemented). For \
+                 path-scoped exemptions use `[rules.\"<pack:rule>\"] exempt_target_globs`, or \
+                 `dcg allowlist add --path`."
+                    .to_string(),
+            );
+        }
+        warnings
+    }
 }
 
 /// Settings for layered allowlist files (`.dcg/allowlist.toml`,
@@ -1716,384 +3130,6 @@ impl Default for AllowlistConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 struct AllowlistConfigLayer {
     auto_prune_expired: Option<bool>,
-}
-
-/// An extended allowlist rule with optional path conditions.
-///
-/// This supports context-aware allowlisting where rules can be scoped
-/// to specific directories or path patterns. Rules can also have expiration
-/// settings (mutually exclusive: only one of `expires`, `ttl`, `ttl_seconds`,
-/// or `session` should be set).
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct AllowlistRule {
-    /// The pattern to allow (regex supported).
-    pub pattern: String,
-
-    /// Optional path patterns where this rule applies.
-    ///
-    /// If `None` or empty, the rule applies globally.
-    /// Supports glob patterns like `/home/*/projects/*`.
-    #[serde(default)]
-    pub paths: Option<Vec<String>>,
-
-    /// Optional comment explaining the rule.
-    #[serde(default)]
-    pub comment: Option<String>,
-
-    /// Optional expiration timestamp (ISO 8601 format).
-    ///
-    /// After this time, the rule is no longer active.
-    /// Example: "2024-06-01T00:00:00Z"
-    ///
-    /// Mutually exclusive with `ttl`, `ttl_seconds`, and `session`.
-    #[serde(default)]
-    pub expires: Option<String>,
-
-    /// Optional time-to-live duration as a human-readable string.
-    ///
-    /// Supported formats:
-    /// - Minutes: "30m", "30min", "30 minutes"
-    /// - Hours: "4h", "4hr", "4 hours"
-    /// - Days: "7d", "7 days"
-    /// - Weeks: "1w", "1 week"
-    ///
-    /// TTL is computed from `created_at` timestamp.
-    /// Mutually exclusive with `expires`, `ttl_seconds`, and `session`.
-    #[serde(default)]
-    pub ttl: Option<String>,
-
-    /// Optional time-to-live duration in seconds.
-    ///
-    /// Alternative to `ttl` for programmatic use.
-    /// TTL is computed from `created_at` timestamp.
-    /// Mutually exclusive with `expires`, `ttl`, and `session`.
-    #[serde(default)]
-    pub ttl_seconds: Option<u64>,
-
-    /// Whether this is a session-only rule.
-    ///
-    /// Session rules are valid only within the shell session that created them.
-    /// Mutually exclusive with `expires`, `ttl`, and `ttl_seconds`.
-    #[serde(default)]
-    pub session: Option<bool>,
-
-    /// Session identifier this rule is bound to when `session = true`.
-    #[serde(default)]
-    pub session_id: Option<String>,
-
-    /// Timestamp when this rule was created (ISO 8601 format).
-    ///
-    /// Required for TTL-based expiration. If not set when a TTL is specified,
-    /// it will be automatically set to the current time when the rule is loaded.
-    #[serde(default)]
-    pub created_at: Option<String>,
-}
-
-impl Default for AllowlistRule {
-    fn default() -> Self {
-        Self {
-            pattern: String::new(),
-            paths: None,
-            comment: None,
-            expires: None,
-            ttl: None,
-            ttl_seconds: None,
-            session: None,
-            session_id: None,
-            created_at: None,
-        }
-    }
-}
-
-/// Parse a human-readable TTL duration string into seconds.
-///
-/// Supported formats:
-/// - Seconds: "30", "30s", "30 sec", "30 seconds"
-/// - Minutes: "30m", "30min", "30 minutes", "30 minute"
-/// - Hours: "4h", "4hr", "4 hours", "4 hour"
-/// - Days: "7d", "7 day", "7 days"
-/// - Weeks: "1w", "1 week", "1 weeks"
-/// - Combined: "1h30m", "1 hour 30 minutes", "2d4h"
-///
-/// # Errors
-///
-/// Returns an error if the format is invalid or the number cannot be parsed.
-pub fn parse_ttl_duration(s: &str) -> Result<u64, String> {
-    let s = s.trim().to_lowercase();
-    if s.is_empty() {
-        return Err("TTL duration cannot be empty".to_string());
-    }
-
-    if s.chars().all(|c| c.is_ascii_digit()) {
-        let seconds = s
-            .parse::<u64>()
-            .map_err(|_| format!("invalid TTL number: '{s}'"))?;
-        return if seconds == 0 {
-            Err("TTL duration must be greater than zero".to_string())
-        } else {
-            Ok(seconds)
-        };
-    }
-
-    let bytes = s.as_bytes();
-    let mut pos = 0;
-    let mut total_seconds = 0_u64;
-
-    while pos < bytes.len() {
-        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
-            pos += 1;
-        }
-        if pos >= bytes.len() {
-            break;
-        }
-
-        let number_start = pos;
-        while pos < bytes.len() && bytes[pos].is_ascii_digit() {
-            pos += 1;
-        }
-        if number_start == pos {
-            return Err(format!("expected TTL number near '{}'", &s[number_start..]));
-        }
-
-        let num_str = &s[number_start..pos];
-        let num = num_str
-            .parse::<u64>()
-            .map_err(|_| format!("invalid TTL number: '{num_str}'"))?;
-
-        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
-            pos += 1;
-        }
-        let unit_start = pos;
-        while pos < bytes.len() && bytes[pos].is_ascii_alphabetic() {
-            pos += 1;
-        }
-        if unit_start == pos {
-            return Err(format!("missing TTL unit after '{num_str}'"));
-        }
-
-        let unit = &s[unit_start..pos];
-        let multiplier = match unit {
-            "s" | "sec" | "secs" | "second" | "seconds" => 1,
-            "m" | "min" | "mins" | "minute" | "minutes" => 60,
-            "h" | "hr" | "hrs" | "hour" | "hours" => 3600,
-            "d" | "day" | "days" => 86_400,
-            "w" | "week" | "weeks" => 604_800,
-            _ => return Err(format!("unknown TTL unit: '{unit}'")),
-        };
-
-        let component = num
-            .checked_mul(multiplier)
-            .ok_or_else(|| format!("TTL overflow: {num} * {multiplier}"))?;
-        total_seconds = total_seconds
-            .checked_add(component)
-            .ok_or_else(|| "TTL overflow while adding duration components".to_string())?;
-
-        if pos < bytes.len() && !bytes[pos].is_ascii_whitespace() && !bytes[pos].is_ascii_digit() {
-            let unexpected = s[pos..].chars().next().unwrap_or('\0');
-            return Err(format!("unexpected TTL character: '{unexpected}'"));
-        }
-    }
-
-    if total_seconds == 0 {
-        Err("TTL duration must be greater than zero".to_string())
-    } else {
-        Ok(total_seconds)
-    }
-}
-
-impl AllowlistRule {
-    /// Check if this rule is currently active (not expired).
-    #[must_use]
-    pub fn is_active(&self) -> bool {
-        let now = Utc::now();
-
-        if self.session.unwrap_or(false) {
-            let Some(bound_session_id) = self.session_id.as_deref().map(str::trim) else {
-                return false;
-            };
-            if bound_session_id.is_empty() {
-                return false;
-            }
-
-            let Some(current_session_id) = crate::allowlist::current_session_id() else {
-                return false;
-            };
-            if bound_session_id != current_session_id.trim() {
-                return false;
-            }
-        }
-
-        // Check absolute expiration timestamp
-        if let Some(expires_str) = &self.expires {
-            if let Ok(expires) = DateTime::parse_from_rfc3339(expires_str) {
-                if now >= expires {
-                    return false;
-                }
-            }
-        }
-
-        // Check TTL-based expiration (requires created_at)
-        if let Some(created_str) = &self.created_at {
-            if let Ok(created) = DateTime::parse_from_rfc3339(created_str) {
-                // Try ttl (human-readable) first, then ttl_seconds
-                let ttl_secs = if let Some(ttl_str) = &self.ttl {
-                    parse_ttl_duration(ttl_str).ok()
-                } else {
-                    self.ttl_seconds
-                };
-
-                if let Some(secs) = ttl_secs {
-                    let expires_at = created + chrono::Duration::seconds(secs as i64);
-                    if now >= expires_at {
-                        return false;
-                    }
-                }
-            }
-        }
-
-        true
-    }
-
-    /// Check if this rule applies globally (no path restrictions).
-    #[must_use]
-    pub fn is_global(&self) -> bool {
-        match &self.paths {
-            None => true,
-            Some(paths) => paths.is_empty() || paths.iter().any(|p| p == "*"),
-        }
-    }
-
-    /// Validate the rule.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - Pattern is empty
-    /// - Paths contain invalid glob patterns
-    /// - Expires format is invalid
-    /// - TTL format is invalid
-    /// - Multiple expiration methods are specified (only one of expires/ttl/ttl_seconds/session allowed)
-    pub fn validate(&self) -> Result<(), String> {
-        // Pattern must be non-empty
-        if self.pattern.trim().is_empty() {
-            return Err("allowlist rule pattern must be non-empty".to_string());
-        }
-
-        // Count how many expiration methods are set
-        let expiration_count = [
-            self.expires.is_some(),
-            self.ttl.is_some(),
-            self.ttl_seconds.is_some(),
-            self.session.unwrap_or(false),
-        ]
-        .iter()
-        .filter(|&&b| b)
-        .count();
-
-        if expiration_count > 1 {
-            return Err(
-                "only one of expires, ttl, ttl_seconds, or session should be set".to_string(),
-            );
-        }
-
-        if self.session.unwrap_or(false)
-            && self
-                .session_id
-                .as_deref()
-                .map(str::trim)
-                .is_none_or(str::is_empty)
-        {
-            return Err("session=true requires non-empty session_id".to_string());
-        }
-
-        // Validate expires format if present
-        if let Some(expires_str) = &self.expires {
-            match DateTime::parse_from_rfc3339(expires_str) {
-                Ok(expires) => {
-                    // Warn if already expired (not an error, just informational)
-                    let now = Utc::now();
-                    if now >= expires {
-                        // Log warning but don't fail - the rule will just be inactive
-                        eprintln!(
-                            "warning: allowlist rule '{}' has already expired ({})",
-                            self.pattern, expires_str
-                        );
-                    }
-                }
-                Err(_) => {
-                    return Err(format!(
-                        "invalid expires format '{}': expected ISO 8601 (e.g., 2024-06-01T00:00:00Z)",
-                        expires_str
-                    ));
-                }
-            }
-        }
-
-        // Validate TTL format if present
-        if let Some(ttl_str) = &self.ttl {
-            parse_ttl_duration(ttl_str).map_err(|e| format!("invalid TTL '{}': {}", ttl_str, e))?;
-        }
-
-        // Validate created_at format if present
-        if let Some(created_str) = &self.created_at {
-            if DateTime::parse_from_rfc3339(created_str).is_err() {
-                return Err(format!(
-                    "invalid created_at format '{}': expected ISO 8601 (e.g., 2024-06-01T00:00:00Z)",
-                    created_str
-                ));
-            }
-        }
-
-        // Warn if TTL is set but created_at is missing (rule won't expire as expected)
-        if (self.ttl.is_some() || self.ttl_seconds.is_some()) && self.created_at.is_none() {
-            eprintln!(
-                "warning: allowlist rule '{}' has TTL but no created_at timestamp; \
-                 TTL will be computed from when the rule is first loaded",
-                self.pattern
-            );
-        }
-
-        // Validate path patterns (basic check for common mistakes)
-        if let Some(paths) = &self.paths {
-            for path in paths {
-                if path.trim().is_empty() {
-                    return Err("allowlist rule path pattern must be non-empty".to_string());
-                }
-                // Check for obviously invalid patterns
-                if path.contains("**/**") {
-                    return Err(format!(
-                        "invalid glob pattern '{}': consecutive ** not allowed",
-                        path
-                    ));
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Ensure the rule has a created_at timestamp.
-    ///
-    /// If `created_at` is not set and a TTL is specified, this sets it to the
-    /// current time. This should be called when loading rules from config.
-    pub fn ensure_created_at(&mut self) {
-        if self.created_at.is_none() && (self.ttl.is_some() || self.ttl_seconds.is_some()) {
-            self.created_at = Some(Utc::now().to_rfc3339());
-        }
-    }
-
-    /// Get the effective TTL in seconds, if any.
-    ///
-    /// Returns the TTL from either the human-readable `ttl` field or the
-    /// numeric `ttl_seconds` field.
-    #[must_use]
-    pub fn effective_ttl_seconds(&self) -> Option<u64> {
-        if let Some(ttl_str) = &self.ttl {
-            parse_ttl_duration(ttl_str).ok()
-        } else {
-            self.ttl_seconds
-        }
-    }
 }
 
 /// An allow override - patterns that should be permitted.
@@ -2187,18 +3223,23 @@ pub struct HistoryConfig {
     /// Redaction mode for stored commands.
     pub redaction_mode: HistoryRedactionMode,
     /// Retention window in days.
+    #[schemars(range(min = 1, max = 3650))]
     pub retention_days: u32,
     /// Maximum database size in megabytes.
+    #[schemars(range(min = 1))]
     pub max_size_mb: u32,
     /// Optional database file path override.
     pub database_path: Option<String>,
     /// Enable automatic pruning of old entries.
     pub auto_prune: bool,
     /// Interval in hours between automatic prune checks.
+    #[schemars(range(min = 1))]
     pub prune_check_interval_hours: u32,
     /// Batch size for write operations (improves performance).
+    #[schemars(range(min = 1))]
     pub batch_size: u32,
     /// Flush interval in milliseconds for batched writes.
+    #[schemars(range(min = 1))]
     pub batch_flush_interval_ms: u32,
 }
 
@@ -2239,7 +3280,7 @@ impl HistoryConfig {
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid retention values.
+    /// Returns an error for invalid history values.
     pub fn validate(&self) -> Result<(), String> {
         if self.retention_days == 0 {
             return Err("history retention_days must be at least 1".to_string());
@@ -2250,7 +3291,48 @@ impl HistoryConfig {
                 Self::MAX_RETENTION_DAYS
             ));
         }
+        if self.max_size_mb == 0 {
+            return Err("history max_size_mb must be at least 1".to_string());
+        }
+        if self.prune_check_interval_hours == 0 {
+            return Err("history prune_check_interval_hours must be at least 1".to_string());
+        }
+        if self.batch_size == 0 {
+            return Err("history batch_size must be at least 1".to_string());
+        }
+        if self.batch_flush_interval_ms == 0 {
+            return Err("history batch_flush_interval_ms must be at least 1".to_string());
+        }
         Ok(())
+    }
+
+    /// Repair invalid runtime values to conservative, non-spinning minima.
+    ///
+    /// The public config type can be constructed directly and layered TOML is
+    /// intentionally presence-aware, so schema validation alone is not a
+    /// runtime boundary. Return whether any value needed repair so the loader
+    /// can surface a single concise warning.
+    fn normalize_runtime_invariants(&mut self) -> bool {
+        let original = (
+            self.retention_days,
+            self.max_size_mb,
+            self.prune_check_interval_hours,
+            self.batch_size,
+            self.batch_flush_interval_ms,
+        );
+        self.retention_days = self.retention_days.clamp(1, Self::MAX_RETENTION_DAYS);
+        self.max_size_mb = self.max_size_mb.max(1);
+        self.prune_check_interval_hours = self.prune_check_interval_hours.max(1);
+        self.batch_size = self.batch_size.max(1);
+        self.batch_flush_interval_ms = self.batch_flush_interval_ms.max(1);
+        original
+            != (
+                self.retention_days,
+                self.max_size_mb,
+                self.prune_check_interval_hours,
+                self.batch_size,
+                self.batch_flush_interval_ms,
+            )
     }
 }
 
@@ -2354,6 +3436,12 @@ impl std::fmt::Display for StrictnessLevel {
 }
 
 /// Git branch-aware strictness configuration.
+///
+/// **`[git_awareness]` is not applied to hook decisions.** Its strictness can
+/// only relax a denial, and the agent being guarded can choose its branch
+/// before the command it wants run, so honoring them would be a
+/// self-service downgrade. `dcg config` and `dcg doctor` warn when
+/// `enabled = true`.
 ///
 /// This allows different strictness levels based on the current git branch,
 /// providing more protection on important branches and more freedom on
@@ -2813,6 +3901,8 @@ impl CompiledBlockOverride {
 /// evaluations. It eliminates per-command regex compilation overhead.
 #[derive(Debug, Default)]
 pub struct CompiledOverrides {
+    /// Fatal trusted-config failure, checked before every authorization path.
+    pub configuration_error: Option<String>,
     /// Compiled allow overrides.
     pub allow: Vec<CompiledAllowOverride>,
     /// Compiled block overrides.
@@ -2841,10 +3931,37 @@ pub enum PatternKind {
 
 impl CompiledOverrides {
     /// Check allow overrides. Returns true if command should be allowed.
+    ///
+    /// Allow patterns are substring-matched, and this check runs *before* pack
+    /// evaluation, so on a compound command a single matching entry used to
+    /// return `allowed` for text it never examined: an entry naming a scratch
+    /// path allowed that path plus whatever followed the `&&` (#340). A
+    /// safe segment silencing a destructive one is the same bypass class
+    /// `split_command_segments` already closes for pack patterns, so allow
+    /// overrides now clear each segment on its own terms.
+    ///
+    /// A single-segment command keeps the historical whole-string semantics.
+    /// A compound command is allowed only when every segment is itself
+    /// allowed; an entry that covers one segment no longer speaks for the
+    /// rest, and anything uncovered falls through to normal evaluation.
+    /// Anchored entries compose across a chain for the first time as a
+    /// result — previously `^a$` and `^b$` allowed neither half of `a && b`.
     #[inline]
     #[must_use]
     pub fn check_allow(&self, command: &str) -> bool {
-        self.allow.iter().any(|o| o.matches(command))
+        if self.allow.is_empty() {
+            return false;
+        }
+
+        let segments = crate::packs::split_command_segments(command);
+        if segments.len() <= 1 {
+            return self.allow.iter().any(|o| o.matches(command));
+        }
+
+        segments.iter().all(|segment| {
+            let segment = segment.trim();
+            segment.is_empty() || self.allow.iter().any(|o| o.matches(segment))
+        })
     }
 
     /// Check block overrides. Returns the reason if command should be blocked.
@@ -2868,7 +3985,10 @@ impl OverridesConfig {
     /// Use `CompiledOverrides::invalid_patterns` to check for issues.
     #[must_use]
     pub fn compile(&self) -> CompiledOverrides {
-        let mut compiled = CompiledOverrides::default();
+        let mut compiled = CompiledOverrides {
+            configuration_error: self.configuration_error.clone(),
+            ..CompiledOverrides::default()
+        };
 
         // Compile allow overrides
         for allow in &self.allow {
@@ -2929,147 +4049,7 @@ impl OverridesConfig {
             }
         }
 
-        // Compile simple allowlist patterns (backward-compatible format)
-        if let Some(allowlist) = &self.allowlist {
-            for pattern in allowlist {
-                if pattern.trim().is_empty() {
-                    continue;
-                }
-                match CompiledRegex::new(pattern) {
-                    Ok(regex) => {
-                        compiled.allow.push(CompiledAllowOverride {
-                            regex,
-                            pattern: pattern.clone(),
-                            condition: ConditionCheck::Always,
-                        });
-                    }
-                    Err(e) => {
-                        compiled.invalid_patterns.push(InvalidPattern {
-                            pattern: pattern.clone(),
-                            error: e.clone(),
-                            kind: PatternKind::Allow,
-                        });
-                    }
-                }
-            }
-        }
-
-        // Compile extended allowlist rules
-        if let Some(rules) = &self.allowlist_rules {
-            for rule in rules {
-                // Skip inactive (expired) rules
-                if !rule.is_active() {
-                    continue;
-                }
-
-                // Validate the rule - skip invalid ones but log the error
-                if let Err(e) = rule.validate() {
-                    compiled.invalid_patterns.push(InvalidPattern {
-                        pattern: rule.pattern.clone(),
-                        error: e,
-                        kind: PatternKind::Allow,
-                    });
-                    continue;
-                }
-
-                match CompiledRegex::new(&rule.pattern) {
-                    Ok(regex) => {
-                        compiled.allow.push(CompiledAllowOverride {
-                            regex,
-                            pattern: rule.pattern.clone(),
-                            condition: ConditionCheck::Always,
-                        });
-                    }
-                    Err(e) => {
-                        compiled.invalid_patterns.push(InvalidPattern {
-                            pattern: rule.pattern.clone(),
-                            error: e.clone(),
-                            kind: PatternKind::Allow,
-                        });
-                    }
-                }
-            }
-        }
-
         compiled
-    }
-
-    /// Load and merge all allowlist rules from both formats.
-    ///
-    /// This returns a unified list of `AllowlistRule` structs, converting
-    /// simple allowlist patterns to the extended format.
-    #[must_use]
-    pub fn load_allowlist(&self) -> Vec<AllowlistRule> {
-        let mut rules = Vec::new();
-
-        // Convert simple format to AllowlistRule
-        if let Some(simple) = &self.allowlist {
-            for pattern in simple {
-                if pattern.trim().is_empty() {
-                    continue;
-                }
-                rules.push(AllowlistRule {
-                    pattern: pattern.clone(),
-                    paths: None, // None means global
-                    ..Default::default()
-                });
-            }
-        }
-
-        // Add extended format rules
-        if let Some(extended) = &self.allowlist_rules {
-            for rule in extended {
-                // Only include active rules
-                if rule.is_active() {
-                    rules.push(rule.clone());
-                }
-            }
-        }
-
-        // Warn on duplicate patterns (log to stderr in debug builds)
-        #[cfg(debug_assertions)]
-        {
-            let mut seen = std::collections::HashSet::new();
-            for rule in &rules {
-                if !seen.insert(&rule.pattern) {
-                    eprintln!(
-                        "dcg: warning: duplicate allowlist pattern: {}",
-                        rule.pattern
-                    );
-                }
-            }
-        }
-
-        rules
-    }
-
-    /// Validate all allowlist rules.
-    ///
-    /// # Errors
-    ///
-    /// Returns a list of validation errors for invalid rules.
-    pub fn validate_allowlist(&self) -> Vec<String> {
-        let mut errors = Vec::new();
-
-        // Validate simple patterns
-        if let Some(patterns) = &self.allowlist {
-            for (i, pattern) in patterns.iter().enumerate() {
-                if pattern.trim().is_empty() {
-                    errors.push(format!("allowlist[{}]: pattern must be non-empty", i));
-                }
-            }
-        }
-
-        // Validate extended rules
-        if let Some(rules) = &self.allowlist_rules {
-            for (i, rule) in rules.iter().enumerate() {
-                if let Err(e) = rule.validate() {
-                    errors.push(format!("allowlist_rules[{}]: {}", i, e));
-                }
-            }
-        }
-
-        errors
     }
 }
 
@@ -3090,77 +4070,389 @@ impl Config {
     /// Priority (highest to lowest):
     /// 1. Environment variables (settings overrides)
     /// 2. Explicit config file (`DCG_CONFIG=/path/to/config.toml`)
-    /// 3. Project config (`.dcg.toml` in repo root)
-    /// 4. User config (`$XDG_CONFIG_HOME/dcg/config.toml`, `~/.config/dcg/config.toml`,
+    /// 3. User config (`$XDG_CONFIG_HOME/dcg/config.toml`, `~/.config/dcg/config.toml`,
     ///    or platform-native config dir)
-    /// 5. System config (`/etc/dcg/config.toml`)
-    /// 6. Compiled defaults
+    /// 4. System config (`/etc/dcg/config.toml`)
+    /// 5. Compiled defaults
+    ///
+    /// An automatically discovered project `.dcg.toml` is not a trusted
+    /// precedence layer. Its monotonic enforcement-only subset is applied
+    /// after user/system files; settings that could weaken or redirect policy
+    /// are discarded. Set `DCG_CONFIG=.dcg.toml` to make a project file an
+    /// explicit, fully trusted config source for that invocation.
     #[must_use]
     pub fn load() -> Self {
+        // Hook mode is latency-sensitive. The shared loader keeps tracing
+        // disabled here so ordinary evaluations do not allocate diagnostic
+        // vectors/paths/details that only `config` and `doctor` consume.
+        Self::load_internal(false, None).0
+    }
+
+    /// Load the effective configuration and retain an auditable account of
+    /// every file source the loader considered.
+    ///
+    /// Diagnostics must consume this report rather than re-deriving source
+    /// state with `Path::exists()`: a path can exist yet be rejected by the
+    /// Unix trust policy, intentionally ignored on a non-Unix platform, or
+    /// skipped because a valid `DCG_CONFIG` replaces the default user file.
+    #[must_use]
+    pub(crate) fn load_with_report() -> ConfigLoadReport {
+        let (config, sources) = Self::load_internal(true, None);
+        ConfigLoadReport {
+            config,
+            sources: sources.expect("source tracing requested"),
+        }
+    }
+
+    /// Load a CLI-selected file with the same trust, precedence and environment
+    /// handling as DCG_CONFIG. A CLI path takes precedence over DCG_CONFIG.
+    #[must_use]
+    pub fn load_with_explicit_path(path: &Path) -> Self {
+        Self::load_internal(false, Some(path)).0
+    }
+
+    /// Why trusted policy could not be loaded. No command is verified while
+    /// this is present, even if another layer contains an allow override.
+    #[must_use]
+    pub fn configuration_error(&self) -> Option<&str> {
+        self.overrides.configuration_error.as_deref()
+    }
+
+    fn failed_config_layer(path: &Path, detail: &str) -> ConfigLayer {
+        // Keep diagnostics bounded and terminal-safe. Automatic project source
+        // text never reaches this function.
+        let path: String = path
+            .to_string_lossy()
+            .chars()
+            .take(1024)
+            .flat_map(char::escape_default)
+            .collect();
+        let detail: String = detail
+            .chars()
+            .take(1024)
+            .flat_map(char::escape_default)
+            .collect();
+        let reason = format!(
+            "DCG configuration error in '{path}': {detail}. Required protection \
+             policies could not be loaded; command evaluation is blocked. \
+             Repair the configuration and run 'dcg doctor --strict'."
+        );
+        ConfigLayer {
+            overrides: Some(OverridesConfig {
+                configuration_error: Some(reason),
+                ..OverridesConfig::default()
+            }),
+            ..ConfigLayer::default()
+        }
+    }
+
+    fn load_internal(
+        capture_sources: bool,
+        explicit_path_override: Option<&Path>,
+    ) -> (Self, Option<Vec<ConfigSourceOutcome>>) {
         // Start with truly empty defaults - packs must be explicitly enabled.
         // generate_default() is for sample configs shown to users, not runtime defaults.
         let mut config = Self::default();
-        if policy_files_disabled() {
-            config.apply_env_overrides();
-            return config;
-        }
+        let mut sources = capture_sources.then(Vec::new);
         let cwd = env::current_dir().ok();
 
         // Optional explicit config path override (highest-priority file config).
-        let explicit_layer = env::var(ENV_CONFIG_PATH)
+        // It is parsed first so the explicitly selected source can suppress the
+        // default user path; its outcome is appended last to preserve the
+        // actual low-to-high precedence order exposed to diagnostics.
+        let selected_path = if let Some(path) = explicit_path_override {
+            if path.as_os_str().is_empty() {
+                Err("the explicit config path is empty")
+            } else {
+                Ok(Some(path.to_path_buf()))
+            }
+        } else if policy_files_disabled() {
+            Ok(None)
+        } else {
+            match env::var(ENV_CONFIG_PATH) {
+                Ok(value) => resolve_config_path_value(&value, cwd.as_deref())
+                    .map(Some)
+                    .ok_or("DCG_CONFIG is set but empty"),
+                Err(env::VarError::NotPresent) => Ok(None),
+                Err(env::VarError::NotUnicode(_)) => Err("DCG_CONFIG is not valid Unicode"),
+            }
+        };
+        let (explicit_layer, explicit_outcome) = match &selected_path {
+            Ok(Some(path)) => Self::load_layer_from_file_with_outcome(
+                path,
+                ConfigSource::Untrusted,
+                ConfigFileLayer::Explicit,
+                ConfigFileAuthority::Full,
+                capture_sources,
+            ),
+            Ok(None) => (None, None),
+            Err(detail) => (
+                Some(Self::failed_config_layer(
+                    Path::new("DCG_CONFIG/--config"),
+                    detail,
+                )),
+                capture_sources.then(|| {
+                    ConfigSourceOutcome::new(
+                        ConfigFileLayer::Explicit,
+                        ConfigFileAuthority::Full,
+                        ConfigFileStatus::Rejected,
+                        None,
+                        Some((*detail).to_string()),
+                    )
+                }),
+            ),
+        };
+        // Selecting the repository file explicitly promotes it to a trusted
+        // source. Do not apply it again as an automatic hardening contribution.
+        let explicit_project_policy = selected_path
+            .as_ref()
             .ok()
-            .and_then(|value| resolve_config_path_value(&value, cwd.as_deref()))
-            .and_then(|path| Self::load_layer_from_file(&path));
+            .and_then(|path| path.as_deref())
+            .and_then(|path| fs::canonicalize(path).ok())
+            .is_some_and(|selected| {
+                cwd.as_deref()
+                    .and_then(|dir| find_repo_root(dir, REPO_ROOT_SEARCH_MAX_HOPS))
+                    .and_then(|root| fs::canonicalize(root.join(PROJECT_CONFIG_NAME)).ok())
+                    .is_some_and(|project| selected == project)
+            });
 
         // Load system config (lowest priority of file configs)
-        if let Some(system_config) = Self::load_system_config_layer() {
-            config.merge_layer(system_config);
+        if !policy_files_disabled() {
+            let system_path = system_config_dir().join(CONFIG_FILE_NAME);
+            let (system_config, system_outcome) = Self::load_layer_from_file_with_outcome(
+                &system_path,
+                ConfigSource::System,
+                ConfigFileLayer::System,
+                ConfigFileAuthority::Full,
+                capture_sources,
+            );
+            record_config_outcome(&mut sources, system_outcome);
+            if let Some(system_config) = system_config {
+                config.merge_layer(system_config);
+            }
         }
 
         // Load user config
         //
-        // If an explicit config file is present and valid, we treat it as the
+        // An explicit config file (including a fatal load failure) is the
         // user-level config and skip loading the default user config path to
         // reduce layering confusion.
-        if explicit_layer.is_none() {
-            if let Some(user_config) = Self::load_user_config_layer() {
+        if explicit_layer.is_some() {
+            if let Some(sources) = sources.as_mut() {
+                let user_path = Self::user_config_candidates()
+                    .into_iter()
+                    .find(|path| fs::symlink_metadata(path).is_ok());
+                sources.push(ConfigSourceOutcome::new(
+                    ConfigFileLayer::User,
+                    ConfigFileAuthority::Full,
+                    ConfigFileStatus::Skipped,
+                    user_path,
+                    Some(
+                        "an explicit config selection replaces the default user config".to_string(),
+                    ),
+                ));
+            }
+        } else if !policy_files_disabled() {
+            let user_config = Self::load_user_config_layer_with_outcomes(&mut sources);
+            if let Some(user_config) = user_config {
                 config.merge_layer(user_config);
             }
         }
 
-        // Load project config (if in a git repo)
-        if let Some(project_config) = Self::load_project_config_layer_from(cwd.as_deref()) {
-            config.merge_layer(project_config);
+        let project_path = cwd
+            .as_deref()
+            .filter(|_| !policy_files_disabled())
+            .and_then(|start_dir| find_repo_root(start_dir, REPO_ROOT_SEARCH_MAX_HOPS))
+            .map(|repo_root| repo_root.join(PROJECT_CONFIG_NAME));
+        if explicit_project_policy {
+            if let Some(sources) = sources.as_mut() {
+                sources.push(ConfigSourceOutcome::new(
+                    ConfigFileLayer::AutomaticProject,
+                    ConfigFileAuthority::EnforcementOnly,
+                    ConfigFileStatus::Skipped,
+                    project_path,
+                    Some(
+                        "the same repository config was selected explicitly; duplicate automatic merge suppressed"
+                            .to_string(),
+                    ),
+                ));
+            }
+        } else if let Some(project_path) = project_path {
+            let (project_layer, project_outcome) = Self::load_layer_from_file_with_outcome(
+                &project_path,
+                ConfigSource::AutoProject,
+                ConfigFileLayer::AutomaticProject,
+                ConfigFileAuthority::EnforcementOnly,
+                capture_sources,
+            );
+            record_config_outcome(&mut sources, project_outcome);
+            if let Some(project_layer) = project_layer {
+                config.merge_layer(project_layer.into_restricted_project_policy());
+            }
+        } else if let Some(sources) = sources.as_mut() {
+            sources.push(ConfigSourceOutcome::new(
+                ConfigFileLayer::AutomaticProject,
+                ConfigFileAuthority::EnforcementOnly,
+                ConfigFileStatus::Missing,
+                None,
+                Some("current directory is not inside a Git repository".to_string()),
+            ));
         }
 
-        // Apply explicit config last among file configs (if present and valid).
+        // Explicit config is the highest-priority file layer.
         if let Some(explicit_layer) = explicit_layer {
             config.merge_layer(explicit_layer);
         }
+        record_config_outcome(&mut sources, explicit_outcome);
 
         // Apply environment variable overrides (highest priority)
         config.apply_env_overrides();
+        if config.history.normalize_runtime_invariants() {
+            crate::emit_stderr!(
+                "Warning: invalid history limits were clamped to safe runtime values \
+                 (retention_days=1..={}, max_size_mb>=1, prune_check_interval_hours>=1, \
+                 batch_size>=1, batch_flush_interval_ms>=1)",
+                HistoryConfig::MAX_RETENTION_DAYS
+            );
+        }
 
-        config
+        // Publish the rule-scoped target exemptions (#284) so the pack matchers
+        // can consult them without a `&Config` parameter. The automatic project
+        // layer was already reduced above, so nothing here is repo-authored.
+        publish_rule_target_exemptions(&config);
+
+        (config, sources)
     }
 
-    /// Load a configuration *layer* from a specific file.
+    /// Merge the automatic repository hardening subset and the explicit file.
     ///
-    /// Layers preserve field presence (via `Option<T>`) so higher-precedence
-    /// configs can explicitly set values back to defaults.
-    #[must_use]
-    fn load_layer_from_file(path: &Path) -> Option<ConfigLayer> {
-        let content = read_config_file_bounded(path, ConfigSource::Untrusted)?;
+    /// The project loader is lazy so selecting the repository's own
+    /// `.dcg.toml` explicitly neither reparses nor reapplies the same file.
+    /// This matters for additive fields such as `packs.enabled`.
+    #[cfg(test)]
+    fn merge_project_and_explicit_layers<F>(
+        &mut self,
+        explicit_layer: Option<ConfigLayer>,
+        explicit_project_policy: bool,
+        project_layer: F,
+    ) where
+        F: FnOnce() -> Option<ConfigLayer>,
+    {
+        if !explicit_project_policy {
+            if let Some(project_layer) = project_layer() {
+                self.merge_layer(project_layer);
+            }
+        }
 
+        // Explicit config is the highest-priority file layer.
+        if let Some(explicit_layer) = explicit_layer {
+            self.merge_layer(explicit_layer);
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn load_layer_from_file_with_source(path: &Path, source: ConfigSource) -> Option<ConfigLayer> {
+        Self::load_layer_from_file_with_outcome(
+            path,
+            source,
+            match source {
+                ConfigSource::AutoProject => ConfigFileLayer::AutomaticProject,
+                ConfigSource::System => ConfigFileLayer::System,
+                ConfigSource::Untrusted => ConfigFileLayer::Explicit,
+            },
+            if source == ConfigSource::AutoProject {
+                ConfigFileAuthority::EnforcementOnly
+            } else {
+                ConfigFileAuthority::Full
+            },
+            false,
+        )
+        .0
+    }
+
+    fn load_layer_from_file_with_outcome(
+        path: &Path,
+        source: ConfigSource,
+        layer: ConfigFileLayer,
+        authority: ConfigFileAuthority,
+        capture_outcome: bool,
+    ) -> (Option<ConfigLayer>, Option<ConfigSourceOutcome>) {
+        let content = match read_config_file_result(path, source) {
+            Ok(content) => content,
+            Err(error) => {
+                let failed_layer = error
+                    .blocks_trusted_layer(source, layer)
+                    .then(|| Self::failed_config_layer(path, error.detail()));
+                let outcome = capture_outcome.then(|| {
+                    let (status, detail) = failed_config_read_outcome(path, source);
+                    ConfigSourceOutcome::new(
+                        layer,
+                        authority,
+                        status,
+                        Some(path.to_path_buf()),
+                        detail,
+                    )
+                });
+                return (failed_layer, outcome);
+            }
+        };
         match toml::from_str(&content) {
-            Ok(layer) => Some(layer),
-            Err(e) => {
-                eprintln!(
-                    "Warning: Failed to parse config file '{}': {}",
-                    path.display(),
-                    e
+            Ok(parsed) => (
+                Some(parsed),
+                capture_outcome.then(|| {
+                    ConfigSourceOutcome::new(
+                        layer,
+                        authority,
+                        ConfigFileStatus::Loaded,
+                        Some(path.to_path_buf()),
+                        None,
+                    )
+                }),
+            ),
+            Err(error) if source == ConfigSource::AutoProject => {
+                let detail = safe_auto_project_toml_error(&content, &error);
+                crate::emit_stderr!("Warning: {}; ignoring it", detail);
+                (
+                    None,
+                    capture_outcome.then(|| {
+                        ConfigSourceOutcome::new(
+                            layer,
+                            authority,
+                            ConfigFileStatus::Invalid,
+                            Some(path.to_path_buf()),
+                            Some(detail),
+                        )
+                    }),
+                )
+            }
+            Err(error) => {
+                // Retain a non-overridable failure instead of dropping policies.
+                // Error::message omits the potentially large source excerpt.
+                let offset = error.span().map_or(0, |span| span.start.min(content.len()));
+                let line = content
+                    .as_bytes()
+                    .iter()
+                    .take(offset)
+                    .filter(|byte| **byte == b'\n')
+                    .count()
+                    + 1;
+                let detail = format!(
+                    "invalid TOML or policy value at line {line}: {}",
+                    error.message()
                 );
-                None
+                let failed_layer = Self::failed_config_layer(path, &detail);
+                (
+                    Some(failed_layer),
+                    capture_outcome.then(|| {
+                        ConfigSourceOutcome::new(
+                            layer,
+                            authority,
+                            ConfigFileStatus::Invalid,
+                            Some(path.to_path_buf()),
+                            Some(detail),
+                        )
+                    }),
+                )
             }
         }
     }
@@ -3168,77 +4460,88 @@ impl Config {
     /// Load configuration from a specific file.
     #[must_use]
     pub fn load_from_file(path: &Path) -> Option<Self> {
-        let content = fs::read_to_string(path).ok()?;
-        toml::from_str(&content).ok()
-    }
-
-    /// Load system-wide configuration.
-    ///
-    /// The system config path is treated as a privileged config source: it sits
-    /// in `ConfigSource::System`, which means `read_config_file_bounded` refuses
-    /// to follow symlinks pointing at user-writable targets (a non-root user
-    /// could otherwise influence system-layer config by symlinking it into their
-    /// home directory).
-    fn load_system_config_layer() -> Option<ConfigLayer> {
-        let path = system_config_dir().join(CONFIG_FILE_NAME);
-        let content = read_config_file_bounded(&path, ConfigSource::System)?;
-        match toml::from_str(&content) {
-            Ok(layer) => Some(layer),
-            Err(e) => {
-                eprintln!(
-                    "Warning: Failed to parse system config file '{}': {}",
-                    path.display(),
-                    e
-                );
-                None
-            }
+        let content = read_config_file_bounded(path, ConfigSource::Untrusted)?;
+        let mut config: Self = toml::from_str(&content).ok()?;
+        if config.history.normalize_runtime_invariants() {
+            crate::emit_stderr!(
+                "Warning: invalid history limits in '{}' were clamped to safe runtime values",
+                path.display()
+            );
         }
+        Some(config)
     }
 
-    /// Load user configuration.
-    ///
-    /// Checks XDG_CONFIG_HOME, XDG-style (`~/.config/dcg/`), and platform-native paths.
-    /// This ensures users can use `~/.config/dcg/config.toml` on all platforms,
-    /// including macOS where `dirs::config_dir()` returns `~/Library/Application Support`.
-    fn load_user_config_layer() -> Option<ConfigLayer> {
-        // First try XDG_CONFIG_HOME (if set)
+    fn user_config_candidates() -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+        let mut push_unique = |path: PathBuf| {
+            if !candidates.contains(&path) {
+                candidates.push(path);
+            }
+        };
+
         if let Ok(xdg_home) = env::var("XDG_CONFIG_HOME") {
             if let Some(xdg_home) = resolve_config_path_value(&xdg_home, None) {
-                let xdg_path = xdg_home.join("dcg").join(CONFIG_FILE_NAME);
-                if xdg_path.exists() {
-                    if let Some(layer) = Self::load_layer_from_file(&xdg_path) {
-                        return Some(layer);
-                    }
-                }
+                push_unique(xdg_home.join("dcg").join(CONFIG_FILE_NAME));
             }
         }
 
-        // Next try XDG-style path (~/.config/dcg/config.toml)
-        // This is what users expect and works consistently across platforms
-        if let Some(home) = dirs::home_dir() {
-            let xdg_path = home.join(".config").join("dcg").join(CONFIG_FILE_NAME);
-            if xdg_path.exists() {
-                if let Some(layer) = Self::load_layer_from_file(&xdg_path) {
-                    return Some(layer);
-                }
-            }
+        if let Some(home) = home_dir() {
+            push_unique(home.join(".config").join("dcg").join(CONFIG_FILE_NAME));
         }
 
-        // Fall back to platform-native path (e.g., ~/Library/Application Support/dcg/ on macOS)
-        let config_dir = dirs::config_dir()?;
-        let path = config_dir.join("dcg").join(CONFIG_FILE_NAME);
-        Self::load_layer_from_file(&path)
+        if let Some(config_dir) = user_config_dir() {
+            push_unique(config_dir.join("dcg").join(CONFIG_FILE_NAME));
+        }
+
+        candidates
     }
 
-    /// Load project-level configuration (`.dcg.toml` in repo root).
+    /// Load the first present user candidate, retaining any fatal error, and record every
+    /// candidate actually attempted before it.
+    fn load_user_config_layer_with_outcomes(
+        sources: &mut Option<Vec<ConfigSourceOutcome>>,
+    ) -> Option<ConfigLayer> {
+        let candidates = Self::user_config_candidates();
+        if candidates.is_empty() {
+            if let Some(sources) = sources.as_mut() {
+                sources.push(ConfigSourceOutcome::new(
+                    ConfigFileLayer::User,
+                    ConfigFileAuthority::Full,
+                    ConfigFileStatus::Missing,
+                    None,
+                    Some("no user configuration directory is available".to_string()),
+                ));
+            }
+            return None;
+        }
+
+        for path in candidates {
+            let capture_outcome = sources.is_some();
+            let (layer, outcome) = Self::load_layer_from_file_with_outcome(
+                &path,
+                ConfigSource::Untrusted,
+                ConfigFileLayer::User,
+                ConfigFileAuthority::Full,
+                capture_outcome,
+            );
+            record_config_outcome(sources, outcome);
+            if layer.is_some() {
+                return layer;
+            }
+        }
+
+        None
+    }
+
+    /// Load the enforcement-only subset of project-level configuration
+    /// (`.dcg.toml` in repo root).
+    #[cfg(all(test, unix))]
     fn load_project_config_layer_from(start_dir: Option<&Path>) -> Option<ConfigLayer> {
         let start_dir = start_dir?;
         let repo_root = find_repo_root(start_dir, REPO_ROOT_SEARCH_MAX_HOPS)?;
         let config_path = repo_root.join(PROJECT_CONFIG_NAME);
-        if !config_path.exists() {
-            return None;
-        }
-        Self::load_layer_from_file(&config_path)
+        Self::load_layer_from_file_with_source(&config_path, ConfigSource::AutoProject)
+            .map(ConfigLayer::into_restricted_project_policy)
     }
 
     /// Merge another config layer into this one (other takes priority when set).
@@ -3307,6 +4610,12 @@ impl Config {
         if let Some(projects) = other.projects {
             self.projects.extend(projects);
         }
+
+        // Per-rule settings merge by rule id; a higher layer replaces the whole
+        // table for a rule it names (#284).
+        if let Some(rules) = other.rules {
+            self.rules.extend(rules);
+        }
     }
 
     fn merge_general_layer(&mut self, general: GeneralConfigLayer) {
@@ -3339,6 +4648,12 @@ impl Config {
         }
         if let Some(fail_closed) = general.fail_closed {
             self.general.fail_closed = fail_closed;
+        }
+        if let Some(unverified_decision) = general.unverified_decision {
+            self.general.unverified_decision = unverified_decision;
+        }
+        if let Some(update_pin) = general.update_pin {
+            self.general.update_pin = update_pin;
         }
     }
 
@@ -3384,8 +4699,25 @@ impl Config {
     }
 
     fn merge_overrides_layer(&mut self, overrides: OverridesConfig) {
+        if let Some(error) = overrides.configuration_error {
+            if let Some(existing) = self.overrides.configuration_error.as_mut() {
+                existing.push('\n');
+                existing.push_str(&error);
+            } else {
+                self.overrides.configuration_error = Some(error);
+            }
+        }
         self.overrides.allow.extend(overrides.allow);
         self.overrides.block.extend(overrides.block);
+        // #327: carry the removed-key sentinels forward so `dcg config` and
+        // `dcg doctor` can warn that the key is not enforced. Without this the
+        // merge silently dropped the keys — exactly the failure being fixed.
+        if overrides.allowlist.is_some() {
+            self.overrides.allowlist = overrides.allowlist;
+        }
+        if overrides.allowlist_rules.is_some() {
+            self.overrides.allowlist_rules = overrides.allowlist_rules;
+        }
     }
 
     const fn merge_allowlist_layer(&mut self, allowlist: AllowlistConfigLayer) {
@@ -3475,6 +4807,9 @@ impl Config {
                 self.logging.events.allow = allow;
             }
         }
+        if let Some(caller_env) = logging.caller_env {
+            self.logging.caller_env = Some(caller_env);
+        }
     }
 
     fn merge_history_layer(&mut self, history: HistoryConfigLayer) {
@@ -3492,6 +4827,18 @@ impl Config {
         }
         if let Some(database_path) = history.database_path {
             self.history.database_path = Some(database_path);
+        }
+        if let Some(auto_prune) = history.auto_prune {
+            self.history.auto_prune = auto_prune;
+        }
+        if let Some(prune_check_interval_hours) = history.prune_check_interval_hours {
+            self.history.prune_check_interval_hours = prune_check_interval_hours;
+        }
+        if let Some(batch_size) = history.batch_size {
+            self.history.batch_size = batch_size;
+        }
+        if let Some(batch_flush_interval_ms) = history.batch_flush_interval_ms {
+            self.history.batch_flush_interval_ms = batch_flush_interval_ms;
         }
     }
 
@@ -3638,6 +4985,13 @@ impl Config {
             }
         }
 
+        // DCG_UPDATE_PIN=true|false|1|0 (#320)
+        if let Some(update_pin) = get_env(&format!("{ENV_PREFIX}_UPDATE_PIN")) {
+            if let Some(parsed) = parse_env_bool(&update_pin) {
+                self.general.update_pin = parsed;
+            }
+        }
+
         // DCG_SELF_HEAL_HOOK=true|false|1|0
         if let Some(self_heal) = get_env(&format!("{ENV_PREFIX}_SELF_HEAL_HOOK")) {
             if let Some(parsed) = parse_env_bool(&self_heal) {
@@ -3706,7 +5060,7 @@ impl Config {
         // Policy config (env overrides)
         // -----------------------------------------------------------------
 
-        // DCG_POLICY_DEFAULT_MODE=deny|warn|log
+        // DCG_POLICY_DEFAULT_MODE=deny|ask|warn|log
         if let Some(mode) = get_env(&format!("{ENV_PREFIX}_POLICY_DEFAULT_MODE")) {
             if let Some(parsed) = parse_policy_mode(&mode) {
                 self.policy.default_mode = Some(parsed);
@@ -3913,6 +5267,10 @@ impl Config {
     /// anyone who does not opt in (issue #160).
     #[must_use]
     pub fn is_fail_closed(&self) -> bool {
+        // Environment preferences cannot turn missing trusted policy into an allow.
+        if self.configuration_error().is_some() {
+            return true;
+        }
         if let Some(value) = env::var(format!("{ENV_PREFIX}_FAIL_CLOSED"))
             .ok()
             .and_then(|value| parse_env_bool(&value))
@@ -3920,6 +5278,54 @@ impl Config {
             return value;
         }
         self.general.fail_closed
+    }
+
+    /// Where allow-once lifecycle events are audited, if anywhere.
+    ///
+    /// The whole event model — code issued, code redeemed, command allowed,
+    /// single-use entry consumed — existed, but every production caller
+    /// passed `None`, so with `general.log_file` set the only allow-once lines
+    /// ever written were `clear` and `revoke`. The step that actually lifts a
+    /// block went unrecorded. Events go to the same `general.log_file` those
+    /// two already use, in `[logging] format`, redacted per
+    /// `[logging] redaction`.
+    #[must_use]
+    pub fn allow_once_audit(&self) -> Option<crate::pending_exceptions::AllowOnceAuditConfig<'_>> {
+        let log_file = self.general.log_file.as_deref()?;
+        Some(crate::pending_exceptions::AllowOnceAuditConfig {
+            log_file,
+            format: match self.logging.format {
+                crate::logging::LogFormat::Json => {
+                    crate::pending_exceptions::AllowOnceLogFormat::Json
+                }
+                crate::logging::LogFormat::Text => {
+                    crate::pending_exceptions::AllowOnceLogFormat::Text
+                }
+            },
+            redaction: &self.logging.redaction,
+        })
+    }
+
+    /// Whether an unverified command (deadline exhausted, or over the command
+    /// size limit) must be denied instead of routed to `ask` (#338).
+    ///
+    /// The `DCG_UNVERIFIED_DECISION` environment variable overrides the
+    /// configured `general.unverified_decision`: `deny` forces denial, `ask`
+    /// forces the default review routing, anything else is ignored.
+    #[must_use]
+    pub fn unverified_denies(&self) -> bool {
+        // Environment preferences cannot turn missing trusted policy into an allow.
+        if self.configuration_error().is_some() {
+            return true;
+        }
+        if let Ok(value) = env::var(format!("{ENV_PREFIX}_UNVERIFIED_DECISION")) {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "deny" => return true,
+                "ask" => return false,
+                _ => {}
+            }
+        }
+        self.general.unverified_decision == UnverifiedDecision::Deny
     }
 
     /// Get the effective pack configuration for a specific project path.
@@ -3940,18 +5346,131 @@ impl Config {
         self.packs.clone()
     }
 
+    /// The pack configuration that applies in the current directory: a
+    /// matching `[projects]` entry's packs, else the global `[packs]`.
+    fn effective_packs_for_cwd(&self) -> PacksConfig {
+        if self.projects.is_empty() {
+            return self.packs.clone();
+        }
+        std::env::current_dir().map_or_else(
+            |_| self.packs.clone(),
+            |cwd| self.effective_packs_for_project(&cwd),
+        )
+    }
+
+    /// The packs loaded from `packs.custom_paths` that this configuration
+    /// leaves enabled, sorted by ID (#588).
+    ///
+    /// Loading a pack through `custom_paths` enables it without listing it in
+    /// `packs.enabled`, the way `system.disk` is on without being listed, so
+    /// `packs.disabled` turns it off again by its exact ID or by its category.
+    /// For an agent, the profile applies on top exactly as it does to the
+    /// built-in packs: `extra_packs` puts a disabled pack back and
+    /// `disabled_packs` removes it last. Preset names cancel only the
+    /// preset's own contribution, which never includes an external pack, so
+    /// they remove nothing here. Core packs are built in, not loaded from
+    /// `custom_paths`, so nothing here can turn them off.
+    #[must_use]
+    pub fn enabled_external_pack_ids(
+        &self,
+        store: &crate::packs::ExternalPackStore,
+        agent: Option<&crate::agent::Agent>,
+    ) -> Vec<String> {
+        fn names_pack_or_category(entries: &[String], pack_id: &str) -> bool {
+            entries.iter().any(|entry| {
+                crate::packs::preset_members(entry).is_none()
+                    && (pack_id == entry
+                        || pack_id
+                            .strip_prefix(entry.as_str())
+                            .is_some_and(|rest| rest.starts_with('.')))
+            })
+        }
+
+        if store.is_empty() {
+            return Vec::new();
+        }
+        let packs = self.effective_packs_for_cwd();
+        let profile = agent.map(|agent| self.agents.profile_for_agent(agent));
+        let mut ids: Vec<String> = store
+            .pack_ids()
+            .filter(|id| {
+                let restored =
+                    profile.is_some_and(|profile| names_pack_or_category(&profile.extra_packs, id));
+                let removed_by_profile = profile
+                    .is_some_and(|profile| names_pack_or_category(&profile.disabled_packs, id));
+                (restored || !names_pack_or_category(&packs.disabled, id)) && !removed_by_profile
+            })
+            .cloned()
+            .collect();
+        ids.sort();
+        ids
+    }
+
     /// Get enabled pack IDs as a deduplicated set.
     #[must_use]
     pub fn enabled_pack_ids(&self) -> HashSet<String> {
+        self.enabled_pack_ids_for_payload(false)
+    }
+
+    /// As [`Self::enabled_pack_ids`], but for a caller that has already seen
+    /// the payload and knows it is a Windows shell command (#451).
+    #[must_use]
+    pub fn enabled_pack_ids_for_payload(&self, windows_payload: bool) -> HashSet<String> {
         if self.projects.is_empty() {
-            return self.packs.enabled_pack_ids();
+            return self.packs.enabled_pack_ids_for_payload(windows_payload);
         }
 
         if let Ok(cwd) = std::env::current_dir() {
-            return self.effective_packs_for_project(&cwd).enabled_pack_ids();
+            return self
+                .effective_packs_for_project(&cwd)
+                .enabled_pack_ids_for_payload(windows_payload);
         }
 
-        self.packs.enabled_pack_ids()
+        self.packs.enabled_pack_ids_for_payload(windows_payload)
+    }
+
+    /// Effective end-to-end hook evaluation budget in milliseconds.
+    ///
+    /// An explicit config or environment value always wins. The broad
+    /// `careful_company_running_windows` preset gets a larger default because
+    /// its cold-start pack set can exceed the ordinary 1000ms budget on older
+    /// Windows workstations.
+    #[must_use]
+    pub fn effective_hook_timeout_ms(&self) -> u64 {
+        self.general.hook_timeout_ms.map_or_else(
+            || {
+                if self.careful_company_preset_is_requested() {
+                    crate::perf::CAREFUL_COMPANY_HOOK_EVALUATION_BUDGET_MS
+                } else {
+                    crate::perf::HOOK_EVALUATION_BUDGET_MS
+                }
+            },
+            |configured| configured.max(crate::perf::MIN_HOOK_TIMEOUT_MS),
+        )
+    }
+
+    /// Human-readable provenance for [`Self::effective_hook_timeout_ms`].
+    #[must_use]
+    pub fn hook_timeout_source(&self) -> &'static str {
+        if self.general.hook_timeout_ms.is_some() {
+            "configured"
+        } else if self.careful_company_preset_is_requested() {
+            "careful_company_running_windows preset"
+        } else {
+            "default"
+        }
+    }
+
+    fn careful_company_preset_is_requested(&self) -> bool {
+        let packs = self.effective_packs_for_cwd();
+        packs
+            .enabled
+            .iter()
+            .any(|pack| pack == "careful_company_running_windows")
+            && !packs
+                .disabled
+                .iter()
+                .any(|pack| pack == "careful_company_running_windows")
     }
 
     /// Get enabled pack IDs adjusted for an agent's profile.
@@ -3960,21 +5479,110 @@ impl Config {
     /// on top of the base configuration.
     #[must_use]
     pub fn enabled_pack_ids_for_agent(&self, agent: &crate::agent::Agent) -> HashSet<String> {
-        let mut packs = self.enabled_pack_ids();
+        self.enabled_pack_ids_for_agent_and_payload(agent, false)
+    }
+
+    /// Warnings for configured keys that parse but change nothing, surfaced
+    /// by `dcg config` and `dcg doctor` so a silently ignored key is
+    /// distinguishable from one that simply didn't match.
+    ///
+    /// `[git_awareness] enabled = true` is one. Its strictness is never applied
+    /// to a hook decision, and deliberately so: as implemented it only ever
+    /// relaxes (a relaxed branch turns a High denial into an allow), and the
+    /// agent being guarded can choose its branch (`git checkout -b feature/x`)
+    /// before the command it wants run.
+    #[must_use]
+    pub fn inert_config_warnings(&self) -> Vec<String> {
+        let mut warnings = self.overrides.removed_key_warnings();
+        if self.git_awareness.enabled {
+            warnings.push(
+                "`[git_awareness]` is not applied to hook decisions: its branch strictness \
+                 can only relax a denial, and the agent being guarded can pick the branch \
+                 (`git checkout -b feature/x`) before the command it wants run. To loosen a \
+                 rule, allowlist it with a reason (`dcg allowlist add`)."
+                    .to_string(),
+            );
+        }
+        // Hook decisions are never graduated: dcg runs once per command, so
+        // the session count is always 1, and graduating would make every
+        // first High finding a warning rather than a block.
+        if self.response.enabled {
+            warnings.push(
+                "`[response]` graduation is advisory: `dcg test` reports the graduated \
+                 response, but hook decisions are not graduated (a first High finding \
+                 still blocks)."
+                    .to_string(),
+            );
+        }
+        warnings
+    }
+
+    /// [`Self::enabled_pack_ids_for_agent`], for a request whose payload is
+    /// known to be PowerShell or Cmd.
+    ///
+    /// The `windows.*` packs are default-on for Windows *payloads*, wherever
+    /// dcg itself runs (#451). A PowerShell tool on macOS or Linux (pwsh) runs
+    /// the same `Clear-Content`/`Format-Volume` cmdlets as one on Windows, and
+    /// keying the default on the build host left those cmdlets unguarded
+    /// there. `disabled = ["windows"]` still wins, as it does on Windows.
+    #[must_use]
+    pub fn enabled_pack_ids_for_agent_and_payload(
+        &self,
+        agent: &crate::agent::Agent,
+        windows_payload: bool,
+    ) -> HashSet<String> {
         let profile = self.agents.profile_for_agent(agent);
+        let packs_config = self.effective_packs_for_cwd();
 
-        // Remove disabled packs (and their sub-packs)
-        for disabled in &profile.disabled_packs {
-            packs.remove(disabled);
-            packs.retain(|p| !p.starts_with(&format!("{disabled}.")));
-        }
+        // A profile can cancel a preset contribution from the base config, but
+        // it must not remove member packs that were also enabled independently
+        // (including Windows' default-on filesystem/system packs).
+        let mut base_requested = packs_config.requested_pack_ids(cfg!(windows) || windows_payload);
+        PacksConfig::remove_disabled_preset_markers(&mut base_requested, &profile.disabled_packs);
+        let mut packs =
+            PacksConfig::resolve_requested_pack_ids(base_requested, &packs_config.disabled);
 
-        // Add extra packs
-        for extra in &profile.extra_packs {
-            packs.insert(extra.clone());
-        }
+        // Agent extras intentionally override base exclusions. Resolve them as
+        // a separate contribution so profile-level preset cancellation still
+        // preserves direct/category/default sources from the base.
+        let mut extra_requested: HashSet<String> = profile.extra_packs.iter().cloned().collect();
+        PacksConfig::remove_disabled_preset_markers(&mut extra_requested, &profile.disabled_packs);
+        packs.extend(PacksConfig::expand_known_pack_groups(&extra_requested));
+
+        // Ordinary profile leaf/category exclusions are last-wins. Preset
+        // exclusions were already applied to the source markers above.
+        PacksConfig::remove_disabled_non_preset_groups(&mut packs, &profile.disabled_packs);
+
+        // Agent profiles may narrow optional packs, but they must not bypass the
+        // same invariant as the base configuration: core protections are
+        // mandatory. Reinsert the category marker after profile exclusions so
+        // `disabled_packs = ["core"]` cannot silently remove core.git and
+        // core.filesystem when the registry resolves the final set.
+        packs.insert("core".to_string());
 
         packs
+    }
+
+    /// Apply an agent profile to already-loaded project/user/system allowlists.
+    ///
+    /// Disabling allowlists is deliberately absolute: it removes both the
+    /// loaded layers and the profile's own additional exact commands. When
+    /// enabled, agent commands are prepended as the highest-precedence layer.
+    #[must_use]
+    pub fn apply_agent_allowlist_profile(
+        &self,
+        agent: &crate::agent::Agent,
+        mut allowlists: crate::allowlist::LayeredAllowlist,
+    ) -> crate::allowlist::LayeredAllowlist {
+        if self.allowlist_disabled_for_agent(agent) {
+            return crate::allowlist::LayeredAllowlist::default();
+        }
+
+        allowlists.prepend_agent_exact_commands(
+            agent.config_key(),
+            self.additional_allowlist_for_agent(agent),
+        );
+        allowlists
     }
 
     /// Get additional allowlist entries for an agent.
@@ -4016,15 +5624,15 @@ impl Config {
 
         let config_dir = if let Some(config_dir) = config_dir {
             config_dir
-        } else if let Some(home) = dirs::home_dir() {
+        } else if let Some(home) = home_dir() {
             let xdg_dir = home.join(".config").join("dcg");
             if xdg_dir.exists() {
                 home.join(".config")
             } else {
-                dirs::config_dir().unwrap_or_else(|| home.join(".config"))
+                user_config_dir().unwrap_or_else(|| home.join(".config"))
             }
         } else {
-            dirs::config_dir()?
+            user_config_dir()?
         };
         let guard_dir = config_dir.join("dcg");
 
@@ -4043,6 +5651,9 @@ impl Config {
     /// Returns an error if the config directory cannot be determined/created,
     /// serialization fails, or the config file cannot be written.
     pub fn save_to_user_config(&self) -> Result<PathBuf, String> {
+        if let Some(error) = self.configuration_error() {
+            return Err(error.to_string());
+        }
         let path = Self::user_config_path().ok_or("Could not determine config directory")?;
 
         let content =
@@ -4080,6 +5691,7 @@ impl Config {
             agents: AgentsConfig::default(),
             response: ResponseConfig::default(),
             projects: std::collections::HashMap::new(),
+            rules: std::collections::HashMap::new(),
             interactive: crate::interactive::InteractiveConfig::default(),
         }
     }
@@ -4108,7 +5720,9 @@ verbose = false
 # Protects against Claude Code overwriting settings.json mid-session.
 # self_heal_hook = true
 
-# Hook evaluation budget override (milliseconds)
+# Hook evaluation wall-clock budget override (milliseconds).
+# Exhaustion is indeterminate: review-capable hooks ask; other hooks block.
+# Values below 10ms are clamped to the minimum safe evaluation window.
 # hook_timeout_ms = 200
 
 #─────────────────────────────────────────────────────────────
@@ -4160,6 +5774,8 @@ verbose = false
 #   database.mongodb      - MongoDB destructive commands
 #   database.redis        - Redis FLUSH commands
 #   database.sqlite       - SQLite destructive commands
+#   database.snowflake    - Snowflake CLI SQL and account operations
+#   database.bigquery     - bq CLI and GoogleSQL: dataset drops, overwrites, time-travel settings
 #   containers.docker     - Docker destructive commands
 #   containers.compose    - Docker Compose destructive commands
 #   containers.podman     - Podman destructive commands
@@ -4209,6 +5825,7 @@ custom_paths = [
 [policy]
 # Optional global override for how matched rules are handled:
 # - "deny": block (default)
+# - "ask": require native operator review; unsupported clients fail closed
 # - "warn": allow but print a warning to stderr (no hook JSON deny)
 # - "log": allow silently (no stderr/stdout; optional log_file history)
 #
@@ -4227,6 +5844,7 @@ custom_paths = [
 [policy.packs]
 # Override mode for an entire pack (pack_id => mode).
 # Examples:
+# "core.git" = "ask"                # require native review for git operations
 # "core.git" = "warn"                # warn-first rollout for git pack
 # "containers.docker" = "deny"       # keep docker destructive ops as hard blocks
 
@@ -4344,7 +5962,8 @@ max_heredocs = 10
 # Optional language filter (scan only these languages). Omit for "all".
 # languages = ["python", "bash", "javascript", "typescript", "ruby", "perl"]
 
-# Graceful degradation (hook defaults are fail-open).
+# Bounded fallback for embedded-code parse/extraction failures.
+# The fallback still scans for high-risk operations before allowing.
 fallback_on_parse_error = true
 fallback_on_timeout = true
 
@@ -4363,8 +5982,13 @@ redaction_mode = "pattern"
 retention_days = 90
 max_size_mb = 500
 
-# Optional database path override.
-# database_path = "~/.config/dcg/history.db"
+# Optional database path override (`~` is expanded; relative paths resolve
+# against the working directory). The DCG_HISTORY_DB environment variable
+# takes precedence over this setting. Default: $XDG_STATE_HOME/dcg/history.db
+# (~/.local/state/dcg/history.db) on Unix, %LOCALAPPDATA%\dcg\history.db on
+# Windows; an existing ~/.config/dcg/history.db from an older release keeps
+# being used until you move it. `dcg doctor` shows the resolved path.
+# database_path = "~/.local/state/dcg/history.db"
 
 #─────────────────────────────────────────────────────────────
 # GRADUATED RESPONSE SYSTEM
@@ -4373,7 +5997,8 @@ max_size_mb = 500
 [response]
 # Enable the graduated response system.
 # When enabled, repeated occurrences of the same command escalate
-# from warning → soft block → hard block.
+# from warning → soft block → hard block. Advisory: `dcg test` reports the
+# graduated response; hook decisions are not graduated.
 enabled = false
 
 # Global graduation mode: "paranoid" | "strict" | "standard" | "lenient" | "warning_only" | "disabled"
@@ -4409,6 +6034,12 @@ history_window = "24h"
 
 # [projects."/path/to/k8s-infra"]
 # packs.enabled = ["kubernetes", "cloud.aws", "infrastructure.terraform"]
+
+# Factory Droid profile (selected by dcg install --droid).
+# Uses the same agent-profile fields as every other supported agent.
+# [agents.droid]
+# extra_packs = ["database"]
+# disabled_allowlist = true
 "#
         .to_string()
     }
@@ -4432,6 +6063,7 @@ fn env_disable_flag_enabled(value: &str) -> bool {
 fn parse_policy_mode(value: &str) -> Option<PolicyMode> {
     match value.trim().to_ascii_lowercase().as_str() {
         "deny" | "block" => Some(PolicyMode::Deny),
+        "ask" | "review" => Some(PolicyMode::Ask),
         "warn" | "warning" => Some(PolicyMode::Warn),
         "log" | "log-only" | "logonly" => Some(PolicyMode::Log),
         _ => None,
@@ -4538,9 +6170,13 @@ mod tests {
     #[test]
     fn system_config_dir_is_platform_correct() {
         let dir = system_config_dir();
-        #[cfg(not(windows))]
+        #[cfg(all(not(windows), not(target_os = "macos")))]
         {
             assert_eq!(dir, PathBuf::from("/etc/dcg"));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(dir, PathBuf::from("/private/etc/dcg"));
         }
         #[cfg(windows)]
         {
@@ -4631,6 +6267,174 @@ mod tests {
         assert_eq!(config.general.color, "auto");
         assert!(config.packs.enabled.is_empty());
         assert!(!config.allowlist.auto_prune_expired);
+    }
+
+    #[test]
+    fn untrusted_project_policy_retains_only_monotonic_protections() {
+        let layer: ConfigLayer = toml::from_str(
+            r#"
+[general]
+fail_closed = true
+max_command_bytes = 1
+self_heal_hook = false
+
+[output]
+explanations_enabled = false
+
+[packs]
+enabled = ["database.postgresql", "attacker.external"]
+disabled = ["core", "system.disk"]
+custom_paths = [".dcg/packs/attacker.yaml"]
+
+[policy]
+default_mode = "deny"
+observe_until = "2099-01-01"
+
+[policy.packs]
+"database.postgresql" = "deny"
+"core.git" = "warn"
+
+[policy.rules]
+"core.git:reset-hard" = "log"
+"database.postgresql:drop-database" = "deny"
+
+[overrides]
+allow = ["git reset --hard"]
+allowlist = ["rm -rf /"]
+block = [
+  { pattern = "^echo project-policy-probe$", reason = "project hardening probe" },
+]
+
+[heredoc]
+enabled = true
+timeout_ms = 1
+max_body_bytes = 1
+languages = ["bash"]
+fallback_on_parse_error = false
+fallback_on_timeout = true
+
+[agents.default]
+disabled_packs = ["core.git"]
+extra_packs = ["cloud.aws"]
+additional_allowlist = ["git reset --hard"]
+disabled_allowlist = false
+
+[response]
+enabled = true
+mode = "warning_only"
+"#,
+        )
+        .expect("parse project config layer");
+
+        let restricted = layer.into_restricted_project_policy();
+
+        let general = restricted.general.expect("fail-closed retained");
+        assert_eq!(general.fail_closed, Some(true));
+        assert_eq!(general.max_command_bytes, None);
+        assert_eq!(general.self_heal_hook, None);
+        assert!(restricted.output.is_none());
+
+        let packs = restricted.packs.expect("pack enable retained");
+        assert_eq!(packs.enabled, ["database.postgresql"]);
+        assert!(packs.disabled.is_empty());
+        assert!(packs.custom_paths.is_empty());
+
+        let policy = restricted.policy.expect("deny policy retained");
+        assert_eq!(policy.default_mode, Some(PolicyMode::Deny));
+        assert_eq!(
+            policy.packs.get("database.postgresql"),
+            Some(&PolicyMode::Deny)
+        );
+        assert!(!policy.packs.contains_key("core.git"));
+        assert_eq!(
+            policy.rules.get("database.postgresql:drop-database"),
+            Some(&PolicyMode::Deny)
+        );
+        assert!(!policy.rules.contains_key("core.git:reset-hard"));
+        assert!(policy.observe_until.is_none());
+
+        // Even block-only overrides are repository-controlled regex programs;
+        // automatic discovery drops them to avoid backtracking/compile DoS.
+        assert!(restricted.overrides.is_none());
+
+        let heredoc = restricted.heredoc.expect("heredoc hardening retained");
+        assert_eq!(heredoc.enabled, Some(true));
+        assert_eq!(heredoc.fallback_on_parse_error, Some(false));
+        assert_eq!(heredoc.fallback_on_timeout, None);
+        assert_eq!(heredoc.timeout_ms, None);
+        assert_eq!(heredoc.max_body_bytes, None);
+        assert_eq!(heredoc.languages, None);
+        assert!(heredoc.allowlist.is_none());
+
+        assert!(restricted.agents.is_none());
+        assert!(restricted.response.is_none());
+        assert!(restricted.projects.is_none());
+    }
+
+    #[test]
+    fn untrusted_project_policy_drops_layer_when_it_only_weakens_protection() {
+        let layer: ConfigLayer = toml::from_str(
+            r#"
+[general]
+fail_closed = false
+max_hook_input_bytes = 1
+max_command_bytes = 1
+
+[packs]
+disabled = ["core", "system.disk"]
+custom_paths = [".dcg/packs/attacker.yaml"]
+
+[policy]
+default_mode = "log"
+
+[overrides]
+allow = ["rm -rf /"]
+allowlist = ["git reset --hard"]
+
+[heredoc]
+enabled = false
+timeout_ms = 0
+languages = ["bash"]
+fallback_on_parse_error = true
+fallback_on_timeout = true
+"#,
+        )
+        .expect("parse project config layer");
+
+        let restricted = layer.into_restricted_project_policy();
+        assert!(restricted.general.is_none());
+        assert!(restricted.packs.is_none());
+        assert!(restricted.policy.is_none());
+        assert!(restricted.overrides.is_none());
+        assert!(restricted.heredoc.is_none());
+    }
+
+    #[test]
+    fn explicitly_selected_project_config_is_not_loaded_or_merged_twice() {
+        let explicit: ConfigLayer = toml::from_str(
+            r#"
+[packs]
+enabled = ["database.postgresql"]
+"#,
+        )
+        .expect("parse explicit project layer");
+        let duplicate: ConfigLayer = toml::from_str(
+            r#"
+[packs]
+enabled = ["database.postgresql"]
+"#,
+        )
+        .expect("parse automatic project layer");
+        let project_loader_called = std::cell::Cell::new(false);
+        let mut config = Config::default();
+
+        config.merge_project_and_explicit_layers(Some(explicit), true, || {
+            project_loader_called.set(true);
+            Some(duplicate)
+        });
+
+        assert!(!project_loader_called.get());
+        assert_eq!(config.packs.enabled, ["database.postgresql"]);
     }
 
     #[test]
@@ -4785,8 +6589,118 @@ auto_prune_expired = true
             ..Default::default()
         };
         let enabled = config.enabled_pack_ids();
-        assert!(enabled.contains("kubernetes"));
+        assert!(
+            !enabled.contains("kubernetes"),
+            "known category markers must be replaced by concrete leaves"
+        );
+        assert!(enabled.contains("kubernetes.kubectl"));
+        assert!(enabled.contains("kubernetes.kustomize"));
         assert!(!enabled.contains("kubernetes.helm"));
+    }
+
+    #[test]
+    fn careful_windows_preset_expands_to_curated_destructive_and_egress_leaves() {
+        let config = Config {
+            packs: PacksConfig {
+                enabled: vec!["careful_company_running_windows".to_string()],
+                disabled: vec!["database.mongodb".to_string()],
+                custom_paths: vec![],
+            },
+            ..Default::default()
+        };
+        let enabled = config.enabled_pack_ids();
+
+        for expected in [
+            "careful_company_running_windows.chat",
+            "careful_company_running_windows.email",
+            "careful_company_running_windows.guardrails",
+            "careful_company_running_windows.transfer",
+            "careful_company_running_windows.tunnel",
+            "careful_company_running_windows.upload",
+            "windows.filesystem",
+            "windows.misc",
+            "windows.powershell",
+            "windows.system",
+            "database.snowflake",
+            "storage.s3",
+            "remote.scp",
+            "backup.rclone",
+            "secrets.vault",
+            "cloud.aws",
+        ] {
+            assert!(
+                enabled.contains(expected),
+                "curated preset must include {expected}: {enabled:?}"
+            );
+        }
+        assert!(
+            !enabled.contains("database.mongodb"),
+            "leaf exclusions must win after preset expansion"
+        );
+        assert!(
+            !enabled.contains("containers.docker"),
+            "unreviewed categories must not silently join the curated preset"
+        );
+        assert!(
+            !enabled.contains("careful_company_running_windows"),
+            "preset marker must resolve to concrete leaves"
+        );
+    }
+
+    #[test]
+    fn disabling_careful_windows_preset_removes_only_its_enablement_contribution() {
+        let config = Config {
+            packs: PacksConfig {
+                enabled: vec![
+                    "careful_company_running_windows".to_string(),
+                    "cloud".to_string(),
+                    "database.snowflake".to_string(),
+                ],
+                disabled: vec!["careful_company_running_windows".to_string()],
+                custom_paths: vec![],
+            },
+            ..Default::default()
+        };
+        let enabled = config.enabled_pack_ids();
+
+        assert!(
+            !enabled
+                .iter()
+                .any(|pack_id| pack_id.starts_with("careful_company_running_windows.")),
+            "disabling the preset must remove its own leaves: {enabled:?}"
+        );
+        for cloud_pack in ["cloud.aws", "cloud.gcp", "cloud.azure"] {
+            assert!(
+                enabled.contains(cloud_pack),
+                "independent cloud-category enablement must survive preset cancellation: {enabled:?}"
+            );
+        }
+        assert!(
+            enabled.contains("database.snowflake"),
+            "an independently enabled preset member must retain its own provenance: {enabled:?}"
+        );
+        assert!(
+            !enabled.contains("remote.scp"),
+            "a preset-only member must disappear with the preset contribution: {enabled:?}"
+        );
+    }
+
+    #[test]
+    fn disabling_preset_preserves_native_windows_default_packs() {
+        let packs = PacksConfig {
+            enabled: vec!["careful_company_running_windows".to_string()],
+            disabled: vec!["careful_company_running_windows".to_string()],
+            custom_paths: vec![],
+        };
+        let enabled = PacksConfig::resolve_requested_pack_ids(
+            packs.requested_pack_ids(true),
+            &packs.disabled,
+        );
+
+        assert!(enabled.contains("windows.filesystem"));
+        assert!(enabled.contains("windows.system"));
+        assert!(!enabled.contains("windows.misc"));
+        assert!(!enabled.contains("windows.powershell"));
     }
 
     #[test]
@@ -4846,6 +6760,19 @@ auto_prune_expired = true
         assert_eq!(config.redaction_mode, HistoryRedactionMode::Pattern);
         assert_eq!(config.retention_days, HistoryConfig::DEFAULT_RETENTION_DAYS);
         assert_eq!(config.max_size_mb, HistoryConfig::DEFAULT_MAX_SIZE_MB);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_history_config_rejects_zero_size_cap() {
+        let config = HistoryConfig {
+            max_size_mb: 0,
+            ..HistoryConfig::default()
+        };
+        assert_eq!(
+            config.validate().unwrap_err(),
+            "history max_size_mb must be at least 1"
+        );
     }
 
     #[test]
@@ -4857,6 +6784,10 @@ redaction_mode = "full"
 retention_days = 30
 max_size_mb = 250
 database_path = "/tmp/dcg-history.db"
+auto_prune = true
+prune_check_interval_hours = 6
+batch_size = 25
+batch_flush_interval_ms = 40
 "#;
         let config: Config = toml::from_str(input).expect("config parses");
         assert!(config.history.enabled);
@@ -4867,6 +6798,31 @@ database_path = "/tmp/dcg-history.db"
             config.history.database_path.as_deref(),
             Some("/tmp/dcg-history.db")
         );
+        assert!(config.history.auto_prune);
+        assert_eq!(config.history.prune_check_interval_hours, 6);
+        assert_eq!(config.history.batch_size, 25);
+        assert_eq!(config.history.batch_flush_interval_ms, 40);
+    }
+
+    #[test]
+    fn history_runtime_fields_survive_presence_aware_layer_merge() {
+        let layer: ConfigLayer = toml::from_str(
+            r"
+[history]
+auto_prune = true
+prune_check_interval_hours = 7
+batch_size = 13
+batch_flush_interval_ms = 29
+",
+        )
+        .expect("history layer parses");
+        let mut config = Config::default();
+        config.merge_layer(layer);
+
+        assert!(config.history.auto_prune);
+        assert_eq!(config.history.prune_check_interval_hours, 7);
+        assert_eq!(config.history.batch_size, 13);
+        assert_eq!(config.history.batch_flush_interval_ms, 29);
     }
 
     #[test]
@@ -4885,6 +6841,50 @@ database_path = "/tmp/dcg-history.db"
         );
         // Sibling field from the same section is honored too (sanity).
         assert!(config.general.verbose);
+    }
+
+    #[test]
+    fn unverified_decision_defaults_to_ask_and_merges_from_config_file() {
+        // #338: the unverified fallback is `ask` unless configured.
+        let config = Config::default();
+        assert_eq!(config.general.unverified_decision, UnverifiedDecision::Ask);
+
+        let layer: ConfigLayer =
+            toml::from_str("[general]\nunverified_decision = \"deny\"\n").expect("layer parses");
+        let mut config = Config::default();
+        config.merge_layer(layer);
+        assert_eq!(
+            config.general.unverified_decision,
+            UnverifiedDecision::Deny,
+            "unverified_decision from a config file must survive the layer merge"
+        );
+
+        // An explicit `ask` in a later layer relaxes an earlier `deny` (both
+        // came from operator-owned layers; only repo configs are restricted).
+        let layer: ConfigLayer =
+            toml::from_str("[general]\nunverified_decision = \"ask\"\n").expect("layer parses");
+        config.merge_layer(layer);
+        assert_eq!(config.general.unverified_decision, UnverifiedDecision::Ask);
+    }
+
+    #[test]
+    fn unverified_decision_from_repo_config_is_tighten_only() {
+        // #338 + repo-config threat model: an attacker-controlled `.dcg.toml`
+        // may opt a session INTO deny-on-unverified, never out of it.
+        let deny_layer: ConfigLayer =
+            toml::from_str("[general]\nunverified_decision = \"deny\"\nverbose = true\n")
+                .expect("layer parses");
+        let restricted = deny_layer.into_restricted_project_policy();
+        let general = restricted.general.expect("deny retained");
+        assert_eq!(general.unverified_decision, Some(UnverifiedDecision::Deny));
+        assert_eq!(general.verbose, None, "non-security fields are dropped");
+
+        let ask_layer: ConfigLayer =
+            toml::from_str("[general]\nunverified_decision = \"ask\"\n").expect("layer parses");
+        assert!(
+            ask_layer.into_restricted_project_policy().general.is_none(),
+            "a repository must not be able to relax deny back to ask"
+        );
     }
 
     #[test]
@@ -4919,7 +6919,7 @@ database_path = "/tmp/dcg-history.db"
 
     #[test]
     fn test_history_database_path_expansion() {
-        if dirs::home_dir().is_none() {
+        if home_dir().is_none() {
             return;
         }
 
@@ -4953,6 +6953,27 @@ database_path = "/tmp/dcg-history.db"
             ..Default::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn history_runtime_invariants_prevent_zero_interval_worker_spins() {
+        let mut config = HistoryConfig {
+            retention_days: 0,
+            max_size_mb: 0,
+            prune_check_interval_hours: 0,
+            batch_size: 0,
+            batch_flush_interval_ms: 0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+        assert!(config.normalize_runtime_invariants());
+        assert_eq!(config.retention_days, 1);
+        assert_eq!(config.max_size_mb, 1);
+        assert_eq!(config.prune_check_interval_hours, 1);
+        assert_eq!(config.batch_size, 1);
+        assert_eq!(config.batch_flush_interval_ms, 1);
+        assert!(config.validate().is_ok());
+        assert!(!config.normalize_runtime_invariants());
     }
 
     // =========================================================================
@@ -6089,6 +8110,39 @@ enabled = false
         config.apply_env_overrides_from(|key| env_map.get(key).map(|v| (*v).to_string()));
 
         assert_eq!(config.general.hook_timeout_ms, Some(150));
+        assert_eq!(config.effective_hook_timeout_ms(), 150);
+        assert_eq!(config.hook_timeout_source(), "configured");
+    }
+
+    #[test]
+    fn careful_company_preset_gets_a_larger_default_hook_budget() {
+        let default = Config::default();
+        assert_eq!(
+            default.effective_hook_timeout_ms(),
+            crate::perf::HOOK_EVALUATION_BUDGET_MS
+        );
+        assert_eq!(default.hook_timeout_source(), "default");
+
+        let mut preset = Config::default();
+        preset.packs.enabled = vec!["careful_company_running_windows".to_string()];
+        assert_eq!(
+            preset.effective_hook_timeout_ms(),
+            crate::perf::CAREFUL_COMPANY_HOOK_EVALUATION_BUDGET_MS
+        );
+        assert_eq!(
+            preset.hook_timeout_source(),
+            "careful_company_running_windows preset"
+        );
+
+        preset.general.hook_timeout_ms = Some(750);
+        assert_eq!(preset.effective_hook_timeout_ms(), 750);
+        assert_eq!(preset.hook_timeout_source(), "configured");
+
+        preset.general.hook_timeout_ms = Some(0);
+        assert_eq!(
+            preset.effective_hook_timeout_ms(),
+            crate::perf::MIN_HOOK_TIMEOUT_MS
+        );
     }
 
     #[test]
@@ -6148,6 +8202,73 @@ enabled = false
         assert!(compiled.invalid_patterns.is_empty());
         assert!(compiled.check_allow("git reset --hard"));
         assert!(!compiled.check_allow("git status"));
+    }
+
+    /// #340: an unanchored allow entry is substring-matched against the whole
+    /// command, and `check_allow` short-circuits before pack evaluation. One
+    /// matching segment therefore used to carry every other segment with it.
+    #[test]
+    fn unanchored_allow_override_does_not_launder_later_segments() {
+        let overrides = OverridesConfig {
+            allow: vec![AllowOverride::Simple(
+                "git stash list /srv/scratch/build".to_string(),
+            )],
+            block: vec![],
+            ..Default::default()
+        };
+        let compiled = overrides.compile();
+
+        // The entry still allows exactly what it names.
+        assert!(compiled.check_allow("git stash list /srv/scratch/build"));
+
+        // But it no longer speaks for a second segment it never matched.
+        for command in [
+            "git stash list /srv/scratch/build && git reset --hard",
+            "git stash list /srv/scratch/build; git reset --hard",
+            "git stash list /srv/scratch/build || git reset --hard",
+            "git stash list /srv/scratch/build | git reset --hard",
+        ] {
+            assert!(
+                !compiled.check_allow(command),
+                "allow entry laundered a trailing segment: {command}"
+            );
+        }
+    }
+
+    /// A command substitution is returned as its own segment, so a safe outer
+    /// command cannot carry a destructive inner one past the allow check.
+    #[test]
+    fn allow_override_does_not_launder_command_substitution() {
+        let overrides = OverridesConfig {
+            allow: vec![AllowOverride::Simple("echo".to_string())],
+            block: vec![],
+            ..Default::default()
+        };
+        let compiled = overrides.compile();
+
+        assert!(compiled.check_allow("echo hello"));
+        assert!(!compiled.check_allow("echo $(git reset --hard)"));
+    }
+
+    /// Every segment being independently allowed is still allowed, and anchored
+    /// entries now compose across a chain (previously neither half matched the
+    /// whole string, so the compound was denied).
+    #[test]
+    fn allow_override_permits_fully_covered_compound() {
+        let overrides = OverridesConfig {
+            allow: vec![
+                AllowOverride::Simple("^git stash list$".to_string()),
+                AllowOverride::Simple("^git status$".to_string()),
+            ],
+            block: vec![],
+            ..Default::default()
+        };
+        let compiled = overrides.compile();
+
+        assert!(compiled.check_allow("git stash list"));
+        assert!(compiled.check_allow("git stash list && git status"));
+        assert!(compiled.check_allow("git status; git stash list"));
+        assert!(!compiled.check_allow("git stash list && git reset --hard"));
     }
 
     #[test]
@@ -6359,407 +8480,77 @@ enabled = false
     }
 
     // ========================================================================
-    // AllowlistRule and Extended Allowlist Tests (git_safety_guard-fvuf)
+    // Removed overrides.allowlist / allowlist_rules keys (#327)
     // ========================================================================
 
     #[test]
-    fn test_allowlist_rule_validation_empty_pattern() {
-        let rule = AllowlistRule {
-            pattern: "".to_string(),
-            ..Default::default()
-        };
-        assert!(rule.validate().is_err());
-        assert!(rule.validate().unwrap_err().contains("non-empty"));
-    }
+    fn removed_allowlist_keys_are_detected_and_warned() {
+        let overrides: OverridesConfig = toml::from_str(
+            r#"
+            allowlist = ["rm -rf /srv/scratch/build"]
 
-    #[test]
-    fn test_allowlist_rule_validation_whitespace_pattern() {
-        let rule = AllowlistRule {
-            pattern: "   ".to_string(),
-            ..Default::default()
-        };
-        assert!(rule.validate().is_err());
-    }
+            [[allowlist_rules]]
+            pattern = "rm -rf /srv/scratch/build"
+            paths = ["/srv/scratch/*"]
+            "#,
+        )
+        .expect("configs carrying the removed keys must still parse");
 
-    #[test]
-    fn test_allowlist_rule_validation_valid_pattern() {
-        let rule = AllowlistRule {
-            pattern: "npm run build".to_string(),
-            paths: Some(vec!["/home/*/projects/*".to_string()]),
-            comment: Some("Allow builds".to_string()),
-            ..Default::default()
-        };
-        assert!(rule.validate().is_ok());
-    }
-
-    #[test]
-    fn test_allowlist_rule_validation_invalid_expires() {
-        let rule = AllowlistRule {
-            pattern: "test".to_string(),
-            expires: Some("not-a-date".to_string()),
-            ..Default::default()
-        };
-        assert!(rule.validate().is_err());
-        assert!(rule.validate().unwrap_err().contains("expires"));
-    }
-
-    #[test]
-    fn test_allowlist_rule_validation_valid_expires() {
-        let rule = AllowlistRule {
-            pattern: "test".to_string(),
-            expires: Some("2030-01-01T00:00:00Z".to_string()),
-            ..Default::default()
-        };
-        assert!(rule.validate().is_ok());
-    }
-
-    #[test]
-    fn test_parse_ttl_duration_accepts_cli_style_combined_units() {
-        assert_eq!(parse_ttl_duration("1h30m").unwrap(), 5_400);
-        assert_eq!(parse_ttl_duration("1 hour 30 minutes").unwrap(), 5_400);
-        assert_eq!(parse_ttl_duration("2d4h").unwrap(), 187_200);
-        assert_eq!(parse_ttl_duration("1w 2d 3h 4m 5s").unwrap(), 788_645);
-    }
-
-    #[test]
-    fn test_parse_ttl_duration_preserves_legacy_single_units() {
-        assert_eq!(parse_ttl_duration("30").unwrap(), 30);
-        assert_eq!(parse_ttl_duration("30 seconds").unwrap(), 30);
-        assert_eq!(parse_ttl_duration("30m").unwrap(), 1_800);
-        assert_eq!(parse_ttl_duration("4 hr").unwrap(), 14_400);
-        assert_eq!(parse_ttl_duration("7 days").unwrap(), 604_800);
-    }
-
-    #[test]
-    fn test_parse_ttl_duration_rejects_invalid_or_empty_values() {
-        assert!(parse_ttl_duration("").unwrap_err().contains("empty"));
-        assert!(
-            parse_ttl_duration("0h")
-                .unwrap_err()
-                .contains("greater than zero")
+        let warnings = overrides.removed_key_warnings();
+        assert_eq!(
+            warnings.len(),
+            2,
+            "one warning per removed key: {warnings:?}"
         );
+        assert!(warnings[0].contains("overrides.allowlist"));
+        assert!(warnings[1].contains("overrides.allowlist_rules"));
         assert!(
-            parse_ttl_duration("1h thirty minutes")
-                .unwrap_err()
-                .contains("number")
-        );
-        assert!(
-            parse_ttl_duration("1x")
-                .unwrap_err()
-                .contains("unknown TTL unit")
-        );
-        assert!(
-            parse_ttl_duration("1h30")
-                .unwrap_err()
-                .contains("missing TTL unit")
+            warnings.iter().all(|w| w.contains("exempt_target_globs")),
+            "warnings must point at a working alternative: {warnings:?}"
         );
     }
 
     #[test]
-    fn test_allowlist_rule_validation_accepts_combined_ttl() {
-        let rule = AllowlistRule {
-            pattern: "test".to_string(),
-            ttl: Some("1h30m".to_string()),
-            created_at: Some("2026-01-01T00:00:00Z".to_string()),
-            ..Default::default()
-        };
+    fn removed_allowlist_keys_grant_no_allowances() {
+        let overrides: OverridesConfig = toml::from_str(
+            r#"
+            allowlist = ["rm -rf /srv/scratch/build"]
 
-        assert!(rule.validate().is_ok());
-        assert_eq!(rule.effective_ttl_seconds(), Some(5_400));
-    }
+            [[allowlist_rules]]
+            pattern = "rm -rf /srv/scratch/build"
+            "#,
+        )
+        .expect("configs carrying the removed keys must still parse");
 
-    #[test]
-    fn test_allowlist_rule_validation_session_requires_session_id() {
-        let rule = AllowlistRule {
-            pattern: "test".to_string(),
-            session: Some(true),
-            session_id: None,
-            ..Default::default()
-        };
-        assert!(rule.validate().is_err());
-        assert!(rule.validate().unwrap_err().contains("session_id"));
-    }
-
-    #[test]
-    fn test_allowlist_rule_is_active_no_expiry() {
-        let rule = AllowlistRule {
-            pattern: "test".to_string(),
-            ..Default::default()
-        };
-        assert!(rule.is_active());
-    }
-
-    #[test]
-    fn test_allowlist_rule_is_active_future_expiry() {
-        let rule = AllowlistRule {
-            pattern: "test".to_string(),
-            expires: Some("2030-01-01T00:00:00Z".to_string()),
-            ..Default::default()
-        };
-        assert!(rule.is_active());
-    }
-
-    #[test]
-    fn test_allowlist_rule_is_active_past_expiry() {
-        let rule = AllowlistRule {
-            pattern: "test".to_string(),
-            expires: Some("2020-01-01T00:00:00Z".to_string()),
-            ..Default::default()
-        };
-        assert!(!rule.is_active());
-    }
-
-    #[test]
-    fn test_allowlist_rule_is_active_session_mismatch_is_inactive() {
-        let rule = AllowlistRule {
-            pattern: "test".to_string(),
-            session: Some(true),
-            session_id: Some("ppid:0|tty:/dev/pts/999".to_string()),
-            ..Default::default()
-        };
-        assert!(!rule.is_active());
-    }
-
-    #[test]
-    fn test_allowlist_rule_is_active_session_match_follows_runtime_detection() {
-        let detected = crate::allowlist::current_session_id();
-        let bound = detected
-            .clone()
-            .unwrap_or_else(|| "ppid:0|tty:/dev/pts/999".to_string());
-        let rule = AllowlistRule {
-            pattern: "test".to_string(),
-            session: Some(true),
-            session_id: Some(bound),
-            ..Default::default()
-        };
-
-        if detected.is_some() {
-            assert!(rule.is_active());
-        } else {
-            assert!(!rule.is_active());
-        }
-    }
-
-    #[test]
-    fn test_allowlist_rule_is_global_no_paths() {
-        let rule = AllowlistRule {
-            pattern: "test".to_string(),
-            paths: None,
-            ..Default::default()
-        };
-        assert!(rule.is_global());
-    }
-
-    #[test]
-    fn test_allowlist_rule_is_global_empty_paths() {
-        let rule = AllowlistRule {
-            pattern: "test".to_string(),
-            paths: Some(vec![]),
-            ..Default::default()
-        };
-        assert!(rule.is_global());
-    }
-
-    #[test]
-    fn test_allowlist_rule_is_global_wildcard() {
-        let rule = AllowlistRule {
-            pattern: "test".to_string(),
-            paths: Some(vec!["*".to_string()]),
-            ..Default::default()
-        };
-        assert!(rule.is_global());
-    }
-
-    #[test]
-    fn test_allowlist_rule_not_global_with_paths() {
-        let rule = AllowlistRule {
-            pattern: "test".to_string(),
-            paths: Some(vec!["/home/user/*".to_string()]),
-            ..Default::default()
-        };
-        assert!(!rule.is_global());
-    }
-
-    #[test]
-    fn test_compile_simple_allowlist() {
-        let overrides = OverridesConfig {
-            allowlist: Some(vec!["npm run build".to_string(), "cargo test".to_string()]),
-            ..Default::default()
-        };
         let compiled = overrides.compile();
-
-        assert_eq!(compiled.allow.len(), 2);
-        assert!(compiled.invalid_patterns.is_empty());
-        assert!(compiled.check_allow("npm run build"));
-        assert!(compiled.check_allow("cargo test"));
-        assert!(!compiled.check_allow("rm -rf"));
+        assert!(compiled.allow.is_empty());
+        assert!(!compiled.check_allow("rm -rf /srv/scratch/build"));
     }
 
     #[test]
-    fn test_compile_allowlist_rules() {
-        let overrides = OverridesConfig {
-            allowlist_rules: Some(vec![AllowlistRule {
-                pattern: "rm -rf node_modules".to_string(),
-                paths: Some(vec!["/home/*/projects/*".to_string()]),
-                comment: Some("Allow node_modules cleanup".to_string()),
-                ..Default::default()
-            }]),
-            ..Default::default()
-        };
-        let compiled = overrides.compile();
-
-        assert_eq!(compiled.allow.len(), 1);
-        assert!(compiled.invalid_patterns.is_empty());
-        assert!(compiled.check_allow("rm -rf node_modules"));
+    fn absent_removed_keys_produce_no_warnings() {
+        let overrides: OverridesConfig = toml::from_str(
+            r#"
+            allow = ["^git stash list$"]
+            "#,
+        )
+        .expect("plain overrides must parse");
+        assert!(overrides.removed_key_warnings().is_empty());
     }
 
+    /// Opt-in features that never change a hook decision say so, rather than
+    /// parsing and silently doing nothing.
     #[test]
-    fn test_compile_both_allowlist_formats() {
-        let overrides = OverridesConfig {
-            allowlist: Some(vec!["npm run build".to_string()]),
-            allowlist_rules: Some(vec![AllowlistRule {
-                pattern: "cargo test".to_string(),
-                ..Default::default()
-            }]),
-            ..Default::default()
-        };
-        let compiled = overrides.compile();
+    fn inert_opt_in_features_are_reported() {
+        let mut config = Config::default();
+        assert!(config.inert_config_warnings().is_empty());
 
-        // Both formats should be merged
-        assert_eq!(compiled.allow.len(), 2);
-        assert!(compiled.check_allow("npm run build"));
-        assert!(compiled.check_allow("cargo test"));
-    }
-
-    #[test]
-    fn test_compile_skips_expired_rules() {
-        let overrides = OverridesConfig {
-            allowlist_rules: Some(vec![
-                AllowlistRule {
-                    pattern: "active-command".to_string(),
-                    expires: Some("2030-01-01T00:00:00Z".to_string()),
-                    ..Default::default()
-                },
-                AllowlistRule {
-                    pattern: "expired-command".to_string(),
-                    expires: Some("2020-01-01T00:00:00Z".to_string()),
-                    ..Default::default()
-                },
-            ]),
-            ..Default::default()
-        };
-        let compiled = overrides.compile();
-
-        // Only the active rule should be compiled
-        assert_eq!(compiled.allow.len(), 1);
-        assert!(compiled.check_allow("active-command"));
-        assert!(!compiled.check_allow("expired-command"));
-    }
-
-    #[test]
-    fn test_compile_skips_empty_patterns() {
-        let overrides = OverridesConfig {
-            allowlist: Some(vec![
-                "valid-pattern".to_string(),
-                "".to_string(),
-                "   ".to_string(),
-            ]),
-            ..Default::default()
-        };
-        let compiled = overrides.compile();
-
-        // Only valid patterns should be compiled
-        assert_eq!(compiled.allow.len(), 1);
-        assert!(compiled.check_allow("valid-pattern"));
-    }
-
-    #[test]
-    fn test_load_allowlist_merges_formats() {
-        let overrides = OverridesConfig {
-            allowlist: Some(vec!["simple-pattern".to_string()]),
-            allowlist_rules: Some(vec![AllowlistRule {
-                pattern: "extended-pattern".to_string(),
-                paths: Some(vec!["/home/*".to_string()]),
-                ..Default::default()
-            }]),
-            ..Default::default()
-        };
-        let rules = overrides.load_allowlist();
-
-        assert_eq!(rules.len(), 2);
-
-        // Simple pattern should be converted to AllowlistRule with no paths
-        assert_eq!(rules[0].pattern, "simple-pattern");
-        assert!(rules[0].paths.is_none());
-
-        // Extended pattern should preserve its paths
-        assert_eq!(rules[1].pattern, "extended-pattern");
-        assert!(rules[1].paths.is_some());
-    }
-
-    #[test]
-    fn test_load_allowlist_filters_expired() {
-        let overrides = OverridesConfig {
-            allowlist_rules: Some(vec![
-                AllowlistRule {
-                    pattern: "active".to_string(),
-                    ..Default::default()
-                },
-                AllowlistRule {
-                    pattern: "expired".to_string(),
-                    expires: Some("2020-01-01T00:00:00Z".to_string()),
-                    ..Default::default()
-                },
-            ]),
-            ..Default::default()
-        };
-        let rules = overrides.load_allowlist();
-
-        // Only active rules should be returned
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].pattern, "active");
-    }
-
-    #[test]
-    fn test_validate_allowlist_empty_pattern() {
-        let overrides = OverridesConfig {
-            allowlist: Some(vec!["".to_string()]),
-            ..Default::default()
-        };
-        let errors = overrides.validate_allowlist();
-
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("non-empty"));
-    }
-
-    #[test]
-    fn test_validate_allowlist_invalid_rule() {
-        let overrides = OverridesConfig {
-            allowlist_rules: Some(vec![AllowlistRule {
-                pattern: "".to_string(),
-                ..Default::default()
-            }]),
-            ..Default::default()
-        };
-        let errors = overrides.validate_allowlist();
-
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("allowlist_rules[0]"));
-    }
-
-    #[test]
-    fn test_validate_allowlist_valid() {
-        let overrides = OverridesConfig {
-            allowlist: Some(vec!["valid-pattern".to_string()]),
-            allowlist_rules: Some(vec![AllowlistRule {
-                pattern: "also-valid".to_string(),
-                ..Default::default()
-            }]),
-            ..Default::default()
-        };
-        let errors = overrides.validate_allowlist();
-
-        assert!(errors.is_empty());
+        config.git_awareness.enabled = true;
+        config.response.enabled = true;
+        let warnings = config.inert_config_warnings();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("[git_awareness]"));
+        assert!(warnings[1].contains("[response]"));
     }
 
     // ========================================================================
@@ -6771,6 +8562,10 @@ enabled = false
         assert_eq!(
             PolicyMode::Deny.to_decision_mode(),
             crate::packs::DecisionMode::Deny
+        );
+        assert_eq!(
+            PolicyMode::Ask.to_decision_mode(),
+            crate::packs::DecisionMode::Ask
         );
         assert_eq!(
             PolicyMode::Warn.to_decision_mode(),
@@ -6801,6 +8596,66 @@ enabled = false
             Some(crate::packs::Severity::High),
         );
         assert_eq!(mode, crate::packs::DecisionMode::Log);
+    }
+
+    /// #509: `branch-delete` was split out of `branch-force-delete`. An entry
+    /// for the old id keeps covering the new one; an entry for the new id
+    /// wins; the legacy link never runs the other way.
+    #[test]
+    fn test_policy_legacy_rule_id_covers_split_rule_509() {
+        let policy_with = |rules: &[(&str, PolicyMode)]| PolicyConfig {
+            default_mode: None,
+            observe_until: None,
+            packs: std::collections::HashMap::new(),
+            rules: rules
+                .iter()
+                .map(|(rule, mode)| ((*rule).to_string(), *mode))
+                .collect(),
+        };
+        let high = Some(crate::packs::Severity::High);
+        let mode = |policy: &PolicyConfig, pattern: &str| {
+            policy.resolve_mode(Some("core.git"), Some(pattern), high)
+        };
+
+        let legacy = policy_with(&[("core.git:branch-force-delete", PolicyMode::Ask)]);
+        assert_eq!(
+            mode(&legacy, "branch-delete"),
+            crate::packs::DecisionMode::Ask
+        );
+        assert_eq!(
+            mode(&legacy, "branch-force-delete"),
+            crate::packs::DecisionMode::Ask
+        );
+
+        let split = policy_with(&[("core.git:branch-delete", PolicyMode::Ask)]);
+        assert_eq!(
+            mode(&split, "branch-delete"),
+            crate::packs::DecisionMode::Ask
+        );
+        assert_eq!(
+            mode(&split, "branch-force-delete"),
+            crate::packs::DecisionMode::Deny,
+            "the new id must not relax the forced forms"
+        );
+
+        let both = policy_with(&[
+            ("core.git:branch-force-delete", PolicyMode::Ask),
+            ("core.git:branch-delete", PolicyMode::Deny),
+        ]);
+        assert_eq!(
+            mode(&both, "branch-delete"),
+            crate::packs::DecisionMode::Deny
+        );
+        assert_eq!(
+            mode(&both, "branch-force-delete"),
+            crate::packs::DecisionMode::Ask
+        );
+
+        // The link is specific to this pack and rule.
+        assert_eq!(
+            legacy.resolve_mode(Some("other.pack"), Some("branch-delete"), high),
+            crate::packs::DecisionMode::Deny
+        );
     }
 
     #[test]
@@ -6898,6 +8753,21 @@ enabled = false
     }
 
     #[test]
+    fn test_policy_resolve_mode_critical_can_require_review_globally() {
+        let policy = PolicyConfig {
+            default_mode: Some(PolicyMode::Ask),
+            ..Default::default()
+        };
+
+        let mode = policy.resolve_mode(
+            Some("core.git"),
+            Some("reset-hard"),
+            Some(crate::packs::Severity::Critical),
+        );
+        assert_eq!(mode, crate::packs::DecisionMode::Ask);
+    }
+
+    #[test]
     fn test_policy_resolve_mode_critical_can_be_loosened_by_rule() {
         let mut policy = PolicyConfig::default();
         policy
@@ -6952,6 +8822,8 @@ enabled = false
         for (input, expected) in [
             ("deny", Some(PolicyMode::Deny)),
             ("block", Some(PolicyMode::Deny)),
+            ("ask", Some(PolicyMode::Ask)),
+            ("review", Some(PolicyMode::Ask)),
             ("warn", Some(PolicyMode::Warn)),
             ("warning", Some(PolicyMode::Warn)),
             ("log", Some(PolicyMode::Log)),
@@ -7592,6 +9464,40 @@ enabled = false
     }
 
     #[test]
+    fn test_droid_profile_and_alias_use_existing_agent_configuration() {
+        use crate::agent::Agent;
+
+        for key in ["droid", "factory-droid", "factory_droid"] {
+            let config: Config = toml::from_str(&format!(
+                r#"
+                [agents.{key}]
+                trust_level = "low"
+                extra_packs = ["database.postgresql"]
+                disabled_packs = ["core"]
+                disabled_allowlist = true
+                additional_allowlist = ["git reset --hard"]
+            "#
+            ))
+            .unwrap();
+            let profile = config.agents.profile_for_agent(&Agent::Droid);
+            assert_eq!(profile.trust_level, TrustLevel::Low);
+            assert!(profile.disabled_allowlist);
+            assert_eq!(profile.additional_allowlist, ["git reset --hard"]);
+            let packs = config.enabled_pack_ids_for_agent(&Agent::Droid);
+            assert!(packs.contains("database.postgresql"));
+            assert!(
+                packs.contains("core"),
+                "profiles must preserve mandatory core protections"
+            );
+            assert!(
+                !config
+                    .enabled_pack_ids_for_agent(&Agent::ClaudeCode)
+                    .contains("database.postgresql")
+            );
+        }
+    }
+
+    #[test]
     fn test_agents_config_profile_for_unknown_falls_back_to_default() {
         let mut config = AgentsConfig::default();
         config.default.trust_level = TrustLevel::Low;
@@ -7643,6 +9549,14 @@ enabled = false
                 ..Default::default()
             },
         );
+        config.profiles.insert(
+            "oh-my-pi".to_string(),
+            AgentProfile {
+                trust_level: TrustLevel::High,
+                additional_allowlist: vec!["cargo test".to_string()],
+                ..Default::default()
+            },
+        );
 
         let codex_profile = config.profile_for_agent(&Agent::CodexCli);
         assert_eq!(codex_profile.trust_level, TrustLevel::High);
@@ -7655,6 +9569,14 @@ enabled = false
         let claude_profile = config.profile_for("claude-code");
         assert_eq!(claude_profile.trust_level, TrustLevel::Low);
         assert!(claude_profile.disabled_allowlist);
+
+        let omp_profile = config.profile_for_agent(&Agent::Omp);
+        assert_eq!(omp_profile.trust_level, TrustLevel::High);
+        assert!(
+            omp_profile
+                .additional_allowlist
+                .contains(&"cargo test".to_string())
+        );
     }
 
     #[test]
@@ -7774,6 +9696,88 @@ additional_allowlist = ["git push origin main"]
         let packs = config.enabled_pack_ids_for_agent(&Agent::ClaudeCode);
         assert!(packs.contains("containers.docker"));
         assert!(packs.contains("core"));
+    }
+
+    #[test]
+    fn test_agent_disabled_leaf_is_not_reintroduced_by_extra_category() {
+        use crate::agent::Agent;
+
+        let mut config = Config::default();
+        config.agents.profiles.insert(
+            "claude-code".to_string(),
+            AgentProfile {
+                extra_packs: vec!["kubernetes".to_string()],
+                disabled_packs: vec!["kubernetes.helm".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let packs = config.enabled_pack_ids_for_agent(&Agent::ClaudeCode);
+        assert!(packs.contains("kubernetes.kubectl"));
+        assert!(packs.contains("kubernetes.kustomize"));
+        assert!(!packs.contains("kubernetes.helm"));
+        assert!(
+            !packs.contains("kubernetes"),
+            "a surviving category marker would reintroduce the disabled leaf"
+        );
+    }
+
+    #[test]
+    fn agent_profile_cannot_disable_mandatory_core_packs() {
+        use crate::agent::Agent;
+
+        let mut config = Config::default();
+        config.agents.profiles.insert(
+            "claude-code".to_string(),
+            AgentProfile {
+                disabled_packs: vec!["core".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let packs = config.enabled_pack_ids_for_agent(&Agent::ClaudeCode);
+        assert!(
+            packs.contains("core"),
+            "agent-level exclusions must preserve the mandatory core marker: {packs:?}"
+        );
+        let ordered = crate::packs::REGISTRY.expand_enabled_ordered(&packs);
+        assert!(ordered.iter().any(|pack| pack == "core.git"));
+        assert!(ordered.iter().any(|pack| pack == "core.filesystem"));
+    }
+
+    #[test]
+    fn agent_can_cancel_preset_without_removing_independent_members() {
+        use crate::agent::Agent;
+
+        let mut config = Config::default();
+        config.packs.enabled = vec![
+            "careful_company_running_windows".to_string(),
+            "cloud".to_string(),
+            "database.snowflake".to_string(),
+        ];
+        config.agents.profiles.insert(
+            "claude-code".to_string(),
+            AgentProfile {
+                disabled_packs: vec!["careful_company_running_windows".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let packs = config.enabled_pack_ids_for_agent(&Agent::ClaudeCode);
+        assert!(
+            !packs
+                .iter()
+                .any(|pack_id| pack_id.starts_with("careful_company_running_windows.")),
+            "agent exclusion must remove the preset leaves: {packs:?}"
+        );
+        for cloud_pack in ["cloud.aws", "cloud.gcp", "cloud.azure"] {
+            assert!(
+                packs.contains(cloud_pack),
+                "profile preset cancellation must preserve base category enablement: {packs:?}"
+            );
+        }
+        assert!(packs.contains("database.snowflake"));
+        assert!(!packs.contains("remote.scp"));
     }
 
     #[test]
@@ -8142,31 +10146,534 @@ low = "disabled"
         assert!(read.is_none());
     }
 
-    #[cfg(unix)]
     #[test]
-    fn read_config_file_bounded_system_rejects_user_writable_symlink_target() {
-        use std::os::unix::fs::PermissionsExt;
-        use tempfile::TempDir;
-        let temp = TempDir::new().expect("tempdir");
-        let user_writable_dir = temp.path().join("user-writable");
-        std::fs::create_dir(&user_writable_dir).unwrap();
-        std::fs::set_permissions(&user_writable_dir, std::fs::Permissions::from_mode(0o777))
-            .unwrap();
-        // Real target in a user-writable directory.
-        let target = user_writable_dir.join("user_target.toml");
-        std::fs::write(&target, "key = \"injected\"").unwrap();
-        // Symlink at a location we'll claim is "system".
-        let symlink_path = temp.path().join("system_config.toml");
-        std::os::unix::fs::symlink(&target, &symlink_path).unwrap();
+    fn auto_project_parse_error_never_reflects_source_bytes() {
+        let secret_marker = "DO_NOT_REFLECT_THIS_REPOSITORY_TEXT";
+        let input = format!(
+            "[general]\nfail_closed = \u{1b}[31m{secret_marker}{}\n",
+            "x".repeat(16_384)
+        );
+        let error =
+            toml::from_str::<ConfigLayer>(&input).expect_err("fixture must be invalid TOML");
 
-        let read = read_config_file_bounded(&symlink_path, ConfigSource::System);
+        let rendered = safe_auto_project_toml_error(&input, &error);
+        assert!(rendered.starts_with("Invalid TOML in automatic project config"));
+        assert!(!rendered.contains(secret_marker));
+        assert!(!rendered.contains('\u{1b}'));
+        assert_eq!(rendered.lines().count(), 1);
+        assert!(rendered.len() < 128);
+    }
+
+    #[test]
+    fn config_source_outcomes_are_lazy_and_authority_aware() {
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "[general]\nfail_closed = true\n").unwrap();
+
+        let (untraced_layer, untraced_outcome) = Config::load_layer_from_file_with_outcome(
+            &path,
+            ConfigSource::Untrusted,
+            ConfigFileLayer::User,
+            ConfigFileAuthority::Full,
+            false,
+        );
+        assert!(untraced_layer.is_some());
         assert!(
-            read.is_none(),
-            "system layer must refuse symlinks pointing at user-writable targets"
+            untraced_outcome.is_none(),
+            "hot-path loading must not allocate a diagnostic outcome"
         );
 
-        // The same symlink loaded as Untrusted is permitted (size still capped).
-        let read = read_config_file_bounded(&symlink_path, ConfigSource::Untrusted);
-        assert_eq!(read.as_deref(), Some("key = \"injected\""));
+        let (traced_layer, traced_outcome) = Config::load_layer_from_file_with_outcome(
+            &path,
+            ConfigSource::AutoProject,
+            ConfigFileLayer::AutomaticProject,
+            ConfigFileAuthority::EnforcementOnly,
+            true,
+        );
+        let traced_outcome = traced_outcome.expect("tracing requested");
+        #[cfg(any(unix, windows))]
+        {
+            assert!(traced_layer.is_some());
+            assert_eq!(traced_outcome.status, ConfigFileStatus::Loaded);
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            assert!(traced_layer.is_none());
+            assert_eq!(traced_outcome.status, ConfigFileStatus::IgnoredUnsupported);
+        }
+        assert_eq!(
+            traced_outcome.authority,
+            ConfigFileAuthority::EnforcementOnly
+        );
+        assert_eq!(traced_outcome.path.as_deref(), Some(path.as_path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_system_leaf_policy_checks_owner_and_write_mode() {
+        // Root-owned, owner-writable files are trusted: only root can change
+        // their contents or mode.
+        assert!(!unix_owner_or_mode_is_user_writable(0, 0o100_644));
+
+        // These are the vulnerable cases that a parent-only check misses.
+        assert!(unix_owner_or_mode_is_user_writable(0, 0o100_664));
+        assert!(unix_owner_or_mode_is_user_writable(0, 0o100_646));
+
+        // A non-root owner can chmod a read-only file and then replace its
+        // contents, so current write bits alone are not enough.
+        assert!(unix_owner_or_mode_is_user_writable(1000, 0o100_444));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_opened_file_identity_binds_descriptor_to_current_path() {
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().expect("tempdir");
+        let first_path = temp.path().join("first.toml");
+        let second_path = temp.path().join("second.toml");
+        std::fs::write(&first_path, "key = 1").unwrap();
+        std::fs::write(&second_path, "key = 2").unwrap();
+
+        let first_file = std::fs::File::open(&first_path).unwrap();
+        let opened = first_file.metadata().unwrap();
+        let current = std::fs::symlink_metadata(&first_path).unwrap();
+        let other = std::fs::symlink_metadata(&second_path).unwrap();
+
+        assert!(unix_metadata_refers_to_same_file(&opened, &current));
+        assert!(!unix_metadata_refers_to_same_file(&opened, &other));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_system_ancestor_policy_rejects_relative_writable_and_symlinked_paths() {
+        use tempfile::TempDir;
+
+        assert_eq!(
+            validate_unix_system_ancestor_chain(Path::new("relative/config.toml")),
+            Err(UnixConfigTrustError::PathMustBeAbsoluteAndNormalized)
+        );
+
+        // Only the ancestor chain is inspected here, so a hypothetical direct
+        // leaf beneath the trusted Unix root has a valid chain.
+        assert_eq!(
+            validate_unix_system_ancestor_chain(Path::new("/config.toml")),
+            Ok(())
+        );
+
+        let temp = TempDir::new().expect("tempdir");
+        assert_eq!(
+            validate_unix_system_ancestor_chain(&temp.path().join("config.toml")),
+            Err(UnixConfigTrustError::UntrustedOwnerOrMode)
+        );
+
+        // The first examined directory resolves through the link to `/etc`,
+        // but the next lexical ancestor is the link itself. Using
+        // symlink_metadata rather than canonicalize must expose and reject it.
+        let linked_root = temp.path().join("linked-root");
+        std::os::unix::fs::symlink("/", &linked_root).unwrap();
+        assert_eq!(
+            validate_unix_system_ancestor_chain(&linked_root.join("etc/config.toml")),
+            Err(UnixConfigTrustError::Symlink)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_project_reads_direct_regular_file_but_rejects_symlink() {
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().expect("tempdir");
+        let target = temp.path().join("target.toml");
+        let link = temp.path().join(".dcg.toml");
+        let payload = "[general]\nfail_closed = true\n";
+        std::fs::write(&target, payload).unwrap();
+        std::fs::create_dir(temp.path().join(".git")).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert_eq!(
+            read_config_file_bounded(&target, ConfigSource::AutoProject).as_deref(),
+            Some(payload)
+        );
+        assert!(read_config_file_bounded(&link, ConfigSource::AutoProject).is_none());
+        assert!(
+            Config::load_project_config_layer_from(Some(temp.path())).is_none(),
+            "automatic project discovery must use the no-symlink source policy"
+        );
+
+        // Explicit/user-selected config paths retain their documented symlink
+        // behavior; only automatic repository discovery is restricted.
+        assert_eq!(
+            read_config_file_bounded(&link, ConfigSource::Untrusted).as_deref(),
+            Some(payload)
+        );
+
+        let (_, outcome) = Config::load_layer_from_file_with_outcome(
+            &link,
+            ConfigSource::AutoProject,
+            ConfigFileLayer::AutomaticProject,
+            ConfigFileAuthority::EnforcementOnly,
+            true,
+        );
+        assert_eq!(
+            outcome.expect("tracing requested").status,
+            ConfigFileStatus::Rejected
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_project_rejects_directory_and_fifo_without_blocking() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().expect("tempdir");
+        assert!(read_config_file_bounded(temp.path(), ConfigSource::AutoProject).is_none());
+
+        let fifo = temp.path().join("config.fifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo must create the test fixture");
+
+        let fifo_for_reader = fifo.clone();
+        let (sender, receiver) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let result = read_config_file_bounded(&fifo_for_reader, ConfigSource::AutoProject);
+            sender.send(result).unwrap();
+        });
+
+        let (timed_out, result) = match receiver.recv_timeout(Duration::from_secs(1)) {
+            Ok(result) => (false, result),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Unblock a regressed blocking open before failing, so the test
+                // suite never leaves a stuck reader thread behind.
+                let writer = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&fifo)
+                    .expect("open FIFO writer to release blocked reader");
+                let result = receiver
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("blocked FIFO reader must exit once paired");
+                drop(writer);
+                (true, result)
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("FIFO reader disconnected without reporting a result")
+            }
+        };
+        reader.join().expect("FIFO reader thread");
+
+        assert!(
+            !timed_out,
+            "restricted config open must never block on a FIFO"
+        );
+        assert!(result.is_none(), "a FIFO must never be parsed as config");
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn non_unix_system_config_is_ignored_even_when_regular() {
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "key = \"value\"").unwrap();
+
+        assert!(read_config_file_bounded(&path, ConfigSource::System).is_none());
+    }
+
+    /// Windows loads a regular automatic project config and refuses a
+    /// symlinked one, matching the Unix `O_NOFOLLOW` policy; the system layer
+    /// stays ignored there (no ACL validation).
+    #[cfg(windows)]
+    #[test]
+    fn windows_auto_project_config_loads_regular_files_and_rejects_reparse_points() {
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join(".dcg.toml");
+        std::fs::write(&path, "[general]\nfail_closed = true\n").unwrap();
+
+        assert!(read_config_file_bounded(&path, ConfigSource::AutoProject).is_some());
+        let (layer, outcome) = Config::load_layer_from_file_with_outcome(
+            &path,
+            ConfigSource::AutoProject,
+            ConfigFileLayer::AutomaticProject,
+            ConfigFileAuthority::EnforcementOnly,
+            true,
+        );
+        assert!(layer.is_some());
+        assert_eq!(
+            outcome.expect("tracing requested").status,
+            ConfigFileStatus::Loaded
+        );
+        assert!(
+            read_config_file_bounded(
+                &temp.path().join("missing.dcg.toml"),
+                ConfigSource::AutoProject
+            )
+            .is_none()
+        );
+        assert!(
+            read_config_file_bounded(temp.path(), ConfigSource::AutoProject).is_none(),
+            "a directory is not a regular file"
+        );
+
+        // Symlink creation needs Developer Mode or elevation; when the host
+        // allows it, the link itself must be refused.
+        let link = temp.path().join("linked.dcg.toml");
+        if std::os::windows::fs::symlink_file(&path, &link).is_ok() {
+            assert!(read_config_file_bounded(&link, ConfigSource::AutoProject).is_none());
+        }
+
+        assert!(read_config_file_bounded(&path, ConfigSource::System).is_none());
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    #[test]
+    fn non_unix_auto_project_config_is_ignored_even_when_regular() {
+        use tempfile::TempDir;
+
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join(".dcg.toml");
+        std::fs::write(&path, "[general]\nfail_closed = true\n").unwrap();
+
+        assert!(read_config_file_bounded(&path, ConfigSource::AutoProject).is_none());
+        let (_, outcome) = Config::load_layer_from_file_with_outcome(
+            &path,
+            ConfigSource::AutoProject,
+            ConfigFileLayer::AutomaticProject,
+            ConfigFileAuthority::EnforcementOnly,
+            true,
+        );
+        assert_eq!(
+            outcome.expect("tracing requested").status,
+            ConfigFileStatus::IgnoredUnsupported
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Per-rule target-path exemptions (#284)
+    // -------------------------------------------------------------------------
+
+    fn exemptions_from(toml_text: &str) -> RuleTargetExemptions {
+        let config: Config = toml::from_str(toml_text).expect("parse rules config");
+        config.rule_target_exemptions()
+    }
+
+    #[test]
+    fn rule_target_glob_matches_literal_subpath() {
+        let exemptions = exemptions_from(
+            r#"
+[rules."core.filesystem:rm-rf-general"]
+exempt_target_globs = ["/srv/jobs/*/tmp/**"]
+"#,
+        );
+        assert_eq!(
+            exemptions.matching_glob("core.filesystem:rm-rf-general", "/srv/jobs/abc/tmp/scratch"),
+            Some("/srv/jobs/*/tmp/**")
+        );
+    }
+
+    #[test]
+    fn rule_target_glob_is_scoped_to_its_own_rule() {
+        let exemptions = exemptions_from(
+            r#"
+[rules."core.filesystem:rm-rf-general"]
+exempt_target_globs = ["/srv/jobs/*/tmp/**"]
+"#,
+        );
+        assert_eq!(
+            exemptions.matching_glob(
+                "core.filesystem:redirect-truncate-root-home",
+                "/srv/jobs/abc/tmp/scratch"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rule_target_single_star_does_not_cross_a_separator() {
+        let exemptions = exemptions_from(
+            r#"
+[rules."core.filesystem:rm-rf-general"]
+exempt_target_globs = ["/srv/jobs/*/tmp/**"]
+"#,
+        );
+        assert_eq!(
+            exemptions.matching_glob("core.filesystem:rm-rf-general", "/srv/jobs/a/b/tmp/scratch"),
+            None
+        );
+    }
+
+    #[test]
+    fn rule_target_rejects_dotdot_traversal() {
+        let exemptions = exemptions_from(
+            r#"
+[rules."core.filesystem:rm-rf-general"]
+exempt_target_globs = ["/srv/jobs/*/tmp/**"]
+"#,
+        );
+        assert_eq!(
+            exemptions.matching_glob(
+                "core.filesystem:rm-rf-general",
+                "/srv/jobs/abc/tmp/../../../Documents"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rule_target_rejects_expansion_and_glob_syntax() {
+        let exemptions = exemptions_from(
+            r#"
+[rules."core.filesystem:rm-rf-general"]
+exempt_target_globs = ["/srv/jobs/*/tmp/**"]
+"#,
+        );
+        for dynamic in [
+            "$DIR/tmp/scratch",
+            "/srv/jobs/${ID}/tmp/scratch",
+            "/srv/jobs/`id`/tmp/scratch",
+            "/srv/jobs/*/tmp/scratch",
+            "%TEMP%/scratch",
+        ] {
+            assert_eq!(
+                exemptions.matching_glob("core.filesystem:rm-rf-general", dynamic),
+                None,
+                "dynamic target {dynamic} must never be exempted"
+            );
+        }
+    }
+
+    #[test]
+    fn rule_target_rejects_brace_quote_and_alternation_obfuscation() {
+        // The spellings from the #390 follow-up: brace expansion (`{a..a}`
+        // is a one-word sequence; zsh MULTIOS writes `{,}`/`{a,b}` to every
+        // word), quote removal, zsh glob alternation, and escapes all make
+        // the runtime path differ from the spelled one, so no glob may match
+        // the spelling.
+        let exemptions = exemptions_from(
+            r#"
+[rules."core.filesystem:rm-rf-general"]
+exempt_target_globs = ["/srv/jobs/*/tmp/**", "/**"]
+"#,
+        );
+        for obfuscated in [
+            "/srv/jobs/abc/tmp/scr{a..a}tch",
+            "/srv/jobs/abc/tmp/scratch{,}",
+            "/srv/jobs/abc/{tmp,etc}/scratch",
+            "/srv/jobs/abc/tmp/scr\"atch\"",
+            "/srv/jobs/abc/tmp/'scratch'",
+            "/srv/jobs/abc/tmp/scr(a|b)tch",
+            #[cfg(not(windows))]
+            "/srv/jobs/abc/tmp/scr\\atch",
+        ] {
+            assert_eq!(
+                exemptions.matching_glob("core.filesystem:rm-rf-general", obfuscated),
+                None,
+                "obfuscated target {obfuscated} must never be exempted"
+            );
+        }
+        // Ordinary punctuation and non-ASCII names remain literal.
+        assert_eq!(
+            exemptions.matching_glob(
+                "core.filesystem:rm-rf-general",
+                "/srv/jobs/abc/tmp/héllo-wörld+v1,2@x.log"
+            ),
+            Some("/srv/jobs/*/tmp/**")
+        );
+    }
+
+    #[test]
+    fn rule_target_normalizes_dot_and_duplicate_separators() {
+        let exemptions = exemptions_from(
+            r#"
+[rules."core.filesystem:rm-rf-general"]
+exempt_target_globs = ["/srv/jobs/*/tmp/**"]
+"#,
+        );
+        assert_eq!(
+            exemptions.matching_glob(
+                "core.filesystem:rm-rf-general",
+                "/srv//jobs/abc/./tmp/scratch"
+            ),
+            Some("/srv/jobs/*/tmp/**")
+        );
+    }
+
+    #[test]
+    fn rule_target_exemption_ignored_for_unsupported_rule() {
+        let config: Config = toml::from_str(
+            r#"
+[rules."core.git:reset-hard"]
+exempt_target_globs = ["/srv/**"]
+"#,
+        )
+        .expect("parse rules config");
+        assert!(config.rule_target_exemptions().is_empty());
+        let warnings = config.rule_target_exemption_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("does not support target exemptions"));
+    }
+
+    #[test]
+    fn rule_target_empty_and_invalid_globs_are_reported() {
+        let config: Config = toml::from_str(
+            r#"
+[rules."core.filesystem:rm-rf-general"]
+exempt_target_globs = ["", "/srv/a**b/**"]
+"#,
+        )
+        .expect("parse rules config");
+        let warnings = config.rule_target_exemption_warnings();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("must not be empty")));
+        assert!(config.rule_target_exemptions().is_empty());
+    }
+
+    #[test]
+    fn rule_target_glob_with_dotdot_is_rejected_at_load() {
+        let config: Config = toml::from_str(
+            r#"
+[rules."core.filesystem:rm-rf-general"]
+exempt_target_globs = ["/srv/jobs/../**"]
+"#,
+        )
+        .expect("parse rules config");
+        assert!(config.rule_target_exemptions().is_empty());
+        assert!(
+            config
+                .rule_target_exemption_warnings()
+                .iter()
+                .any(|w| w.contains("`..`"))
+        );
+    }
+
+    #[test]
+    fn automatic_project_config_cannot_grant_a_target_exemption() {
+        // #284: `exempt_target_globs` reduces coverage, so a repository-authored
+        // `.dcg.toml` must never contribute one.
+        let layer: ConfigLayer = toml::from_str(
+            r#"
+[rules."core.filesystem:rm-rf-general"]
+exempt_target_globs = ["/**"]
+"#,
+        )
+        .expect("parse project config layer");
+        assert!(layer.rules.is_some(), "layer should parse the table");
+        assert!(
+            layer.into_restricted_project_policy().rules.is_none(),
+            "an automatically discovered .dcg.toml must not carry [rules] exemptions"
+        );
     }
 }
+
+#[cfg(test)]
+#[path = "config_load_regression_tests.rs"]
+mod config_load_regression_tests;

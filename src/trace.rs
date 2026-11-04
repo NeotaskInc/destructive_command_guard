@@ -47,9 +47,12 @@ use serde::Serialize;
 use std::time::Instant;
 
 /// Current JSON schema version for explain output.
+///
 /// JSON schema version for `dcg explain --format json`.
 /// v2 adds `matched_span`, `matched_text_preview`, and `explanation` in `match`.
-pub const EXPLAIN_JSON_SCHEMA_VERSION: u32 = 2;
+/// v3 adds the conservative `indeterminate` decision.
+/// v4 adds `mode`, the resolved `[policy]` decision mode (issue #417).
+pub const EXPLAIN_JSON_SCHEMA_VERSION: u32 = 4;
 
 /// A complete trace of a command evaluation.
 ///
@@ -62,8 +65,21 @@ pub struct ExplainTrace {
     pub normalized_command: Option<String>,
     /// The sanitized command (after masking safe string arguments).
     pub sanitized_command: Option<String>,
-    /// The final decision (Allow or Deny).
+    /// The evaluator's finding (Allow, Deny, or Indeterminate).
+    ///
+    /// This is what the pattern engine concluded, *before* `[policy]` decides
+    /// what to do about it. Read [`ExplainTrace::effective_mode`] for the
+    /// outcome the hook actually produces.
     pub decision: EvaluationDecision,
+    /// The resolved `[policy]` decision mode for this finding (issue #417).
+    ///
+    /// A rule set to `warn`, `ask`, or `log` still produces `decision: Deny`
+    /// from the evaluator — the mode is what turns that finding into a block, a
+    /// review request, or an allow. Reporting the finding alone made `explain`
+    /// contradict both the live hook and `dcg test` for every non-`deny` rule.
+    /// `None` means no mode applies (nothing matched), and is rendered as the
+    /// bare decision.
+    pub effective_mode: Option<crate::packs::DecisionMode>,
     /// Whether evaluation was skipped due to time budget exhaustion.
     pub skipped_due_to_budget: bool,
     /// Total evaluation duration in microseconds.
@@ -336,6 +352,9 @@ impl TraceCollector {
             normalized_command: self.normalized_command,
             sanitized_command: self.sanitized_command,
             decision,
+            // Policy resolution needs the `Config` the caller owns, so the CLI
+            // fills this in (same division of labour as `dialect_divergence`).
+            effective_mode: None,
             skipped_due_to_budget: self.skipped_due_to_budget,
             total_duration_us,
             steps: self.steps,
@@ -347,6 +366,46 @@ impl TraceCollector {
 }
 
 impl ExplainTrace {
+    /// Record the resolved `[policy]` decision mode for this finding.
+    ///
+    /// Called by the `dcg explain` CLI path, which owns the `Config` that
+    /// policy resolution needs.
+    pub const fn set_effective_mode(&mut self, mode: Option<crate::packs::DecisionMode>) {
+        self.effective_mode = mode;
+    }
+
+    /// The outcome label a reader should act on.
+    ///
+    /// Collapses the evaluator finding and the resolved policy mode into the
+    /// one answer the hook would produce, so `explain` cannot report `DENY` for
+    /// a rule configured to `warn`.
+    #[must_use]
+    pub fn outcome_label(&self) -> &'static str {
+        use crate::packs::DecisionMode;
+        match (self.decision, self.effective_mode) {
+            (EvaluationDecision::Allow, _) => "ALLOW",
+            (EvaluationDecision::Indeterminate, _) => "INDETERMINATE",
+            (EvaluationDecision::Deny, Some(DecisionMode::Warn)) => "WARN",
+            (EvaluationDecision::Deny, Some(DecisionMode::Log)) => "LOG",
+            (EvaluationDecision::Deny, Some(DecisionMode::Ask)) => "ASK",
+            (EvaluationDecision::Deny, _) => "DENY",
+        }
+    }
+
+    /// Whether the resolved outcome lets the command run.
+    #[must_use]
+    pub fn outcome_permits_execution(&self) -> bool {
+        use crate::packs::DecisionMode;
+        matches!(
+            (self.decision, self.effective_mode),
+            (EvaluationDecision::Allow, _)
+                | (
+                    EvaluationDecision::Deny,
+                    Some(DecisionMode::Warn | DecisionMode::Log)
+                )
+        )
+    }
+
     /// Get the stable rule ID (if a match occurred).
     #[must_use]
     pub fn rule_id(&self) -> Option<&str> {
@@ -384,10 +443,9 @@ impl ExplainTrace {
     #[must_use]
     pub fn format_compact(&self, max_command_len: Option<usize>) -> String {
         let max_len = max_command_len.unwrap_or(60);
-        let decision_str = match self.decision {
-            EvaluationDecision::Allow => "ALLOW",
-            EvaluationDecision::Deny => "DENY",
-        };
+        // The resolved outcome, not the raw evaluator finding: a rule set to
+        // `warn` must not read as `DENY` here (issue #417).
+        let decision_str = self.outcome_label();
 
         let duration_str = format_duration(self.total_duration_us);
         let command_preview = truncate_utf8(&self.command, max_len);
@@ -442,12 +500,39 @@ impl ExplainTrace {
             "{bold}══════════════════════════════════════════════════════════════════{reset}\n\n"
         ));
 
-        // Decision with color
-        let decision_str = match self.decision {
-            EvaluationDecision::Allow => format!("{green}{bold}ALLOW{reset}"),
-            EvaluationDecision::Deny => format!("{red}{bold}DENY{reset}"),
+        // Decision with color. This is the RESOLVED outcome (evaluator finding
+        // plus `[policy]` mode), because a reader acts on what the hook does,
+        // not on what the pattern engine found (issue #417).
+        let label = self.outcome_label();
+        let decision_str = match label {
+            "ALLOW" => format!("{green}{bold}ALLOW{reset}"),
+            "DENY" => format!("{red}{bold}DENY{reset}"),
+            "WARN" | "LOG" => format!("{yellow}{bold}{label}{reset}"),
+            _ => format!("{yellow}{bold}{label}{reset}"),
         };
         out.push_str(&format!("{bold}Decision:{reset} {decision_str}\n"));
+        // When policy moved the outcome away from the matched rule's default,
+        // name the rule that did it — otherwise a WARN with a critical-severity
+        // match below it reads as a contradiction.
+        if let Some(mode) = self.effective_mode {
+            if self.decision == EvaluationDecision::Deny && mode != crate::packs::DecisionMode::Deny
+            {
+                out.push_str(&format!(
+                    "{bold}Policy:{reset}   rule matched, [policy] mode {yellow}{}{reset} — {}\n",
+                    mode.label(),
+                    if self.outcome_permits_execution() {
+                        "the command is allowed to run"
+                    } else {
+                        "execution requires operator review"
+                    }
+                ));
+            }
+        }
+        if self.decision == EvaluationDecision::Indeterminate {
+            out.push_str(&format!(
+                "{yellow}{bold}Action:{reset}   Execution is not allowed without a safety decision.\n"
+            ));
+        }
         out.push_str(&format!(
             "{bold}Latency:{reset}  {}\n",
             format_duration(self.total_duration_us)
@@ -685,7 +770,10 @@ impl ExplainTrace {
             decision: match self.decision {
                 EvaluationDecision::Allow => "allow".to_string(),
                 EvaluationDecision::Deny => "deny".to_string(),
+                EvaluationDecision::Indeterminate => "indeterminate".to_string(),
             },
+            mode: self.effective_mode.map(|mode| mode.label().to_string()),
+            outcome: self.outcome_label().to_ascii_lowercase(),
             skipped_due_to_budget: self.skipped_due_to_budget.then_some(true),
             total_duration_us: self.total_duration_us,
             steps: self.steps.iter().map(TraceStep::to_json).collect(),
@@ -697,6 +785,10 @@ impl ExplainTrace {
             } else {
                 Some(suggestions)
             },
+            // #289: filled in by the `dcg explain` CLI path, which owns the
+            // dialect the evaluation ran under. The trace itself does not
+            // re-evaluate.
+            dialect_divergence: None,
         }
     }
 }
@@ -718,8 +810,21 @@ pub struct ExplainJsonOutput {
     /// Sanitized command (if different from original).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sanitized_command: Option<String>,
-    /// Decision: "allow" or "deny".
+    /// The evaluator's finding: "allow", "deny", or "indeterminate".
+    ///
+    /// Unchanged across schema versions. `[policy]` decides what happens to a
+    /// "deny" finding — read `mode` and `outcome` for that.
     pub decision: String,
+    /// Resolved `[policy]` decision mode: "deny", "ask", "warn", or "log"
+    /// (schema v4, issue #417). Absent when nothing matched, so no mode applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// The outcome the hook would produce, collapsing `decision` and `mode`:
+    /// "allow", "deny", "ask", "warn", "log", or "indeterminate" (schema v4).
+    ///
+    /// This is the field to gate on. `decision: "deny"` with `mode: "warn"`
+    /// means the command runs, which `outcome: "warn"` states directly.
+    pub outcome: String,
     /// Whether evaluation was skipped due to time budget exhaustion.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skipped_due_to_budget: Option<bool>,
@@ -739,6 +844,11 @@ pub struct ExplainJsonOutput {
     /// Actionable suggestions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggestions: Option<Vec<JsonSuggestion>>,
+    /// Dialect-divergence metadata (#289): present only when the command was
+    /// evaluated under the default all-dialect (`unknown`) analysis and that
+    /// analysis denied it. Additive field — absent means "not checked".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dialect_divergence: Option<crate::cli::DialectDivergence>,
 }
 
 /// JSON representation of a trace step.
@@ -966,6 +1076,7 @@ impl TraceDetails {
                 decision: match decision {
                     EvaluationDecision::Allow => "allow".to_string(),
                     EvaluationDecision::Deny => "deny".to_string(),
+                    EvaluationDecision::Indeterminate => "indeterminate".to_string(),
                 },
                 allowlisted: *allowlisted,
             },
@@ -1166,8 +1277,9 @@ fn format_step_details_summary(details: &TraceDetails) -> String {
             let dec = match decision {
                 EvaluationDecision::Allow => "ALLOW",
                 EvaluationDecision::Deny => "DENY",
+                EvaluationDecision::Indeterminate => "INDETERMINATE",
             };
-            if *allowlisted {
+            if *allowlisted && *decision == EvaluationDecision::Allow {
                 format!("{dec} (allowlisted)")
             } else {
                 dec.to_string()
@@ -1516,6 +1628,7 @@ mod tests {
             normalized_command: None,
             sanitized_command: None,
             decision: EvaluationDecision::Allow,
+            effective_mode: None,
             skipped_due_to_budget: false,
             total_duration_us: 94,
             steps: vec![],
@@ -1529,12 +1642,54 @@ mod tests {
     }
 
     #[test]
+    fn format_indeterminate_is_explicit_and_never_looks_allowed() {
+        let trace = ExplainTrace {
+            command: "complex command".to_string(),
+            normalized_command: None,
+            sanitized_command: None,
+            decision: EvaluationDecision::Indeterminate,
+            effective_mode: None,
+            skipped_due_to_budget: true,
+            total_duration_us: 200_000,
+            steps: vec![TraceStep {
+                name: "policy_decision",
+                duration_us: 0,
+                details: TraceDetails::PolicyDecision {
+                    decision: EvaluationDecision::Indeterminate,
+                    allowlisted: false,
+                },
+            }],
+            match_info: None,
+            allowlist_info: None,
+            pack_summary: None,
+        };
+
+        assert_eq!(
+            trace.format_compact(None),
+            "INDETERMINATE (200ms) complex command"
+        );
+
+        let pretty = trace.format_pretty(false);
+        assert!(pretty.contains("Decision: INDETERMINATE"));
+        assert!(pretty.contains("Execution is not allowed"));
+        assert!(!pretty.contains("Decision: ALLOW"));
+
+        let json = trace.format_json();
+        assert!(json.contains("\"schema_version\": 4"));
+        assert!(json.contains("\"decision\": \"indeterminate\""));
+        assert!(json.contains("\"skipped_due_to_budget\": true"));
+        assert!(!json.contains("\"decision\": \"allow\""));
+        assert!(json.contains("\"decision\": \"indeterminate\""));
+    }
+
+    #[test]
     fn format_compact_deny() {
         let trace = ExplainTrace {
             command: "git reset --hard".to_string(),
             normalized_command: None,
             sanitized_command: None,
             decision: EvaluationDecision::Deny,
+            effective_mode: None,
             skipped_due_to_budget: false,
             total_duration_us: 847,
             steps: vec![],
@@ -1570,6 +1725,7 @@ mod tests {
             normalized_command: None,
             sanitized_command: None,
             decision: EvaluationDecision::Allow,
+            effective_mode: None,
             skipped_due_to_budget: false,
             total_duration_us: 1200,
             steps: vec![],
@@ -1590,6 +1746,7 @@ mod tests {
             normalized_command: None,
             sanitized_command: None,
             decision: EvaluationDecision::Deny,
+            effective_mode: None,
             skipped_due_to_budget: false,
             total_duration_us: 1_500,
             steps: vec![],
@@ -1627,6 +1784,7 @@ mod tests {
             normalized_command: None,
             sanitized_command: None,
             decision: EvaluationDecision::Allow,
+            effective_mode: None,
             skipped_due_to_budget: false,
             total_duration_us: 94,
             steps: vec![],
@@ -1657,6 +1815,7 @@ mod tests {
             normalized_command: None,
             sanitized_command: None,
             decision: EvaluationDecision::Deny,
+            effective_mode: None,
             skipped_due_to_budget: false,
             total_duration_us: 847,
             steps: vec![],
@@ -1709,6 +1868,7 @@ mod tests {
             normalized_command: Some("git reset --hard".to_string()),
             sanitized_command: None,
             decision: EvaluationDecision::Deny,
+            effective_mode: None,
             skipped_due_to_budget: false,
             total_duration_us: 1200,
             steps: vec![],
@@ -1757,6 +1917,7 @@ mod tests {
             normalized_command: None,
             sanitized_command: None,
             decision: EvaluationDecision::Allow,
+            effective_mode: None,
             skipped_due_to_budget: false,
             total_duration_us: 500,
             steps: vec![],
@@ -1787,6 +1948,7 @@ mod tests {
             normalized_command: None,
             sanitized_command: None,
             decision: EvaluationDecision::Allow,
+            effective_mode: None,
             skipped_due_to_budget: false,
             total_duration_us: 100,
             steps: vec![],
@@ -1820,6 +1982,7 @@ mod tests {
             normalized_command: None,
             sanitized_command: None,
             decision: EvaluationDecision::Allow,
+            effective_mode: None,
             skipped_due_to_budget: false,
             total_duration_us: 200,
             steps: vec![
@@ -1875,6 +2038,7 @@ mod tests {
             normalized_command: None,
             sanitized_command: None,
             decision: EvaluationDecision::Deny,
+            effective_mode: None,
             skipped_due_to_budget: false,
             total_duration_us: 847,
             steps: vec![],
@@ -2009,6 +2173,7 @@ mod tests {
             normalized_command: None,
             sanitized_command: None,
             decision: EvaluationDecision::Allow,
+            effective_mode: None,
             skipped_due_to_budget: false,
             total_duration_us: 94,
             steps: vec![],
@@ -2018,7 +2183,7 @@ mod tests {
         };
 
         let json = trace.format_json();
-        assert!(json.contains("\"schema_version\": 2"));
+        assert!(json.contains("\"schema_version\": 4"));
         assert!(json.contains("\"decision\": \"allow\""));
         assert!(json.contains("\"command\": \"git status\""));
         assert!(json.contains("\"total_duration_us\": 94"));
@@ -2030,7 +2195,8 @@ mod tests {
             command: "git status".to_string(),
             normalized_command: None,
             sanitized_command: None,
-            decision: EvaluationDecision::Allow,
+            decision: EvaluationDecision::Indeterminate,
+            effective_mode: None,
             skipped_due_to_budget: true,
             total_duration_us: 10,
             steps: vec![],
@@ -2041,6 +2207,7 @@ mod tests {
 
         let json = trace.format_json();
         assert!(json.contains("\"skipped_due_to_budget\": true"));
+        assert!(json.contains("\"decision\": \"indeterminate\""));
     }
 
     #[test]
@@ -2050,6 +2217,7 @@ mod tests {
             normalized_command: None,
             sanitized_command: None,
             decision: EvaluationDecision::Deny,
+            effective_mode: None,
             skipped_due_to_budget: false,
             total_duration_us: 847,
             steps: vec![],
@@ -2100,6 +2268,7 @@ mod tests {
             normalized_command: None,
             sanitized_command: None,
             decision: EvaluationDecision::Allow,
+            effective_mode: None,
             skipped_due_to_budget: false,
             total_duration_us: 200,
             steps: vec![
@@ -2158,6 +2327,7 @@ mod tests {
             normalized_command: None,
             sanitized_command: None,
             decision: EvaluationDecision::Allow,
+            effective_mode: None,
             skipped_due_to_budget: false,
             total_duration_us: 500,
             steps: vec![],
@@ -2186,6 +2356,7 @@ mod tests {
             normalized_command: None,
             sanitized_command: None,
             decision: EvaluationDecision::Allow,
+            effective_mode: None,
             skipped_due_to_budget: false,
             total_duration_us: 100,
             steps: vec![],
@@ -2215,6 +2386,7 @@ mod tests {
             normalized_command: Some("git reset --hard".to_string()),
             sanitized_command: None,
             decision: EvaluationDecision::Deny,
+            effective_mode: None,
             skipped_due_to_budget: false,
             total_duration_us: 847,
             steps: vec![TraceStep {
@@ -2261,9 +2433,128 @@ mod tests {
         assert!(value.get("steps").is_some());
     }
 
+    fn deny_trace_with_mode(mode: Option<crate::packs::DecisionMode>) -> ExplainTrace {
+        ExplainTrace {
+            command: "git branch -D x".to_string(),
+            normalized_command: None,
+            sanitized_command: None,
+            decision: EvaluationDecision::Deny,
+            effective_mode: mode,
+            skipped_due_to_budget: false,
+            total_duration_us: 42,
+            steps: vec![],
+            match_info: Some(MatchInfo {
+                rule_id: Some("core.git:branch-force-delete".to_string()),
+                pack_id: Some("core.git".to_string()),
+                pattern_name: Some("branch-force-delete".to_string()),
+                severity: Some(Severity::High),
+                reason: "branch deletion requires approval".to_string(),
+                source: MatchSource::Pack,
+                match_start: None,
+                match_end: None,
+                matched_text_preview: None,
+                explanation: None,
+            }),
+            allowlist_info: None,
+            pack_summary: None,
+        }
+    }
+
+    #[test]
+    fn policy_mode_overrides_are_reflected_in_the_reported_outcome() {
+        // Regression #417: explain reported the rule's severity-default DENY and
+        // ignored `[policy.rules]`, contradicting both the live hook and
+        // `dcg test` for every rule configured to warn/ask/log.
+        use crate::packs::DecisionMode;
+        let cases = [
+            (None, "DENY", true),
+            (Some(DecisionMode::Deny), "DENY", true),
+            (Some(DecisionMode::Ask), "ASK", true),
+            (Some(DecisionMode::Warn), "WARN", false),
+            (Some(DecisionMode::Log), "LOG", false),
+        ];
+        for (mode, expected_label, expected_blocks) in cases {
+            let trace = deny_trace_with_mode(mode);
+            assert_eq!(
+                trace.outcome_label(),
+                expected_label,
+                "mode {mode:?} must report {expected_label}"
+            );
+            assert_eq!(
+                trace.outcome_permits_execution(),
+                !expected_blocks,
+                "mode {mode:?} execution permission"
+            );
+            assert!(
+                trace.format_compact(None).starts_with(expected_label),
+                "compact output must lead with {expected_label}"
+            );
+            assert!(
+                trace
+                    .format_pretty(false)
+                    .contains(&format!("Decision: {expected_label}")),
+                "pretty output must report {expected_label}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_output_carries_mode_and_outcome_for_a_policy_override() {
+        use crate::packs::DecisionMode;
+        let output = deny_trace_with_mode(Some(DecisionMode::Warn)).to_json_output();
+        assert_eq!(
+            output.decision, "deny",
+            "the evaluator finding stays stable across schema versions"
+        );
+        assert_eq!(output.mode.as_deref(), Some("warn"));
+        assert_eq!(
+            output.outcome, "warn",
+            "consumers gate on `outcome`, which collapses decision and mode"
+        );
+
+        let unmatched = ExplainTrace {
+            command: "git status".to_string(),
+            normalized_command: None,
+            sanitized_command: None,
+            decision: EvaluationDecision::Allow,
+            effective_mode: None,
+            skipped_due_to_budget: false,
+            total_duration_us: 1,
+            steps: vec![],
+            match_info: None,
+            allowlist_info: None,
+            pack_summary: None,
+        }
+        .to_json_output();
+        assert!(unmatched.mode.is_none());
+        assert_eq!(unmatched.outcome, "allow");
+    }
+
+    #[test]
+    fn a_policy_override_names_the_rule_that_moved_the_outcome() {
+        use crate::packs::DecisionMode;
+        let pretty = deny_trace_with_mode(Some(DecisionMode::Warn)).format_pretty(false);
+        assert!(
+            pretty.contains("[policy] mode warn"),
+            "a WARN above a High-severity match must explain itself.\n{pretty}"
+        );
+        assert!(
+            pretty.contains("the command is allowed to run"),
+            "say plainly that the command proceeds.\n{pretty}"
+        );
+
+        let plain_deny = deny_trace_with_mode(Some(DecisionMode::Deny)).format_pretty(false);
+        assert!(
+            !plain_deny.contains("[policy] mode"),
+            "an ordinary deny adds no policy note.\n{plain_deny}"
+        );
+    }
+
     #[test]
     fn json_schema_version_is_stable() {
-        assert_eq!(EXPLAIN_JSON_SCHEMA_VERSION, 2);
+        // v4 added `mode` and `outcome` so a consumer can see the resolved
+        // `[policy]` decision, which explain previously omitted entirely (#417).
+        assert_eq!(EXPLAIN_JSON_SCHEMA_VERSION, 4);
     }
 
     #[test]
@@ -2273,6 +2564,7 @@ mod tests {
             normalized_command: None,
             sanitized_command: None,
             decision: EvaluationDecision::Allow,
+            effective_mode: None,
             skipped_due_to_budget: false,
             total_duration_us: 100,
             steps: vec![],
@@ -2283,9 +2575,14 @@ mod tests {
 
         let output = trace.to_json_output();
 
-        assert_eq!(output.schema_version, 2);
+        assert_eq!(output.schema_version, 4);
         assert_eq!(output.command, "git status");
         assert_eq!(output.decision, "allow");
+        assert_eq!(output.outcome, "allow");
+        assert!(
+            output.mode.is_none(),
+            "no mode applies when nothing matched"
+        );
         assert_eq!(output.total_duration_us, 100);
         assert!(output.steps.is_empty());
         assert!(output.match_info.is_none());
@@ -2539,6 +2836,7 @@ mod tests {
             normalized_command: None,
             sanitized_command: None,
             decision: EvaluationDecision::Deny,
+            effective_mode: None,
             skipped_due_to_budget: false,
             total_duration_us: 100,
             steps: vec![],
@@ -2576,6 +2874,7 @@ mod tests {
             normalized_command: None,
             sanitized_command: None,
             decision: EvaluationDecision::Deny,
+            effective_mode: None,
             skipped_due_to_budget: false,
             total_duration_us: 100,
             steps: vec![],
@@ -2622,6 +2921,7 @@ mod tests {
             normalized_command: None,
             sanitized_command: None,
             decision: EvaluationDecision::Allow,
+            effective_mode: None,
             skipped_due_to_budget: false,
             total_duration_us: 100,
             steps: vec![],
@@ -2634,6 +2934,10 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
         let version = parsed["schema_version"].as_u64();
-        assert_eq!(version, Some(2), "Schema version should be 2");
+        assert_eq!(
+            version,
+            Some(u64::from(EXPLAIN_JSON_SCHEMA_VERSION)),
+            "serialized schema version must match the public constant"
+        );
     }
 }

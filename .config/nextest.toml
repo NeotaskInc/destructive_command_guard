@@ -32,6 +32,21 @@ final-status-level = "all"
 retries = 1
 # Longer timeout for CI (may be slower)
 slow-timeout = { period = "60s", terminate-after = 2 }
+# Neotask fork (dev-igbgn, MON ruling): upstream v0.16.0's own tests that fail on the tag, on upstream main and here,
+# excluded by exact name. NEOTASK-FORK.md lists each with its evidence; drop an entry once upstream passes it.
+default-filter = """
+not (
+    (binary(=cli_e2e) & test(=custom_pack_loading_tests::exact_command_grants_do_not_reappear_after_detection_rewrites))
+  | (binary(=cross_pack_corpus) & test(=cross_pack_true_positive_controls_still_deny))
+  | (binary(=repro_277_git_stdin_sink_fallback) & test(=unquoted_delimiter_with_command_substitution_stays_denied))
+  | (binary(=repro_313_powershell_read_only_false_positives) & test(=escaped_dcg_options_keep_agent_values_and_inspection_arguments_as_data))
+  | (binary(=repro_313_powershell_read_only_false_positives) & test(=escaped_dcg_syntax_cannot_hide_guardrail_changes))
+  | (binary(=repro_313_powershell_read_only_false_positives) & test(=global_options_preserve_inspection_and_argument_data))
+  | (binary(=repro_313_powershell_read_only_false_positives) & test(=native_agent_argument_boundaries_are_dialect_specific))
+  | (binary(=repro_393_heredoc_boundary_data_sink) & test(=executing_receivers_and_expanding_bodies_stay_denied))
+  | (binary(=repro_558_ifs_destinations) & test(=literal_command_queries_and_quoted_wrapper_operands_remain_harmless))
+)
+"""
 
 # JUnit XML output for CI integration
 [profile.ci.junit]
@@ -79,3 +94,68 @@ path = "junit.xml"
 report-name = "git-safety-guard-coverage-test-results"
 store-success-output = false
 store-failure-output = true
+
+# Neotask fork (dev-igbgn, MON ruling #82548): upstream v0.16.0's tests that fail on Windows only, excluded on
+# Windows by exact name and enforced on Linux and macOS. A platform override's default-filter replaces the
+# profile's, so this one keeps the 9 above too. NEOTASK-FORK.md lists the 44 by reason; dev-32i0o2 retires them.
+[[profile.ci.overrides]]
+platform = 'cfg(windows)'
+default-filter = """
+(not (
+    (binary(=cli_e2e) & test(=custom_pack_loading_tests::exact_command_grants_do_not_reappear_after_detection_rewrites))
+  | (binary(=cross_pack_corpus) & test(=cross_pack_true_positive_controls_still_deny))
+  | (binary(=repro_277_git_stdin_sink_fallback) & test(=unquoted_delimiter_with_command_substitution_stays_denied))
+  | (binary(=repro_313_powershell_read_only_false_positives) & test(=escaped_dcg_options_keep_agent_values_and_inspection_arguments_as_data))
+  | (binary(=repro_313_powershell_read_only_false_positives) & test(=escaped_dcg_syntax_cannot_hide_guardrail_changes))
+  | (binary(=repro_313_powershell_read_only_false_positives) & test(=global_options_preserve_inspection_and_argument_data))
+  | (binary(=repro_313_powershell_read_only_false_positives) & test(=native_agent_argument_boundaries_are_dialect_specific))
+  | (binary(=repro_393_heredoc_boundary_data_sink) & test(=executing_receivers_and_expanding_bodies_stay_denied))
+  | (binary(=repro_558_ifs_destinations) & test(=literal_command_queries_and_quoted_wrapper_operands_remain_harmless))
+))
+& not (
+    (binary_id(=destructive_command_guard::cli_e2e) & test(=allow_once_flow_tests::expired_inline_interpreter_grants_never_authorize_issue_599))
+  | (binary_id(=destructive_command_guard::cli_e2e) & test(=allow_once_flow_tests::explicit_inline_policy_denials_preserve_unforced_grants_issue_599))
+  | (binary_id(=destructive_command_guard::cli_e2e) & test(=allow_once_flow_tests::forced_nested_policy_grants_skip_retained_ordinary_grants_issue_599))
+  | (binary_id(=destructive_command_guard::cli_e2e) & test(=allow_once_flow_tests::incomplete_nested_policy_inspection_preserves_inline_grants_issue_599))
+  | (binary_id(=destructive_command_guard::cli_e2e) & test(=allow_once_flow_tests::inline_interpreter_native_grants_match_original_bytes_and_cwd_issue_599))
+  | (binary_id(=destructive_command_guard::cli_e2e) & test(=allow_once_flow_tests::nested_inline_policy_denials_require_explicit_force_issue_599))
+  | (binary_id(=destructive_command_guard::cli_e2e) & test(=allow_once_flow_tests::nested_inline_requests_cannot_borrow_an_inner_grant_issue_599))
+  | (binary_id(=destructive_command_guard::cli_e2e) & test(=allow_once_flow_tests::nested_policy_denials_preserve_outer_inline_grants_issue_599))
+  | (binary_id(=destructive_command_guard::cli_e2e) & test(=allow_once_flow_tests::nested_policy_order_preserves_ordinary_inline_grants_issue_599))
+  | (binary_id(=destructive_command_guard::cli_e2e) & test(=allow_once_flow_tests::opaque_quoted_python_sources_preserve_nested_policy_issue_599))
+  | (binary_id(=destructive_command_guard::cli_e2e) & test(=allow_once_flow_tests::outer_quoted_interpreter_grants_survive_nested_inspection_issue_599))
+  | (binary_id(=destructive_command_guard::cli_e2e) & test(=allow_once_flow_tests::unread_python_sources_cannot_clear_policy_with_a_decoy_issue_599))
+  | (binary_id(=destructive_command_guard::cli_e2e) & test(=config_tests::doctor_audits_project_user_and_system_allowlists_from_nested_cwd))
+  | (binary_id(=destructive_command_guard::cli_e2e) & test(=config_tests::doctor_reports_untrusted_project_allowlist_as_inactive))
+  | (binary_id(=destructive_command_guard::cli_e2e) & test(=config_tests::doctor_warns_about_global_indefinite_user_rule_issue_545))
+  | (binary_id(=destructive_command_guard::cli_e2e) & test(=custom_pack_loading_tests::command_grants_cannot_be_acquired_from_a_confidence_replay))
+  | (binary_id(=destructive_command_guard) & test(=cli::tests::reasonix_home_override_is_normalized_like_reasonix))
+  | (binary_id(=destructive_command_guard) & test(=cli::tests::reasonix_settings_merge_preserves_user_state))
+  | (binary_id(=destructive_command_guard) & test(=cli::tests::reasonix_windows_entry_is_quoted_and_recognized))
+  | (binary_id(=destructive_command_guard) & test(=evaluator::tests::database_script_files_are_bounded_and_inspected_by_their_client_pack))
+  | (binary_id(=destructive_command_guard::repro_541_active_config_edge_cases) & test(=absolute_relative_and_home_paths_share_the_active_install_lifecycle))
+  | (binary_id(=destructive_command_guard::robot_mode) & test(=test_omp_robot_boundary_persists_history_before_block_exit_and_isolates_agents))
+  | (binary_id(=destructive_command_guard) & test(=simulate::tests::simulation_uses_resolved_policy_modes))
+  | (binary_id(=destructive_command_guard::suggest_allowlist_e2e) & test(=apply_flag_out_of_range_index))
+  | (binary_id(=destructive_command_guard::suggest_allowlist_e2e) & test(=apply_flag_refuses_require_confirmation_without_accept_risk))
+  | (binary_id(=destructive_command_guard::suggest_allowlist_e2e) & test(=apply_flag_writes_require_confirmation_with_accept_risk))
+  | (binary_id(=destructive_command_guard::suggest_allowlist_e2e) & test(=apply_flag_writes_to_allowlist))
+  | (binary_id(=destructive_command_guard::suggest_allowlist_e2e) & test(=test_suggest_allowlist_ci_forces_non_interactive_mode))
+  | (binary_id(=destructive_command_guard::suggest_allowlist_e2e) & test(=test_suggest_allowlist_cli_parsing_confidence_filter))
+  | (binary_id(=destructive_command_guard::suggest_allowlist_e2e) & test(=test_suggest_allowlist_cli_parsing_format))
+  | (binary_id(=destructive_command_guard::suggest_allowlist_e2e) & test(=test_suggest_allowlist_cli_parsing_risk_filter))
+  | (binary_id(=destructive_command_guard::suggest_allowlist_e2e) & test(=test_suggest_allowlist_empty_history))
+  | (binary_id(=destructive_command_guard::suggest_allowlist_e2e) & test(=test_suggest_allowlist_interactive_accept_writes_allowlist))
+  | (binary_id(=destructive_command_guard::suggest_allowlist_e2e) & test(=test_suggest_allowlist_interactive_quit_early))
+  | (binary_id(=destructive_command_guard::suggest_allowlist_e2e) & test(=test_suggest_allowlist_interactive_shows_action_prompts))
+  | (binary_id(=destructive_command_guard::suggest_allowlist_e2e) & test(=test_suggest_allowlist_interactive_skip_no_write))
+  | (binary_id(=destructive_command_guard::suggest_allowlist_e2e) & test(=test_suggest_allowlist_json_output_non_empty))
+  | (binary_id(=destructive_command_guard::suggest_allowlist_e2e) & test(=test_suggest_allowlist_json_output_structure))
+  | (binary_id(=destructive_command_guard::suggest_allowlist_e2e) & test(=test_suggest_allowlist_limit_filter))
+  | (binary_id(=destructive_command_guard::suggest_allowlist_e2e) & test(=test_suggest_allowlist_min_frequency_filter))
+  | (binary_id(=destructive_command_guard::suggest_allowlist_e2e) & test(=test_suggest_allowlist_non_interactive_no_writes))
+  | (binary_id(=destructive_command_guard::suggest_allowlist_e2e) & test(=test_suggest_allowlist_output_diagnostics))
+  | (binary_id(=destructive_command_guard::suggest_allowlist_e2e) & test(=test_suggest_allowlist_robot_env_forces_json_non_interactive_mode))
+  | (binary_id(=destructive_command_guard::suggest_allowlist_e2e) & test(=test_suggest_allowlist_runs_without_crash))
+)
+"""

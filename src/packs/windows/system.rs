@@ -3,13 +3,17 @@
 //! Covers the catastrophic Windows disk/system operations that are *not* plain
 //! filesystem deletes (those live in `windows.filesystem`):
 //!   - **Volume Shadow Copy destruction** — `vssadmin delete shadows`,
-//!     `wmic shadowcopy delete`. This is the hallmark of ransomware and a common
+//!     `wmic shadowcopy delete`, and `Win32_ShadowCopy` instances removed
+//!     through WMI/CIM. This is the hallmark of ransomware and a common
 //!     accidental data-loss vector: it destroys System Restore points and the
 //!     shadow copies many backup tools rely on.
 //!   - **Whole-volume / partition destruction** — `diskpart`, `Format-Volume`,
-//!     `Clear-Disk`, `Remove-Partition`, `Initialize-Disk`, `Reset-PhysicalDisk`.
+//!     `Clear-Disk`, `Remove-Partition`, `Remove-VirtualDisk`, `Initialize-Disk`,
+//!     `Reset-PhysicalDisk`.
 //!   - **Free-space wipe / boot config** — `cipher /w` (makes deleted files
 //!     unrecoverable), `bcdedit /delete` (boot configuration).
+//!   - **Data zeroing / forced dismount** — `fsutil file setzerodata` and
+//!     `fsutil volume dismount`.
 //!
 //! Design note: a *dedicated* `windows.system` pack is used rather than
 //! extending the existing default-on-everywhere `system.disk` pack (mkfs/dd/
@@ -59,11 +63,14 @@ pub fn create_pack() -> Pack {
         id: "windows.system".to_string(),
         name: "Windows Disk & System",
         description: "Protects against catastrophic Windows disk/system operations: \
-                      `vssadmin delete shadows` / `wmic shadowcopy delete` (Volume Shadow Copy \
-                      destruction), `diskpart`, `Format-Volume`, `Clear-Disk`, `Remove-Partition`, \
-                      `Initialize-Disk`, `Reset-PhysicalDisk`, `cipher /w`, and `bcdedit /delete`.",
-        // Realistic keyword casings (case-sensitive quick-reject); see
-        // packs::windows module docs.
+                      `vssadmin delete shadows` / `wmic shadowcopy delete` / `Win32_ShadowCopy` \
+                      deletion through WMI or CIM (Volume Shadow Copy destruction), `wbadmin \
+                      delete` (backup recovery points), `diskpart`, `Format-Volume`, `Clear-Disk`, \
+                      `Remove-Partition`, `Remove-VirtualDisk`, `Initialize-Disk`, \
+                      `Reset-PhysicalDisk`, `cipher /w`, `bcdedit /delete`, and \
+                      destructive `fsutil` file/volume operations.",
+        // Conventional keyword casings retained for readable metadata; the
+        // quick-reject itself is ASCII case-insensitive. See packs::windows.
         keywords: &[
             "vssadmin",
             "VSSADMIN",
@@ -72,6 +79,11 @@ pub fn create_pack() -> Pack {
             "shadowcopy",
             "ShadowCopy",
             "SHADOWCOPY",
+            // Boundary-aware quick-reject: `shadowcopy` never matches inside
+            // `Win32_ShadowCopy` (the `_` before it is a word character).
+            "Win32_ShadowCopy",
+            "win32_shadowcopy",
+            "WIN32_SHADOWCOPY",
             "diskpart",
             "DISKPART",
             "Format-Volume",
@@ -83,6 +95,9 @@ pub fn create_pack() -> Pack {
             "Remove-Partition",
             "remove-partition",
             "REMOVE-PARTITION",
+            "Remove-VirtualDisk",
+            "remove-virtualdisk",
+            "REMOVE-VIRTUALDISK",
             "Initialize-Disk",
             "initialize-disk",
             "INITIALIZE-DISK",
@@ -93,12 +108,29 @@ pub fn create_pack() -> Pack {
             "CIPHER",
             "bcdedit",
             "BCDEDIT",
+            "wbadmin",
+            "WBADMIN",
+            "fsutil",
+            "FSUTIL",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
         keyword_matcher: None,
         safe_regex_set: None,
         safe_regex_set_is_complete: false,
+    }
+}
+
+/// A storage cmdlet previewed with a bare `-WhatIf` switch; see
+/// `create_safe_patterns`. Shared with the core.filesystem baseline so the two
+/// packs cannot disagree about what a preview is.
+pub(crate) const STORAGE_WHATIF_SAFE: &str = r#"(?i)^\s*(?:format-volume|clear-disk|remove-partition|remove-virtualdisk|initialize-disk|reset-physicaldisk)\b[^|&;\r\n'"`$@(){}]*\s-whatif(?:\s[^|&;\r\n'"`$@(){}]*)?$"#;
+
+/// The `storage-whatif` safe pattern (see [`STORAGE_WHATIF_SAFE`]).
+pub(crate) fn storage_whatif_safe_pattern() -> SafePattern {
+    SafePattern {
+        regex: crate::packs::regex_engine::LazyCompiledRegex::new(STORAGE_WHATIF_SAFE),
+        name: "storage-whatif",
     }
 }
 
@@ -116,10 +148,14 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // `-WhatIf` previews, but only on PowerShell storage cmdlets that
         // honor it. A stray `-WhatIf` must not whitelist cmd.exe tools such as
         // vssadmin, cipher, or bcdedit.
-        safe_pattern!(
-            "storage-whatif",
-            r"(?i)^\s*(?:format-volume|clear-disk|remove-partition|initialize-disk|reset-physicaldisk)\b[^|&;\r\n]*\s-whatif\b[^|&;\r\n]*$"
-        ),
+        //
+        // Only the bare switch counts. `-WhatIf:$false` (or `:0`) turns the
+        // preview OFF and the cmdlet really runs; `\b` used to accept it, so
+        // `Remove-Partition ... -WhatIf:$false` was allowed. The whole command
+        // may also not contain quotes, backticks, `$`, `@`, parentheses or
+        // braces: ` -WhatIf` inside a quoted label or a `$( )` subexpression
+        // is not a switch on the cmdlet. Anything doubtful stays denied.
+        storage_whatif_safe_pattern(),
     ]
 }
 
@@ -140,6 +176,24 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Take a fresh backup (wbadmin / your backup tool) instead of deleting recovery points",
             SHADOW_SUGGESTIONS
         ),
+        // `wbadmin delete catalog|backup|systemstatebackup` removes Windows
+        // Server Backup / system-image recovery points: the same inhibit-recovery
+        // step as shadow deletion, and just as irreversible.
+        destructive_pattern!(
+            "wbadmin-delete",
+            r"(?i)\bwbadmin(?:\.exe)?\s+delete\s+(?:catalog|backup|systemstatebackup)\b",
+            "wbadmin delete destroys Windows backup recovery points or the backup catalog.",
+            Critical,
+            "`wbadmin delete backup` / `delete systemstatebackup` removes Windows Server Backup and \
+             system-image recovery points (with `-keepVersions:0`, all of them), and `wbadmin delete \
+             catalog` erases the catalog that makes the remaining backups restorable. Like \
+             `vssadmin delete shadows`, it is a standard ransomware step and an irreversible loss \
+             of recovery.\n\n\
+             Safer alternatives:\n\
+             - wbadmin get versions: list the recovery points first\n\
+             - Take a fresh backup before pruning old versions",
+            SHADOW_SUGGESTIONS
+        ),
         destructive_pattern!(
             "wmic-shadowcopy-delete",
             r"(?i)\bwmic(?:\.exe)?\s+shadowcopy\s+delete\b",
@@ -153,10 +207,40 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Back up before removing any recovery points",
             SHADOW_SUGGESTIONS
         ),
+        // The PowerShell spelling of the same deletion: the `Win32_ShadowCopy`
+        // WMI/CIM class piped into `Remove-WmiObject`/`Remove-CimInstance` (or
+        // their `rwmi`/`rcim` aliases), or its instances' `.Delete()` method,
+        // directly (`(Get-WmiObject Win32_ShadowCopy).Delete()`) or per item
+        // (`| ForEach-Object { $_.Delete() }`). It is the form current
+        // ransomware uses once `vssadmin`/`wmic` are watched, and it was
+        // allowed while those two were Critical. Listing or selecting shadow
+        // copies stays allowed.
+        destructive_pattern!(
+            "wmi-shadowcopy-delete",
+            r"(?i)\bwin32_shadowcopy\b[^\r\n;]*?(?:\|\s*(?:remove-wmiobject|rwmi|remove-ciminstance|rcim)\b|\.delete\s*\()",
+            "Deleting Win32_ShadowCopy instances destroys Volume Shadow Copies.",
+            Critical,
+            "Piping `Win32_ShadowCopy` (from `Get-WmiObject` / `Get-CimInstance`) into \
+             `Remove-WmiObject` / `Remove-CimInstance`, or calling `.Delete()` on its instances, \
+             deletes Volume Shadow Copies exactly like `vssadmin delete shadows`: the snapshots \
+             behind System Restore, Previous Versions and many backup tools. It is a standard \
+             ransomware step and an irreversible loss of local recovery.\n\n\
+             Safer alternatives:\n\
+             - Get-CimInstance Win32_ShadowCopy / vssadmin list shadows: inspect first\n\
+             - Back up before removing any recovery points",
+            SHADOW_SUGGESTIONS
+        ),
         // === Whole-volume / partition destruction ===
+        //
+        // diskpart reads its script from `/s <file>`, from stdin redirected
+        // from a file (`diskpart < wipe.txt`), or from a pipe. The pipe form
+        // puts the commands BEFORE the word diskpart (`(echo select disk 1 &
+        // echo clean) | diskpart`), where the lookahead never looked, so it
+        // was allowed; the second alternative reads the producer side of a
+        // pipe that ends in diskpart.
         destructive_pattern!(
             "diskpart",
-            r"(?i)\bdiskpart(?:\.exe)?\b(?=[^|&\r\n]*(?:/s\b|\bclean\b|\bdelete\b|\bformat\b))",
+            r"(?i)\bdiskpart(?:\.exe)?\b(?=[^|&\r\n]*(?:/s\b|<|\bclean\b|\bdelete\b|\bformat\b))|\b(?:clean|delete|format)\b[^\r\n]*\|\s*diskpart(?:\.exe)?\b",
             "diskpart with clean/delete/format/script reconfigures or wipes disks and partitions.",
             High,
             "`diskpart` is the low-level disk-partitioning tool. Driven by a script (`/s file.txt`) or \
@@ -206,6 +290,23 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Back up the partition's data before removing it",
             DISK_SUGGESTIONS
         ),
+        // A Storage Spaces virtual disk is the volume's backing store:
+        // `Remove-VirtualDisk` deletes it and every byte on it, the
+        // Storage-Spaces counterpart of Remove-Partition. (`Remove-StoragePool`
+        // refuses while virtual disks remain, so it is not the data-loss step.)
+        destructive_pattern!(
+            "remove-virtualdisk",
+            r"(?i)\bremove-virtualdisk\b",
+            "Remove-VirtualDisk deletes a Storage Spaces virtual disk and all data on it.",
+            Critical,
+            "`Remove-VirtualDisk` deletes a Storage Spaces virtual disk: the volume on it and \
+             every file it holds are gone, with no undo. A wrong friendly name destroys a live \
+             data volume.\n\n\
+             Safer alternatives:\n\
+             - Get-VirtualDisk: confirm the exact disk and that its data is backed up\n\
+             - Add -WhatIf to preview",
+            DISK_SUGGESTIONS
+        ),
         destructive_pattern!(
             "initialize-or-reset-disk",
             r"(?i)\b(?:initialize-disk|reset-physicaldisk)\b",
@@ -246,6 +347,42 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Export with `bcdedit /export` before modifying anything",
             WIPE_SUGGESTIONS
         ),
+        // === fsutil ===
+        //
+        // `setzerodata` is the Windows spelling of zeroing a file in place —
+        // the same primitive `core.filesystem` already denies on the POSIX side
+        // as a shrink-or-zero truncation. The effect was inside a pack's stated
+        // scope while this spelling reached no rule at any dialect.
+        destructive_pattern!(
+            "fsutil-setzerodata",
+            r"(?i)\bfsutil(?:\.exe)?\s+file\s+setzerodata\b",
+            "fsutil file setzerodata zeroes a byte range of a file in place.",
+            High,
+            "`fsutil file setzerodata offset=<n> length=<n> <file>` overwrites that range with \
+             zeroes directly on disk. The previous contents are gone with no confirmation, no \
+             recycle bin and no backup — the same act as zeroing a file on POSIX, which is \
+             already denied. Pointed at a database, a VHD or a log, it destroys the region \
+             without the file changing size, so the damage is not obvious afterwards.\n\n\
+             Safer alternatives:\n\
+             - Confirm the target and range first: `fsutil file queryvaliddata <file>`\n\
+             - Copy the file aside before modifying it\n\
+             - To reclaim space, delete the file normally and let the filesystem free it",
+            WIPE_SUGGESTIONS
+        ),
+        destructive_pattern!(
+            "fsutil-volume-dismount",
+            r"(?i)\bfsutil(?:\.exe)?\s+volume\s+dismount\b",
+            "fsutil volume dismount forcibly dismounts a volume, invalidating open handles.",
+            High,
+            "`fsutil volume dismount <drive>` forces the volume offline. Every open handle is \
+             invalidated, so processes writing to it lose buffered data and can leave files \
+             half-written; on a system or data volume this is an outage, not a cleanup step. \
+             It is the Windows neighbour of a forced unmount, which is already denied.\n\n\
+             Safer alternatives:\n\
+             - Stop the services using the volume first, then dismount\n\
+             - `fsutil volume diskfree <drive>` / `mountvol` to inspect without dismounting",
+            WIPE_SUGGESTIONS
+        ),
     ]
 }
 
@@ -263,6 +400,40 @@ mod tests {
         assert_patterns_compile(&pack);
         assert_all_patterns_have_reasons(&pack);
         assert_unique_pattern_names(&pack);
+    }
+
+    /// `fsutil` had no rule at all, at any dialect, with every pack enabled.
+    ///
+    /// `setzerodata` is the Windows spelling of zeroing a file in place, which
+    /// `core.filesystem` already denies on the POSIX side, so the effect was
+    /// inside a pack's stated scope while this spelling reached nothing.
+    #[test]
+    fn blocks_fsutil_data_destruction() {
+        let pack = create_pack();
+        for (command, rule) in [
+            (
+                r"fsutil file setzerodata offset=0 length=4096 C:\data.db",
+                "fsutil-setzerodata",
+            ),
+            (
+                r"fsutil.exe file setZeroData offset=0 length=1 C:\x",
+                "fsutil-setzerodata",
+            ),
+            ("fsutil volume dismount C:", "fsutil-volume-dismount"),
+            ("FSUTIL VOLUME DISMOUNT D:", "fsutil-volume-dismount"),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
+
+        // Read-only and unrelated fsutil subcommands are ordinary inspection.
+        for command in [
+            "fsutil volume diskfree C:",
+            "fsutil file queryvaliddata C:\\data.db",
+            "fsutil fsinfo drives",
+            "fsutil dirty query C:",
+        ] {
+            assert_allows(&pack, command);
+        }
     }
 
     #[test]
@@ -294,10 +465,58 @@ mod tests {
             ),
             ("VSSADMIN DELETE SHADOWS /ALL", "vssadmin-delete-shadows"),
             ("wmic shadowcopy delete", "wmic-shadowcopy-delete"),
+            ("wbadmin delete catalog -quiet", "wbadmin-delete"),
+            (
+                "wbadmin delete systemstatebackup -keepVersions:0",
+                "wbadmin-delete",
+            ),
+            (
+                "WBADMIN.EXE DELETE BACKUP -keepVersions:0 -quiet",
+                "wbadmin-delete",
+            ),
+            (
+                "Get-WmiObject Win32_ShadowCopy | Remove-WmiObject",
+                "wmi-shadowcopy-delete",
+            ),
+            (
+                "Get-CimInstance Win32_ShadowCopy | Remove-CimInstance",
+                "wmi-shadowcopy-delete",
+            ),
+            (
+                "gcim -ClassName Win32_ShadowCopy | Where-Object { $_.VolumeName -like '*C*' } | rcim",
+                "wmi-shadowcopy-delete",
+            ),
+            (
+                "(Get-WmiObject Win32_ShadowCopy).Delete()",
+                "wmi-shadowcopy-delete",
+            ),
+            (
+                "gwmi win32_shadowcopy | ForEach-Object { $_.Delete() }",
+                "wmi-shadowcopy-delete",
+            ),
+            (
+                "Get-WmiObject -Query 'select * from Win32_ShadowCopy' | rwmi",
+                "wmi-shadowcopy-delete",
+            ),
         ];
         for (command, expected) in checks {
             assert_blocks_with_pattern(&pack, command, expected);
             assert_blocks_with_severity(&pack, command, Severity::Critical);
+            assert!(
+                pack.might_match(command),
+                "keyword gate must admit {command}"
+            );
+        }
+        for command in [
+            "Get-CimInstance Win32_ShadowCopy",
+            "Get-WmiObject Win32_ShadowCopy | Select-Object ID, InstallDate",
+            "Get-CimInstance Win32_ShadowCopy | Measure-Object",
+            "Get-WmiObject Win32_ShadowCopy; Remove-Item .\\old.log",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command} lists shadow copies and must stay allowed"
+            );
         }
     }
 
@@ -305,12 +524,43 @@ mod tests {
     fn blocks_disk_and_partition_destruction() {
         let pack = create_pack();
         assert_blocks_with_pattern(&pack, "diskpart /s wipe.txt", "diskpart");
+        // A script on stdin: redirected from a file, or piped in, where the
+        // commands come before the word diskpart.
+        for command in [
+            "diskpart < wipe.txt",
+            "(echo select disk 1 & echo clean) | diskpart",
+            "echo select disk 0 ^& clean | diskpart",
+            "echo delete partition override | diskpart.exe",
+            "(echo select volume 3 & echo format fs=ntfs quick) | diskpart",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "diskpart");
+        }
+        for command in [
+            "echo list disk | diskpart",
+            "(echo list volume) | diskpart",
+            "diskpart /?",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command} only lists and must stay allowed"
+            );
+        }
         assert_blocks_with_pattern(&pack, "Format-Volume -DriveLetter D", "format-volume");
         assert_blocks_with_pattern(&pack, "Clear-Disk -Number 1 -RemoveData", "clear-disk");
         assert_blocks_with_pattern(
             &pack,
             "Remove-Partition -DiskNumber 1 -PartitionNumber 2",
             "remove-partition",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "Remove-VirtualDisk -FriendlyName Data -Confirm:$false",
+            "remove-virtualdisk",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "Get-VirtualDisk Data | Remove-VirtualDisk",
+            "remove-virtualdisk",
         );
         assert_blocks_with_pattern(
             &pack,
@@ -348,14 +598,45 @@ mod tests {
             "Format-Volume -DriveLetter D -WhatIf",
             "Clear-Disk -Number 1 -RemoveData -WhatIf",
             "Remove-Partition -DiskNumber 1 -PartitionNumber 2 -WhatIf",
+            "Remove-VirtualDisk -FriendlyName Data -WhatIf",
             "Initialize-Disk -Number 2 -WhatIf",
             "Reset-PhysicalDisk -FriendlyName Disk1 -WhatIf",
             "bcdedit /enum",
+            "wbadmin get versions",
+            "wbadmin start backup -backupTarget:E: -include:C: -quiet",
             // bare diskpart with no destructive verb on the line is not flagged here
             "diskpart",
         ];
         for command in allowed {
             assert_allows(&pack, command);
         }
+    }
+
+    /// `-WhatIf:$false` disables the preview, so the cmdlet really runs; the
+    /// carve-out used to accept it through `\b`. A ` -WhatIf` that is not a
+    /// switch on the cmdlet (inside a quoted argument or a subexpression) and
+    /// a longer parameter name must not count either.
+    #[test]
+    fn whatif_carve_out_accepts_only_the_bare_switch() {
+        let pack = create_pack();
+        for command in [
+            "Format-Volume -DriveLetter D -WhatIf:$false",
+            "Format-Volume -DriveLetter D -WhatIf:$False -Confirm:$false",
+            "Clear-Disk -Number 1 -RemoveData -WhatIf:$false",
+            "Remove-Partition -DiskNumber 1 -PartitionNumber 2 -WhatIf:0",
+            "Initialize-Disk -Number 2 -WhatIf:$false",
+            "Reset-PhysicalDisk -FriendlyName Disk1 -WhatIf:$false",
+            "Format-Volume -DriveLetter D -NewFileSystemLabel ' -WhatIf'",
+            "Format-Volume -DriveLetter D -NewFileSystemLabel \" -WhatIf\"",
+            "Remove-Partition -DiskNumber $(Get-Disk -WhatIf) -PartitionNumber 2",
+            "Remove-Partition -DiskNumber 1 -PartitionNumber 2 -WhatIfx",
+            "Remove-Partition -DiskNumber 1 -PartitionNumber 2 `\n-WhatIf",
+        ] {
+            assert!(pack.check(command).is_some(), "must stay denied: {command}");
+        }
+        assert_allows(
+            &pack,
+            "Remove-Partition -DiskNumber 1 -PartitionNumber 2 -WhatIf -Confirm",
+        );
     }
 }

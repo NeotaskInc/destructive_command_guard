@@ -91,6 +91,8 @@ Commands containing these keywords are checked against this pack:
 
 - `docker-compose`
 - `docker compose`
+- `podman-compose`
+- `podman compose`
 - `compose`
 
 ### Safe Patterns (Allowed)
@@ -99,13 +101,13 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `compose-config` | `(?:docker-compose\|docker\s+compose)\s+config` |
-| `compose-ps` | `(?:docker-compose\|docker\s+compose)\s+ps` |
-| `compose-logs` | `(?:docker-compose\|docker\s+compose)\s+logs` |
-| `compose-up` | `(?:docker-compose\|docker\s+compose)\s+up` |
-| `compose-build` | `(?:docker-compose\|docker\s+compose)\s+build` |
-| `compose-pull` | `(?:docker-compose\|docker\s+compose)\s+pull` |
-| `compose-down-no-volumes` | `(?:docker-compose\|docker\s+compose)\s+down(?!\s+.*(?:-v\b\|--volumes\|--rmi))` |
+| `compose-config` | `(?:docker-compose\|docker\s+compose\|podman-compose\|podman\s+compose)\s+config` |
+| `compose-ps` | `(?:docker-compose\|docker\s+compose\|podman-compose\|podman\s+compose)\s+ps` |
+| `compose-logs` | `(?:docker-compose\|docker\s+compose\|podman-compose\|podman\s+compose)\s+logs` |
+| `compose-up` | `(?:docker-compose\|docker\s+compose\|podman-compose\|podman\s+compose)\s+up` |
+| `compose-build` | `(?:docker-compose\|docker\s+compose\|podman-compose\|podman\s+compose)\s+build` |
+| `compose-pull` | `(?:docker-compose\|docker\s+compose\|podman-compose\|podman\s+compose)\s+pull` |
+| `compose-down-no-volumes` | `(?:docker-compose\|docker\s+compose\|podman-compose\|podman\s+compose)\s+(?:-[^\s;\|&`()<>]*\s+(?:[^\s;\|&`()<>-][^\s;\|&`()<>]*\s+)?)*down(?!\s+.*(?:-[vt]*v[vt]*\b\|--volumes\|--rmi))(?:\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 
@@ -174,6 +176,7 @@ These patterns match potentially destructive commands:
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
 | `system-prune` | podman system prune removes ALL unused containers, pods, images. Use 'podman system df' to preview. | high |
+| `system-reset` | podman system reset deletes ALL containers, pods, images, networks and volumes. | critical |
 | `volume-prune` | podman volume prune removes ALL unused volumes and their data permanently. | critical |
 | `pod-prune` | podman pod prune removes ALL stopped pods. | medium |
 | `image-prune` | podman image prune removes unused images. Use 'podman images' to review first. | medium |

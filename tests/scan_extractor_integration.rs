@@ -18,18 +18,7 @@ use std::process::Command;
 fn run_dcg_scan(args: &[&str]) -> std::process::Output {
     let dcg_bin = std::env::var("DCG_BIN")
         .map(std::path::PathBuf::from)
-        .or_else(|_| {
-            std::env::var_os("CARGO_BIN_EXE_dcg")
-                .map(std::path::PathBuf::from)
-                .ok_or(std::env::VarError::NotPresent)
-        })
-        .unwrap_or_else(|_| {
-            let mut path = std::env::current_exe().expect("current_exe");
-            path.pop(); // test binary name
-            path.pop(); // deps/
-            path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
-            path
-        });
+        .unwrap_or_else(|_| std::path::PathBuf::from(env!("CARGO_BIN_EXE_dcg")));
 
     Command::new(dcg_bin)
         .args(["scan"])
@@ -356,6 +345,43 @@ fn scan_package_json_ignores_description() {
     assert!(
         findings.is_empty(),
         "should not flag description field content"
+    );
+}
+
+#[test]
+fn scan_powershell_detects_multiline_outlook_com_send() {
+    let dir = tempfile::tempdir().unwrap();
+    let mailer = dir.path().join("send-dossier.ps1");
+    std::fs::write(
+        &mailer,
+        r#"$outlook = New-Object -ComObject Outlook.Application
+$mail = $outlook.CreateItem(0)
+$mail.To = 'outside@example.test'
+$mail.Subject = 'Daily dossier'
+$mail.HTMLBody = Get-Content .\dossier.html -Raw
+$mail.Send()
+"#,
+    )
+    .unwrap();
+
+    let output = run_dcg_scan(&[
+        "--paths",
+        mailer.to_str().unwrap(),
+        "--format",
+        "json",
+        "--with-packs",
+        "careful_company_running_windows.email",
+    ]);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let findings = json["findings"].as_array().unwrap();
+    assert!(
+        findings.iter().any(|finding| {
+            finding["rule_id"] == "careful_company_running_windows.email:outlook-com-send"
+        }),
+        "multi-line Outlook send must be reported\nstdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

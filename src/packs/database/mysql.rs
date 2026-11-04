@@ -57,12 +57,12 @@ const TRUNCATE_TABLE_SUGGESTIONS: &[PatternSuggestion] = &[
         "Check how many rows would be deleted",
     ),
     PatternSuggestion::new(
-        "DELETE FROM {tablename}",
-        "Use DELETE for transactional, recoverable deletion",
-    ),
-    PatternSuggestion::new(
         "CREATE TABLE {tablename}_backup AS SELECT * FROM {tablename}",
         "Backup data to temporary table before truncating",
+    ),
+    PatternSuggestion::gated(
+        "DELETE FROM {tablename}",
+        "Transactional, recoverable deletion — but an unfiltered DELETE is gated as well",
     ),
 ];
 
@@ -76,9 +76,9 @@ const DELETE_WITHOUT_WHERE_SUGGESTIONS: &[PatternSuggestion] = &[
         "SELECT COUNT(*) FROM {tablename}",
         "Check how many rows exist before deletion",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "TRUNCATE TABLE {tablename}",
-        "Use TRUNCATE if you truly want to delete all rows (faster)",
+        "Faster if you truly want all rows gone — but TRUNCATE is gated as well",
     ),
     PatternSuggestion::new(
         "SELECT * FROM {tablename} LIMIT 10",
@@ -191,6 +191,7 @@ pub fn create_pack() -> Pack {
             "drop",
             "truncate",
             "GRANT",
+            "UPDATE",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
@@ -231,10 +232,11 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             High,
             "Materialize and review the exact SQL before piping or redirecting it into the client."
         ),
-        // DROP DATABASE
+        // DROP DATABASE. In MySQL/MariaDB `DROP SCHEMA` is a synonym, not a
+        // narrower operation, so it shares the rule id.
         destructive_pattern!(
             "drop-database",
-            r"(?i)\bDROP\s+DATABASE\b",
+            r"(?i)\bDROP\s+(?:DATABASE|SCHEMA)\b",
             "DROP DATABASE permanently deletes the entire database. Verify and back up first.",
             Critical,
             "DROP DATABASE completely removes a database and ALL its contents:\n\n\
@@ -273,7 +275,10 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // TRUNCATE TABLE
         destructive_pattern!(
             "truncate-table",
-            r"(?i)TRUNCATE\s+(?:TABLE\s+)?[a-zA-Z_]",
+            // Keep byte-identical to `crate::packs::database::TRUNCATE_TABLE_PATTERN`
+            // (asserted by `truncate_table_pattern_is_shared`); the rationale
+            // for every constraint lives on that constant. Issue #403.
+            r#"(?i)(?:(?:^|[;"'`])(?:\s|/\*(?:[^*]|\*+[^*/])*\*+/)*|\r?\n(?:\s|/\*(?:[^*]|\*+[^*/])*\*+/)*(?=TRUNCATE\s+TABLE\b)|/\*!\d*\s*)(?<![-\w.$])TRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?[A-Za-z_][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_$]*)*(?![A-Za-z0-9_$]*[-.])\s*(?:[;,)"'`]|\*/|$|\s+(?:CASCADE|RESTRICT|RESTART|CONTINUE|IDENTITY)\b)"#,
             "TRUNCATE permanently deletes all rows. Cannot be rolled back in MySQL.",
             High,
             "TRUNCATE is faster than DELETE but more dangerous in MySQL:\n\n\
@@ -287,13 +292,14 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Check row count first:\n  \
              SELECT COUNT(*) FROM tablename;\n\n\
              If you need rollback capability, use:\n  \
-             DELETE FROM tablename;  -- Slower but transactional",
+             DELETE FROM tablename;  -- Slower but transactional (dcg gates an \
+             unfiltered DELETE too, so this form also needs approval)",
             TRUNCATE_TABLE_SUGGESTIONS
         ),
         // DELETE without WHERE
         destructive_pattern!(
             "delete-without-where",
-            r"(?i)DELETE\s+FROM\s+(?:(?:[a-zA-Z_][a-zA-Z0-9_]*|`[^`]+`)(?:\.(?:[a-zA-Z_][a-zA-Z0-9_]*|`[^`]+`))?)\s*(?:;|$)",
+            r"(?i)\bDELETE\s+FROM\s+(?:(?:[a-zA-Z_][a-zA-Z0-9_]*|`[^`]+`)(?:\.(?:[a-zA-Z_][a-zA-Z0-9_]*|`[^`]+`))?)\s*(?:;|$)",
             "DELETE without WHERE clause deletes ALL rows. Add a WHERE clause.",
             High,
             "DELETE without WHERE removes ALL rows from the table:\n\n\
@@ -303,7 +309,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Does NOT reset AUTO_INCREMENT counter\n\
              - Much slower than TRUNCATE for large tables\n\n\
              If you meant to delete all rows:\n\
-             - TRUNCATE is faster (but non-transactional)\n\
+             - TRUNCATE is faster (but non-transactional, and dcg gates it too)\n\
              - DELETE in transaction allows rollback\n\n\
              Otherwise, add a WHERE clause:\n  \
              DELETE FROM tablename WHERE condition;\n\n\
@@ -311,6 +317,34 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              SELECT COUNT(*) FROM tablename;  -- all rows!\n  \
              SELECT * FROM tablename LIMIT 10;",
             DELETE_WITHOUT_WHERE_SUGGESTIONS
+        ),
+        // UPDATE without WHERE rewrites every row (same blast radius as the
+        // unscoped DELETE above).
+        destructive_pattern!(
+            "update-without-where",
+            // Keep byte-identical to `crate::packs::database::UPDATE_WITHOUT_WHERE_PATTERN`.
+            r#"(?i)\bUPDATE\s+(?:(?:LOW_PRIORITY|IGNORE|ONLY|OR\s+(?:ROLLBACK|ABORT|REPLACE|FAIL|IGNORE))\s+)*(?:[A-Za-z_][\w$]*|"[^"]+"|`[^`]+`|\[[^\]]+\])(?:\s*\.\s*(?:[A-Za-z_][\w$]*|"[^"]+"|`[^`]+`|\[[^\]]+\]))?\s+(?:(?:AS\s+)?(?!SET\b)[A-Za-z_]\w*\s+)?SET\b(?:(?!\bWHERE\b)[^;])*(?:;|$)"#,
+            "UPDATE without WHERE clause overwrites the column in ALL rows. Add a WHERE clause.",
+            High,
+            "UPDATE without WHERE changes every row in the table. With autocommit on (the \
+             MySQL default) the previous values are gone the moment it runs.\n\n\
+             Scope it:\n  \
+             UPDATE tablename SET col = value WHERE condition;\n\n\
+             Preview what would change:\n  \
+             SELECT COUNT(*) FROM tablename WHERE condition;"
+        ),
+        // ALTER TABLE … DROP COLUMN (and DROP PARTITION) deletes data in every
+        // row; index/key/constraint drops are metadata only.
+        destructive_pattern!(
+            "drop-column",
+            // Keep byte-identical to `crate::packs::database::DROP_COLUMN_PATTERN`.
+            r#"(?i)\bALTER\s+TABLE\b[^;]*?\bDROP\s+(?:COLUMN\s+)?(?:IF\s+EXISTS\s+)?(?!(?:CONSTRAINT|DEFAULT|NOT\s+NULL|IDENTITY|EXPRESSION|INDEX|KEY|PRIMARY\s+KEY|FOREIGN\s+KEY|CHECK)\b)[A-Za-z_"`\[]"#,
+            "ALTER TABLE ... DROP COLUMN permanently deletes that column's data in every row.",
+            High,
+            "Dropping a column (or a partition) removes its data from every row it covers; \
+             ALTER TABLE is not transactional in MySQL, so there is no rollback.\n\n\
+             Back up the column first:\n  \
+             CREATE TABLE tablename_col_backup AS SELECT id, col FROM tablename;"
         ),
         // mysqladmin drop
         destructive_pattern!(
@@ -374,7 +408,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // GRANT ALL PRIVILEGES
         destructive_pattern!(
             "grant-all",
-            r"(?i)GRANT\s+ALL\s+(?:PRIVILEGES\s+)?ON\s+\*\.\*",
+            r"(?i)\bGRANT\s+ALL\s+(?:PRIVILEGES\s+)?ON\s+\*\.\*",
             "GRANT ALL ON *.* gives unrestricted access to all databases.",
             High,
             "GRANT ALL PRIVILEGES ON *.* gives the user complete control:\n\n\
@@ -439,6 +473,118 @@ mod tests {
     use super::*;
     use crate::packs::test_helpers::*;
 
+    /// Issue #403: Tailwind's `truncate` utility class is not SQL DDL.
+    ///
+    /// The class list is the overwhelmingly common spelling in current
+    /// frontend code, and `truncate` followed by another class satisfied the
+    /// old "word, whitespace, letter" pattern, so ordinary React/TypeScript
+    /// edits could not be made through any shell command.
+    #[test]
+    fn tailwind_truncate_class_is_not_ddl() {
+        let pack = create_pack();
+        for command in [
+            "truncate line-through",
+            "TRUNCATE line-through",
+            "truncate text-sm",
+            "truncate flex-1",
+            "echo class=\"min-w-0 truncate line-through\"",
+            "bun run build -- --class truncate line-through",
+            // The `\b`-after-punctuation class: a word boundary also exists
+            // after `.` and `-`, so these used to match.
+            "x.truncate 5",
+            "cargo run -- --no-truncate output",
+        ] {
+            assert_allows(&pack, command);
+        }
+    }
+
+    /// The same expression must still see every real spelling of the DDL.
+    #[test]
+    fn truncate_ddl_spellings_still_block() {
+        let pack = create_pack();
+        for command in [
+            "truncate table users",
+            "TRUNCATE TABLE users",
+            "truncate users",
+            "truncate users;",
+            "truncate only users",
+            "TRUNCATE TABLE public.users",
+            "truncate foo CASCADE",
+            "truncate table a, b",
+            "TRUNCATE users RESTART IDENTITY",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "truncate-table");
+        }
+    }
+
+    /// Issue #394: the word `truncate` as an operand of another command is not
+    /// DDL. The `truncate-table` rule denied `cat truncate x`, `sort truncate b`
+    /// and `wc -l truncate x` — plain file reads whose operands happen to be
+    /// named like SQL identifiers — as "would delete database rows".
+    #[test]
+    fn truncate_as_another_commands_operand_is_not_ddl() {
+        let pack = create_pack();
+        for command in [
+            "cat truncate x",
+            "sort truncate b",
+            "wc -l truncate x",
+            "ls truncate x",
+            "diff truncate other",
+            "cp truncate backup",
+            "mv truncate archive",
+            "stat truncate x",
+        ] {
+            assert_allows(&pack, command);
+        }
+    }
+
+    /// The statement-position constraint must not cost a single real execution
+    /// path: a quoted client argument, a `;`-separated later statement, or text
+    /// start (which is what a heredoc body and a reconstructed `echo … | mysql`
+    /// payload both look like by the time they reach the pattern).
+    #[test]
+    fn truncate_statement_openers_still_block() {
+        let pack = create_pack();
+        for command in [
+            "TRUNCATE TABLE users",
+            "mysql -e \"TRUNCATE TABLE users\"",
+            "mysql --execute=\"TRUNCATE users\"",
+            "mysql -u root -p db -e 'TRUNCATE TABLE users;'",
+            "mysql -e \"DELETE FROM a WHERE id=1; TRUNCATE TABLE b;\"",
+            "mariadb -e \"TRUNCATE TABLE users\"",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "truncate-table");
+        }
+    }
+
+    /// A continuation line is a conditional opener: it counts when the explicit
+    /// `TRUNCATE TABLE` spelling follows it.
+    ///
+    /// Regression: constraint 4 originally accepted only text start, `;`, and a
+    /// quote, which under-blocked a statement sitting on a continuation line
+    /// after a SQL comment — it has no `;` before it and is not at text start.
+    /// A bare newline opener would instead re-admit #403, so the `TABLE` keyword
+    /// is the evidence that separates SQL from a wrapped class list.
+    #[test]
+    fn a_continuation_line_opens_a_statement_when_table_is_explicit() {
+        let pack = create_pack();
+        for command in [
+            "mysql -e \"-- clean the table\nTRUNCATE TABLE users\"",
+            "mysql -e \"SET foreign_key_checks=0\nTRUNCATE TABLE users\"",
+            "mysql -e \"-- clean\r\nTRUNCATE TABLE users\"",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "truncate-table");
+        }
+
+        // The #403 class must stay out: a wrapped class list has no `TABLE`.
+        for command in [
+            "echo \"<div class=\\\"p-2\ntruncate flex\\\">\"",
+            "echo \"class=\\\"min-w-0\ntruncate line-through\\\"\"",
+        ] {
+            assert_allows(&pack, command);
+        }
+    }
+
     #[test]
     fn test_drop_database() {
         let pack = create_pack();
@@ -457,6 +603,15 @@ mod tests {
             "DROP DATABASE IF EXISTS mydb;",
             "permanently deletes the entire database",
         );
+        // `DROP SCHEMA` is MySQL's synonym for `DROP DATABASE`.
+        for command in [
+            "DROP SCHEMA mydb;",
+            "mysql -u root -e \"drop schema prod\"",
+            "DROP SCHEMA IF EXISTS mydb",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "drop-database");
+        }
+        assert_allows(&pack, "SELECT schema_name FROM information_schema.schemata");
     }
 
     #[test]

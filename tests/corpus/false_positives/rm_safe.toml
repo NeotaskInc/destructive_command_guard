@@ -12,11 +12,6 @@ command = "rm -rf /tmp/build"
 expected = "allow"
 
 [[case]]
-description = "rm -rf /tmp/* is safe"
-command = "rm -rf /tmp/*"
-expected = "allow"
-
-[[case]]
 description = "rm -rf /tmp with trailing slash is safe"
 command = "rm -rf /tmp/foo/"
 expected = "allow"
@@ -33,11 +28,6 @@ expected = "allow"
 [[case]]
 description = "rm -rf in /var/tmp is safe"
 command = "rm -rf /var/tmp/build"
-expected = "allow"
-
-[[case]]
-description = "rm -rf /var/tmp/* is safe"
-command = "rm -rf /var/tmp/*"
 expected = "allow"
 
 # ============================================================================
@@ -64,12 +54,30 @@ description = "rm --force --recursive /tmp is safe (long flags reversed)"
 command = "rm --force --recursive /tmp/build"
 expected = "allow"
 
-# NOTE: rm -rf with extra flags may not match safe patterns
-# The --verbose flag between -rf and path causes pattern mismatch
-# [[case]]
-# description = "rm -rf with verbose in /tmp is safe"
-# command = "rm -rf --verbose /tmp/build"
-# expected = "allow"
+[[case]]
+description = "bare recursive rm in literal /tmp is safe"
+command = "rm -r /tmp/build"
+expected = "allow"
+
+[[case]]
+description = "bare recursive rm in literal /var/tmp is safe"
+command = "rm --recursive /var/tmp/cache"
+expected = "allow"
+
+[[case]]
+description = "interactive mode after force restores prompting"
+command = "rm -rf -i ./build"
+expected = "allow"
+
+[[case]]
+description = "interactive once after force restores prompting"
+command = "rm -r --force --interactive=once ./build"
+expected = "allow"
+
+[[case]]
+description = "rm -rf with verbose in /tmp is safe"
+command = "rm -rf --verbose /tmp/build"
+expected = "allow"
 
 # ============================================================================
 # Non-recursive rm is always safe
@@ -98,4 +106,32 @@ expected = "allow"
 [[case]]
 description = "rm with -v (verbose) is safe"
 command = "rm -v file.txt"
+expected = "allow"
+
+# bd-5xgt controls: the flag-quote fix dequotes option-position tokens, but
+# quoted DATA is not a command and an unbalanced quote is a syntax error that
+# never runs rm — both must stay allowed.
+[[case]]
+description = "recursive-delete mention inside a quoted echo argument (data)"
+command = "echo 'rm -rf /'"
+expected = "allow"
+
+[[case]]
+description = "recursive-delete text as a grep search pattern (data)"
+command = "grep 'rm -rf' file"
+expected = "allow"
+
+[[case]]
+description = "unbalanced quote in an rm flag is a syntax error, not a bypass"
+command = "rm -r'f /"
+expected = "allow"
+
+[[case]]
+description = "a cd into a project does not make its ordinary files protected (#480)"
+command = "cd ~/project && rm notes.txt"
+expected = "allow"
+
+[[case]]
+description = "a cd inside a subshell that already exited moves nothing (#480)"
+command = "( cd ~/.ssh ); rm id_rsa"
 expected = "allow"

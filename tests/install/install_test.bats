@@ -22,6 +22,84 @@ teardown() {
 }
 
 # ============================================================================
+# Parsing
+# ============================================================================
+
+@test "install.sh parses under every bash on the host, including macOS /bin/bash 3.2" {
+    # `curl … | bash` runs whichever bash is first on PATH; on stock macOS
+    # that is /bin/bash 3.2, which rejects a `case` inside `$(...)` that bash
+    # 5 accepts. A parse error there fails the whole install before it starts.
+    local shells=() candidate
+    for candidate in /bin/bash "$(command -v bash)"; do
+        [ -x "$candidate" ] && shells+=("$candidate")
+    done
+    [ "${#shells[@]}" -gt 0 ] || skip "no bash executable found"
+    for candidate in "${shells[@]}"; do
+        run "$candidate" -n "$INSTALL_SCRIPT"
+        [ "$status" -eq 0 ] || {
+            echo "$candidate ($("$candidate" -c 'echo "$BASH_VERSION"')): $output"
+            return 1
+        }
+        # uninstall.sh is piped to the same bash by its own one-liner.
+        run "$candidate" -n "$UNINSTALL_SCRIPT"
+        [ "$status" -eq 0 ] || {
+            echo "$candidate uninstall.sh: $output"
+            return 1
+        }
+    done
+}
+
+# Feed a script on stdin to a shell, the way `curl ... | <shell>` does. Every
+# destination is pinned under the test's temp dir and only `--help` is asked
+# for, so even a broken guard cannot install anything.
+run_piped_script() {
+    local shell_cmd="$1" script="$2"
+    # shellcheck disable=SC2086 # "bash --posix" must split into two words
+    run env -i HOME="$HOME" PATH=/usr/bin:/bin DEST="$TEST_TMPDIR/dest" \
+        VERSION=v0.0.0-test $shell_cmd -s -- --help < "$script"
+}
+
+@test "install.sh and uninstall.sh piped to a non-bash shell stop with a clear message (#587)" {
+    local shells=() candidate script
+    for candidate in dash zsh ksh mksh posh; do
+        command -v "$candidate" >/dev/null 2>&1 && shells+=("$(command -v "$candidate")")
+    done
+    [ "${#shells[@]}" -gt 0 ] || skip "no non-bash shell installed"
+    for candidate in "${shells[@]}"; do
+        for script in "$INSTALL_SCRIPT" "$UNINSTALL_SCRIPT"; do
+            run_piped_script "$candidate" "$script"
+            [ "$status" -eq 1 ] || {
+                echo "$candidate $(basename "$script"): status $status: $output"
+                return 1
+            }
+            [[ "$output" == *"this script needs bash"* ]] || {
+                echo "$candidate $(basename "$script"): $output"
+                return 1
+            }
+        done
+    done
+    [ ! -e "$TEST_TMPDIR/dest" ]
+}
+
+@test "install.sh run by bash in POSIX mode (curl ... | sh where sh is bash) still runs (#587)" {
+    # POSIX-mode bash rejects process substitution, which install.sh uses, so
+    # the script must leave POSIX mode before reaching it.
+    run_piped_script "bash --posix" "$INSTALL_SCRIPT"
+    [ "$status" -eq 0 ] || {
+        echo "status $status: $output"
+        return 1
+    }
+    [[ "$output" == *"Usage: install.sh"* ]]
+    if [ -x /bin/bash ]; then
+        run_piped_script "/bin/bash --posix" "$INSTALL_SCRIPT"
+        [ "$status" -eq 0 ] || {
+            echo "/bin/bash --posix: status $status: $output"
+            return 1
+        }
+    fi
+}
+
+# ============================================================================
 # Platform Detection Tests
 # ============================================================================
 
@@ -210,6 +288,29 @@ MOCKEOF
     grep -Fxq -- "-Vm" "$MINISIGN_ARGS_FILE"
     grep -Fxq -- "$artifact" "$MINISIGN_ARGS_FILE"
     grep -Fxq -- "-P" "$MINISIGN_ARGS_FILE"
+    grep -Fxq -- "RWSoYi6NXJWzaRs1mJmOwwXrZfPWcq6MXnQlNMLBYKzlIQTLwuVQG6uO" "$MINISIGN_ARGS_FILE"
+}
+
+@test "verify_minisign_signature: legacy key is scoped to v0.6.7" {
+    TMP="$TEST_TMPDIR/minisign-legacy"
+    mkdir -p "$TMP"
+    local artifact="$TMP/dcg.tar.xz"
+    local signature="$TMP/release.minisig"
+    printf 'artifact' > "$artifact"
+    printf 'signature' > "$signature"
+    export MINISIGN_ARGS_FILE="$TMP/minisign.args"
+    cat > "$TEST_TMPDIR/bin/minisign" << 'MOCKEOF'
+#!/bin/bash
+printf '%s\n' "$@" > "$MINISIGN_ARGS_FILE"
+exit 0
+MOCKEOF
+    chmod +x "$TEST_TMPDIR/bin/minisign"
+    MINISIGN_SIGNATURE_URL="file://$signature"
+    REQUIRE_MINISIGN=1
+    VERSION="v0.6.7"
+
+    run verify_minisign_signature "$artifact" "https://example.invalid/dcg.tar.xz"
+    [ "$status" -eq 0 ]
     grep -Fxq -- "RWTQoKUb0Ue4NsqTpPWnABCrIU0+m25zsMlbv6UcRClQ7jmRP3A7NmTB" "$MINISIGN_ARGS_FILE"
 }
 
@@ -289,9 +390,238 @@ MOCKEOF
     [[ "$output" == *"Required minisign signature"* ]]
 }
 
+@test "cosign_version_is_patched: enforces repaired release floors" {
+    local mock_cosign="$TEST_TMPDIR/bin/cosign"
+    cat > "$mock_cosign" << 'MOCKEOF'
+#!/bin/bash
+printf '{"gitVersion":"%s"}\n' "$MOCK_COSIGN_VERSION"
+MOCKEOF
+    chmod +x "$mock_cosign"
+
+    # version|expected status (0 = patched)
+    local cases=(
+        "v2.6.1|1"
+        "v2.6.2|0"
+        "v3.0.3|1"
+        "v3.0.4|0"
+        "v3.1.2|0"
+        "v3.0.4-rc.1|1"
+        "v2.6.2-rc.1|1"
+        "devel|1"
+        "v3.1.3+dirty|0"
+        "v3.0.4+dirty|0"
+        "v3.0.3+dirty|1"
+        "3.1.3|0"
+        "v3.1.3-dirty|0"
+        "v3.0.4-dirty|1"
+        "v3.0.4-3-gabc1234|1"
+        "v3.1.0-rc.1+build.5|0"
+        "v2.6.10|0"
+        "v2.08.0|0"
+        "v4.0.0-rc.1|0"
+        "v1.13.9|1"
+        "v3.1|1"
+        "v3.1.3 junk|1"
+        "|1"
+    )
+    local entry version expected
+    for entry in "${cases[@]}"; do
+        version="${entry%|*}"
+        expected="${entry##*|}"
+        export MOCK_COSIGN_VERSION="$version"
+        run cosign_version_is_patched "$mock_cosign"
+        if [ "$expected" -eq 0 ]; then
+            [ "$status" -eq 0 ] || { echo "expected '$version' to count as patched"; return 1; }
+        else
+            [ "$status" -ne 0 ] || { echo "expected '$version' to be rejected"; return 1; }
+        fi
+    done
+}
+
+@test "cosign_version_is_patched: reads pretty JSON and the plain-text GitVersion line (GH #505)" {
+    local mock_cosign="$TEST_TMPDIR/bin/cosign"
+    cat > "$mock_cosign" << 'MOCKEOF'
+#!/bin/bash
+if [ "${2:-}" = "--json" ]; then
+  [ "$MOCK_COSIGN_JSON" = 0 ] && exit 1
+  printf '{\n  "gitVersion": "%s",\n  "gitTreeState": "dirty"\n}\n' "$MOCK_COSIGN_VERSION"
+  exit 0
+fi
+printf '  ______\nGitVersion:    %s\nGitCommit:     11926fa\n' "$MOCK_COSIGN_VERSION"
+MOCKEOF
+    chmod +x "$mock_cosign"
+
+    export MOCK_COSIGN_VERSION="v3.1.3+dirty"
+    export MOCK_COSIGN_JSON=1
+    run cosign_version_is_patched "$mock_cosign"
+    [ "$status" -eq 0 ]
+    MOCK_COSIGN_JSON=0
+    run cosign_version_is_patched "$mock_cosign"
+    [ "$status" -eq 0 ]
+    MOCK_COSIGN_VERSION="v3.0.3+dirty"
+    run cosign_version_is_patched "$mock_cosign"
+    [ "$status" -ne 0 ]
+}
+
+@test "verify_sigstore_bundle: a distro cosign build verifies instead of being skipped (GH #505)" {
+    TMP="$TEST_TMPDIR/sigstore-work"
+    mkdir -p "$TMP"
+    local artifact="$TMP/dcg.tar.xz"
+    local bundle="$TEST_TMPDIR/release.sigstore.json"
+    printf 'artifact' > "$artifact"
+    printf '{}' > "$bundle"
+    export COSIGN_ARGS_FILE="$TMP/cosign.args"
+    cat > "$TEST_TMPDIR/bin/cosign" << 'MOCKEOF'
+#!/bin/bash
+if [ "${1:-}" = "version" ]; then
+  printf '{"gitVersion":"%s"}\n' "$MOCK_COSIGN_VERSION"
+  exit 0
+fi
+if [ "${1:-}" = "verify-blob" ] && [ "${2:-}" = "--help" ]; then
+  printf '%s\n' 'Usage: cosign verify-blob --bundle FILE --key FILE'
+  exit 0
+fi
+printf '%s\n' "$@" > "$COSIGN_ARGS_FILE"
+case " $* " in
+  *" --key "*) exit 0 ;;
+  *) exit 1 ;;
+esac
+MOCKEOF
+    chmod +x "$TEST_TMPDIR/bin/cosign"
+    SIGSTORE_BUNDLE_URL="file://$bundle"
+
+    export MOCK_COSIGN_VERSION="v3.1.3+dirty"
+    run verify_sigstore_bundle "$artifact" "https://example.invalid/dcg.tar.xz"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"cosign local release key"* ]]
+    grep -Fxq -- "--key" "$COSIGN_ARGS_FILE"
+
+    rm -f "$COSIGN_ARGS_FILE"
+    MOCK_COSIGN_VERSION="v3.0.3+dirty"
+    run verify_sigstore_bundle "$artifact" "https://example.invalid/dcg.tar.xz"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"cosign reports version 'v3.0.3+dirty'"* ]]
+    [ ! -e "$COSIGN_ARGS_FILE" ]
+}
+
+@test "verify_sigstore_bundle: prefers the pinned local release key" {
+    TMP="$TEST_TMPDIR/sigstore-work"
+    mkdir -p "$TMP"
+    local artifact="$TMP/dcg.tar.xz"
+    local bundle="$TEST_TMPDIR/release.sigstore.json"
+    printf 'artifact' > "$artifact"
+    printf '{}' > "$bundle"
+    export COSIGN_ARGS_FILE="$TMP/cosign.args"
+    cat > "$TEST_TMPDIR/bin/cosign" << 'MOCKEOF'
+#!/bin/bash
+if [ "${1:-}" = "version" ]; then
+  printf '{"gitVersion":"v3.1.2"}\n'
+  exit 0
+fi
+if [ "${1:-}" = "verify-blob" ] && [ "${2:-}" = "--help" ]; then
+  printf '%s\n' 'Usage: cosign verify-blob --bundle FILE --key FILE'
+  exit 0
+fi
+printf '%s\n' "$@" > "$COSIGN_ARGS_FILE"
+case " $* " in
+  *" --key "*) exit 0 ;;
+  *) exit 1 ;;
+esac
+MOCKEOF
+    chmod +x "$TEST_TMPDIR/bin/cosign"
+    SIGSTORE_BUNDLE_URL="file://$bundle"
+
+    run verify_sigstore_bundle "$artifact" "https://example.invalid/dcg.tar.xz"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"cosign local release key"* ]]
+    grep -Fxq -- "--key" "$COSIGN_ARGS_FILE"
+    grep -Fxq -- "$TMP/dcg-cosign-release.pub" "$COSIGN_ARGS_FILE"
+    grep -Fq -- "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcD" "$TMP/dcg-cosign-release.pub"
+}
+
 # ============================================================================
 # Agent Detection Tests
 # ============================================================================
+
+@test "Claude settings resolver: default, empty, absolute, relative, tilde and literal path values" {
+    unset CLAUDE_CONFIG_DIR
+    [ "$(claude_config_dir)" = "$HOME/.claude" ]
+    export CLAUDE_CONFIG_DIR=""
+    [ "$(claude_config_dir)" = "$HOME/.claude" ]
+
+    export CLAUDE_CONFIG_DIR="$TEST_TMPDIR/active Claude"
+    [ "$(claude_config_dir)" = "$TEST_TMPDIR/active Claude" ]
+    export CLAUDE_CONFIG_DIR="relative Claude/../active"
+    [ "$(claude_config_dir)" = "$PWD/relative Claude/../active" ]
+    export CLAUDE_CONFIG_DIR='~/active Claude'
+    [ "$(claude_config_dir)" = "$HOME/active Claude" ]
+    export CLAUDE_CONFIG_DIR='~'
+    [ "$(claude_config_dir)" = "$HOME" ]
+
+    export CLAUDE_CONFIG_DIR='~someone/$HOME/$(touch should-not-execute)'
+    [ "$(claude_config_dir)" = "$PWD/~someone/\$HOME/\$(touch should-not-execute)" ]
+    [ ! -e "$PWD/should-not-execute" ]
+    export CLAUDE_CONFIG_DIR=$'active\n'
+    # Keep the helper's terminating newline distinct from the literal path.
+    local resolved
+    resolved="$(claude_config_dir; printf .)"
+    [ "${resolved%$'\n.'}" = "$PWD/"$'active\n' ]
+}
+
+@test "detect_agents: explicit CLAUDE_CONFIG_DIR detects Claude before its directory exists" {
+    setup_mock_codex
+    export CLAUDE_CONFIG_DIR="$TEST_TMPDIR/active Claude"
+    detect_agents
+    [[ " ${DETECTED_AGENTS[*]} " =~ " claude-code " ]]
+    [[ " ${DETECTED_AGENTS[*]} " =~ " codex-cli " ]]
+    [ ! -e "$CLAUDE_CONFIG_DIR" ]
+
+    mkdir -p "$CLAUDE_CONFIG_DIR"
+    detect_agents
+    [[ " ${DETECTED_AGENTS[*]} " =~ " claude-code " ]]
+}
+
+@test "shell startup check: resolves active Claude directory each time and warns when missing" {
+    command -v jq >/dev/null || skip "jq not available"
+    cat > "$TEST_TMPDIR/bin/dcg" <<'EOF'
+#!/bin/bash
+exit 0
+EOF
+    chmod +x "$TEST_TMPDIR/bin/dcg"
+    mkdir -p "$HOME/.claude" "$HOME/active Claude"
+    printf '%s\n' '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"dcg"}]}]}}' > "$HOME/.claude/settings.json"
+    printf '{}\n' > "$HOME/active Claude/settings.json"
+
+    maybe_add_shell_check
+    run bash --noprofile --norc -c 'source "$HOME/.bashrc"'
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+
+    export CLAUDE_CONFIG_DIR='~/active Claude'
+    run bash --noprofile --norc -c 'source "$HOME/.bashrc"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Hook missing from $HOME/active Claude/settings.json"* ]]
+
+    export CLAUDE_CONFIG_DIR='missing Claude'
+    run bash --noprofile --norc -c 'source "$HOME/.bashrc"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Hook missing from $PWD/missing Claude/settings.json"* ]]
+
+    export CLAUDE_CONFIG_DIR=""
+    run bash --noprofile --norc -c 'source "$HOME/.bashrc"'
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+
+    mv "$HOME/.claude/settings.json" "$TEST_TMPDIR/protected-default.json"
+    unset CLAUDE_CONFIG_DIR
+    run bash --noprofile --norc -c 'source "$HOME/.bashrc"'
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    export CLAUDE_CONFIG_DIR=""
+    run bash --noprofile --norc -c 'source "$HOME/.bashrc"'
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
 
 @test "detect_agents: finds Claude Code when directory exists" {
     log_test "Testing Claude Code detection via directory..."
@@ -335,6 +665,65 @@ MOCKEOF
     log_test "Detected agents: ${DETECTED_AGENTS[*]:-none}"
 
     [[ " ${DETECTED_AGENTS[*]} " =~ " continue " ]]
+}
+
+@test "detect_agents: ignores stale Oh My Pi native state without an executable" {
+    log_test "Testing stale Oh My Pi native state..."
+
+    mkdir -p "$HOME/.omp/agent"
+    detect_agents
+    log_test "Detected agents: ${DETECTED_AGENTS[*]:-none}"
+
+    [[ ! " ${DETECTED_AGENTS[*]} " =~ " omp " ]]
+}
+
+@test "detect_agents: ignores stale Oh My Pi path and profile selectors" {
+    log_test "Testing stale Oh My Pi selectors..."
+
+    export PI_CONFIG_DIR=".custom-omp"
+    mkdir -p "$HOME/.custom-omp/agent"
+    export PI_CODING_AGENT_DIR="$HOME/.custom-agent"
+    mkdir -p "$PI_CODING_AGENT_DIR"
+    export OMP_PROFILE="work"
+    export PI_PROFILE="legacy"
+    detect_agents
+
+    [[ ! " ${DETECTED_AGENTS[*]} " =~ " omp " ]]
+}
+
+@test "detect_agents: ignores a non-executable omp PATH candidate" {
+    log_test "Testing a non-executable Oh My Pi PATH candidate..."
+
+    printf '#!/usr/bin/env bash\nprintf "not executable\\n"\n' > "$TEST_TMPDIR/bin/omp"
+    detect_agents
+
+    [[ ! " ${DETECTED_AGENTS[*]} " =~ " omp " ]]
+}
+
+@test "detect_agents: ignores an omp shell function without an external executable" {
+    log_test "Testing an Oh My Pi function-only shadow..."
+
+    omp() { printf 'function-shadow\n'; }
+    detect_agents
+
+    [[ ! " ${DETECTED_AGENTS[*]} " =~ " omp " ]]
+}
+
+@test "detect_agents: resolves the external omp executable behind a function" {
+    log_test "Testing exact external Oh My Pi executable resolution..."
+
+    cat > "$TEST_TMPDIR/bin/omp" << 'EOF'
+#!/usr/bin/env bash
+printf 'omp/external-1.2.3\n'
+EOF
+    chmod +x "$TEST_TMPDIR/bin/omp"
+    omp() { printf 'function-shadow\n'; }
+    type() { printf '/definitely/not/omp\n'; }
+    AGENT_VERSION_LOOKUP=1
+    detect_agents
+
+    [[ " ${DETECTED_AGENTS[*]} " =~ " omp " ]]
+    [ "$OMP_VERSION" = "omp/external-1.2.3" ]
 }
 
 @test "detect_agents: finds multiple agents" {

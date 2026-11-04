@@ -7,6 +7,7 @@ This document describes packs in the `platform` category.
 - [GitHub Platform](#platformgithub)
 - [GitLab Platform](#platformgitlab)
 - [Railway Platform](#platformrailway)
+- [Azure DevOps CLI](#platformazure_devops)
 - [Modal Platform](#platformmodal)
 - [Kamal](#platformkamal)
 
@@ -16,13 +17,14 @@ This document describes packs in the `platform` category.
 
 **Pack ID:** `platform.github`
 
-Protects against destructive GitHub CLI operations like deleting repositories, gists, releases, or SSH keys.
+Protects against destructive GitHub CLI operations like changing repository visibility or deleting repositories, gists, releases, or SSH keys.
 
 ### Keywords
 
 Commands containing these keywords are checked against this pack:
 
 - `gh`
+- `curl`
 
 ### Safe Patterns (Allowed)
 
@@ -30,16 +32,19 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `gh-repo-list-view` | `gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|\S+))?)*\s+repo\s+(?:list\|view)\b` |
-| `gh-gist-list-view` | `gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|\S+))?)*\s+gist\s+(?:list\|view)\b` |
-| `gh-release-list-view` | `gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|\S+))?)*\s+release\s+(?:list\|view)\b` |
-| `gh-issue-list-view` | `gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|\S+))?)*\s+issue\s+(?:list\|view)\b` |
-| `gh-ssh-key-list` | `gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|\S+))?)*\s+ssh-key\s+list\b` |
-| `gh-secret-list` | `gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|\S+))?)*\s+secret\s+list\b` |
-| `gh-variable-list` | `gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|\S+))?)*\s+variable\s+list\b` |
-| `gh-auth-status` | `gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|\S+))?)*\s+auth\s+status\b` |
-| `gh-status` | `gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|\S+))?)*\s+status\b` |
-| `gh-api-explicit-get` | `^(?!(?=.*(?:-X\s*\|--method(?:=\|\s+))DELETE\b))gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|\S+))?)*\s+api\b.*(?:-X\s*\|--method(?:=\|\s+))GET\b` |
+| `gh-repo-list-view` | `gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|(?!--?[A-Za-z])[^\s;&\|]+))?)*\s+repo\s+(?:list\|view)\b` |
+| `gh-gist-list-view` | `gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|(?!--?[A-Za-z])[^\s;&\|]+))?)*\s+gist\s+(?:list\|view)\b` |
+| `gh-release-list-view` | `gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|(?!--?[A-Za-z])[^\s;&\|]+))?)*\s+release\s+(?:list\|view)\b` |
+| `gh-issue-list-view` | `gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|(?!--?[A-Za-z])[^\s;&\|]+))?)*\s+issue\s+(?:list\|view)\b` |
+| `gh-ssh-key-list` | `gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|(?!--?[A-Za-z])[^\s;&\|]+))?)*\s+ssh-key\s+list\b` |
+| `gh-secret-list` | `gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|(?!--?[A-Za-z])[^\s;&\|]+))?)*\s+secret\s+list\b` |
+| `gh-variable-list` | `gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|(?!--?[A-Za-z])[^\s;&\|]+))?)*\s+variable\s+list\b` |
+| `gh-auth-status` | `gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|(?!--?[A-Za-z])[^\s;&\|]+))?)*\s+auth\s+status\b` |
+| `gh-status` | `gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|(?!--?[A-Za-z])[^\s;&\|]+))?)*\s+status\b` |
+| `gh-api-explicit-get` | `^(?!(?=.*(?:-X\s*\|--method(?:=\|\s+))DELETE\b))gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|(?!--?[A-Za-z])[^\s;&\|]+))?)*\s+api\b.*(?:-X\s*\|--method(?:=\|\s+))GET\b` |
+| `gh-help` | `gh(?:\s+(?:\x22[^\x22]*\x22\|'[^']*'\|(?!--(?:\s\|$))[^\s;&\|<>\x22']+))*\s+--help(?:\s\|$)(?![^;&\|]*--visibility(?:=\|\s))` |
+| `gh-help-short` | `gh(?!(?:\s+[^\s;&\|]+)*?\s+repo\s+edit(?:\s\|$))(?:\s+(?:\x22[^\x22]*\x22\|'[^']*'\|(?!--(?:\s\|$))[^\s;&\|<>\x22']+))*\s+-h(?:\s\|$)` |
+| `gh-help-topic` | `gh(?:\s+--?[A-Za-z][A-Za-z0-9-]*\b(?:\s+(?!(?:repo\|gist\|release\|issue\|ssh-key\|secret\|variable\|run\|auth\|status\|api)\b)(?:(?:\x22[^\x22]*\x22)\|(?:'[^']*')\|(?!--?[A-Za-z])[^\s;&\|]+))?)*\s+help(?:\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 
@@ -48,9 +53,11 @@ These patterns match potentially destructive commands:
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
 | `gh-repo-delete` | gh repo delete permanently deletes a GitHub repository. This cannot be undone. | high |
+| `gh-repo-visibility-change` | gh repo edit --visibility changes repository visibility and can remove stars or detach forks. | high |
 | `gh-repo-archive` | gh repo archive makes a repository read-only. While reversible, it stops all write access. | high |
 | `gh-gist-delete` | gh gist delete permanently deletes a Gist. | high |
 | `gh-release-delete` | gh release delete permanently deletes a release. | high |
+| `gh-release-delete-asset` | gh release delete-asset permanently deletes an uploaded release asset. | medium |
 | `gh-issue-delete` | gh issue delete permanently deletes an issue. | high |
 | `gh-ssh-key-delete` | gh ssh-key delete removes an SSH key, potentially breaking access. | high |
 | `gh-secret-delete` | gh secret delete removes GitHub Actions secrets. | high |
@@ -62,7 +69,9 @@ These patterns match potentially destructive commands:
 | `gh-api-delete-hook` | gh api DELETE hooks removes repository webhooks. | high |
 | `gh-api-delete-deploy-key` | gh api DELETE keys removes deploy keys. | high |
 | `gh-api-delete-release` | gh api DELETE releases removes GitHub releases. | high |
-| `gh-api-delete-repo` | gh api DELETE calls can be destructive. Please verify the endpoint. | high |
+| `gh-api-delete-repo` | gh api DELETE /repos/{owner}/{repo} permanently deletes a GitHub repository. This cannot be undone. | high |
+| `curl-api-delete-repo` | curl DELETE /repos/{owner}/{repo} permanently deletes a GitHub repository. This cannot be undone. | high |
+| `gh-api-delete-generic` | gh api DELETE calls can be destructive. Please verify the endpoint. | high |
 
 ### Allowlist Guidance
 
@@ -251,6 +260,83 @@ To allowlist all rules from this pack (use with caution):
 ```toml
 [[allow]]
 rule = "platform.railway:*"
+reason = "Your reason here"
+risk_acknowledged = true
+```
+
+---
+
+## Azure DevOps CLI
+
+**Pack ID:** `platform.azure_devops`
+
+Protects against destructive Azure DevOps CLI extension operations like project delete, repos delete, pipeline delete, and permission reset
+
+### Keywords
+
+Commands containing these keywords are checked against this pack:
+
+- `az`
+- `devops`
+- `repos`
+- `pipelines`
+- `boards`
+- `artifacts`
+
+### Safe Patterns (Allowed)
+
+These patterns match safe commands that are always allowed:
+
+| Pattern Name | Pattern |
+|--------------|----------|
+| `az-devops-help` | `(?<![\w-])az(?:\s+(?:\x22[^\x22]*\x22\|'[^']*'\|(?!--(?:\s\|$))[^\s;&\|<>\x22']+))*\s+--help(?:\s\|$)` |
+| `az-devops-help-short` | `(?<![\w-])az(?:\s+(?:\x22[^\x22]*\x22\|'[^']*'\|(?!--(?:\s\|$))[^\s;&\|<>\x22']+))*\s+-h(?:\s\|$)` |
+
+### Destructive Patterns (Blocked)
+
+These patterns match potentially destructive commands:
+
+| Pattern Name | Reason | Severity |
+|--------------|--------|----------|
+| `devops-project-delete` | az devops project delete destroys a team project and every repository, pipeline, board and wiki in it. | critical |
+| `devops-team-delete` | az devops team delete removes a team along with its board configuration. | high |
+| `devops-user-remove` | az devops user remove revokes a user's access to the whole organization. | high |
+| `devops-security-group-delete` | az devops security group delete removes a security group and every permission granted through it. | high |
+| `devops-security-group-membership-remove` | az devops security group membership remove revokes a user's or group's membership. | medium |
+| `devops-security-permission-reset-all` | az devops security permission reset-all clears EVERY permission on a token for a user or group. | high |
+| `devops-security-permission-reset` | az devops security permission reset clears the named permission bits for a user or group. | medium |
+| `devops-service-endpoint-delete` | az devops service-endpoint delete removes a service connection and its stored credentials. | high |
+| `devops-wiki-delete` | az devops wiki delete removes a wiki and all of its pages. | high |
+| `devops-wiki-page-delete` | az devops wiki page delete removes a wiki page and its subtree. | medium |
+| `devops-extension-uninstall` | az devops extension uninstall removes a marketplace extension organization-wide. | medium |
+| `devops-logout` | az devops logout clears the stored Azure DevOps credential; with no --org it clears every organization. | medium |
+| `devops-invoke-delete` | az devops invoke --http-method DELETE issues an arbitrary Azure DevOps DELETE request. | high |
+| `devops-invoke-write` | az devops invoke with PUT/PATCH/POST issues an arbitrary state-changing Azure DevOps request. | medium |
+| `repos-delete` | az repos delete destroys a Git repository and its entire history. | critical |
+| `repos-ref-delete` | az repos ref delete removes a server-side branch or tag. | high |
+| `repos-policy-delete` | az repos policy delete removes a branch policy — the protection on a protected branch. | high |
+| `pipelines-delete` | az pipelines delete removes a pipeline definition and its run history. | high |
+| `pipelines-folder-delete` | az pipelines folder delete removes a pipeline folder and the pipelines inside it. | medium |
+| `pipelines-variable-group-delete` | az pipelines variable-group delete removes a shared variable group and its secrets. | high |
+| `pipelines-variable-delete` | az pipelines variable delete removes a pipeline or variable-group variable. | medium |
+| `boards-work-item-delete` | az boards work-item delete removes a work item; with --destroy it is destroyed permanently. | high |
+| `boards-classification-node-delete` | az boards area/iteration project delete removes a classification node from the project. | medium |
+
+### Allowlist Guidance
+
+To allowlist a specific rule from this pack, add to your allowlist:
+
+```toml
+[[allow]]
+rule = "platform.azure_devops:<pattern-name>"
+reason = "Your reason here"
+```
+
+To allowlist all rules from this pack (use with caution):
+
+```toml
+[[allow]]
+rule = "platform.azure_devops:*"
 reason = "Your reason here"
 risk_acknowledged = true
 ```

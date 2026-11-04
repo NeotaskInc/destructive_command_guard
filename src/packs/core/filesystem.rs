@@ -1,8 +1,10 @@
-//! Core filesystem patterns - protections against destructive rm commands.
+//! Core filesystem patterns - protections against destructive filesystem commands.
 //!
 //! This includes patterns for:
-//! - rm -rf outside temp directories (blocked)
-//! - rm -rf in literal /tmp and /var/tmp subdirectories (allowed)
+//! - recursive `rm` (`-r`/`-R`, with or without `-f`) outside temp directories
+//! - bounded literal `/tmp` and `/var/tmp` recursive-removal exceptions
+//! - equivalent destruction through `find -delete`, `unlink`, `truncate`, and
+//!   archive/remove or cross-segment relocation primitives
 
 use crate::packs::{DestructivePattern, Pack, PatternSuggestion, Platform, SafePattern, Severity};
 use crate::{destructive_pattern, safe_pattern};
@@ -22,8 +24,12 @@ const RM_RF_ROOT_HOME_SUGGESTIONS: &[PatternSuggestion] = &[
         "List directory contents to verify the path",
     ),
     PatternSuggestion::new(
-        "rm -rf /path/to/specific/subdirectory",
-        "Use explicit, specific paths instead of root or home",
+        "rm -rf /tmp/<subdir>",
+        "Scope deletion to a disposable temp path — dcg allows literal /tmp targets without confirmation",
+    ),
+    PatternSuggestion::gated(
+        "rm -rf <specific-subdirectory>",
+        "A specific non-temp path is safer than root/home but still a recursive delete, so it needs approval",
     ),
 ];
 
@@ -31,7 +37,7 @@ const RM_RF_ROOT_HOME_SUGGESTIONS: &[PatternSuggestion] = &[
 const RM_RF_GENERAL_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new(
         "rm -ri {path}",
-        "Interactive mode: confirms each file before deletion",
+        "Interactive mode: confirms each file before deletion (needs a terminal: with stdin closed, as under an agent hook, it deletes nothing and exits 0)",
     ),
     PatternSuggestion::with_platform(
         "trash-put {path}",
@@ -42,6 +48,11 @@ const RM_RF_GENERAL_SUGGESTIONS: &[PatternSuggestion] = &[
         "gio trash {path}",
         "Move to trash via GNOME (requires gio)",
         Platform::Linux,
+    ),
+    PatternSuggestion::with_platform(
+        "mv {path} ~/.Trash/",
+        "Move to the Finder trash instead of deleting (macOS has no ~/.local/share/Trash)",
+        Platform::MacOS,
     ),
     PatternSuggestion::new(
         "mv {path} /tmp/delete-me-{timestamp}",
@@ -65,7 +76,7 @@ const RM_RF_GENERAL_SUGGESTIONS: &[PatternSuggestion] = &[
 const RM_R_F_SEPARATE_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new(
         "rm -ri {path}",
-        "Interactive mode: confirms each file before deletion",
+        "Interactive mode: confirms each file before deletion (needs a terminal: with stdin closed, as under an agent hook, it deletes nothing and exits 0)",
     ),
     PatternSuggestion::new(
         "rm -r -f /tmp/{subdir}",
@@ -81,10 +92,10 @@ const RM_R_F_SEPARATE_SUGGESTIONS: &[PatternSuggestion] = &[
 const RM_RECURSIVE_FORCE_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new(
         "rm --interactive --recursive {path}",
-        "Interactive mode: confirms each file before deletion",
+        "Interactive mode: confirms each file before deletion (needs a terminal: with stdin closed, as under an agent hook, it deletes nothing and exits 0)",
     ),
     PatternSuggestion::new(
-        "find {path} --maxdepth 2 -ls | head -30",
+        "find {path} -maxdepth 2 -ls | head -30",
         "Preview directory structure before deletion",
     ),
     PatternSuggestion::new(
@@ -109,7 +120,7 @@ const FIND_DELETE_SUGGESTIONS: &[PatternSuggestion] = &[
         "find /tmp/{subdir} -delete",
         "Safe temp directory deletion (allowed without confirmation)",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "find {path} -print -delete",
         "If you must proceed: use -print to log every deletion",
     ),
@@ -121,7 +132,7 @@ const FIND_DELETE_SUGGESTIONS: &[PatternSuggestion] = &[
 /// destruction with no recovery.
 const UNLINK_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new("ls -la {path}", "Verify the path before unlinking"),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "cp {path} {path}.bak && unlink {path}",
         "Make a backup first if you really must remove the original",
     ),
@@ -141,7 +152,7 @@ const UNLINK_SUGGESTIONS: &[PatternSuggestion] = &[
 /// shrinks the file by N bytes (data loss). Both are recoverable only
 /// from backups.
 const TRUNCATE_SUGGESTIONS: &[PatternSuggestion] = &[
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "cp {path} {path}.bak && truncate -s 0 {path}",
         "Make a backup before zeroing the file",
     ),
@@ -151,8 +162,8 @@ const TRUNCATE_SUGGESTIONS: &[PatternSuggestion] = &[
         "Safe temp-directory truncate (allowed without confirmation)",
     ),
     PatternSuggestion::new(
-        "head -c <N> {path} > {path}.head && mv {path}.head {path}",
-        "Keep the first N bytes instead of dropping data blindly",
+        "head -c <N> {path} > /tmp/{subdir}/head && cp -f /tmp/{subdir}/head {path}",
+        "Keep the first N bytes instead of dropping data blindly (write via a temp file)",
     ),
 ];
 
@@ -165,7 +176,7 @@ const SHRED_SUGGESTIONS: &[PatternSuggestion] = &[
         "ls -la {path}",
         "Verify the path before shredding (no recovery)",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "cp {path} {path}.bak && shred -u {path}",
         "Make a backup first if you might need the data",
     ),
@@ -173,7 +184,7 @@ const SHRED_SUGGESTIONS: &[PatternSuggestion] = &[
         "shred -u /tmp/{subdir}/scratch",
         "Safe temp-directory shred (allowed without confirmation)",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "shred -n 1 -u {path}",
         "Single-pass shred is faster (and on SSDs, multi-pass adds little)",
     ),
@@ -212,7 +223,7 @@ const DD_OVERWRITE_SUGGESTIONS: &[PatternSuggestion] = &[
         "ls -la {path}",
         "Verify the path before overwriting (no recovery)",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "cp {path} {path}.bak && dd if=/dev/zero of={path} bs=1M count=10",
         "Make a backup first if you might need the data",
     ),
@@ -238,7 +249,30 @@ const MV_SENSITIVE_SUGGESTIONS: &[PatternSuggestion] = &[
     ),
     PatternSuggestion::new(
         "mv {path} {path}.deleted-YYYYMMDD",
-        "In-place rename for soft-delete (no cross-segment hop, easy to undo)",
+        "In-place rename for soft-delete (no cross-segment hop, easy to undo) — allowed inside a home subtree; a home root, a top-level home directory, a dotfile tree, or a system path is still gated",
+    ),
+    PatternSuggestion::new(
+        "mv /tmp/{subdir}/foo /tmp/{subdir}/bar",
+        "Safe temp-directory rename (allowed without confirmation)",
+    ),
+];
+
+/// Suggestions for `mv-dynamic-path`. Same shape as the sensitive-path set,
+/// but the in-place rename stays ungated: with a *literal* path it is exactly
+/// the escape from the dynamic-path denial (a literal non-sensitive rename is
+/// allowed), so the gate marker would be wrong here.
+const MV_DYNAMIC_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "ls -la {path}",
+        "Resolve and verify the expanded path before any move",
+    ),
+    PatternSuggestion::new(
+        "cp -a {path} {path}.bak",
+        "Copy first (preserves the original) — verify the copy, then remove only after confirmation",
+    ),
+    PatternSuggestion::new(
+        "mv {path} {path}.deleted-YYYYMMDD",
+        "Use resolved literal paths for an in-place soft-delete rename",
     ),
     PatternSuggestion::new(
         "mv /tmp/{subdir}/foo /tmp/{subdir}/bar",
@@ -275,8 +309,12 @@ const SENSITIVE_PROPAGATION_DELETE_SUGGESTIONS: &[PatternSuggestion] = &[
 const REDIRECT_TRUNCATE_SUGGESTIONS: &[PatternSuggestion] = &[
     PatternSuggestion::new("ls -la {path}", "Verify the path before any redirect"),
     PatternSuggestion::new(
-        "cp {path} {path}.bak && echo data > {path}",
-        "Make a backup first if you might need the previous content",
+        "producer | dcg create-new {path}",
+        "After resolving a literal destination, create it only if no file, directory, or symlink already exists",
+    ),
+    PatternSuggestion::new(
+        "cp {path} {path}.bak && echo data > /tmp/{subdir}/out && cp -f /tmp/{subdir}/out {path}",
+        "Back up the target, write the new content to a temp file, then copy it into place",
     ),
     PatternSuggestion::new(
         "echo data >> {path}",
@@ -287,7 +325,44 @@ const REDIRECT_TRUNCATE_SUGGESTIONS: &[PatternSuggestion] = &[
         "Safe temp-directory redirect (allowed without confirmation)",
     ),
 ];
-use crate::{normalize::NormalizeTokenKind, normalize::tokenize_for_normalization};
+
+/// Suggestions for the `.git`-internals write rules.
+///
+/// Deliberately not [`REDIRECT_TRUNCATE_SUGGESTIONS`]. That list offers
+/// `echo data >> {path}` as the gentler spelling, which is sound advice for an
+/// ordinary file and wrong for a git internal: appending a `[url] insteadOf`
+/// section or a `[core] pager` command to `.git/config` runs on the next git
+/// invocation without destroying a byte, so the truncate/append axis the
+/// redirect rules are drawn on does not separate safe from unsafe here (#457).
+/// `cp` from a staged file stays on the list on purpose — it is the one
+/// spelling that puts a human-reviewable artifact between the agent and the
+/// repository, and the rules below leave it allowed.
+const GIT_INTERNALS_WRITE_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "git config <key> <value>",
+        "Change repository configuration through git, which writes atomically and validates the key",
+    ),
+    PatternSuggestion::new(
+        "git update-ref <ref> <sha>",
+        "Move a ref through git rather than by writing .git/refs or .git/HEAD",
+    ),
+    PatternSuggestion::new(
+        "producer | dcg create-new {path}",
+        "After resolving a literal destination, create it only if no file, directory, or symlink already exists",
+    ),
+    PatternSuggestion::new(
+        "cat .git/config",
+        "Reading anything under .git is never blocked",
+    ),
+    PatternSuggestion::new(
+        "echo data > /tmp/{subdir}/config && cp /tmp/{subdir}/config .git/config",
+        "Stage the proposed file outside the repository and copy it in after review",
+    ),
+];
+use crate::normalize::{
+    NormalizeTokenKind, ShellDialect, ShellTokenDecoder, ShellTokenRole,
+    tokenize_for_normalization, tokenize_for_shell_dialect,
+};
 use std::ops::Range;
 
 const RM_RF_ROOT_HOME_NAME: &str = "rm-rf-root-home";
@@ -306,6 +381,306 @@ const RM_R_F_SEPARATE_REASON: &str =
 const RM_RECURSIVE_FORCE_NAME: &str = "rm-recursive-force-long";
 const RM_RECURSIVE_FORCE_REASON: &str =
     "rm --recursive --force is destructive and requires human approval.";
+const RM_RECURSIVE_ROOT_HOME_NAME: &str = "rm-recursive-root-home";
+const RM_RECURSIVE_ROOT_HOME_REASON: &str = "recursive rm targeting a root, home, or absolute system path is EXTREMELY DANGEROUS, even without --force.";
+const RM_BARE_GLOB_NAME: &str = "rm-bare-glob";
+const RM_BARE_GLOB_REASON: &str = "rm with a bare * operand deletes every file the shell finds in the working directory - an unbounded, shell-chosen file set that cannot be reviewed from the command text. This command will NOT be executed.";
+const RM_BARE_GLOB_ROOT_NAME: &str = "rm-bare-glob-root";
+const RM_BARE_GLOB_ROOT_REASON: &str = "rm /* deletes the top-level entries of the filesystem root; on systems where /bin, /lib, and /sbin are symlinks this can brick the machine even without -r. EXTREMELY DANGEROUS.";
+const RM_RECURSIVE_GENERAL_NAME: &str = "rm-recursive-general";
+const RM_RECURSIVE_GENERAL_REASON: &str = "recursive rm can silently remove an entire writable directory tree and requires human approval, even without --force.";
+const RM_RECURSIVE_UNVERIFIED_NAME: &str = "rm-recursive-unverified";
+const RM_RECURSIVE_UNVERIFIED_REASON: &str = "a dynamically resolved executable may be rm and is followed by recursive deletion syntax that cannot be verified safe before shell expansion.";
+const POWERSHELL_REMOVE_ITEM_RECURSIVE_NAME: &str = "powershell-remove-item-recursive";
+const POWERSHELL_REMOVE_ITEM_RECURSIVE_REASON: &str = "PowerShell Remove-Item (or an alias) with -Recurse permanently deletes an entire item tree without using the Recycle Bin.";
+const RM_PROTECTED_FILE_NAME: &str = "rm-protected-file";
+const RM_PROTECTED_FILE_REASON: &str = "rm on a protected credential or login-startup file is one-shot data destruction with no recovery. EXTREMELY DANGEROUS.";
+/// The same rule's reason when every protected target is inside a `.git`
+/// directory (#533): that is repository state, not a credential, so saying
+/// "credential or login-startup file" sent users looking for the wrong thing.
+/// The rule id, severity and decision are unchanged, so existing allowlist
+/// entries for `rm-protected-file` keep working.
+const RM_PROTECTED_GIT_INTERNAL_REASON: &str = "rm inside a .git directory deletes the repository's own state (index, refs, HEAD, config, hooks or objects), which git cannot rebuild. Requires human approval; for a stale index.lock, first confirm no git process is running in this repository.";
+
+// ============================================================================
+// Guidance for classifier-only rules (#348)
+// ============================================================================
+//
+// The semantic rm classifier decides reason and severity itself and never
+// walks `destructive_patterns`, so a denial it produces has to look its
+// explanation and safer-alternative suggestions up by rule name
+// (`Pack::rule_guidance`). Most classifier rule names double as regex rules
+// and carry their text on the pattern. The four below exist only inside the
+// classifier, so their guidance lives here. These rows are text only: they
+// cannot change what the guard blocks, only what a blocked caller is told.
+
+/// Suggestions for a recursive `rm` that carries no force flag.
+const RM_RECURSIVE_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "rm -ri {path}",
+        "Interactive mode: confirms each file before deletion (needs a terminal: with stdin closed, as under an agent hook, it deletes nothing and exits 0)",
+    ),
+    PatternSuggestion::with_platform(
+        "trash-put {path}",
+        "Move to trash instead of permanent deletion (requires trash-cli)",
+        Platform::Linux,
+    ),
+    PatternSuggestion::with_platform(
+        "mv {path} ~/.Trash/",
+        "Move to the Finder trash instead of deleting (macOS has no ~/.local/share/Trash)",
+        Platform::MacOS,
+    ),
+    PatternSuggestion::new(
+        "mv {path} /tmp/delete-me-{timestamp}",
+        "Move the tree aside instead of deleting it; remove the holding copy after review",
+    ),
+    PatternSuggestion::new(
+        "rm -r /tmp/{subdir}",
+        "Safe temp directory deletion (allowed without confirmation)",
+    ),
+    PatternSuggestion::new(
+        "ls -la {path}",
+        "List directory contents to verify the path",
+    ),
+];
+
+/// Suggestions for a recursive delete whose command word is resolved at run
+/// time (`find … -exec {} -r …`, PowerShell splatting).
+const RM_RECURSIVE_UNVERIFIED_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::gated(
+        "rm -r {path}",
+        "Name the executable literally so the recursive delete gets the ordinary rm decision",
+    ),
+    PatternSuggestion::new(
+        "echo {command}",
+        "Print the assembled command first, then run the literal text it produced",
+    ),
+    PatternSuggestion::new(
+        "ls -la {path}",
+        "List directory contents to verify the path",
+    ),
+];
+
+/// Suggestions for PowerShell `Remove-Item -Recurse`.
+const POWERSHELL_REMOVE_ITEM_RECURSIVE_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "Get-ChildItem -Recurse {path}",
+        "List the item tree before removing it",
+    ),
+    PatternSuggestion::new(
+        "Remove-Item -Recurse -WhatIf {path}",
+        "Report what the removal would do without removing anything",
+    ),
+    PatternSuggestion::new(
+        "Move-Item {path} (Join-Path ([IO.Path]::GetTempPath()) delete-me-{timestamp})",
+        "Move the tree aside instead of deleting it; the temp path resolves on Windows and POSIX pwsh alike",
+    ),
+];
+
+/// Suggestions for a non-recursive rm with a bare `*` operand.
+const RM_BARE_GLOB_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "ls -la",
+        "List what the glob would expand to before deleting anything",
+    ),
+    PatternSuggestion::new(
+        "rm ./file-one ./file-two",
+        "Delete explicitly named files so the removal set is reviewable",
+    ),
+    PatternSuggestion::new(
+        "rm *.log",
+        "Constrain the glob to a reviewable shape instead of everything",
+    ),
+    PatternSuggestion::new(
+        "rm -i *",
+        "Interactive glob delete: confirms each file (needs a terminal: with stdin closed, as under an agent hook, it deletes nothing and exits 0)",
+    ),
+    PatternSuggestion::new(
+        "mv ./file /tmp/delete-me-{timestamp}",
+        "Move files aside instead of deleting them; remove the holding copy after review",
+    ),
+];
+
+const RM_BARE_GLOB_EXPLANATION: &str = "A bare * (or ./*) handed to rm is expanded by the shell at execution time, so \
+     the command text never shows what gets deleted: every file in the working \
+     directory that matches, whatever the directory happens to contain when the \
+     command runs. Leaving off -f does not bound it - -f only decides whether errors \
+     are reported, and the write-protection query it suppresses reaches nobody under \
+     an agent hook.\n\n\
+     Preview the expansion, then delete a reviewable set (dcg allows these forms):\n  \
+     ls -la                           # see what * would match\n  \
+     rm ./file-one ./file-two         # explicitly named files\n  \
+     rm *.log                         # a constrained, reviewable glob\n  \
+     rm -i *                          # interactive; needs a terminal - with stdin closed it deletes nothing and exits 0\n  \
+     mv ./file /tmp/delete-me-<literal-timestamp>   # move aside instead of deleting";
+
+const RM_PROTECTED_FILE_EXPLANATION: &str = "This deletes a protected file: an SSH or GPG key, a \
+     cloud or container credential, a shell startup file, a system account \
+     file such as /etc/shadow or /etc/sudoers, or a file inside a repository's \
+     .git directory. Losing a credential is not a file you can rebuild from the \
+     repository - it is a locked-out account, a revoked deploy key, or a machine \
+     that no longer authenticates. Inside .git the files are the repository's own \
+     state (the index, refs, HEAD, config with its remotes and credential \
+     helpers, hooks and the object store), and git cannot rebuild them either.\n\n\
+     There is NO recovery without backups.\n\n\
+     A stale .git/index.lock left behind by a crashed git process is the common \
+     legitimate case. Removing it while a git command is still running can \
+     corrupt the index, so first confirm that no git process is using this \
+     repository (for example `pgrep -fl git`), and get explicit human approval \
+     for the removal.\n\n\
+     dcg already blocks every other single-file spelling of this - unlink, \
+     shred -u, truncate -s 0 - and every embedded-language spelling. Plain rm was \
+     the one that got through, because the rm rules all require a recursive flag \
+     and -r is exactly the flag you do not need to delete one file.\n\n\
+     This rule is narrow on purpose: it decides on the protected-file table, not \
+     on a directory prefix, so ordinary deletes under a home directory \
+     (rm ~/notes.txt, rm ~/project/src/main.rs) are untouched.\n\n\
+     Safer alternatives (dcg allows all of these):\n  \
+     ls -la {path}                                  # confirm what this actually names\n  \
+     mv {path} /tmp/delete-me-<literal-timestamp>   # move aside; reversible while you verify\n  \
+     cp {path} {path}.bak                           # keep an explicit copy before anything else\n\n\
+     For an SSH key specifically, remove the authorized entry rather than the \
+     key file, so an existing session is not the last one you have.";
+
+/// Deliberately no `cp {path} {path}.bak && rm {path}`.
+///
+/// That is the shape `UNLINK_SUGGESTIONS` offers, and it is right there because
+/// `unlink` keeps working once a backup exists. It cannot be offered here: the
+/// `rm {path}` half is the command this very rule denies, so suggesting it
+/// would send the caller back into the same wall. The backup and the deletion
+/// are split instead, and the move-aside form carries the actual remedy.
+const RM_PROTECTED_FILE_SUGGESTIONS: &[PatternSuggestion] = &[
+    PatternSuggestion::new(
+        "ls -la {path}",
+        "Confirm which file this actually names before deleting it",
+    ),
+    PatternSuggestion::new(
+        "mv {path} /tmp/delete-me-{timestamp}",
+        "Move it aside instead: reversible, and proves nothing depended on it",
+    ),
+    PatternSuggestion::new(
+        "cp {path} {path}.bak",
+        "Keep an explicit copy before doing anything irreversible",
+    ),
+];
+
+const RM_BARE_GLOB_ROOT_EXPLANATION: &str = "rm /* expands to every top-level entry of the filesystem root. Without -r the \
+     directories survive, but on systems where /bin, /lib, and /sbin are symlinks \
+     into /usr, deleting those symlinks bricks the machine - no shell, no rescue \
+     tooling, and -f is irrelevant to any of it.\n\n\
+     There is almost no legitimate reason to run this. If one file under / was \
+     meant, name it explicitly after previewing (dcg allows these forms):\n  \
+     ls -la /                        # see what /* would match\n  \
+     rm /specific-file               # one named file, still reviewed\n  \
+     mv /specific-file /tmp/delete-me-<literal-timestamp>";
+
+const RM_RECURSIVE_GENERAL_EXPLANATION: &str = "rm -r deletes a directory and everything under it. Leaving off -f does not \
+     bound the command: -f only decides whether errors are reported and whether a \
+     write-protected file is queried, and that query reaches a terminal, not an agent \
+     hook. Everything the process can unlink, it unlinks, and there is no undo.\n\n\
+     dcg auto-allows recursive deletion only for literal temp paths:\n  \
+     rm -r /tmp/<subdir>/scratch\n\n\
+     For any other directory, preview first, then either delete interactively or move \
+     the tree aside (dcg allows both forms):\n  \
+     ls -la /path/to/directory\n  \
+     rm -ri /path/to/directory   # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
+     mv /path/to/directory /tmp/delete-me-<literal-timestamp>\n\n\
+     The trash directory is ~/.Trash on macOS and ~/.local/share/Trash on Linux.";
+
+const RM_RECURSIVE_ROOT_HOME_EXPLANATION: &str = "A recursive rm rooted at /, ~, or $HOME removes the account or the machine, and \
+     leaving off -f changes nothing about that: -f decides whether errors are reported, \
+     not what is deleted.\n\n\
+     There is NO recovery without backups. Even with backups, full restoration takes \
+     hours to days.\n\n\
+     If one directory under the home was meant, name it in full and delete that \
+     instead:\n  \
+     rm -r ~/projects/scratch-build   # a specific path, still reviewed\n  \
+     rm -r ~                          # never this\n\n\
+     dcg auto-allows recursive deletion only for literal temp paths:\n  \
+     rm -r /tmp/<subdir>/scratch\n\n\
+     For a specific directory, preview first, then either delete interactively or move \
+     the tree aside (dcg allows both forms):\n  \
+     ls -la /path/to/directory\n  \
+     rm -ri /path/to/directory   # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
+     mv /path/to/directory /tmp/delete-me-<literal-timestamp>";
+
+const RM_RECURSIVE_UNVERIFIED_EXPLANATION: &str = "The command word is resolved at run time, so dcg cannot read which binary will \
+     run, and the arguments beside it are recursive deletion syntax. A find -exec \
+     placeholder is filled from the search result, and PowerShell splatting takes both \
+     the flags and the path from a hashtable, so in either form the deletion target is \
+     assembled after this check would have run. dcg fails closed here rather than guess.\n\n\
+     Make the command word literal and the command gets the ordinary recursive-rm \
+     decision instead:\n  \
+     rm -r ./tree\n\n\
+     If the command really must be assembled, print the assembled text first and run \
+     that literal text. Reading the tree costs nothing and is always accepted:\n  \
+     ls -la /path/to/directory";
+
+const POWERSHELL_REMOVE_ITEM_RECURSIVE_EXPLANATION: &str = "Remove-Item -Recurse deletes the whole item tree immediately. PowerShell has no \
+     Recycle Bin step: the cmdlet unlinks, and nothing lands anywhere recoverable.\n\n\
+     Preview and safer forms:\n  \
+     Get-ChildItem -Recurse <path>          # list the tree first\n  \
+     Remove-Item -Recurse -WhatIf <path>    # report the removal without doing it (dcg allows -WhatIf)\n  \
+     Move-Item <path> (Join-Path ([IO.Path]::GetTempPath()) delete-me-<literal-timestamp>)\n\n\
+     To recycle rather than delete, call \
+     Microsoft.VisualBasic.FileIO.FileSystem::DeleteDirectory with SendToRecycleBin.";
+
+/// Explanation and safer-alternative suggestions for a rule that only the
+/// semantic rm/PowerShell classifier can attribute a denial to.
+///
+/// Returns `None` for every rule that has a `destructive_patterns` entry, so
+/// the pattern's own text stays authoritative for those.
+pub(crate) fn classifier_rule_guidance(
+    name: &str,
+) -> Option<(&'static str, &'static [PatternSuggestion])> {
+    match name {
+        n if n == RM_RECURSIVE_GENERAL_NAME => {
+            Some((RM_RECURSIVE_GENERAL_EXPLANATION, RM_RECURSIVE_SUGGESTIONS))
+        }
+        n if n == RM_RECURSIVE_ROOT_HOME_NAME => Some((
+            RM_RECURSIVE_ROOT_HOME_EXPLANATION,
+            RM_RF_ROOT_HOME_SUGGESTIONS,
+        )),
+        n if n == RM_RECURSIVE_UNVERIFIED_NAME => Some((
+            RM_RECURSIVE_UNVERIFIED_EXPLANATION,
+            RM_RECURSIVE_UNVERIFIED_SUGGESTIONS,
+        )),
+        n if n == POWERSHELL_REMOVE_ITEM_RECURSIVE_NAME => Some((
+            POWERSHELL_REMOVE_ITEM_RECURSIVE_EXPLANATION,
+            POWERSHELL_REMOVE_ITEM_RECURSIVE_SUGGESTIONS,
+        )),
+        n if n == RM_BARE_GLOB_NAME => Some((RM_BARE_GLOB_EXPLANATION, RM_BARE_GLOB_SUGGESTIONS)),
+        n if n == RM_BARE_GLOB_ROOT_NAME => {
+            Some((RM_BARE_GLOB_ROOT_EXPLANATION, RM_BARE_GLOB_SUGGESTIONS))
+        }
+        n if n == RM_PROTECTED_FILE_NAME => {
+            Some((RM_PROTECTED_FILE_EXPLANATION, RM_PROTECTED_FILE_SUGGESTIONS))
+        }
+        _ => None,
+    }
+}
+
+/// Every rule name the semantic rm/PowerShell classifier can emit.
+///
+/// Kept beside the constants so a test can prove that each one delivers
+/// authored guidance through `Pack::rule_guidance`: a new classifier rule
+/// without a `destructive_patterns` entry or a `classifier_rule_guidance`
+/// row would otherwise reach the blocked caller mute (#348).
+pub(crate) const CLASSIFIER_RULE_NAMES: &[&str] = &[
+    RM_RF_ROOT_HOME_NAME,
+    RM_R_F_SEPARATE_ROOT_HOME_NAME,
+    RM_RECURSIVE_FORCE_ROOT_HOME_NAME,
+    RM_RF_GENERAL_NAME,
+    RM_R_F_SEPARATE_NAME,
+    RM_RECURSIVE_FORCE_NAME,
+    RM_RECURSIVE_ROOT_HOME_NAME,
+    RM_RECURSIVE_GENERAL_NAME,
+    RM_RECURSIVE_UNVERIFIED_NAME,
+    POWERSHELL_REMOVE_ITEM_RECURSIVE_NAME,
+    RM_BARE_GLOB_NAME,
+    RM_BARE_GLOB_ROOT_NAME,
+    RM_PROTECTED_FILE_NAME,
+];
 
 pub(crate) fn is_pre_rm_propagation_rule(name: Option<&str>) -> bool {
     matches!(
@@ -314,6 +689,13 @@ pub(crate) fn is_pre_rm_propagation_rule(name: Option<&str>) -> bool {
             "cp-sensitive-then-delete"
                 | "ln-symlink-sensitive-then-delete"
                 | "rsync-sensitive-then-delete"
+                // A semantically safe rm must not shadow destruction caused
+                // by a redirect in the same shell segment. Keep these ahead
+                // of the rm Allow fast path as well.
+                | "redirect-truncate-root-home"
+                | "redirect-truncate-dynamic-path"
+                | "redirect-truncate-git-internals-relative"
+                | "redirect-append-git-internals-relative"
         )
     )
 }
@@ -340,11 +722,164 @@ pub(crate) enum RmParseDecision {
     NoMatch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RmExecutableCertainty {
+    Exact,
+    MayBeRm,
+    Other,
+}
+
+/// The two unlink rules share an executed-argv proof, not a raw-text search.
+/// Keep the arguments as source text for their existing pattern attribution.
+pub(crate) struct UnlinkCommand {
+    pub(crate) matching_view: String,
+    pub(crate) safe: bool,
+}
+
+pub(crate) fn is_unlink_rule(name: Option<&str>) -> bool {
+    matches!(name, Some("unlink-root-home" | "unlink-general"))
+}
+
+/// Recover a literal POSIX unlink invocation without interpreting its argv as
+/// another command (#550). Shell quote removal applies to the executable word:
+/// `'unlink'`, `u'n'link` and `'/usr/bin/unlink'` all execute the same utility.
+/// Only that word is replaced in the matching view; operands retain their
+/// quoting, and the original command remains available to every other rule.
+pub(crate) fn unlink_command_for_pattern_matching(
+    command: &str,
+    dialect: ShellDialect,
+) -> Option<UnlinkCommand> {
+    if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
+        || (!command.contains("unlink") && !command.contains(['\'', '"', '\\']))
+    {
+        return None;
+    }
+    let (ungrouped, _) = strip_leading_posix_group_openers(command);
+    let (unprefixed, _) = strip_leading_rm_prefixes(ungrouped);
+    let stripped = crate::normalize::strip_wrapper_prefixes(unprefixed);
+    if stripped.wrapper_limit_reached {
+        return None;
+    }
+    let source = stripped.normalized.as_ref();
+    let tokens = tokenize_for_shell_dialect(source, ShellDialect::Posix);
+    let executable = tokens.first()?;
+    if executable.kind != NormalizeTokenKind::Word {
+        return None;
+    }
+    let executable_end = crate::normalize::consume_posix_word_token(
+        source.as_bytes(),
+        executable.byte_range.start,
+        source.len(),
+    );
+    let decoded = crate::normalize::decode_posix_literal_word(
+        source.get(executable.byte_range.start..executable_end)?,
+    )?;
+    // `xargs [OPTION]... unlink [ARG]...` runs unlink with its input items
+    // appended, or substituted for an `-I` placeholder, so the real operands
+    // never appear on the line: `cat list | xargs -I{} unlink {}` was allowed
+    // once the rules were scoped to the executed command. Judge the child
+    // invocation with a synthetic operand standing for that input, as the rm
+    // parser does; input can never earn the temp or help exemption.
+    if decoded.rsplit('/').next() == Some("xargs") {
+        let frontend_tokens = tokenize_for_normalization(source);
+        let child_index = xargs_command_index(source, &frontend_tokens)?;
+        let child = rm_frontend_suffix(source, &frontend_tokens, child_index)?;
+        let nested = unlink_command_for_pattern_matching(child, dialect)?;
+        return Some(UnlinkCommand {
+            matching_view: format!("{} ./__dcg_xargs_input__", nested.matching_view.trim_end()),
+            safe: false,
+        });
+    }
+    if decoded.rsplit('/').next() != Some("unlink") {
+        return None;
+    }
+
+    let arguments: Vec<&str> = tokens
+        .iter()
+        .skip(1)
+        .filter_map(|token| token.text(source))
+        .collect();
+    let single_command = executable_end == executable.byte_range.end
+        && tokens
+            .iter()
+            .all(|token| token.kind == NormalizeTokenKind::Word);
+    let informational = single_command
+        && matches!(arguments.as_slice(), [argument] if
+            crate::normalize::decode_posix_literal_word(argument)
+                .is_some_and(|value| matches!(value.as_ref(), "--help" | "--version")));
+    let operand = match arguments.as_slice() {
+        [operand] => Some(*operand),
+        [options_end, operand]
+            if crate::normalize::decode_posix_literal_word(options_end)
+                .is_some_and(|value| value == "--") =>
+        {
+            Some(*operand)
+        }
+        _ => None,
+    };
+    // Exempt only one statically recovered target below a literal temp root.
+    // Decoding a quoted operand here proves its value; it never turns that
+    // value into executable source or makes a dynamic temp root trustworthy.
+    let temporary = single_command
+        && command == unprefixed
+        && !crate::normalize::wrapper_changes_filesystem_context(command)
+        && operand
+            // Unknown dialects can interpret POSIX quoting as path bytes or
+            // expand native shell syntax. Pack APIs carry no dialect, so only
+            // syntax-free ASCII operands get this new exemption there.
+            // Preserve the old temp rules' backslash boundary in all dialects.
+            .filter(|operand| {
+                !operand.contains('\\')
+                    && (dialect == ShellDialect::Posix
+                        || operand.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric()
+                                || matches!(byte, b'/' | b'.' | b'_' | b'-')
+                        }))
+            })
+            .and_then(crate::normalize::decode_posix_literal_word)
+            .is_some_and(|path| {
+                !path.contains(['\0', '\\'])
+                    && LITERAL_TEMP_PREFIXES
+                        .iter()
+                        .find_map(|prefix| path.strip_prefix(prefix))
+                        .is_some_and(|suffix| {
+                            temp_path_suffix_has_real_component(suffix)
+                                && !has_dotdot_segment(suffix)
+                                // Win32 can normalize trailing dots/spaces;
+                                // an unknown shell cannot prove these literal.
+                                && (dialect == ShellDialect::Posix
+                                    || suffix.split('/').all(|component| {
+                                        !component.ends_with(['.', ' '])
+                                    }))
+                        })
+            });
+    Some(UnlinkCommand {
+        matching_view: format!("unlink {}", &source[executable_end..]),
+        safe: informational || temporary,
+    })
+}
+
 #[derive(Debug)]
 struct PathToken<'a> {
     unquoted: &'a str,
+    /// The operand exactly as spelled, quotes and all.
+    ///
+    /// `unquoted` has already had the outer quotes removed, which loses the
+    /// one distinction the protected-file classifier depends on: `rm ~/x`
+    /// expands to the home directory and `rm "~/x"` does not. That classifier
+    /// does its own quote and escape decoding, so it wants the raw word (#469).
+    raw: &'a str,
     quote: QuoteKind,
     range: Range<usize>,
+    /// The byte right after the operand is an unquoted `(`.
+    ///
+    /// The tokenizer ends an operand at `(` because it is subshell syntax,
+    /// but zsh reads a `(` glued to a word as glob alternation or a glob
+    /// qualifier: `rm -rf ~/scratch/lo(g|x)` removes `~/scratch/log`, not
+    /// the spelled `~/scratch/lo`. The operand text is therefore not the
+    /// path the shell would hand to `unlink`, and nothing that trusts the
+    /// spelling (the `exempt_target_globs` match) may act on it.
+    glued_to_paren: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -354,64 +889,187 @@ enum RmFlagStyle {
     Long,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum RmInteractiveMode {
+    #[default]
+    Default,
+    Never,
+    Once,
+    Always,
+}
+
+impl RmInteractiveMode {
+    /// Whether this mode makes GNU `rm` actually prompt for the command
+    /// described by `recursive` and `operands`.
+    ///
+    /// `-i` (`Always`) prompts before every file, so it needs no context. `-I`
+    /// (`Once`) does not, and the condition is the whole point of the flag:
+    ///
+    /// > `-I`, `--interactive=once` — prompt once before removing more than
+    /// > three files, or when removing recursively
+    ///
+    /// Treating `Once` as unconditional made `rm -I <private key>` read as
+    /// bounded by a prompt that GNU never issues, so the rules that stand down
+    /// for an interactive command stood down for a silent deletion (#481). One,
+    /// two and three named files all deleted without a prompt and were allowed.
+    ///
+    /// A glob is ONE operand here even though the shell may expand it to many,
+    /// because whether `-I` prompts is then not knowable from the command text.
+    /// Counting it as one keeps the answer "no proven prompt", which leaves the
+    /// rule standing — the conservative direction, and the one that leaves the
+    /// glob rules to make their own case.
+    const fn prompts_for(self, recursive: bool, operands: usize) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Once => recursive || operands > 3,
+            Self::Default | Self::Never => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RmFlagState {
-    style: RmFlagStyle,
+    force_style: Option<RmFlagStyle>,
+    recursive_span: Option<Range<usize>>,
     span: Option<Range<usize>>,
-    saw_terminator: bool,
+    interactive_mode: RmInteractiveMode,
 }
 
 #[derive(Debug, Default)]
 #[allow(clippy::struct_excessive_bools)]
 struct RmFlagTracker {
     combined_span: Option<Range<usize>>,
-    seen_r: bool,
-    r_span: Option<Range<usize>>,
-    seen_f: bool,
-    f_span: Option<Range<usize>>,
+    seen_short_recursive: bool,
+    short_recursive_span: Option<Range<usize>>,
+    seen_short_force: bool,
+    short_force_span: Option<Range<usize>>,
     seen_long_recursive: bool,
-    recursive_span: Option<Range<usize>>,
+    long_recursive_span: Option<Range<usize>>,
     seen_long_force: bool,
-    force_span: Option<Range<usize>>,
-    saw_terminator: bool,
+    long_force_span: Option<Range<usize>>,
+    interactive_mode: RmInteractiveMode,
 }
 
 impl RmFlagTracker {
     fn resolve(self) -> Option<RmFlagState> {
-        if let Some(span) = self.combined_span {
-            return Some(RmFlagState {
-                style: RmFlagStyle::Combined,
-                span: Some(span),
-                saw_terminator: self.saw_terminator,
-            });
-        }
+        let recursive_span = self
+            .short_recursive_span
+            .clone()
+            .or_else(|| self.long_recursive_span.clone());
+        recursive_span.as_ref()?;
 
-        if self.seen_r && self.seen_f {
-            return Some(RmFlagState {
-                style: RmFlagStyle::Separate,
-                span: self.r_span.or(self.f_span),
-                saw_terminator: self.saw_terminator,
-            });
-        }
+        let saw_force = self.seen_short_force || self.seen_long_force;
+        let force_style = if !saw_force {
+            None
+        } else if self.combined_span.is_some() {
+            Some(RmFlagStyle::Combined)
+        } else if self.seen_long_recursive && self.seen_long_force {
+            Some(RmFlagStyle::Long)
+        } else {
+            // This also covers mixed short/long forms such as
+            // `rm -r --force` and `rm --recursive -f`.
+            Some(RmFlagStyle::Separate)
+        };
 
-        if self.seen_long_recursive && self.seen_long_force {
-            return Some(RmFlagState {
-                style: RmFlagStyle::Long,
-                span: self.recursive_span.or(self.force_span),
-                saw_terminator: self.saw_terminator,
-            });
-        }
+        let span = self
+            .combined_span
+            .or_else(|| recursive_span.clone())
+            .or(self.short_force_span)
+            .or(self.long_force_span);
 
-        None
+        Some(RmFlagState {
+            force_style,
+            recursive_span,
+            span,
+            interactive_mode: self.interactive_mode,
+        })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RmLongOption {
+    Dir,
+    Force,
+    Help,
+    Interactive,
+    NoPreserveRoot,
+    OneFileSystem,
+    PreserveRoot,
+    PresumeInputTty,
+    Recursive,
+    Verbose,
+    Version,
+}
+
+const RM_LONG_OPTIONS: &[(&str, RmLongOption)] = &[
+    ("dir", RmLongOption::Dir),
+    ("force", RmLongOption::Force),
+    ("help", RmLongOption::Help),
+    ("interactive", RmLongOption::Interactive),
+    ("no-preserve-root", RmLongOption::NoPreserveRoot),
+    ("one-file-system", RmLongOption::OneFileSystem),
+    ("preserve-root", RmLongOption::PreserveRoot),
+    ("presume-input-tty", RmLongOption::PresumeInputTty),
+    ("recursive", RmLongOption::Recursive),
+    ("verbose", RmLongOption::Verbose),
+    ("version", RmLongOption::Version),
+];
+
+fn resolve_rm_long_option(name: &str) -> Option<RmLongOption> {
+    if let Some((_, option)) = RM_LONG_OPTIONS
+        .iter()
+        .find(|(candidate, _)| *candidate == name)
+    {
+        return Some(*option);
+    }
+
+    let mut matches = RM_LONG_OPTIONS
+        .iter()
+        .filter(|(candidate, _)| candidate.starts_with(name))
+        .map(|(_, option)| *option);
+    let option = matches.next()?;
+    matches.next().is_none().then_some(option)
+}
+
+fn parse_rm_interactive_mode(value: &str) -> Option<RmInteractiveMode> {
+    if value.is_empty() {
+        return None;
+    }
+
+    let candidates = [
+        ("never", RmInteractiveMode::Never),
+        ("no", RmInteractiveMode::Never),
+        ("none", RmInteractiveMode::Never),
+        ("once", RmInteractiveMode::Once),
+        ("always", RmInteractiveMode::Always),
+        ("yes", RmInteractiveMode::Always),
+    ];
+    let mut resolved = None;
+    for (candidate, mode) in candidates {
+        if candidate.starts_with(value) {
+            if resolved.is_some_and(|existing| existing != mode) {
+                return None;
+            }
+            resolved = Some(mode);
+        }
+    }
+    resolved
 }
 
 pub(crate) fn parse_rm_command(command: &str) -> RmParseDecision {
     let segments = crate::packs::split_command_segments(command);
     if segments.len() > 1 {
+        let stdin_context = RmStdinContext::new(command);
         let mut saw_allow = false;
         for segment in segments {
-            match parse_rm_command_segment(segment) {
+            let command_start = command.as_ptr() as usize;
+            let segment_start = segment.as_ptr() as usize;
+            let automated_stdin = segment_start
+                .checked_sub(command_start)
+                .is_some_and(|offset| {
+                    stdin_context.segment_receives_automated_stdin(offset, ShellDialect::Posix)
+                });
+            match parse_rm_command_segment(segment, automated_stdin) {
                 RmParseDecision::Deny(hit) => return RmParseDecision::Deny(hit),
                 RmParseDecision::Allow => saw_allow = true,
                 RmParseDecision::NoMatch => {}
@@ -425,10 +1083,2276 @@ pub(crate) fn parse_rm_command(command: &str) -> RmParseDecision {
         };
     }
 
-    parse_rm_command_segment(command)
+    parse_rm_command_segment(command, false)
 }
 
-fn parse_rm_command_segment(command: &str) -> RmParseDecision {
+/// Return whether an rm invocation at `segment_start` can read answers from a
+/// non-terminal source inherited from the surrounding shell program.
+///
+/// A command-local redirect is handled by the rm argv parser itself. This
+/// helper covers provenance that is invisible in an isolated segment: direct
+/// pipeline input, a pipeline feeding an enclosing POSIX brace/subshell group,
+/// and a prior `exec 0<...` redirection that persists in the current shell.
+/// Unknown callers use the conservative POSIX model; PowerShell/Cmd retain the
+/// direct-pipeline behavior while their richer stream semantics are handled by
+/// their dialect-specific parsers.
+pub(crate) fn rm_segment_receives_automated_stdin(
+    command: &str,
+    segment_start: usize,
+    dialect: ShellDialect,
+) -> bool {
+    RmStdinContext::new(command).segment_receives_automated_stdin(segment_start, dialect)
+}
+
+/// Source-wide prerequisites for the existing stdin provenance parsers.
+///
+/// A multiline command can contribute hundreds of segment queries. Re-splitting
+/// and tokenizing every preceding segment for each query is quadratic even when
+/// the command cannot contain a pipeline or an `exec` redirect. These facts are
+/// computed once from the exact source and shared by all of its segment queries;
+/// they do not classify a command, choose packs, or change either parser.
+pub(crate) struct RmStdinContext<'a> {
+    command: &'a str,
+    has_pipe: bool,
+    has_exec_stdin_redirect: bool,
+}
+
+impl<'a> RmStdinContext<'a> {
+    pub(crate) fn new(command: &'a str) -> Self {
+        Self {
+            command,
+            has_pipe: command.contains('|'),
+            has_exec_stdin_redirect: command.contains("exec") && command.contains('<'),
+        }
+    }
+
+    pub(crate) fn segment_receives_automated_stdin(
+        &self,
+        segment_start: usize,
+        dialect: ShellDialect,
+    ) -> bool {
+        let Some(prefix) = self.command.get(..segment_start) else {
+            return false;
+        };
+        let prefix = prefix.trim_end();
+        if prefix.ends_with("|&") || (prefix.ends_with('|') && !prefix.ends_with("||")) {
+            return true;
+        }
+
+        if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+            return false;
+        }
+
+        // A group can acquire automated stdin only from a literal `|` byte.
+        // The exec parser recognizes an exact raw token basename after outer
+        // quote removal, so every token it accepts contains contiguous `exec`.
+        // Its stdin redirect grammar also requires a literal `<` byte.
+        // Quoted data and escapes may make either fact a false positive; the
+        // complete existing parser still resolves those cases. Neither fact
+        // can exclude a positive result from its respective parser.
+        (self.has_pipe && posix_pipeline_group_is_active(self.command, segment_start))
+            || (self.has_exec_stdin_redirect
+                && prior_posix_exec_redirects_stdin(self.command, segment_start))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PosixGroupInput {
+    close: PosixGroupClose,
+    automated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PosixGroupClose {
+    Byte(u8),
+    Word(&'static str),
+}
+
+fn posix_pipeline_group_is_active(command: &str, segment_start: usize) -> bool {
+    let bytes = command.as_bytes();
+    let end = segment_start.min(bytes.len());
+    let mut groups: Vec<PosixGroupInput> = Vec::new();
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut pipeline_pending = false;
+    let mut at_command_start = true;
+    let mut heredocs: Vec<(String, bool)> = Vec::new();
+
+    while index < end {
+        let byte = bytes[index];
+        if byte == b'\\' && !in_single && index + 1 < end {
+            index += 2;
+            continue;
+        }
+        if byte == b'\'' && !in_double {
+            in_single = !in_single;
+            index += 1;
+            continue;
+        }
+        if byte == b'"' && !in_single {
+            in_double = !in_double;
+            index += 1;
+            continue;
+        }
+        if in_single || in_double {
+            index += 1;
+            continue;
+        }
+
+        if byte == b'#' && posix_comment_starts(bytes, index) {
+            index = bytes[index..end]
+                .iter()
+                .position(|candidate| *candidate == b'\n')
+                .map_or(end, |newline| index + newline);
+            continue;
+        }
+        if byte == b'<'
+            && bytes.get(index + 1) == Some(&b'<')
+            && bytes.get(index + 2) != Some(&b'<')
+        {
+            if let Some((delimiter, strip_tabs, after)) =
+                parse_posix_heredoc_delimiter(command, index, end)
+            {
+                heredocs.push((delimiter, strip_tabs));
+                index = after;
+                continue;
+            }
+        }
+
+        match byte {
+            b'|' if bytes.get(index + 1) == Some(&b'|') => {
+                pipeline_pending = false;
+                at_command_start = true;
+                index += 2;
+                continue;
+            }
+            b'|' => {
+                pipeline_pending = true;
+                at_command_start = true;
+                index += 1 + usize::from(bytes.get(index + 1) == Some(&b'&'));
+                continue;
+            }
+            b'&' if bytes.get(index + 1) == Some(&b'&') => {
+                pipeline_pending = false;
+                at_command_start = true;
+                index += 2;
+                continue;
+            }
+            b';' | b'&' => {
+                pipeline_pending = false;
+                at_command_start = true;
+            }
+            b'\n' => {
+                pipeline_pending = false;
+                at_command_start = true;
+                if !heredocs.is_empty() {
+                    index = skip_posix_heredoc_bodies(command, index + 1, end, &mut heredocs);
+                    continue;
+                }
+            }
+            b'(' | b'{' => {
+                let inherited =
+                    pipeline_pending || groups.last().is_some_and(|group| group.automated);
+                groups.push(PosixGroupInput {
+                    close: PosixGroupClose::Byte(if byte == b'(' { b')' } else { b'}' }),
+                    automated: inherited,
+                });
+                pipeline_pending = false;
+                at_command_start = true;
+            }
+            b')' | b'}' => {
+                if groups
+                    .last()
+                    .is_some_and(|group| group.close == PosixGroupClose::Byte(byte))
+                {
+                    groups.pop();
+                }
+                pipeline_pending = false;
+                at_command_start = false;
+            }
+            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
+                let word_end = bytes[index..end]
+                    .iter()
+                    .position(|candidate| !candidate.is_ascii_alphanumeric() && *candidate != b'_')
+                    .map_or(end, |offset| index + offset);
+                let word = &command[index..word_end];
+                if at_command_start {
+                    if groups.last().is_some_and(|group| {
+                        matches!(group.close, PosixGroupClose::Word(close) if close == word)
+                    }) {
+                        groups.pop();
+                        pipeline_pending = false;
+                        at_command_start = false;
+                    } else if let Some(close) = posix_compound_close_word(word) {
+                        let inherited = pipeline_pending
+                            || groups.last().is_some_and(|group| group.automated);
+                        groups.push(PosixGroupInput {
+                            close: PosixGroupClose::Word(close),
+                            automated: inherited,
+                        });
+                        pipeline_pending = false;
+                        at_command_start = false;
+                    } else if matches!(word, "do" | "then" | "else" | "elif") {
+                        pipeline_pending = false;
+                        at_command_start = true;
+                    } else {
+                        pipeline_pending = false;
+                        at_command_start = false;
+                    }
+                }
+                index = word_end;
+                continue;
+            }
+            byte if !byte.is_ascii_whitespace() => {
+                pipeline_pending = false;
+                at_command_start = false;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+
+    groups.iter().any(|group| group.automated)
+}
+
+fn posix_compound_close_word(word: &str) -> Option<&'static str> {
+    match word {
+        "while" | "until" | "for" | "select" => Some("done"),
+        "if" => Some("fi"),
+        "case" => Some("esac"),
+        _ => None,
+    }
+}
+
+fn posix_comment_starts(bytes: &[u8], index: usize) -> bool {
+    index == 0
+        || bytes.get(index.wrapping_sub(1)).is_some_and(|previous| {
+            previous.is_ascii_whitespace() || matches!(previous, b';' | b'|' | b'&' | b'(' | b'{')
+        })
+}
+
+fn parse_posix_heredoc_delimiter(
+    command: &str,
+    operator_start: usize,
+    end: usize,
+) -> Option<(String, bool, usize)> {
+    let bytes = command.as_bytes();
+    let mut index = operator_start + 2;
+    let strip_tabs = bytes.get(index) == Some(&b'-');
+    index += usize::from(strip_tabs);
+    while index < end && matches!(bytes[index], b' ' | b'\t') {
+        index += 1;
+    }
+    let start = index;
+    let mut quote = None;
+    let mut delimiter = String::new();
+    while index < end {
+        let byte = bytes[index];
+        if quote.is_none() && (byte.is_ascii_whitespace() || matches!(byte, b';' | b'|' | b'&')) {
+            break;
+        }
+        if matches!(byte, b'\'' | b'"') {
+            if quote == Some(byte) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(byte);
+            } else {
+                delimiter.push(char::from(byte));
+            }
+        } else if byte == b'\\' && quote != Some(b'\'') && index + 1 < end {
+            index += 1;
+            delimiter.push(char::from(bytes[index]));
+        } else {
+            delimiter.push(char::from(byte));
+        }
+        index += 1;
+    }
+    (!delimiter.is_empty() && index > start).then_some((delimiter, strip_tabs, index))
+}
+
+fn skip_posix_heredoc_bodies(
+    command: &str,
+    mut index: usize,
+    end: usize,
+    heredocs: &mut Vec<(String, bool)>,
+) -> usize {
+    while let Some((delimiter, strip_tabs)) = heredocs.first() {
+        if index >= end {
+            return end;
+        }
+        let line_end = command[index..end]
+            .find('\n')
+            .map_or(end, |offset| index + offset);
+        let line = &command[index..line_end];
+        let comparable = if *strip_tabs {
+            line.trim_start_matches('\t')
+        } else {
+            line
+        };
+        index = (line_end + usize::from(line_end < end)).min(end);
+        if comparable.trim_end_matches('\r') == delimiter {
+            heredocs.remove(0);
+        }
+    }
+    index
+}
+
+fn prior_posix_exec_redirects_stdin(command: &str, segment_start: usize) -> bool {
+    let command_start = command.as_ptr() as usize;
+    let target_scope = posix_subshell_scope_at(command, segment_start);
+    let mut redirected = false;
+
+    for segment in crate::packs::split_command_segments(command) {
+        let pointer = segment.as_ptr() as usize;
+        let Some(start) = pointer.checked_sub(command_start) else {
+            continue;
+        };
+        let end = start.saturating_add(segment.len());
+        if end > segment_start {
+            continue;
+        }
+        if posix_exec_stdin_redirect_offset(segment).is_some_and(|exec_offset| {
+            posix_subshell_scope_at(command, start.saturating_add(exec_offset)) == target_scope
+        }) {
+            redirected = true;
+        }
+    }
+
+    redirected
+}
+
+fn posix_subshell_scope_at(command: &str, offset: usize) -> Vec<usize> {
+    let bytes = command.as_bytes();
+    let end = offset.min(bytes.len());
+    let mut scopes = Vec::new();
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while index < end {
+        let byte = bytes[index];
+        if byte == b'\\' && !in_single && index + 1 < end {
+            index += 2;
+            continue;
+        }
+        if byte == b'\'' && !in_double {
+            in_single = !in_single;
+            index += 1;
+            continue;
+        }
+        if byte == b'"' && !in_single {
+            in_double = !in_double;
+            index += 1;
+            continue;
+        }
+        if in_single {
+            index += 1;
+            continue;
+        }
+
+        if byte == b'$' && bytes.get(index + 1) == Some(&b'(') {
+            scopes.push(index);
+            index += 2;
+            continue;
+        }
+        if !in_double && byte == b'(' {
+            scopes.push(index);
+        } else if byte == b')' && !scopes.is_empty() {
+            scopes.pop();
+        }
+        index += 1;
+    }
+
+    scopes
+}
+
+fn posix_exec_stdin_redirect_offset(original_segment: &str) -> Option<usize> {
+    let segment = strip_leading_posix_group_openers(original_segment).0;
+    let suffix_offset =
+        (segment.as_ptr() as usize).checked_sub(original_segment.as_ptr() as usize)?;
+    let tokens = tokenize_for_normalization(segment);
+    let exec_index = tokens.iter().position(|token| {
+        token.kind != NormalizeTokenKind::Separator
+            && token
+                .text(segment)
+                .is_some_and(|word| rm_frontend_basename(strip_outer_quotes(word).1) == "exec")
+    })?;
+
+    // `exec` must be the command word, not data passed to another utility.
+    if tokens[..exec_index].iter().any(|token| {
+        token.kind != NormalizeTokenKind::Separator
+            && token.text(segment).is_some_and(|word| {
+                !crate::normalize::is_env_assignment(word)
+                    && shell_redirection_prefix(word).is_none()
+            })
+    }) {
+        return None;
+    }
+
+    let redirects = tokens.iter().skip(exec_index + 1).any(|token| {
+        token.text(segment).is_some_and(|word| {
+            shell_redirection_prefix(word).is_some_and(|redirect| redirect.redirects_stdin)
+        })
+    });
+    redirects.then(|| suffix_offset.saturating_add(tokens[exec_index].byte_range.start))
+}
+
+pub(crate) fn parse_rm_command_segment(command: &str, pipeline_stdin: bool) -> RmParseDecision {
+    let original = command;
+    let (command, stripped_group_opener) = strip_leading_posix_group_openers(original);
+    let (command, leading_stdin_redirect) = strip_leading_rm_prefixes(command);
+    let stripped_leading_prefix = stripped_group_opener || command.as_ptr() != original.as_ptr();
+    let (normalized, was_normalized) = normalize_rm_execution_frontends(command);
+    let mut decision =
+        parse_normalized_rm_command_segment(&normalized, pipeline_stdin || leading_stdin_redirect);
+    if matches!(decision, RmParseDecision::NoMatch) {
+        decision = parse_rm_argv_frontend(&normalized);
+    }
+
+    // Wrapper/path normalization changes byte offsets. A span into that
+    // temporary string must never be reported as if it indexed the original
+    // hook command.
+    if was_normalized || stripped_leading_prefix {
+        if let RmParseDecision::Deny(hit) = &mut decision {
+            hit.span = None;
+        }
+    }
+
+    decision
+}
+
+/// Parse one evaluator-proven command slice using the caller's shell dialect.
+/// Exact rm invocations retain the established parser. A dynamic executable
+/// that can resolve to `rm` is blocked only when the remaining argv is itself
+/// recursive-deletion syntax.
+pub(crate) fn parse_rm_command_segment_in_dialect(
+    command: &str,
+    pipeline_stdin: bool,
+    dialect: ShellDialect,
+) -> RmParseDecision {
+    // A PowerShell assignment is an expression statement, not an executable
+    // invocation. Treating its variable name as a dynamic command creates
+    // false `rm-recursive-unverified` denials whenever the assigned value
+    // happens to contain splatting-like data (for example a here-string
+    // beginning with `@'`). Any executable `$()` content on the right-hand side
+    // is evaluated separately by the outer evaluator before this segment scan.
+    if dialect == ShellDialect::PowerShell && powershell_variable_assignment(command) {
+        return RmParseDecision::NoMatch;
+    }
+    if matches!(dialect, ShellDialect::PowerShell | ShellDialect::Cmd) {
+        let windows = parse_windows_rm_segment(command, pipeline_stdin, dialect);
+        if !matches!(windows, RmParseDecision::NoMatch) {
+            return windows;
+        }
+    }
+
+    let exact = parse_rm_command_segment(command, pipeline_stdin);
+    if !matches!(exact, RmParseDecision::NoMatch) {
+        return exact;
+    }
+
+    // Under `Unknown` the honest answer is the fail-closed union. Every arm
+    // above keys on an EXACT dialect, and `hook::refine_shell_dialect`
+    // down-trusts a mislabeled `Bash` payload to `Unknown` -- which matched no
+    // arm, so a Windows payload fell through to the POSIX parse and
+    // `Remove-Item .git\config`, `del %USERPROFILE%\.ssh\authorized_keys` and
+    // their siblings were allowed while `rm .git/config` and
+    // `rm ~/.ssh/authorized_keys` denied (#491).
+    //
+    // The code those commands needed already existed and was already wired:
+    // `parse_cmd_protected_file_segment` was written for exactly them (#486).
+    // Only the dialect gate stood in front of it. Two controls said so: forcing
+    // `Unknown` changed nothing (it is the value neither arm accepts), and
+    // `dcg explain` reported no `dialect_divergence` at all, so it was not a
+    // case of one dialect denying and the hook reading the wrong one.
+    //
+    // POSIX IS TRIED FIRST, ABOVE. That ordering is the whole safety argument:
+    // an ordinary `rm` keeps its own reading, and only a command the POSIX
+    // parser declines is offered to the Windows front ends. It is also the
+    // convention `credential_files::shell::classify` already established for
+    // this same situation (`posix().or_else(PowerShell).or_else(Cmd)`), so this
+    // follows it rather than inventing a second one.
+    if dialect == ShellDialect::Unknown {
+        for windows in [ShellDialect::PowerShell, ShellDialect::Cmd] {
+            let hit = parse_windows_rm_segment(command, pipeline_stdin, windows);
+            if !matches!(hit, RmParseDecision::NoMatch) {
+                return hit;
+            }
+        }
+    }
+
+    parse_unverified_rm_command_segment(command, pipeline_stdin, dialect)
+}
+
+/// The Windows delete front ends for one CONCRETE dialect.
+///
+/// Split out of [`parse_rm_command_segment_in_dialect`] so the `Unknown` union
+/// runs exactly the same code the concrete dialects do, rather than a second
+/// copy that could drift from it.
+fn parse_windows_rm_segment(
+    command: &str,
+    pipeline_stdin: bool,
+    dialect: ShellDialect,
+) -> RmParseDecision {
+    match dialect {
+        ShellDialect::PowerShell => {
+            // A PowerShell assignment is an expression statement, not an
+            // invocation; see the caller's note. The guard travels with the
+            // front end so the union cannot bypass it.
+            if powershell_variable_assignment(command) {
+                return RmParseDecision::NoMatch;
+            }
+            parse_powershell_remove_item_segment(command, pipeline_stdin)
+        }
+        ShellDialect::Cmd => {
+            let decoded = parse_cmd_decoded_rm_segment(command, pipeline_stdin);
+            if !matches!(decoded, RmParseDecision::NoMatch) {
+                return decoded;
+            }
+            // The decoder above only runs for commands carrying `^`, so the
+            // plain spelling of a protected-file delete reached nothing (#451).
+            parse_cmd_protected_file_segment(command)
+        }
+        ShellDialect::Posix | ShellDialect::Unknown => RmParseDecision::NoMatch,
+    }
+}
+
+/// Whether a Windows-dialect delete target names a protected file (#451).
+///
+/// The classifier that owns the protected-path table reads POSIX spelling, so
+/// the Windows one is translated rather than duplicated — a second table is
+/// exactly the drift that #441/#452/#465/#468 were:
+///
+/// - `\` becomes `/`. Both shells accept either, and `$HOME\.ssh\id_rsa` and
+///   `$HOME/.ssh/id_rsa` name the same file.
+/// - Every Windows spelling of the home directory becomes `$HOME`, the anchor
+///   the table already recognises: PowerShell's `$env:USERPROFILE` and cmd's
+///   `%USERPROFILE%` / `%HOMEPATH%`. This is a rename of the same concept, not
+///   a new root — on Windows `%USERPROFILE%` IS the home directory, and dcg's
+///   own `config::home_dir()` resolves it that way (bd-b2b1).
+///
+/// Everything else is left alone, so a target the classifier cannot prove
+/// literal still declines there rather than here.
+fn windows_target_is_protected(target: &str) -> bool {
+    let candidate = windows_protected_candidate(target);
+    crate::packs::core::credential_files::may_name_protected_path(&candidate)
+        && crate::packs::core::credential_files::names_protected_file(&candidate)
+}
+
+/// The `rm-protected-file` reason for the Windows targets this rule denies
+/// (#533), judged on the same normalized spelling as
+/// [`windows_target_is_protected`]: the git-internals wording only when every
+/// one of them is inside `.git`.
+fn windows_rm_protected_files_reason<S: AsRef<str>>(protected_targets: &[S]) -> &'static str {
+    let git_only = !protected_targets.is_empty()
+        && protected_targets.iter().all(|target| {
+            crate::packs::core::credential_files::names_protected_git_internal(
+                &windows_protected_candidate(target.as_ref()),
+            )
+        });
+    if git_only {
+        RM_PROTECTED_GIT_INTERNAL_REASON
+    } else {
+        RM_PROTECTED_FILE_REASON
+    }
+}
+
+/// A Windows target rewritten for the POSIX protected-file classifier:
+/// backslashes as slashes and a leading Windows home alias as `$HOME`.
+fn windows_protected_candidate(target: &str) -> String {
+    /// Windows home anchors, longest first so `%HOMEDRIVE%%HOMEPATH%` is not
+    /// half-consumed by the `%HOMEPATH%` entry.
+    const HOME_ALIASES: &[&str] = &[
+        "%HOMEDRIVE%%HOMEPATH%",
+        "${env:USERPROFILE}",
+        "$env:USERPROFILE",
+        "%USERPROFILE%",
+        "${env:HOME}",
+        "$env:HOME",
+        "%HOMEPATH%",
+        "%HOME%",
+    ];
+
+    let mut candidate = target.replace('\\', "/");
+    for alias in HOME_ALIASES {
+        if let Some(rest) = strip_prefix_ascii_case_insensitive(&candidate, alias) {
+            candidate = format!("$HOME{rest}");
+            break;
+        }
+    }
+    candidate
+}
+
+/// A plain `del`/`erase` of a protected file, in the cmd dialect (#451).
+///
+/// `parse_cmd_decoded_rm_segment` only runs for commands carrying `^`, because
+/// it exists to undo cmd's escape obfuscation. The ordinary spelling therefore
+/// reached no protected-file judgment at all: measured, `del
+/// %USERPROFILE%\.ssh\id_rsa` was allowed while `rm ~/.ssh/id_rsa` denied, for
+/// five target files and every `del`/`erase` switch combination.
+///
+/// Only the two file-deleting verbs are read here. `rd`/`rmdir` remove a
+/// directory and are the recursive rules' business, not this one's.
+fn parse_cmd_protected_file_segment(command: &str) -> RmParseDecision {
+    let tokens = tokenize_for_shell_dialect(command, ShellDialect::Cmd);
+    let mut words = tokens
+        .iter()
+        .take_while(|token| token.kind != NormalizeTokenKind::Separator)
+        .filter_map(|token| token.text(command));
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::Cmd);
+    let Some(executable) = words
+        .next()
+        .and_then(|word| decoder.decode(word, ShellTokenRole::Syntax))
+    else {
+        return RmParseDecision::NoMatch;
+    };
+    if !cmd_file_delete_verb(executable.as_ref()) {
+        return RmParseDecision::NoMatch;
+    }
+
+    // Every protected target is collected (the decision is unchanged: any one
+    // denies) so the reason can say "credential" whenever any target is one
+    // (#533).
+    let mut protected_targets: Vec<String> = Vec::new();
+    for word in words {
+        // cmd switches are `/f`, `/q`, `/s`, … — a leading slash is an option
+        // here, never a POSIX root.
+        if word.starts_with('/') {
+            continue;
+        }
+        let Some(decoded) = decoder.decode(word, ShellTokenRole::Data) else {
+            continue;
+        };
+        let target = strip_outer_quotes(decoded.as_ref()).1;
+        if target.is_empty() || !windows_target_is_protected(target) {
+            continue;
+        }
+        protected_targets.push(target.to_string());
+    }
+    if protected_targets.is_empty() {
+        return RmParseDecision::NoMatch;
+    }
+    RmParseDecision::Deny(RmParseMatch {
+        pattern_name: RM_PROTECTED_FILE_NAME,
+        reason: windows_rm_protected_files_reason(&protected_targets),
+        severity: Severity::Critical,
+        span: None,
+    })
+}
+
+/// `str::strip_prefix` with an ASCII case-insensitive comparison, because
+/// PowerShell variable names are case-insensitive (`$env:userprofile`).
+fn strip_prefix_ascii_case_insensitive<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = value.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &value[prefix.len()..])
+}
+
+fn powershell_variable_assignment(command: &str) -> bool {
+    let Some(mut tail) = command.trim_start().strip_prefix('$') else {
+        return false;
+    };
+
+    if let Some(braced) = tail.strip_prefix('{') {
+        let Some(close) = braced.find('}') else {
+            return false;
+        };
+        tail = &braced[close + 1..];
+    } else {
+        let variable_len = tail
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':'))
+            .count();
+        if variable_len == 0 {
+            return false;
+        }
+        tail = &tail[variable_len..];
+    }
+
+    let tail = tail.trim_start();
+    ["=", "+=", "-=", "*=", "/=", "%="]
+        .iter()
+        .any(|operator| tail.starts_with(operator))
+}
+
+/// Tell the evaluator's keyword-index layer when caller-proven shell syntax
+/// can hide the `rm`/`Remove-Item` command word from bytewise pack keywords.
+/// The semantic parser must still make the final Allow/Deny decision; this is
+/// only a conservative candidate-selection signal.
+pub(crate) fn rm_semantic_scan_required(command: &str, dialect: ShellDialect) -> bool {
+    match dialect {
+        ShellDialect::PowerShell => {
+            if command.contains('&') {
+                // The call operator can execute a variable, subexpression, or
+                // concatenation whose bytes contain no literal pack keyword.
+                return true;
+            }
+            // There used to be a `!command.contains(['`', '@', '&', '$', '('])`
+            // short-circuit here, on the theory that a command with no
+            // obfuscation character would already have been selected by the
+            // bytewise pack keywords. That holds for `rm`, which is a keyword.
+            // It does not hold for the cmdlet spellings — `Remove-Item`, `ri`,
+            // `del`, `rd`, `erase` are not core.filesystem keywords — so the
+            // plain, unobfuscated `Remove-Item -Recurse ./tree` fell between the
+            // two mechanisms: too plain for this scan's prefilter, and invisible
+            // to the keyword index. `Remove-Item -Recurse -Force $HOME` blocked
+            // only because the `$` happened to satisfy the prefilter, so the
+            // spelling with a variable in it was caught while the plain literal
+            // was not (#451).
+            //
+            // The segment check below is the authoritative test and already
+            // decodes the command word against `powershell_remove_item_alias`,
+            // so it answers this correctly on its own. Only PowerShell and
+            // Unknown dialects reach this arm, so the tokenizing cost does not
+            // land on the POSIX hot path.
+            crate::packs::split_command_segments_in_dialect(command, dialect)
+                .into_iter()
+                .any(powershell_segment_requires_rm_semantic_scan)
+        }
+        ShellDialect::Cmd => {
+            // There used to be a `!command.contains(['^', '%', '!'])`
+            // short-circuit here, on the same theory the PowerShell arm above
+            // used to hold: a command with no obfuscation character would
+            // already have been selected by the bytewise pack keywords. That
+            // holds for `rm`, which is a keyword. It does not hold for cmd's
+            // OWN delete verbs — `del` and `erase` are not core.filesystem
+            // keywords — so `del %USERPROFILE%\.ssh\id_rsa` fell between the
+            // two mechanisms exactly as the plain cmdlets did, and the
+            // protected-file rule never ran for it (#451).
+            //
+            // The segment check below is the authoritative test. Only Cmd and
+            // Unknown dialects reach this arm, so the tokenizing cost does not
+            // land on the POSIX hot path.
+            crate::packs::split_command_segments_in_dialect(command, dialect)
+                .into_iter()
+                .any(cmd_segment_requires_rm_semantic_scan)
+        }
+        ShellDialect::Posix => crate::packs::split_command_segments_in_dialect(command, dialect)
+            .into_iter()
+            .any(posix_segment_requires_rm_semantic_scan),
+        ShellDialect::Unknown => {
+            rm_semantic_scan_required(command, ShellDialect::Posix)
+                || rm_semantic_scan_required(command, ShellDialect::PowerShell)
+                || rm_semantic_scan_required(command, ShellDialect::Cmd)
+        }
+    }
+}
+
+fn posix_segment_requires_rm_semantic_scan(segment: &str) -> bool {
+    if !segment.contains(['$', '`', '\'', '"', '\\', '*', '?', '[', '{']) {
+        return false;
+    }
+    // Ask about the segment as written AND about the segment with wrapper
+    // prefixes removed, and admit the pack if EITHER view names a writer.
+    //
+    // Both views are needed, and taking only one is a real defect in each
+    // direction:
+    //
+    // - As-written only: the first token of `sudo python3 -c "…"` is `sudo`,
+    //   which is neither a credential writer nor an interpreter, so the pack
+    //   was never made a candidate and `credential-file-write` never ran, while
+    //   the identical command without the prefix denied. Measured: all twelve
+    //   combinations of {sudo, env, /usr/bin/env, FOO=1} x three interpreters
+    //   writing a login-shell startup file were allowed (#464).
+    //
+    // - Unwrapped only: `strip_wrapper_prefixes` also unwraps an *interpreter*
+    //   down to the code it runs, so the first token of `python3 -c "open(…)"`
+    //   becomes the payload rather than `python3`, and the gate answers false
+    //   for a command it used to admit. That is a false NEGATIVE, and it is why
+    //   this ORs rather than replaces.
+    //
+    // OR-ing is strictly more permissive than the original, so it can only add
+    // candidates. It cannot manufacture a false positive: nothing here decides
+    // anything, it only lets the classifier see a command it would otherwise
+    // never judge, and the classifier is what decides.
+    // The unwrap is deliberately on the right of the `||`: this runs on every
+    // command, and a segment whose first word is already a writer never pays
+    // for the rewrite.
+    segment_names_semantic_writer(segment)
+        || segment_names_semantic_writer(
+            crate::normalize::strip_wrapper_prefixes(segment)
+                .normalized
+                .as_ref(),
+        )
+        // Leading redirects, grouping, and a redirect attached to argv0 do
+        // not change the executable. The unlink proof shares the actual word
+        // boundary so those forms cannot hide a quoted basename from this gate.
+        || unlink_command_for_pattern_matching(segment, ShellDialect::Posix).is_some()
+}
+
+/// Whether the first word of `segment`, as spelled, is a writer the semantic
+/// rules in this pack own.
+fn segment_names_semantic_writer(segment: &str) -> bool {
+    let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
+    let Some(raw) = tokens
+        .iter()
+        .find(|token| token.kind != NormalizeTokenKind::Separator)
+        .and_then(|token| token.text(segment))
+    else {
+        return false;
+    };
+    let dynamic = rm_executable_certainty(raw, ShellDialect::Posix);
+    if dynamic == RmExecutableCertainty::MayBeRm {
+        return true;
+    }
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);
+    decoder
+        .decode(raw, ShellTokenRole::Syntax)
+        .is_some_and(|decoded| {
+            let executable = rm_frontend_basename(decoded.as_ref());
+            // An obfuscated writer spelling (`t''ee`, `\tee`) carries no
+            // keyword; `credential-file-write` still has to see it.
+            matches!(executable, "rm" | "unlink")
+                || super::credential_files::is_credential_writer(executable)
+        })
+}
+
+/// Candidate-selection signal for every dialect-sensitive semantic owned by
+/// core.filesystem. Evaluators should OR this with their ordinary keyword
+/// index result before deciding to skip the pack.
+pub(crate) fn filesystem_semantic_scan_required(command: &str, dialect: ShellDialect) -> bool {
+    rm_semantic_scan_required(command, dialect)
+        || (dialect == ShellDialect::Cmd
+            && command.contains('>')
+            && command.contains(['%', '!', '^']))
+        // PowerShell/Cmd writers of a protected file (#477). `Add-Content`
+        // and `Copy-Item` are in no keyword row, so without this the
+        // credential classifier could not run on the idiomatic spellings.
+        || (dialect != ShellDialect::Posix
+            && super::credential_files::names_windows_shell_writer(command))
+        // `cd ~/.ssh && echo k > authorized_keys` (#480): the redirect target
+        // is relative, so no keyword spells the protected path; the `cd` does.
+        // The evaluator anchors the target to that directory.
+        //
+        // A `cd` to `/` or another ancestor of a protected root leaves the
+        // protected part of the path to the relative target, which no needle
+        // spells: `cd / && echo x >> etc/sudoers`. The file writers the
+        // classifier knows write as `>` does (`cd / && tee -a etc/sudoers`).
+        || (matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
+            && (command.contains('>')
+                || ["tee", "cp", "mv", "install", "ln", "dd", "sed"]
+                    .iter()
+                    .any(|writer| contains_ascii_command_word(command, writer)))
+            && (contains_ascii_command_word(command, "cd")
+                || contains_ascii_command_word(command, "pushd"))
+            && (super::credential_files::may_name_protected_path(command)
+                || cd_reaches_a_protected_ancestor(command)))
+        // Fork-bomb reachability (issue #302): the `fork-bomb` rule matches a
+        // shell function-definition shape (`name() { … }`). The paren pair is
+        // pure syntax that keyword-based quick-reject cannot see, and POSIX
+        // permits whitespace inside it (`name ( )`), so a literal `()` keyword
+        // both costs a keyword slot and misses the spaced form. A space-
+        // tolerant scan here forces core.filesystem to run whenever an empty
+        // paren pair is present; the regex then does the precise matching.
+        || command_contains_empty_paren_pair(command)
+}
+
+/// Roots under which [`super::credential_files`] protects files, as path
+/// components; `/private/etc` is macOS's real `/etc`.
+const PROTECTED_ROOT_COMPONENTS: &[&[&str]] = &[
+    &["etc"],
+    &["private", "etc"],
+    &["home"],
+    &["homes"],
+    &["Users"],
+    &["root"],
+    &["var", "home"],
+    &["usr", "home"],
+    &["export", "home"],
+    &["var", "services", "homes"],
+];
+
+/// Whether some `cd`/`pushd` in `command` moves to `/`, a protected root, or
+/// an ancestor of one (`/`, `//`, `/usr/..`, `/home`, `/var`, `/private`,
+/// `/volume1`), from where a relative path can reach protected files without
+/// spelling any root a needle knows. The target is read lexically, with `.`
+/// and `..` resolved; a quoted target counts. Linear.
+fn cd_reaches_a_protected_ancestor(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    ["cd", "pushd"].iter().any(|verb| {
+        command.match_indices(verb).any(|(at, _)| {
+            let starts_word = at == 0
+                || matches!(
+                    bytes[at - 1],
+                    b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b'{'
+                );
+            let end = at + verb.len();
+            if !starts_word || !matches!(bytes.get(end), Some(b' ' | b'\t')) {
+                return false;
+            }
+            let target = command[end..]
+                .split_ascii_whitespace()
+                .find(|word| !matches!(*word, "-P" | "-L" | "-e" | "-@" | "--"))
+                .unwrap_or("")
+                .trim_matches(['\'', '"'])
+                .trim_end_matches([';', '&', '|', ')', '}']);
+            let Some(path) = target.strip_prefix('/') else {
+                return false;
+            };
+            let mut components: Vec<&str> = Vec::new();
+            for component in path.split('/') {
+                match component {
+                    "" | "." => {}
+                    ".." => {
+                        components.pop();
+                    }
+                    other => components.push(other),
+                }
+            }
+            let volume = |component: &str| {
+                component.strip_prefix("volume").is_some_and(|number| {
+                    !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
+                })
+            };
+            components.is_empty()
+                || (components.len() == 1 && volume(components[0]))
+                || PROTECTED_ROOT_COMPONENTS.iter().any(|root| {
+                    components.len() <= root.len()
+                        && components.iter().zip(root.iter()).all(|(a, b)| a == b)
+                })
+        })
+    })
+}
+
+/// True when the command contains `(` followed by only ASCII whitespace and
+/// then `)` — the empty parameter list of a shell function definition, the one
+/// piece of the fork-bomb shape that carries no executable keyword.
+fn command_contains_empty_paren_pair(command: &str) -> bool {
+    let bytes = command.as_bytes();
+    let mut index = 0usize;
+    while let Some(open) = bytes[index..].iter().position(|&b| b == b'(') {
+        let mut cursor = index + open + 1;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if bytes.get(cursor) == Some(&b')') {
+            return true;
+        }
+        index = index + open + 1;
+    }
+    false
+}
+
+/// Refine the global substring index's candidate signal for core.filesystem.
+///
+/// The global index deliberately uses substring matching as a conservative
+/// first pass. That makes its short keywords prone to unrelated hits: most
+/// notably, `cp` appears at the end of both `scp` and `pscp`. Every
+/// core.filesystem command pattern requires the corresponding executable name
+/// at a regex word boundary, while every redirect pattern contains `>`.
+/// Mirroring that necessary lexical condition here preserves a superset of the
+/// pack's matches without cold-initializing the pack for unrelated commands.
+pub(crate) fn filesystem_keyword_candidate(command: &str) -> bool {
+    // The trailing four are the Windows disk-destruction verbs (cross-platform
+    // baseline, #451), matched case-insensitively so the base spelling covers
+    // every case. `wmic` alone selects the pack; the `wmic-shadowcopy-delete`
+    // regex then requires `shadowcopy delete`, so ordinary `wmic` queries still
+    // fall through to Allow.
+    const COMMAND_WORDS: &[&str] = &[
+        "rm",
+        "find",
+        "unlink",
+        "truncate",
+        "shred",
+        "tar",
+        // Archive extraction writes the archive's members into the destination
+        // directory, and is judged exactly where a `cp`/`rsync` destination
+        // already is. `tar` is listed above for the source-deleting rule; these
+        // carry no other rule, so without them the extraction classifier is
+        // never reached.
+        "bsdtar",
+        "unzip",
+        "7z",
+        "7za",
+        "7zr",
+        "dd",
+        "mv",
+        "cp",
+        "ln",
+        "rsync",
+        "vssadmin",
+        "wmic",
+        "format-volume",
+        "clear-disk",
+        // `wmi-shadowcopy-delete`: the class name is the one word every
+        // spelling carries (`Get-WmiObject Win32_ShadowCopy | Remove-WmiObject`).
+        "win32_shadowcopy",
+    ];
+    // `credential-file-write` writers (plus the GNU-prefixed spellings macOS
+    // users install from Homebrew coreutils). These are common words —
+    // `npm install`, `cargo install`, `sed … | tee /tmp/out` — so they only
+    // select the pack when the command can also spell a protected path;
+    // cold-initialising the pack's regex set costs ~10 ms per hook process.
+    const WRITER_WORDS: &[&str] = &[
+        "tee", "sponge", "install", "sed", "perl", "gtee", "gsed", "gcp", "gmv", "ginstall", "gln",
+        "gdd",
+    ];
+
+    command.contains('>')
+        || COMMAND_WORDS
+            .iter()
+            .any(|word| contains_ascii_command_word(command, word))
+        || (super::credential_files::may_name_protected_path(command)
+            && WRITER_WORDS
+                .iter()
+                .any(|word| contains_ascii_command_word(command, word)))
+}
+
+fn contains_ascii_command_word(command: &str, word: &str) -> bool {
+    let bytes = command.as_bytes();
+    let word_bytes = word.as_bytes();
+
+    if word_bytes.is_empty() || bytes.len() < word_bytes.len() {
+        return false;
+    }
+
+    bytes
+        .windows(word_bytes.len())
+        .enumerate()
+        .any(|(start, candidate)| {
+            candidate.eq_ignore_ascii_case(word_bytes)
+                && (start == 0 || !is_ascii_regex_word(bytes[start - 1]))
+                && bytes
+                    .get(start + word_bytes.len())
+                    .is_none_or(|byte| !is_ascii_regex_word(*byte))
+        })
+}
+
+const fn is_ascii_regex_word(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn powershell_segment_requires_rm_semantic_scan(segment: &str) -> bool {
+    let segment = segment.trim_start();
+    if segment.starts_with('&') {
+        return true;
+    }
+    // `… | ForEach-Object { Remove-Item $_ }`: the Remove-Item is inside the
+    // block, so the segment's first word is ForEach-Object and the pack was
+    // never selected for the evaluator's per-item check to run.
+    if let Some(statements) = powershell_foreach_block_statements(segment) {
+        return statements
+            .iter()
+            .any(|statement| powershell_segment_requires_rm_semantic_scan(statement));
+    }
+    let tokens = tokenize_for_shell_dialect(segment, ShellDialect::PowerShell);
+    let Some(raw) = tokens
+        .iter()
+        .find(|token| token.kind != NormalizeTokenKind::Separator)
+        .and_then(|token| token.text(segment))
+    else {
+        return false;
+    };
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
+    decoder
+        .decode(raw, ShellTokenRole::Syntax)
+        .is_some_and(|decoded| powershell_remove_item_alias(decoded.as_ref()))
+}
+
+fn cmd_segment_requires_rm_semantic_scan(segment: &str) -> bool {
+    let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Cmd);
+    let Some(raw) = tokens
+        .iter()
+        .find(|token| token.kind != NormalizeTokenKind::Separator)
+        .and_then(|token| token.text(segment))
+    else {
+        return false;
+    };
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::Cmd);
+    let Some(decoded) = decoder.decode(raw, ShellTokenRole::Syntax) else {
+        return false;
+    };
+    if matches!(
+        rm_executable_certainty(decoded.as_ref(), ShellDialect::Cmd),
+        RmExecutableCertainty::Exact | RmExecutableCertainty::MayBeRm
+    ) {
+        return true;
+    }
+    // `rm_executable_certainty` answers `Exact` only for a literal `rm`, so
+    // cmd's own file-deleting verbs are invisible to it. They are what a cmd
+    // caller actually writes, and neither is a pack keyword (#451).
+    cmd_file_delete_verb(decoded.as_ref())
+}
+
+/// cmd's file-deleting verbs. `rd`/`rmdir` are deliberately absent: they remove
+/// a directory, which is the recursive rules' business rather than the
+/// protected-file rule's.
+fn cmd_file_delete_verb(executable: &str) -> bool {
+    let executable = strip_outer_quotes(executable).1;
+    let basename = rm_frontend_basename(executable).to_ascii_lowercase();
+    matches!(basename.trim_end_matches(".exe"), "del" | "erase")
+}
+
+fn parse_cmd_decoded_rm_segment(command: &str, automated_stdin: bool) -> RmParseDecision {
+    if !command.contains('^') {
+        return RmParseDecision::NoMatch;
+    }
+    let tokens = tokenize_for_shell_dialect(command, ShellDialect::Cmd);
+    let Some((command_index, raw_executable)) =
+        tokens.iter().enumerate().find_map(|(index, token)| {
+            (token.kind != NormalizeTokenKind::Separator)
+                .then(|| token.text(command).map(|word| (index, word)))
+                .flatten()
+        })
+    else {
+        return RmParseDecision::NoMatch;
+    };
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::Cmd);
+    let Some(executable) = decoder.decode(raw_executable, ShellTokenRole::Syntax) else {
+        return RmParseDecision::NoMatch;
+    };
+    if rm_executable_certainty(executable.as_ref(), ShellDialect::Cmd)
+        != RmExecutableCertainty::Exact
+    {
+        return RmParseDecision::NoMatch;
+    }
+
+    let mut candidate = String::from("rm");
+    for token in tokens.iter().skip(command_index + 1) {
+        if token.kind == NormalizeTokenKind::Separator {
+            break;
+        }
+        let Some(raw) = token.text(command) else {
+            continue;
+        };
+        let word = if raw.starts_with('-') {
+            decoder
+                .decode(raw, ShellTokenRole::Syntax)
+                .unwrap_or_else(|| raw.into())
+        } else {
+            std::borrow::Cow::Borrowed(raw)
+        };
+        candidate.push(' ');
+        candidate.push_str(word.as_ref());
+    }
+
+    let mut decision = parse_normalized_rm_command_segment(&candidate, automated_stdin);
+    if let RmParseDecision::Deny(hit) = &mut decision {
+        hit.span = None;
+    }
+    decision
+}
+
+fn parse_unverified_rm_command_segment(
+    command: &str,
+    pipeline_stdin: bool,
+    dialect: ShellDialect,
+) -> RmParseDecision {
+    let command = command.trim();
+    let powershell_call_operator = dialect == ShellDialect::PowerShell
+        && command
+            .strip_prefix('&')
+            .is_some_and(|suffix| !suffix.trim_start().is_empty());
+    let command = if powershell_call_operator {
+        command
+            .strip_prefix('&')
+            .map(str::trim_start)
+            .unwrap_or(command)
+    } else {
+        command
+    };
+    let powershell_expression_argv = powershell_call_operator
+        .then(|| powershell_call_expression_argv(command))
+        .flatten();
+    let (command, leading_stdin_redirect) = strip_leading_rm_prefixes(command);
+    let normalized = strip_rm_dynamic_frontends(command);
+    let tokens = tokenize_for_shell_dialect(&normalized, dialect);
+    let Some(executable) = tokens
+        .iter()
+        .find(|token| token.kind != NormalizeTokenKind::Separator)
+    else {
+        return RmParseDecision::NoMatch;
+    };
+    let Some(raw_executable) = executable.text(&normalized) else {
+        return RmParseDecision::NoMatch;
+    };
+    let certainty = rm_executable_certainty(raw_executable, dialect);
+    let powershell_expression = powershell_call_operator
+        && (powershell_expression_argv.is_some()
+            || !powershell_call_target_is_static_literal(raw_executable));
+    if certainty != RmExecutableCertainty::MayBeRm && !powershell_expression {
+        return RmParseDecision::NoMatch;
+    }
+    let Some(argv) =
+        powershell_expression_argv.or_else(|| normalized.get(executable.byte_range.end..))
+    else {
+        return RmParseDecision::NoMatch;
+    };
+    let candidate = format!("rm{argv}");
+    let automated_stdin = pipeline_stdin || leading_stdin_redirect;
+    let posix_decision = parse_normalized_rm_command_segment(&candidate, automated_stdin);
+    let powershell_decision = (dialect == ShellDialect::PowerShell)
+        .then(|| parse_powershell_remove_item_segment(&candidate, automated_stdin));
+    if !matches!(posix_decision, RmParseDecision::Deny(_))
+        && !powershell_decision.is_some_and(|decision| matches!(decision, RmParseDecision::Deny(_)))
+    {
+        return RmParseDecision::NoMatch;
+    }
+
+    rm_unverified_deny()
+}
+
+fn powershell_call_expression_argv(command: &str) -> Option<&str> {
+    let command = command.trim_start();
+    let bytes = command.as_bytes();
+    let open = if bytes.first() == Some(&b'(') {
+        0
+    } else if bytes.starts_with(b"$(") {
+        1
+    } else {
+        return None;
+    };
+    let mut depth = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut index = open;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'`' && !in_single && index + 1 < bytes.len() {
+            index += 2;
+            continue;
+        }
+        if byte == b'\'' && !in_double {
+            in_single = !in_single;
+            index += 1;
+            continue;
+        }
+        if byte == b'"' && !in_single {
+            in_double = !in_double;
+            index += 1;
+            continue;
+        }
+        if !in_single && !in_double {
+            if byte == b'(' {
+                depth += 1;
+            } else if byte == b')' {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return command.get(index + 1..);
+                }
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+fn powershell_call_target_is_static_literal(raw: &str) -> bool {
+    let raw = raw.trim();
+    if raw.len() >= 2 {
+        let first = raw.as_bytes()[0];
+        let last = *raw.as_bytes().last().unwrap_or(&0);
+        if first == b'\'' && last == b'\'' {
+            return true;
+        }
+        if first == b'"' && last == b'"' {
+            return !raw[1..raw.len() - 1].contains(['$', '`']);
+        }
+    }
+
+    !raw.is_empty()
+        && raw.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/' | b'\\' | b':')
+        })
+}
+
+fn parse_powershell_remove_item_segment(command: &str, automated_stdin: bool) -> RmParseDecision {
+    let command = command.trim();
+    let command = command
+        .strip_prefix('&')
+        .map(str::trim_start)
+        .filter(|suffix| !suffix.is_empty())
+        .unwrap_or(command);
+    let tokens = tokenize_for_shell_dialect(command, ShellDialect::PowerShell);
+    let Some((command_index, executable)) = tokens.iter().enumerate().find_map(|(index, token)| {
+        (token.kind != NormalizeTokenKind::Separator)
+            .then(|| token.text(command).map(|word| (index, word)))
+            .flatten()
+    }) else {
+        return RmParseDecision::NoMatch;
+    };
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
+    let Some(executable) = decoder.decode(executable, ShellTokenRole::Syntax) else {
+        return RmParseDecision::NoMatch;
+    };
+    if !powershell_remove_item_alias(executable.as_ref()) {
+        return RmParseDecision::NoMatch;
+    }
+
+    let mut recurse = false;
+    let mut what_if = false;
+    let mut has_target = automated_stdin;
+    // Pipeline-fed targets are invisible here, so they can never all be
+    // proven literal temp subpaths (#285).
+    let mut targets_are_literal_temp = !automated_stdin;
+    // The literal targets, kept so a NON-recursive delete can still be judged
+    // against the protected-file table (#451). Pipeline-fed targets never land
+    // here, which is the same literal-only stance the POSIX rule takes.
+    let mut literal_targets: Vec<String> = Vec::new();
+    let mut index = command_index + 1;
+    while let Some(token) = tokens.get(index) {
+        if token.kind == NormalizeTokenKind::Separator {
+            let separator = token.text(command).unwrap_or_default();
+            index += 1;
+            if separator == "(" {
+                // Parenthesized PowerShell expressions are evaluated and
+                // supplied as a real argument (`-Path (Resolve-Path ...)`).
+                // Their runtime value cannot be proven to stay inside a
+                // literal temp directory.
+                has_target = true;
+                targets_are_literal_temp = false;
+                continue;
+            }
+            if separator == ")" {
+                continue;
+            }
+            break;
+        }
+        let Some(word) = token.text(command) else {
+            index += 1;
+            continue;
+        };
+        index += 1;
+
+        if let Some(redirect) = shell_redirection_prefix(word) {
+            if redirect.operator_end == word.trim_end().len()
+                && tokens
+                    .get(index)
+                    .is_some_and(|target| target.kind != NormalizeTokenKind::Separator)
+            {
+                index += 1;
+            }
+            continue;
+        }
+
+        if word.starts_with('@') {
+            // Splatting can inject both -Recurse and the target path, so the
+            // invocation cannot be proven non-recursive from its raw argv.
+            return rm_unverified_deny();
+        }
+        let syntax_role = if word.starts_with('-') || word == "--%" {
+            ShellTokenRole::Syntax
+        } else {
+            ShellTokenRole::Data
+        };
+        let Some(decoded_word) = decoder.decode(word, syntax_role) else {
+            continue;
+        };
+        let word = strip_outer_quotes(decoded_word.as_ref())
+            .1
+            .trim_end_matches(')');
+        if word.is_empty() {
+            continue;
+        }
+        if let Some(value) = powershell_switch_value(word, "recurse", 1, true) {
+            recurse = value;
+            continue;
+        }
+        if let Some(value) = powershell_switch_value(word, "whatif", 2, false) {
+            what_if = value;
+            continue;
+        }
+        if word.starts_with('-') {
+            if let Some((_, value)) = word.split_once(':').filter(|(name, value)| {
+                matches!(name.to_ascii_lowercase().as_str(), "-path" | "-literalpath")
+                    && !value.is_empty()
+            }) {
+                has_target = true;
+                targets_are_literal_temp &= windows_literal_user_temp_subpath(value);
+                literal_targets.push(value.to_string());
+            }
+            continue;
+        }
+        has_target = true;
+        targets_are_literal_temp &= windows_literal_user_temp_subpath(word);
+        literal_targets.push(word.to_string());
+    }
+
+    if !recurse {
+        // A non-recursive `Remove-Item` still deletes the file it names, and
+        // `rm ~/.ssh/id_rsa` — the POSIX spelling of the very same deletion —
+        // denies under `rm-protected-file` in this same always-on pack. Measured
+        // before this, all six protected targets and all five delete verbs
+        // (`Remove-Item`, `ri`, `del`, `erase`, `rm`) were allowed with and
+        // without `-Force`, on every host and pack set, because this parser
+        // returned NoMatch for anything that did not recurse (#451).
+        //
+        // `-WhatIf` still allows: it reports the removal without performing it,
+        // the same carve-out the recursive arm makes just below.
+        if !what_if
+            && let Some(target) = literal_targets
+                .iter()
+                .find(|target| windows_target_is_protected(target))
+        {
+            let protected_targets: Vec<&String> = literal_targets
+                .iter()
+                .filter(|target| windows_target_is_protected(target))
+                .collect();
+            return RmParseDecision::Deny(RmParseMatch {
+                pattern_name: RM_PROTECTED_FILE_NAME,
+                reason: windows_rm_protected_files_reason(&protected_targets),
+                severity: Severity::Critical,
+                span: command
+                    .find(target.as_str())
+                    .map(|at| at..at + target.len()),
+            });
+        }
+        return RmParseDecision::NoMatch;
+    }
+    if !has_target {
+        return RmParseDecision::NoMatch;
+    }
+    if what_if {
+        return RmParseDecision::Allow;
+    }
+    if targets_are_literal_temp {
+        // #285: every proven target is a literal per-user Windows temp
+        // subpath — the same carve-out `rm -rf /tmp/<subpath>` gets. Dynamic
+        // spellings such as `$env:TEMP\x` keep the `$TMPDIR` review policy.
+        return RmParseDecision::Allow;
+    }
+
+    RmParseDecision::Deny(RmParseMatch {
+        pattern_name: POWERSHELL_REMOVE_ITEM_RECURSIVE_NAME,
+        reason: POWERSHELL_REMOVE_ITEM_RECURSIVE_REASON,
+        severity: Severity::Critical,
+        span: None,
+    })
+}
+
+/// Whether the pipeline stage feeding the segment at `segment_start` is a
+/// recursive PowerShell listing — `Get-ChildItem -Recurse` (or `gci`, `ls`,
+/// `dir`, `-Depth N`).
+///
+/// `Get-ChildItem -Recurse C:\src | Remove-Item -Force` is the idiomatic
+/// PowerShell tree delete, and it was allowed in every dialect: the recursion
+/// is on the producer, so the `-Recurse` the Remove-Item classifier looks for
+/// never appears on the consumer (#451 comment). Every item of the tree
+/// reaches `Remove-Item`, the same deletion `find … -delete` performs.
+pub(crate) fn powershell_recursive_listing_feeds(command: &str, segment_start: usize) -> bool {
+    let Some(prefix) = command.get(..segment_start) else {
+        return false;
+    };
+    let prefix = prefix.trim_end();
+    let Some(producer_end) = prefix.strip_suffix('|').filter(|rest| !rest.ends_with('|')) else {
+        return false;
+    };
+    let producer_start = producer_end
+        .rfind([';', '|', '&', '\n', '{', '('])
+        .map_or(0, |at| at + 1);
+    let producer = producer_end[producer_start..].trim();
+    let tokens = tokenize_for_shell_dialect(producer, ShellDialect::PowerShell);
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::PowerShell);
+    let mut words = tokens
+        .iter()
+        .filter(|token| token.kind != NormalizeTokenKind::Separator)
+        .filter_map(|token| token.text(producer));
+    let Some(executable) = words
+        .next()
+        .and_then(|word| decoder.decode(word, ShellTokenRole::Syntax))
+    else {
+        return false;
+    };
+    let lister = ["get-childitem", "gci", "ls", "dir"]
+        .iter()
+        .any(|alias| executable.eq_ignore_ascii_case(alias));
+    lister
+        && words.any(|word| {
+            decoder
+                .decode(word, ShellTokenRole::Syntax)
+                .is_some_and(|word| {
+                    powershell_switch_value(word.as_ref(), "recurse", 1, true) == Some(true)
+                        || powershell_switch_value(word.as_ref(), "depth", 2, false).is_some()
+                })
+        })
+}
+
+/// Whether the segment at `segment_start` is a statement inside a
+/// `ForEach-Object { … }` block that a recursive listing feeds.
+///
+/// PowerShell segments split at `;` even inside braces, so in
+/// `gci -Recurse | % { Write-Host $_; Remove-Item $_ }` the Remove-Item is its
+/// own segment whose prefix ends in `;`, not `|`. Walk back to the enclosing
+/// unmatched `{`, require the ForEach word before it, and ask the ordinary
+/// pipeline question about the stage feeding that word.
+pub(crate) fn powershell_foreach_block_fed_by_recursive_listing(
+    command: &str,
+    segment_start: usize,
+) -> bool {
+    let Some(prefix) = command.get(..segment_start) else {
+        return false;
+    };
+    let mut depth = 0usize;
+    let mut open = None;
+    for (index, byte) in prefix.bytes().enumerate().rev() {
+        match byte {
+            b'}' => depth += 1,
+            b'{' if depth == 0 => {
+                open = Some(index);
+                break;
+            }
+            b'{' => depth -= 1,
+            _ => {}
+        }
+    }
+    let Some(open) = open else {
+        return false;
+    };
+    let head = prefix[..open].trim_end();
+    let word_start = head
+        .rfind(|ch: char| ch.is_whitespace() || ch == '|')
+        .map_or(0, |at| at + 1);
+    let word = &head[word_start..];
+    ["foreach-object", "%", "foreach"]
+        .iter()
+        .any(|alias| word.eq_ignore_ascii_case(alias))
+        && powershell_recursive_listing_feeds(command, word_start)
+}
+
+/// The statements inside a `ForEach-Object { … }` (or `%`, `foreach`) script
+/// block, when `segment` is one. `gci -Recurse | % { Remove-Item $_ -Force }`
+/// is the other common tree delete: the block runs once per item of the tree,
+/// so each statement in it is judged like a directly piped Remove-Item.
+pub(crate) fn powershell_foreach_block_statements(segment: &str) -> Option<Vec<&str>> {
+    let segment = segment.trim();
+    let first = segment.split_whitespace().next()?;
+    if !["foreach-object", "%", "foreach"]
+        .iter()
+        .any(|alias| first.eq_ignore_ascii_case(alias))
+    {
+        return None;
+    }
+    let open = segment.find('{')?;
+    let close = segment.rfind('}').filter(|close| *close > open)?;
+    Some(
+        segment[open + 1..close]
+            .split([';', '\n'])
+            .map(str::trim)
+            .filter(|statement| !statement.is_empty())
+            .collect(),
+    )
+}
+
+fn powershell_remove_item_alias(executable: &str) -> bool {
+    ["remove-item", "rm", "ri", "del", "erase", "rd", "rmdir"]
+        .iter()
+        .any(|alias| executable.eq_ignore_ascii_case(alias))
+}
+
+fn powershell_switch_value(
+    word: &str,
+    canonical: &str,
+    minimum_abbreviation: usize,
+    unknown_value: bool,
+) -> Option<bool> {
+    let parameter = word.strip_prefix('-')?;
+    let (name, value) = parameter
+        .split_once(':')
+        .map_or((parameter, None), |(name, value)| (name, Some(value)));
+    let name = name.to_ascii_lowercase();
+    if name.len() < minimum_abbreviation || !canonical.starts_with(&name) {
+        return None;
+    }
+
+    Some(match value.map(str::to_ascii_lowercase).as_deref() {
+        None | Some("$true" | "true" | "1") => true,
+        Some("$false" | "false" | "0") => false,
+        Some(_) => unknown_value,
+    })
+}
+
+fn rm_unverified_deny() -> RmParseDecision {
+    RmParseDecision::Deny(RmParseMatch {
+        pattern_name: RM_RECURSIVE_UNVERIFIED_NAME,
+        reason: RM_RECURSIVE_UNVERIFIED_REASON,
+        severity: Severity::High,
+        span: None,
+    })
+}
+
+fn strip_rm_dynamic_frontends(command: &str) -> String {
+    let mut current = command.to_string();
+    for _ in 0..MAX_RM_EXECUTION_FRONTENDS {
+        let stripped = crate::normalize::strip_wrapper_prefixes(&current)
+            .normalized
+            .into_owned();
+        if stripped != current {
+            current = stripped;
+            continue;
+        }
+        let Some(suffix) = strip_rm_execution_frontend(&current) else {
+            break;
+        };
+        current = suffix.to_string();
+    }
+    current
+}
+
+pub(crate) fn rm_executable_certainty(
+    raw_executable: &str,
+    dialect: ShellDialect,
+) -> RmExecutableCertainty {
+    let dynamic_pattern = match dialect {
+        ShellDialect::Posix => symbolic_posix_executable_pattern(raw_executable),
+        ShellDialect::PowerShell => symbolic_powershell_executable_pattern(raw_executable),
+        ShellDialect::Cmd => symbolic_cmd_executable_pattern(raw_executable),
+        ShellDialect::Unknown => symbolic_posix_executable_pattern(raw_executable)
+            .or_else(|| symbolic_powershell_executable_pattern(raw_executable))
+            .or_else(|| symbolic_cmd_executable_pattern(raw_executable)),
+    };
+    if let Some(pattern) = dynamic_pattern {
+        return if wildcard_pattern_may_equal_rm(&pattern) {
+            RmExecutableCertainty::MayBeRm
+        } else {
+            RmExecutableCertainty::Other
+        };
+    }
+
+    let executable = strip_outer_quotes(raw_executable).1;
+    if rm_frontend_basename(executable) == "rm" {
+        RmExecutableCertainty::Exact
+    } else {
+        RmExecutableCertainty::Other
+    }
+}
+
+const RM_DYNAMIC_WILDCARD: char = '\0';
+
+fn wildcard_pattern_may_equal_rm(pattern: &str) -> bool {
+    let target = "rm";
+    let starts_dynamic = pattern.starts_with(RM_DYNAMIC_WILDCARD);
+    let ends_dynamic = pattern.ends_with(RM_DYNAMIC_WILDCARD);
+    let fragments: Vec<&str> = pattern
+        .split(RM_DYNAMIC_WILDCARD)
+        .filter(|fragment| !fragment.is_empty())
+        .collect();
+    let Some(first) = fragments.first() else {
+        return true;
+    };
+    let Some(last) = fragments.last() else {
+        return true;
+    };
+    if !starts_dynamic && !target.starts_with(first) {
+        return false;
+    }
+    if !ends_dynamic && !target.ends_with(last) {
+        return false;
+    }
+
+    let mut offset = 0usize;
+    for fragment in fragments {
+        let Some(relative) = target.get(offset..).and_then(|tail| tail.find(fragment)) else {
+            return false;
+        };
+        offset += relative + fragment.len();
+    }
+    true
+}
+
+fn symbolic_posix_executable_pattern(raw: &str) -> Option<String> {
+    let mut pattern = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut dynamic = false;
+
+    while let Some(character) = chars.next() {
+        if single_quoted {
+            if character == '\'' {
+                single_quoted = false;
+            } else {
+                pattern.push(character);
+            }
+            continue;
+        }
+        match character {
+            '\'' if !double_quoted => single_quoted = true,
+            '"' => double_quoted = !double_quoted,
+            '\\' => {
+                if let Some(literal) = chars.next() {
+                    pattern.push(literal);
+                }
+            }
+            '$' => {
+                dynamic = true;
+                pattern.push(RM_DYNAMIC_WILDCARD);
+                skip_symbolic_expansion(&mut chars);
+            }
+            '`' => {
+                dynamic = true;
+                pattern.push(RM_DYNAMIC_WILDCARD);
+                while let Some(inner) = chars.next() {
+                    if inner == '\\' {
+                        chars.next();
+                    } else if inner == '`' {
+                        break;
+                    }
+                }
+            }
+            _ => pattern.push(character),
+        }
+    }
+
+    dynamic.then_some(pattern)
+}
+
+fn skip_symbolic_expansion(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    let Some(next) = chars.peek().copied() else {
+        return;
+    };
+    match next {
+        '{' => {
+            chars.next();
+            let mut depth = 1usize;
+            for character in chars.by_ref() {
+                match character {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        '(' => {
+            chars.next();
+            let mut depth = 1usize;
+            for character in chars.by_ref() {
+                match character {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        '\'' | '"' => {
+            let quote = chars.next().unwrap_or(next);
+            while let Some(character) = chars.next() {
+                if character == '\\' {
+                    chars.next();
+                } else if character == quote {
+                    break;
+                }
+            }
+        }
+        character if character.is_ascii_alphabetic() || character == '_' => {
+            while chars
+                .peek()
+                .is_some_and(|character| character.is_ascii_alphanumeric() || *character == '_')
+            {
+                chars.next();
+            }
+        }
+        _ => {
+            chars.next();
+        }
+    }
+}
+
+fn symbolic_powershell_executable_pattern(raw: &str) -> Option<String> {
+    let mut pattern = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut dynamic = false;
+
+    while let Some(character) = chars.next() {
+        if single_quoted {
+            if character == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    chars.next();
+                    pattern.push('\'');
+                } else {
+                    single_quoted = false;
+                }
+            } else {
+                pattern.push(character);
+            }
+            continue;
+        }
+        match character {
+            '\'' if !double_quoted => single_quoted = true,
+            '"' => double_quoted = !double_quoted,
+            '`' => {
+                if let Some(literal) = chars.next() {
+                    pattern.push(literal);
+                }
+            }
+            '$' => {
+                dynamic = true;
+                pattern.push(RM_DYNAMIC_WILDCARD);
+                skip_symbolic_expansion(&mut chars);
+            }
+            _ => pattern.push(character),
+        }
+    }
+
+    dynamic.then_some(pattern)
+}
+
+fn symbolic_cmd_executable_pattern(raw: &str) -> Option<String> {
+    let mut pattern = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    let mut dynamic = false;
+
+    while let Some(character) = chars.next() {
+        match character {
+            '"' => {}
+            '^' => {
+                if let Some(literal) = chars.next() {
+                    pattern.push(literal);
+                }
+            }
+            delimiter @ ('%' | '!') => {
+                let mut expansion = false;
+                for inner in chars.by_ref() {
+                    if inner == delimiter {
+                        expansion = true;
+                        break;
+                    }
+                }
+                if expansion {
+                    dynamic = true;
+                    pattern.push(RM_DYNAMIC_WILDCARD);
+                } else {
+                    pattern.push(delimiter);
+                }
+            }
+            _ => pattern.push(character),
+        }
+    }
+
+    dynamic.then_some(pattern)
+}
+
+/// Return the executable-bearing suffix after POSIX assignment words and
+/// leading redirections. These prefixes do not replace the command word, but
+/// they must be removed before the bounded wrapper/path normalizer can see it.
+fn strip_leading_rm_prefixes(command: &str) -> (&str, bool) {
+    let tokens = tokenize_for_normalization(command);
+    let mut index = 0usize;
+    let mut saw_prefix = false;
+    let mut stdin_redirect = false;
+
+    while let Some(token) = tokens.get(index) {
+        if token.kind == NormalizeTokenKind::Separator {
+            break;
+        }
+        let Some(text) = token.text(command) else {
+            return (command, false);
+        };
+        if crate::normalize::is_env_assignment(text) {
+            saw_prefix = true;
+            index += 1;
+            continue;
+        }
+        if shell_redirection_prefix(text).is_some() {
+            saw_prefix = true;
+            stdin_redirect |= starts_with_shell_stdin_redirection(text);
+            index += 1;
+            if shell_redirection_consumes_next_word(text) {
+                let Some(target) = tokens.get(index) else {
+                    return (command, stdin_redirect);
+                };
+                if target.kind == NormalizeTokenKind::Separator {
+                    return (command, stdin_redirect);
+                }
+                index += 1;
+            }
+            continue;
+        }
+        break;
+    }
+
+    if !saw_prefix {
+        return (command, false);
+    }
+    let Some(command_token) = tokens.get(index) else {
+        return (command, stdin_redirect);
+    };
+    command
+        .get(command_token.byte_range.start..)
+        .map_or((command, stdin_redirect), |suffix| (suffix, stdin_redirect))
+}
+
+fn strip_leading_posix_group_openers(mut command: &str) -> (&str, bool) {
+    let original = command;
+    loop {
+        command = command.trim_start();
+        if let Some(suffix) = command.strip_prefix('(') {
+            command = suffix;
+            continue;
+        }
+        if let Some(suffix) = command.strip_prefix('{').filter(|suffix| {
+            suffix
+                .as_bytes()
+                .first()
+                .is_none_or(u8::is_ascii_whitespace)
+        }) {
+            command = suffix;
+            continue;
+        }
+        if let Some(suffix) = ["do", "then", "else"].into_iter().find_map(|reserved| {
+            command.strip_prefix(reserved).and_then(|suffix| {
+                suffix
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_whitespace)
+                    .then_some(suffix)
+            })
+        }) {
+            command = suffix;
+            continue;
+        }
+        break;
+    }
+    (command, command.as_ptr() != original.as_ptr())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ShellRedirectionPrefix {
+    operator_end: usize,
+    redirects_stdin: bool,
+}
+
+fn shell_redirection_prefix(text: &str) -> Option<ShellRedirectionPrefix> {
+    let leading = text.len().saturating_sub(text.trim_start().len());
+    let input = text.get(leading..)?;
+    let bytes = input.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let mut index = 0usize;
+    let mut fd_is_stdin = true;
+    if bytes[0].is_ascii_digit() {
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        fd_is_stdin = &input[..index] == "0";
+    } else if bytes[0] == b'*' {
+        index = 1;
+        fd_is_stdin = false;
+    } else if bytes[0] == b'{' {
+        let close = bytes.iter().position(|byte| *byte == b'}')?;
+        let name = input.get(1..close)?;
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return None;
+        }
+        index = close + 1;
+        fd_is_stdin = false;
+    }
+
+    let operator = input.get(index..)?;
+    let operator_len = [
+        "<<<", "<<-", "&>>", "<>", "<&", "<<", ">>", ">&", ">|", "&>", "<", ">",
+    ]
+    .into_iter()
+    .find_map(|candidate| operator.starts_with(candidate).then_some(candidate.len()))?;
+    let operator_text = operator.get(..operator_len)?;
+    let redirects_stdin =
+        fd_is_stdin && operator_text.starts_with('<') && !operator_text.starts_with("<>");
+
+    Some(ShellRedirectionPrefix {
+        operator_end: leading + index + operator_len,
+        redirects_stdin,
+    })
+}
+
+fn starts_with_shell_stdin_redirection(text: &str) -> bool {
+    shell_redirection_prefix(text).is_some_and(|redirect| redirect.redirects_stdin)
+}
+
+fn shell_redirection_consumes_next_word(text: &str) -> bool {
+    shell_redirection_prefix(text)
+        .is_some_and(|redirect| redirect.operator_end == text.trim_end().len())
+}
+
+const MAX_RM_EXECUTION_FRONTENDS: usize = 16;
+
+/// Repeatedly apply the shared wrapper/path normalizer and the small set of
+/// POSIX launch frontends whose option arity is known here. The hard layer cap
+/// prevents adversarial wrapper chains from turning parsing into unbounded
+/// work.
+fn normalize_rm_execution_frontends(command: &str) -> (String, bool) {
+    let mut current = command.to_string();
+    let mut changed = false;
+
+    for _ in 0..MAX_RM_EXECUTION_FRONTENDS {
+        let normalized = crate::normalize::normalize_command(&current).into_owned();
+        if normalized != current {
+            current = normalized;
+            changed = true;
+            continue;
+        }
+
+        let Some(suffix) = strip_rm_execution_frontend(&current) else {
+            break;
+        };
+        current = suffix.to_string();
+        changed = true;
+    }
+
+    (current, changed)
+}
+
+fn rm_frontend_word<'a>(
+    command: &'a str,
+    tokens: &[crate::normalize::NormalizeToken],
+    index: usize,
+) -> Option<&'a str> {
+    let token = tokens.get(index)?;
+    (token.kind != NormalizeTokenKind::Separator)
+        .then(|| token.text(command))
+        .flatten()
+        .map(|text| strip_outer_quotes(text).1)
+}
+
+fn rm_frontend_suffix<'a>(
+    command: &'a str,
+    tokens: &[crate::normalize::NormalizeToken],
+    index: usize,
+) -> Option<&'a str> {
+    let token = tokens.get(index)?;
+    (token.kind != NormalizeTokenKind::Separator)
+        .then(|| command.get(token.byte_range.start..))
+        .flatten()
+}
+
+fn rm_frontend_basename(word: &str) -> &str {
+    word.rsplit(['/', '\\']).next().unwrap_or(word)
+}
+
+fn strip_rm_execution_frontend(command: &str) -> Option<&str> {
+    crate::normalize::strip_posix_execution_frontend(command).map(|(remaining, _)| remaining)
+}
+
+fn parse_rm_argv_frontend(command: &str) -> RmParseDecision {
+    let tokens = tokenize_for_normalization(command);
+    let Some(executable) = rm_frontend_word(command, &tokens, 0) else {
+        return RmParseDecision::NoMatch;
+    };
+    match rm_frontend_basename(executable) {
+        "xargs" => {
+            let Some(command_index) = xargs_command_index(command, &tokens) else {
+                return RmParseDecision::NoMatch;
+            };
+            let Some(child) = rm_frontend_suffix(command, &tokens, command_index) else {
+                return RmParseDecision::NoMatch;
+            };
+            // Input items are appended to INITIAL-ARGS. Model both a recursive
+            // option and a non-temp operand so untrusted input cannot supply
+            // either half of a destructive rm invocation unnoticed. An
+            // explicit child `--` still correctly prevents option injection.
+            parse_nested_rm_execution(child, " -r ./__dcg_xargs_input__")
+        }
+        "find" => parse_find_exec_rm_actions(command, &tokens),
+        _ => RmParseDecision::NoMatch,
+    }
+}
+
+fn xargs_command_index(
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+) -> Option<usize> {
+    let mut index = 1usize;
+    while let Some(word) = rm_frontend_word(command, tokens, index) {
+        if word == "--" {
+            return (index + 1 < tokens.len()).then_some(index + 1);
+        }
+        if matches!(word, "--help" | "--version") {
+            return None;
+        }
+        if matches!(
+            word,
+            "-0" | "--null"
+                | "-o"
+                | "--open-tty"
+                | "-p"
+                | "--interactive"
+                | "-r"
+                | "--no-run-if-empty"
+                | "-t"
+                | "--verbose"
+                | "-x"
+                | "--exit"
+                | "--show-limits"
+        ) {
+            index += 1;
+            continue;
+        }
+        if matches!(
+            word,
+            "-a" | "--arg-file"
+                | "-d"
+                | "--delimiter"
+                | "-E"
+                | "-I"
+                | "-L"
+                | "-n"
+                | "-P"
+                | "-s"
+                | "--max-lines"
+                | "--max-args"
+                | "--max-procs"
+                | "--max-chars"
+                | "--process-slot-var"
+        ) {
+            index = index.checked_add(2)?;
+            continue;
+        }
+        if [
+            "--arg-file=",
+            "--delimiter=",
+            "--eof=",
+            "--replace=",
+            "--max-lines=",
+            "--max-args=",
+            "--max-procs=",
+            "--max-chars=",
+            "--process-slot-var=",
+        ]
+        .iter()
+        .any(|prefix| {
+            word.strip_prefix(prefix)
+                .is_some_and(|value| !value.is_empty())
+        }) {
+            index += 1;
+            continue;
+        }
+        if matches!(word, "-e" | "-i" | "-l" | "--eof" | "--replace") {
+            index += 1;
+            continue;
+        }
+        if let Some(short) = word.strip_prefix('-').filter(|short| !short.is_empty()) {
+            let bytes = short.as_bytes();
+            let mut position = 0usize;
+            let mut consume_next = false;
+            while position < bytes.len() {
+                match bytes[position] {
+                    b'0' | b'o' | b'p' | b'r' | b't' | b'x' => position += 1,
+                    b'e' | b'i' | b'l' => {
+                        // Optional short-option values must be attached.
+                        position = bytes.len();
+                    }
+                    b'a' | b'd' | b'E' | b'I' | b'L' | b'n' | b'P' | b's' => {
+                        consume_next = position + 1 == bytes.len();
+                        position = bytes.len();
+                    }
+                    _ => return None,
+                }
+            }
+            index = index.checked_add(1 + usize::from(consume_next))?;
+            continue;
+        }
+        return Some(index);
+    }
+    None
+}
+
+fn parse_nested_rm_execution(command: &str, synthetic_suffix: &str) -> RmParseDecision {
+    let (command, stdin_redirect) = strip_leading_rm_prefixes(command);
+    let (normalized, _) = normalize_rm_execution_frontends(command);
+    let candidate = format!("{normalized}{synthetic_suffix}");
+    let mut decision = parse_normalized_rm_command_segment(&candidate, stdin_redirect);
+    if matches!(decision, RmParseDecision::NoMatch) {
+        decision =
+            parse_unverified_rm_command_segment(&candidate, stdin_redirect, ShellDialect::Posix);
+    }
+    if let RmParseDecision::Deny(hit) = &mut decision {
+        hit.span = None;
+    }
+    decision
+}
+
+fn find_exec_terminator(word: &str) -> bool {
+    let word = strip_outer_quotes(word).1;
+    matches!(word, ";" | r"\;" | "+")
+}
+
+fn parse_find_exec_rm_actions(
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+) -> RmParseDecision {
+    let mut index = 1usize;
+    while index < tokens.len() {
+        let Some(word) = rm_frontend_word(command, tokens, index) else {
+            index += 1;
+            continue;
+        };
+        if !matches!(word, "-exec" | "-execdir") {
+            index += 1;
+            continue;
+        }
+
+        let child_start = index + 1;
+        let mut terminator = child_start;
+        while terminator < tokens.len() {
+            let Some(candidate) = rm_frontend_word(command, tokens, terminator) else {
+                break;
+            };
+            if find_exec_terminator(candidate) {
+                break;
+            }
+            terminator += 1;
+        }
+        if child_start >= terminator || terminator >= tokens.len() {
+            return RmParseDecision::NoMatch;
+        }
+        let Some(start) = tokens.get(child_start).map(|token| token.byte_range.start) else {
+            return RmParseDecision::NoMatch;
+        };
+        let Some(end) = tokens
+            .get(terminator.saturating_sub(1))
+            .map(|token| token.byte_range.end)
+        else {
+            return RmParseDecision::NoMatch;
+        };
+        let Some(child) = command.get(start..end) else {
+            return RmParseDecision::NoMatch;
+        };
+        let child_tokens = &tokens[child_start..terminator];
+        if let Some(executable) = child_tokens.first().and_then(|token| token.text(command)) {
+            let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);
+            let executable = decoder
+                .decode(executable, ShellTokenRole::Syntax)
+                .unwrap_or_else(|| executable.into());
+            if executable.contains("{}") {
+                let argv = child_tokens
+                    .first()
+                    .and_then(|token| command.get(token.byte_range.end..end))
+                    .unwrap_or_default();
+                let candidate = format!("rm{argv}");
+                if matches!(
+                    parse_normalized_rm_command_segment(&candidate, false),
+                    RmParseDecision::Deny(_)
+                ) {
+                    return rm_unverified_deny();
+                }
+            }
+        }
+        if let RmParseDecision::Deny(hit) = parse_nested_rm_execution(child, "") {
+            return RmParseDecision::Deny(hit);
+        }
+        index = terminator + 1;
+    }
+    RmParseDecision::NoMatch
+}
+
+fn parse_normalized_rm_command_segment(command: &str, automated_stdin: bool) -> RmParseDecision {
     let tokens = tokenize_for_normalization(command);
     if tokens.is_empty() {
         return RmParseDecision::NoMatch;
@@ -448,7 +3372,7 @@ fn parse_rm_command_segment(command: &str) -> RmParseDecision {
         };
 
         if text == "rm" {
-            return parse_rm_segment(command, &tokens, i + 1);
+            return parse_rm_segment(command, &tokens, i + 1, automated_stdin);
         }
 
         // Skip to the next separator before scanning for another command word.
@@ -461,108 +3385,230 @@ fn parse_rm_command_segment(command: &str) -> RmParseDecision {
     RmParseDecision::NoMatch
 }
 
-#[allow(clippy::too_many_lines)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RmOptionScanning {
+    /// GNU `getopt_long` permutes options that follow operands.
+    GnuPermuted,
+    /// Apple/BSD `getopt` stops permanently at the first non-option operand.
+    AppleStopAtFirstOperand,
+}
+
 fn parse_rm_segment(
     command: &str,
     tokens: &[crate::normalize::NormalizeToken],
     start_idx: usize,
+    automated_stdin: bool,
+) -> RmParseDecision {
+    let gnu = parse_rm_segment_with_option_scanning(
+        command,
+        tokens,
+        start_idx,
+        automated_stdin,
+        RmOptionScanning::GnuPermuted,
+    );
+    let apple = parse_rm_segment_with_option_scanning(
+        command,
+        tokens,
+        start_idx,
+        automated_stdin,
+        RmOptionScanning::AppleStopAtFirstOperand,
+    );
+
+    // Preserve the established GNU rule identity when both platforms delete,
+    // but deny if either supported argv grammar can remove a tree. In
+    // particular, GNU treats a trailing `--help` or `-i` as an option, while
+    // Apple/BSD treats it as another operand after the first path and may have
+    // already deleted the preceding recursive target.
+    if matches!(&gnu, RmParseDecision::Deny(_)) {
+        return gnu;
+    }
+    if matches!(&apple, RmParseDecision::Deny(_)) {
+        return apple;
+    }
+    if matches!(gnu, RmParseDecision::Allow) || matches!(apple, RmParseDecision::Allow) {
+        RmParseDecision::Allow
+    } else {
+        RmParseDecision::NoMatch
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn parse_rm_segment_with_option_scanning(
+    command: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+    start_idx: usize,
+    automated_stdin: bool,
+    option_scanning: RmOptionScanning,
 ) -> RmParseDecision {
     let mut options_ended = false;
     let mut flags = RmFlagTracker::default();
-
     let mut paths: Vec<PathToken<'_>> = Vec::new();
+    let mut token_index = start_idx;
 
-    for token in tokens.iter().skip(start_idx) {
+    while let Some(token) = tokens.get(token_index) {
         if token.kind == NormalizeTokenKind::Separator {
             break;
         }
 
         let Some(text) = token.text(command) else {
+            token_index += 1;
             continue;
         };
+        token_index += 1;
 
-        if !options_ended {
-            if text == "--" {
-                options_ended = true;
-                flags.saw_terminator = true;
-                continue;
+        // Shell redirections are not argv entries for rm. Consume a detached
+        // redirect target together with its operator; evaluator preserves and
+        // attributes destructive redirects through its dedicated redirect
+        // view before honoring a semantic rm Allow decision.
+        if shell_redirection_prefix(text).is_some() {
+            if shell_redirection_consumes_next_word(text)
+                && tokens
+                    .get(token_index)
+                    .is_some_and(|target| target.kind != NormalizeTokenKind::Separator)
+            {
+                token_index += 1;
             }
-
-            if text.starts_with('-') && text != "-" {
-                if text.starts_with("--") {
-                    if text.starts_with("--recursive") {
-                        flags.seen_long_recursive = true;
-                        if flags.recursive_span.is_none() {
-                            flags.recursive_span = Some(token.byte_range.clone());
-                        }
-                    }
-                    if text.starts_with("--force") {
-                        flags.seen_long_force = true;
-                        if flags.force_span.is_none() {
-                            flags.force_span = Some(token.byte_range.clone());
-                        }
-                    }
-                } else {
-                    let flag_text = text.trim_start_matches('-');
-                    if !flag_text.is_empty() {
-                        let has_r = flag_text.chars().any(|c| c == 'r' || c == 'R');
-                        let has_f = flag_text.chars().any(|c| c == 'f');
-                        if has_r && has_f {
-                            if flags.combined_span.is_none() {
-                                flags.combined_span = Some(token.byte_range.clone());
-                            }
-                        } else {
-                            if has_r && !flags.seen_r {
-                                flags.seen_r = true;
-                                flags.r_span = Some(token.byte_range.clone());
-                            }
-                            if has_f && !flags.seen_f {
-                                flags.seen_f = true;
-                                flags.f_span = Some(token.byte_range.clone());
-                            }
-                        }
-                    }
-                }
-
-                continue;
-            }
-        }
-
-        // Skip trailing shell redirections (`> log`, `2>/dev/null`,
-        // `2>&1`, `&>>file`, …). These are not arguments to `rm` and
-        // must not count as paths the rm parser checks against the
-        // safe-path list (#120). Without this guard the safe-path
-        // determination silently fails on commands like
-        //   rm -rf /tmp/foo /tmp/bar 2>/dev/null
-        // because the trailing redirection token is treated as a third
-        // path, which doesn't match any rm-rf-tmp safe pattern, and the
-        // whole command ends up flagged as rm-rf-root-home.
-        if crate::normalize::starts_with_shell_redirection(text) {
-            // Mark options-ended so a later non-redirect token isn't
-            // re-interpreted as a flag, but DO NOT add to paths.
-            options_ended = true;
             continue;
         }
 
-        options_ended = true;
+        // A subshell close is shell syntax even when it is lexically glued to
+        // the final argv word (`(rm -ri ./tree)`). Remove only unquoted trailing
+        // `)` operators; quoted/escaped parentheses remain ordinary operands.
+        let text = if token_index == tokens.len() && text.ends_with(')') {
+            text.trim_end_matches(')')
+        } else {
+            text
+        };
+        if text.is_empty() {
+            continue;
+        }
+
+        // Option tokens are always executed shell syntax (never data), so a
+        // quote embedded in the option cluster is concatenation the shell has
+        // already resolved: `rm -r'f' /`, `rm -'r'f /`, and `rm '-r'f /` all
+        // run `rm -rf /`. Collapse balanced quotes to read the true flags
+        // (bd-5xgt). Operands keep their own quote handling below, so a quoted
+        // data path is unaffected. An *unbalanced* quote is a shell syntax
+        // error that never runs rm, so it stays opaque and matches nothing.
+        let dequoted = dequote_rm_flag_token(text);
+        let flag_text = dequoted.as_ref();
+
+        if !options_ended {
+            if flag_text == "--" {
+                // `options_ended` is the whole effect: everything after the
+                // POSIX end-of-options marker is an operand. The marker itself
+                // deliberately does NOT feed the verdict — it makes a command
+                // strictly safer to parse and never changes what an operand
+                // names, so the temp exemption is decided by operand content
+                // alone (#395).
+                options_ended = true;
+                continue;
+            }
+
+            if flag_text.starts_with('-') && flag_text != "-" {
+                let option_decision = if option_scanning
+                    == RmOptionScanning::AppleStopAtFirstOperand
+                    && !apple_rm_option_token_is_valid(flag_text)
+                {
+                    RmOptionDecision::Invalid
+                } else {
+                    apply_rm_option(flag_text, token.byte_range.clone(), &mut flags)
+                };
+                match option_decision {
+                    RmOptionDecision::Continue => {}
+                    // GNU rm treats --help and --version as terminal, even
+                    // when operands precede them through getopt permutation.
+                    RmOptionDecision::Terminal => return RmParseDecision::NoMatch,
+                    // An unknown, ambiguous, or malformed option makes rm
+                    // fail before it can recursively remove an operand.
+                    RmOptionDecision::Invalid => return RmParseDecision::NoMatch,
+                }
+                continue;
+            }
+        }
+
         let (quote, unquoted) = strip_outer_quotes(text);
+        let glued_to_paren = command.as_bytes().get(token.byte_range.end) == Some(&b'(');
         paths.push(PathToken {
             unquoted,
+            raw: text,
             quote,
             range: token.byte_range.clone(),
+            glued_to_paren,
         });
+        if option_scanning == RmOptionScanning::AppleStopAtFirstOperand {
+            options_ended = true;
+        }
     }
 
-    let flag_state = flags.resolve();
-    let Some(flag_state) = flag_state else {
-        return RmParseDecision::NoMatch;
+    // GNU rm resolves -f/--force and all interactive modes in argv order.
+    // -i and -I override an earlier force; a later force overrides either.
+    let redirected_stdin = tokens
+        .iter()
+        .skip(start_idx)
+        .take_while(|token| token.kind != NormalizeTokenKind::Separator)
+        .filter_map(|token| token.text(command))
+        .any(starts_with_shell_stdin_redirection);
+    // Non-recursive here: `flags.resolve()` below returns `None` without a
+    // recursive span, and that is the branch these two rules serve.
+    let interactive_prompts = flags.interactive_mode.prompts_for(false, paths.len());
+
+    let Some(flag_state) = flags.resolve() else {
+        // Non-recursive rm has no dangerous flag shape of its own, but a bare
+        // `*` operand still hands the shell an unbounded deletion set (#334).
+        let bare_glob = parse_bare_glob_rm(
+            &paths,
+            interactive_prompts,
+            automated_stdin,
+            redirected_stdin,
+        );
+        if !matches!(bare_glob, RmParseDecision::NoMatch) {
+            return bare_glob;
+        }
+        // …and a named operand can still be a protected credential or
+        // login-startup file, which `rm` alone was letting through (#469).
+        // Ordered after the glob rules so the broader attribution wins when a
+        // command somehow satisfies both.
+        return parse_protected_file_rm(
+            &paths,
+            interactive_prompts,
+            automated_stdin,
+            redirected_stdin,
+        );
     };
 
+    // `rm -r` without an operand only reports a usage error. More
+    // importantly, requiring a real operand prevents a bare option token
+    // from being mislabeled as an attempted tree deletion.
+    if paths.is_empty() {
+        return RmParseDecision::NoMatch;
+    }
+
+    // Recursive by construction: `resolve()` requires a recursive span, and
+    // `-I` does prompt when recursing.
+    if flag_state.interactive_mode.prompts_for(true, paths.len())
+        && !automated_stdin
+        && !redirected_stdin
+    {
+        return RmParseDecision::Allow;
+    }
+
+    // Recursive-only commands use the combined-style literal-temp policy:
+    // double quotes preserve a static /tmp path, while expansions and
+    // traversal remain denied. Existing force-form behavior is unchanged.
+    //
+    // `--` deliberately does NOT disqualify the temp exemption (issue #395).
+    // The POSIX end-of-options marker is what a careful script writes so an
+    // operand beginning with `-` cannot be read as a flag; it makes the command
+    // strictly safer and never changes what an operand names. The exemption is
+    // decided entirely by operand content below, so `rm -rf -- /tmp/build` is
+    // judged exactly like `rm -rf /tmp/build`, while `rm -rf -- ~/x` and
+    // `rm -rf -- -rf /tmp/x` still deny — neither operand set is all-temp.
+    let path_style = flag_state.force_style.unwrap_or(RmFlagStyle::Combined);
     let safe_paths = !paths.is_empty()
-        && !flag_state.saw_terminator
         && paths
             .iter()
-            .all(|path| path_is_safe_for_style(path, flag_state.style));
+            .all(|path| path_is_safe_for_style(path, path_style));
 
     if safe_paths {
         return RmParseDecision::Allow;
@@ -570,40 +3616,59 @@ fn parse_rm_segment(
 
     let is_critical = paths
         .iter()
-        .any(|path| path_is_root_home(path) && !path_is_safe_for_style(path, flag_state.style));
+        .any(|path| path_is_root_home(path) && !path_is_safe_for_style(path, path_style));
 
-    let (pattern_name, reason, severity) = if is_critical {
-        match flag_state.style {
-            RmFlagStyle::Combined => (
-                RM_RF_ROOT_HOME_NAME,
-                RM_RF_ROOT_HOME_REASON,
-                Severity::Critical,
-            ),
-            RmFlagStyle::Separate => (
-                RM_R_F_SEPARATE_ROOT_HOME_NAME,
-                RM_R_F_SEPARATE_ROOT_HOME_REASON,
-                Severity::Critical,
-            ),
-            RmFlagStyle::Long => (
-                RM_RECURSIVE_FORCE_ROOT_HOME_NAME,
-                RM_RECURSIVE_FORCE_ROOT_HOME_REASON,
-                Severity::Critical,
-            ),
+    let (pattern_name, reason, severity) = match (is_critical, flag_state.force_style) {
+        (true, Some(RmFlagStyle::Combined)) => (
+            RM_RF_ROOT_HOME_NAME,
+            RM_RF_ROOT_HOME_REASON,
+            Severity::Critical,
+        ),
+        (true, Some(RmFlagStyle::Separate)) => (
+            RM_R_F_SEPARATE_ROOT_HOME_NAME,
+            RM_R_F_SEPARATE_ROOT_HOME_REASON,
+            Severity::Critical,
+        ),
+        (true, Some(RmFlagStyle::Long)) => (
+            RM_RECURSIVE_FORCE_ROOT_HOME_NAME,
+            RM_RECURSIVE_FORCE_ROOT_HOME_REASON,
+            Severity::Critical,
+        ),
+        (true, None) => (
+            RM_RECURSIVE_ROOT_HOME_NAME,
+            RM_RECURSIVE_ROOT_HOME_REASON,
+            Severity::Critical,
+        ),
+        (false, Some(RmFlagStyle::Combined)) => {
+            (RM_RF_GENERAL_NAME, RM_RF_GENERAL_REASON, Severity::High)
         }
-    } else {
-        match flag_state.style {
-            RmFlagStyle::Combined => (RM_RF_GENERAL_NAME, RM_RF_GENERAL_REASON, Severity::High),
-            RmFlagStyle::Separate => (RM_R_F_SEPARATE_NAME, RM_R_F_SEPARATE_REASON, Severity::High),
-            RmFlagStyle::Long => (
-                RM_RECURSIVE_FORCE_NAME,
-                RM_RECURSIVE_FORCE_REASON,
-                Severity::High,
-            ),
+        (false, Some(RmFlagStyle::Separate)) => {
+            (RM_R_F_SEPARATE_NAME, RM_R_F_SEPARATE_REASON, Severity::High)
         }
+        (false, Some(RmFlagStyle::Long)) => (
+            RM_RECURSIVE_FORCE_NAME,
+            RM_RECURSIVE_FORCE_REASON,
+            Severity::High,
+        ),
+        (false, None) => (
+            RM_RECURSIVE_GENERAL_NAME,
+            RM_RECURSIVE_GENERAL_REASON,
+            Severity::High,
+        ),
     };
+
+    // Rule-scoped target exemption (#284). The rule that would fire is now
+    // known, so its configured `exempt_target_globs` get their one chance
+    // here. Only this rule stands down: a different rm spelling resolves to a
+    // different rule id and is unaffected, and every non-rm rule still sees the
+    // whole command.
+    if rm_targets_exempted_for_rule(pattern_name, &paths) {
+        return RmParseDecision::Allow;
+    }
 
     let span = flag_state
         .span
+        .or(flag_state.recursive_span)
         .or_else(|| paths.first().map(|path| path.range.clone()));
 
     RmParseDecision::Deny(RmParseMatch {
@@ -612,6 +3677,444 @@ fn parse_rm_segment(
         severity,
         span,
     })
+}
+
+/// Deny a non-recursive `rm` whose operand is a bare working-directory or
+/// root glob (#334): `rm -f *`, `rm ./*`, `rm /*`.
+///
+/// Without `-r` the recursive rules never see these, yet the shell expands
+/// the glob to every matching entry, so the deleted set is unbounded and
+/// invisible in the command text. `-f` is deliberately not required: it only
+/// changes error reporting, and the write-protection query it suppresses
+/// reaches nobody under an agent hook. Suffix and prefix globs (`*.log`,
+/// `build/*`) stay untouched — they name a reviewable shape — as do quoted
+/// operands (`rm '*'` is one literal file) and genuinely interactive
+/// invocations, which prompt per file exactly like the recursive forms.
+/// A non-recursive `rm` whose operand names a protected credential or
+/// login-startup file (#469).
+///
+/// `rm /etc/shadow` and `rm ~/.ssh/authorized_keys` were allowed while
+/// `unlink`, `shred -u` and `truncate -s 0` denied the same nine targets, and so
+/// did all six embedded languages. The cause is structural rather than a gap in
+/// the path matching: every `rm` rule requires a recursive flag, and `-r` is
+/// exactly the flag you do not need in order to delete one file. `rm -rf` on the
+/// same paths has always denied.
+///
+/// The predicate is `core::credential_files`' protected-file table, not
+/// `path_is_root_home`. That distinction is the whole design. `path_is_root_home`
+/// matches anything under `/home`, `/etc` or `/var`, which is affordable for
+/// `rm -rf` — recursive deletion under a home directory is rare — and is not
+/// affordable here, where it would deny `rm ~/notes.txt` and
+/// `rm ~/project/src/main.rs`. The credential table separates `~/.ssh/id_rsa`
+/// from `~/notes.txt`, which is the separation this rule needs and the reason it
+/// can be Critical without being noisy.
+///
+/// Severity matches the three sibling rules, which are all Critical on these
+/// paths. The usual argument for softening it — that `rm` carries far more
+/// traffic than `unlink` — is answered by the narrower predicate rather than by
+/// a lower severity: the commands this fires on are the ones where the file is
+/// irrecoverable.
+///
+/// The interactive carve-out is the same one `parse_bare_glob_rm` applies, for
+/// the same reason, so `rm -i` keeps behaving identically across both.
+fn parse_protected_file_rm(
+    paths: &[PathToken<'_>],
+    interactive_prompts: bool,
+    automated_stdin: bool,
+    redirected_stdin: bool,
+) -> RmParseDecision {
+    if paths.is_empty() {
+        return RmParseDecision::NoMatch;
+    }
+    if interactive_prompts && !automated_stdin && !redirected_stdin {
+        // The per-file prompt bounds the deletion; with stdin closed, as
+        // under a hook, rm deletes nothing and exits 0.
+        return RmParseDecision::NoMatch;
+    }
+
+    // The raw operand, not `unquoted`: the classifier does its own quote and
+    // escape decoding, and it needs an unquoted `~` or `$HOME` to survive in
+    // order to recognise the root. Handing it the stripped spelling would lose
+    // the difference between `rm ~/.ssh/id_rsa`, which expands to the key, and
+    // `rm "~/.ssh/id_rsa"`, which names a directory literally called `~`.
+    // `may_name_protected_path` first: `rm` runs constantly, and this is the
+    // cheap lexical superset the classifier publishes for exactly this
+    // purpose. `rm ./build/stamp` and `rm target/debug/app` fail it on a
+    // substring test and never pay for word decoding.
+    //
+    // A literal brace alternation is enumerable, not unknown: the shell turns
+    // `~/.ssh/{id_rsa,id_ed25519}` into two named files, so each is judged
+    // (#482). Anything the expansion cannot prove declines, as before.
+    let names_protected = |raw: &str| {
+        crate::packs::core::credential_files::may_name_protected_path(raw)
+            && crate::packs::core::credential_files::names_protected_file(raw)
+    };
+    let Some(path) = paths.iter().find(|path| {
+        names_protected(path.raw)
+            || literal_brace_expansions(path.raw)
+                .is_some_and(|expansions| expansions.iter().any(|word| names_protected(word)))
+    }) else {
+        return RmParseDecision::NoMatch;
+    };
+
+    if rm_targets_exempted_for_rule(RM_PROTECTED_FILE_NAME, paths) {
+        // Only this rule stands down (#284); other rules still see the
+        // command, so report no-match rather than a shielding allow.
+        return RmParseDecision::NoMatch;
+    }
+
+    // The git-internals wording only when every protected operand is inside
+    // `.git` (#533); one credential anywhere keeps the credential wording.
+    let git_only = paths
+        .iter()
+        .filter(|candidate| {
+            names_protected(candidate.raw)
+                || literal_brace_expansions(candidate.raw)
+                    .is_some_and(|expansions| expansions.iter().any(|word| names_protected(word)))
+        })
+        .all(|candidate| {
+            rm_protected_file_reason(candidate.raw) == RM_PROTECTED_GIT_INTERNAL_REASON
+        });
+    RmParseDecision::Deny(RmParseMatch {
+        pattern_name: RM_PROTECTED_FILE_NAME,
+        reason: if git_only {
+            RM_PROTECTED_GIT_INTERNAL_REASON
+        } else {
+            RM_PROTECTED_FILE_REASON
+        },
+        severity: Severity::Critical,
+        span: Some(path.range.clone()),
+    })
+}
+
+/// The `rm-protected-file` reason for one POSIX operand that this rule denies
+/// (#533): the git-internals wording only when every protected target the
+/// operand (or its literal brace expansions) names is inside `.git`.
+fn rm_protected_file_reason(raw: &str) -> &'static str {
+    use crate::packs::core::credential_files::{
+        may_name_protected_path, names_protected_file, names_protected_git_internal,
+    };
+    let names_protected = |word: &str| may_name_protected_path(word) && names_protected_file(word);
+    let git_only = if names_protected(raw) {
+        names_protected_git_internal(raw)
+    } else {
+        literal_brace_expansions(raw).is_some_and(|expansions| {
+            let protected: Vec<&String> = expansions
+                .iter()
+                .filter(|word| names_protected(word))
+                .collect();
+            !protected.is_empty()
+                && protected
+                    .iter()
+                    .all(|word| names_protected_git_internal(word))
+        })
+    };
+    if git_only {
+        RM_PROTECTED_GIT_INTERNAL_REASON
+    } else {
+        RM_PROTECTED_FILE_REASON
+    }
+}
+
+/// The words bash brace-expands an unquoted `a{b,c}d` operand into, when every
+/// alternative is literal (#482).
+///
+/// `None` when there is nothing to expand or the expansion is not provable
+/// from the text: quoting or escapes anywhere in the word, an expansion
+/// (`$`, `` ` ``) inside a group, a nested or unbalanced brace, a range
+/// (`{1..3}`), or more than [`MAX_BRACE_EXPANSIONS`] results. A group with no
+/// comma (`{id_rsa}`) is not an expansion at all — bash keeps it literally —
+/// so it stays in the word unchanged.
+pub(crate) fn literal_brace_expansions(raw: &str) -> Option<Vec<String>> {
+    const MAX_BRACE_EXPANSIONS: usize = 64;
+    if !raw.contains('{') || raw.contains(['\'', '"', '\\']) {
+        return None;
+    }
+    let mut expansions = vec![String::new()];
+    let mut expanded = false;
+    let mut rest = raw;
+    while let Some(open) = rest.find('{') {
+        let (prefix, after) = rest.split_at(open);
+        let close = after.find('}')?;
+        let body = &after[1..close];
+        if body.contains('{') {
+            return None;
+        }
+        for word in &mut expansions {
+            word.push_str(prefix);
+        }
+        if body.contains(',') {
+            if body.contains(['$', '`']) || body.contains("..") {
+                return None;
+            }
+            let alternatives: Vec<&str> = body.split(',').collect();
+            if expansions.len() * alternatives.len() > MAX_BRACE_EXPANSIONS {
+                return None;
+            }
+            expansions = expansions
+                .iter()
+                .flat_map(|word| alternatives.iter().map(move |alt| format!("{word}{alt}")))
+                .collect();
+            expanded = true;
+        } else {
+            // No comma: bash leaves the braces as literal characters.
+            for word in &mut expansions {
+                word.push_str(&after[..=close]);
+            }
+        }
+        rest = &after[close + 1..];
+    }
+    for word in &mut expansions {
+        word.push_str(rest);
+    }
+    expanded.then_some(expansions)
+}
+
+fn parse_bare_glob_rm(
+    paths: &[PathToken<'_>],
+    interactive_prompts: bool,
+    automated_stdin: bool,
+    redirected_stdin: bool,
+) -> RmParseDecision {
+    if paths.is_empty() {
+        return RmParseDecision::NoMatch;
+    }
+    if interactive_prompts && !automated_stdin && !redirected_stdin {
+        // The per-file prompt bounds the deletion; with stdin closed, as
+        // under a hook, rm deletes nothing and exits 0.
+        return RmParseDecision::NoMatch;
+    }
+
+    let unquoted_operand = |wanted: fn(&str) -> bool| {
+        paths
+            .iter()
+            .find(|path| path.quote == QuoteKind::None && wanted(path.unquoted))
+    };
+
+    // Root first: the more severe attribution wins when both shapes appear.
+    if let Some(path) = unquoted_operand(|text| text == "/*") {
+        if rm_targets_exempted_for_rule(RM_BARE_GLOB_ROOT_NAME, paths) {
+            // Only this rule stands down (#284); other rules still see the
+            // command, so report no-match rather than a shielding allow.
+            return RmParseDecision::NoMatch;
+        }
+        return RmParseDecision::Deny(RmParseMatch {
+            pattern_name: RM_BARE_GLOB_ROOT_NAME,
+            reason: RM_BARE_GLOB_ROOT_REASON,
+            severity: Severity::Critical,
+            span: Some(path.range.clone()),
+        });
+    }
+
+    if let Some(path) = unquoted_operand(|text| matches!(text, "*" | "./*")) {
+        if rm_targets_exempted_for_rule(RM_BARE_GLOB_NAME, paths) {
+            return RmParseDecision::NoMatch;
+        }
+        return RmParseDecision::Deny(RmParseMatch {
+            pattern_name: RM_BARE_GLOB_NAME,
+            reason: RM_BARE_GLOB_REASON,
+            severity: Severity::High,
+            span: Some(path.range.clone()),
+        });
+    }
+
+    RmParseDecision::NoMatch
+}
+
+fn apple_rm_option_token_is_valid(text: &str) -> bool {
+    // Apple's file_cmds `rm` calls getopt(3) with exactly
+    // `dfiIPRrvWx`; unlike GNU getopt_long, Darwin's getopt stops at
+    // the first non-option argv entry.
+    let Some(short) = text.strip_prefix('-') else {
+        return false;
+    };
+    !short.is_empty()
+        && !short.starts_with('-')
+        && short.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'd' | b'f' | b'i' | b'I' | b'P' | b'R' | b'r' | b'v' | b'W' | b'x'
+            )
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RmOptionDecision {
+    Continue,
+    Terminal,
+    Invalid,
+}
+
+fn apply_rm_option(text: &str, span: Range<usize>, flags: &mut RmFlagTracker) -> RmOptionDecision {
+    if let Some(long) = text.strip_prefix("--") {
+        return apply_rm_long_option(long, span, flags);
+    }
+
+    let short = &text[1..];
+    if short.is_empty() || !short.is_ascii() {
+        return RmOptionDecision::Invalid;
+    }
+
+    let has_recursive = short.bytes().any(|byte| matches!(byte, b'r' | b'R'));
+    let has_force = short.as_bytes().contains(&b'f');
+    for byte in short.bytes() {
+        match byte {
+            b'r' | b'R' => {
+                flags.seen_short_recursive = true;
+                flags
+                    .short_recursive_span
+                    .get_or_insert_with(|| span.clone());
+            }
+            b'f' => {
+                flags.seen_short_force = true;
+                flags.short_force_span.get_or_insert_with(|| span.clone());
+                flags.interactive_mode = RmInteractiveMode::Never;
+            }
+            b'i' => flags.interactive_mode = RmInteractiveMode::Always,
+            b'I' => flags.interactive_mode = RmInteractiveMode::Once,
+            // GNU plus BSD/macOS neutral rm options. None consumes an
+            // additional argv token.
+            b'd' | b'E' | b'P' | b'v' | b'W' | b'x' => {}
+            _ => return RmOptionDecision::Invalid,
+        }
+    }
+
+    if has_recursive && has_force {
+        flags.combined_span.get_or_insert(span);
+    }
+    RmOptionDecision::Continue
+}
+
+fn apply_rm_long_option(
+    text: &str,
+    span: Range<usize>,
+    flags: &mut RmFlagTracker,
+) -> RmOptionDecision {
+    let (name, value) = text
+        .split_once('=')
+        .map_or((text, None), |(name, value)| (name, Some(value)));
+    let Some(option) = resolve_rm_long_option(name) else {
+        return RmOptionDecision::Invalid;
+    };
+
+    match option {
+        RmLongOption::Recursive if value.is_none() => {
+            flags.seen_long_recursive = true;
+            flags.long_recursive_span.get_or_insert(span);
+        }
+        RmLongOption::Force if value.is_none() => {
+            flags.seen_long_force = true;
+            flags.long_force_span.get_or_insert(span);
+            flags.interactive_mode = RmInteractiveMode::Never;
+        }
+        RmLongOption::Interactive => {
+            let mode = match value {
+                Some(value) => parse_rm_interactive_mode(value),
+                None => Some(RmInteractiveMode::Always),
+            };
+            let Some(mode) = mode else {
+                return RmOptionDecision::Invalid;
+            };
+            flags.interactive_mode = mode;
+        }
+        RmLongOption::PreserveRoot => {
+            if value.is_some_and(|value| value.is_empty() || !"all".starts_with(value)) {
+                return RmOptionDecision::Invalid;
+            }
+        }
+        RmLongOption::Help | RmLongOption::Version if value.is_none() => {
+            return RmOptionDecision::Terminal;
+        }
+        RmLongOption::Dir
+        | RmLongOption::NoPreserveRoot
+        | RmLongOption::OneFileSystem
+        | RmLongOption::PresumeInputTty
+        | RmLongOption::Verbose
+            if value.is_none() => {}
+        _ => return RmOptionDecision::Invalid,
+    }
+
+    RmOptionDecision::Continue
+}
+
+/// Collapse balanced shell quotes and backslash escapes within an `rm` option
+/// token so the true flag letters are read (`-r'f'` -> `-rf`, `-r"f"` -> `-rf`,
+/// `'-r'f` -> `-rf`). Only applied to option-position tokens, which are always
+/// executed syntax rather than data.
+///
+/// Returns the token unchanged (borrowed) when it has no quotes/escapes, or
+/// when a quote is *unbalanced* — an unterminated quote is a shell syntax error
+/// that never runs `rm`, so it must stay opaque and match no flag rather than
+/// be silently "repaired" into a destructive one.
+///
+/// Bash ANSI-C (`$'…'`) and locale (`$"…"`) quoting are quoting too: without
+/// them `rm $'-rf' /` read as the operand `$-rf` (the `$-` parameter) and was
+/// allowed while `rm '-rf' /` denied.
+fn dequote_rm_flag_token(token: &str) -> std::borrow::Cow<'_, str> {
+    if !token.bytes().any(|b| matches!(b, b'\'' | b'"' | b'\\')) {
+        return std::borrow::Cow::Borrowed(token);
+    }
+    let mut out = String::with_capacity(token.len());
+    let mut chars = token.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '$' if chars.peek() == Some(&'\'') => {
+                chars.next();
+                if crate::normalize::decode_ansi_c_quoted(&mut chars, &mut out).is_err() {
+                    return std::borrow::Cow::Borrowed(token);
+                }
+            }
+            // `$"…"` is a double-quoted string after (no-op) translation;
+            // dropping the `$` hands it to the arm below.
+            '$' if chars.peek() == Some(&'"') => {}
+            // Single quotes: everything until the next `'` is literal.
+            '\'' => {
+                let mut closed = false;
+                for inner in chars.by_ref() {
+                    if inner == '\'' {
+                        closed = true;
+                        break;
+                    }
+                    out.push(inner);
+                }
+                if !closed {
+                    return std::borrow::Cow::Borrowed(token);
+                }
+            }
+            // Double quotes: literal, except backslash escapes `"`, `\`, `$`,
+            // and backtick (POSIX double-quote semantics).
+            '"' => {
+                let mut closed = false;
+                while let Some(inner) = chars.next() {
+                    match inner {
+                        '"' => {
+                            closed = true;
+                            break;
+                        }
+                        '\\' => match chars.next() {
+                            Some(esc @ ('"' | '\\' | '$' | '`')) => out.push(esc),
+                            Some(other) => {
+                                out.push('\\');
+                                out.push(other);
+                            }
+                            None => return std::borrow::Cow::Borrowed(token),
+                        },
+                        other => out.push(other),
+                    }
+                }
+                if !closed {
+                    return std::borrow::Cow::Borrowed(token);
+                }
+            }
+            // A backslash outside quotes escapes the next character.
+            '\\' => match chars.next() {
+                Some(escaped) => out.push(escaped),
+                None => return std::borrow::Cow::Borrowed(token),
+            },
+            other => out.push(other),
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 fn strip_outer_quotes(token: &str) -> (QuoteKind, &str) {
@@ -626,6 +4129,43 @@ fn strip_outer_quotes(token: &str) -> (QuoteKind, &str) {
     (QuoteKind::None, token)
 }
 
+/// Whether every `rm` target is covered by `pattern_name`'s configured
+/// `exempt_target_globs` (#284).
+///
+/// All-or-nothing on purpose: `rm -rf ~/scratch/a /etc` must stay denied, so a
+/// single unexempted target keeps the rule firing. Single-quoted targets are
+/// never eligible — the shell does not expand `~` inside them, so the literal
+/// spelling names a different path than the glob's author meant. Neither is
+/// an operand glued to a `(`: the tokenizer stops the operand there, but zsh
+/// reads `lo(g|x)` as alternation and removes `log`, so the spelled prefix is
+/// not the path removed (bash rejects the same text as a syntax error).
+fn rm_targets_exempted_for_rule(pattern_name: &str, paths: &[PathToken<'_>]) -> bool {
+    if paths.is_empty() {
+        return false;
+    }
+    let rule_id = format!("core.filesystem:{pattern_name}");
+    if !crate::config::rule_has_target_exemptions(&rule_id) {
+        return false;
+    }
+
+    let mut matched: Vec<(&str, String)> = Vec::with_capacity(paths.len());
+    for path in paths {
+        // A double-quoted path keeps its literal text; the shared normalizer
+        // rejects any remaining expansion syntax either way.
+        if path.quote == QuoteKind::Single || path.glued_to_paren {
+            return false;
+        }
+        let Some(glob) = crate::config::rule_target_exemption(&rule_id, path.unquoted) else {
+            return false;
+        };
+        matched.push((path.unquoted, glob));
+    }
+    for (target, glob) in &matched {
+        crate::config::note_rule_target_suppression(&rule_id, glob, target);
+    }
+    true
+}
+
 fn path_is_safe_for_style(path: &PathToken<'_>, style: RmFlagStyle) -> bool {
     if path.quote == QuoteKind::Double && style != RmFlagStyle::Combined {
         return false;
@@ -638,38 +4178,121 @@ fn path_is_safe_for_style(path: &PathToken<'_>, style: RmFlagStyle) -> bool {
     }
 }
 
+/// Literal temp-family prefixes, including macOS's canonical `/private`
+/// forms (`/tmp` and `/var/tmp` are symlinks to them there) (#244).
+const LITERAL_TEMP_PREFIXES: [&str; 4] =
+    ["/tmp/", "/var/tmp/", "/private/tmp/", "/private/var/tmp/"];
+
 fn path_is_safe_unquoted(path: &str) -> bool {
-    if let Some(rest) = path.strip_prefix("/tmp/") {
-        return temp_path_suffix_is_static_unquoted(rest);
-    }
-    if let Some(rest) = path.strip_prefix("/var/tmp/") {
-        return temp_path_suffix_is_static_unquoted(rest);
-    }
-    false
+    LITERAL_TEMP_PREFIXES
+        .iter()
+        .find_map(|prefix| path.strip_prefix(prefix))
+        .is_some_and(temp_path_suffix_is_static_unquoted)
+        || windows_literal_user_temp_subpath(path)
 }
 
 fn path_is_safe_double_quoted(path: &str) -> bool {
     // Double quotes do not change literal path text. Keep literal temporary
     // directories in parity with the unquoted path classifier while retaining
     // the same traversal and shell-expansion guards.
-    if let Some(rest) = path.strip_prefix("/tmp/") {
-        return temp_path_suffix_is_static_double_quoted(rest);
+    LITERAL_TEMP_PREFIXES
+        .iter()
+        .find_map(|prefix| path.strip_prefix(prefix))
+        .is_some_and(temp_path_suffix_is_static_double_quoted)
+        || windows_literal_user_temp_subpath(path)
+}
+
+/// Literal per-user Windows temp subpaths (#285), the Windows counterpart of
+/// the `/tmp/<subpath>` carve-out above. Recognizes the native
+/// `C:\Users\<user>\AppData\Local\Temp\<subpath>` spelling (either separator,
+/// any drive letter) and the Git Bash / MSYS2
+/// `/c/Users/<user>/AppData/Local/Temp/<subpath>` form that Claude Code's Bash
+/// tool emits on Windows. Windows path resolution is case-insensitive, so the
+/// component comparison is too.
+///
+/// Deliberately excluded, mirroring the `$TMPDIR` policy documented in the
+/// README ("Dynamic temp roots ... Blocked for review"):
+/// - dynamic spellings (`$TEMP`, `$env:TEMP`, `%TEMP%`): the variable is
+///   caller-controlled and can point anywhere;
+/// - the machine-wide `C:\Windows\Temp`: shared with services and other users;
+/// - the temp root itself with no subpath, like `/tmp` without a component.
+pub(crate) fn windows_literal_user_temp_subpath(path: &str) -> bool {
+    // Expansion syntax, quote characters, and cmd/PowerShell multi-argument
+    // separators are never part of one static literal path.
+    if path.bytes().any(|byte| {
+        matches!(
+            byte,
+            b'$' | b'`' | b'%' | b'{' | b'}' | b'\'' | b'"' | b',' | b';'
+        )
+    }) {
+        return false;
     }
-    if let Some(rest) = path.strip_prefix("/var/tmp/") {
-        return temp_path_suffix_is_static_double_quoted(rest);
+
+    let bytes = path.as_bytes();
+    let rest = if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+    {
+        // Native drive form `X:\...` / `X:/...`.
+        &path[3..]
+    } else if bytes.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b'/'
+    {
+        // Git Bash / MSYS2 drive form `/x/...`.
+        &path[3..]
+    } else {
+        return false;
+    };
+    // A second drive designator (`C:\...Temp\x,D:` style smuggling) cannot be
+    // part of the temp subtree.
+    if rest.contains(':') {
+        return false;
     }
-    false
+
+    let mut components: Vec<&str> = rest.split(['/', '\\']).collect();
+    while components.last() == Some(&"") {
+        components.pop();
+    }
+    // `Users`, `<user>`, `AppData`, `Local`, `Temp`, plus at least one real
+    // component under the temp root (deleting the root itself stays reviewed).
+    if components.len() < 6 {
+        return false;
+    }
+    if components.iter().any(|component| {
+        // Dot-only components (`.`, `..`, and cmd's `...` and longer, which
+        // resolve as repeated parent traversal in some contexts) can leave the
+        // temp subtree, and Win32 strips trailing dots and spaces from a
+        // component, so `Temp.` / `Temp ` would name a different directory
+        // than the one proven here.
+        component.is_empty()
+            || component.bytes().all(|byte| byte == b'.')
+            || component.ends_with('.')
+            || component.ends_with(' ')
+    }) {
+        return false;
+    }
+    components[0].eq_ignore_ascii_case("Users")
+        && components[2].eq_ignore_ascii_case("AppData")
+        && components[3].eq_ignore_ascii_case("Local")
+        && components[4].eq_ignore_ascii_case("Temp")
+        // PowerShell expands `*`, `?` and `[…]` in -Path, quoted or not.
+        && !starts_with_glob(components[5], &['*', '?', '['])
 }
 
 fn temp_path_suffix_is_static_unquoted(path: &str) -> bool {
-    !has_dotdot_segment(path)
+    temp_path_suffix_has_real_component(path)
+        && !temp_path_first_component_globs_children(path)
+        && !has_dotdot_segment(path)
         && !path
             .bytes()
             .any(|byte| matches!(byte, b'$' | b'`' | b'{' | b'}' | b'\\' | b'\'' | b'"'))
 }
 
 fn temp_path_suffix_is_static_double_quoted(path: &str) -> bool {
-    if has_dotdot_segment(path) {
+    if !temp_path_suffix_has_real_component(path) || has_dotdot_segment(path) {
         return false;
     }
 
@@ -701,6 +4324,30 @@ fn temp_path_suffix_is_static_double_quoted(path: &str) -> bool {
     true
 }
 
+fn temp_path_suffix_has_real_component(path: &str) -> bool {
+    path.split('/')
+        .any(|component| !component.is_empty() && component != ".")
+}
+
+/// An unquoted path's first real component under the temp root is the entry it
+/// names, so one that starts with a glob (`*`, `.*`, `?x`, `[a-z]*`) names any
+/// child of the shared root and empties it just as the root itself would
+/// (dev-hs30uj). A literal prefix (`/tmp/sigtest*`) or a glob deeper down
+/// (`/tmp/build/*`) stays inside names the caller chose; inside double quotes the
+/// shell expands no glob at all (`"/tmp/[build]"`).
+fn temp_path_first_component_globs_children(path: &str) -> bool {
+    path.split('/')
+        .find(|component| !component.is_empty() && *component != ".")
+        .is_some_and(|first| starts_with_glob(first, &['*', '?', '[']))
+}
+
+fn starts_with_glob(component: &str, wildcards: &[char]) -> bool {
+    component
+        .strip_prefix('.')
+        .unwrap_or(component)
+        .starts_with(wildcards)
+}
+
 fn has_dotdot_segment(path: &str) -> bool {
     path.split('/')
         .filter(|segment| !segment.is_empty())
@@ -727,21 +4374,129 @@ fn path_is_root_home(path: &PathToken<'_>) -> bool {
     false
 }
 
+/// Top-level directories whose subtrees are the operating system, another
+/// user's data, or a whole mounted volume. A recursive delete anywhere under
+/// one of these keeps the Critical root/home severity at any depth.
+const CRITICAL_TOP_LEVEL_DIRS: &[&str] = &[
+    "Applications",
+    "Library",
+    "Program Files",
+    "Program Files (x86)",
+    "ProgramData",
+    "System",
+    "Volumes",
+    "Windows",
+    "bin",
+    "boot",
+    "cores",
+    "dev",
+    "etc",
+    "lib",
+    "lib32",
+    "lib64",
+    "libx32",
+    "media",
+    "mnt",
+    "nix",
+    "opt",
+    "private",
+    "proc",
+    "root",
+    "sbin",
+    "snap",
+    "srv",
+    "sys",
+    "usr",
+    "var",
+];
+
+/// Directories whose direct children are user home directories.
+const HOME_PARENT_DIRS: &[&str] = &["home", "Users"];
+
+/// Whether a recursive delete of `text` earns the Critical root/home rule.
+///
+/// Critical means "this can take out the OS or a whole home directory", so it
+/// covers root, a home root (`~`, `~user`, `$HOME`, `/home/<u>`, `/Users/<u>`,
+/// `/root`), a home's top-level entries and dotfile trees (`~/Documents`,
+/// `~/.ssh/...`), any direct child of `/`, and anything under a system or
+/// mount directory. A path two or more real components into a home directory
+/// (`/home/u/proj/dist`) or outside the system dirs (`/data/proj/dist`) is
+/// still denied, under the general rule at High: calling it "destroy your
+/// entire operating system" was inaccurate (#196).
+///
+/// Every doubt resolves to Critical. A component that can expand at runtime
+/// (`$`, backtick, glob, brace, tilde) or a `..` anywhere could make the
+/// operand name a shallower directory than it reads as, so either keeps the
+/// Critical rule.
 fn path_text_is_root_home(text: &str) -> bool {
-    // Absolute paths starting with / are dangerous regardless of quotes
-    // e.g. rm -rf "/" is just as deadly as rm -rf /
-    if text.starts_with('/') {
-        return true;
+    if let Some(rest) = text.strip_prefix('~') {
+        // `~` and `~user` both name a home root; only the part after the
+        // first `/` can take the operand below it.
+        return match rest.find('/') {
+            Some(slash) => !path_is_deep_below_home(&rest[slash..]),
+            None => true,
+        };
     }
 
-    if text.starts_with('~') {
-        return true;
+    for home in ["$HOME", "${HOME}"] {
+        if let Some(rest) = text.strip_prefix(home) {
+            if rest.is_empty() {
+                return true;
+            }
+            if rest.starts_with('/') {
+                return !path_is_deep_below_home(rest);
+            }
+        }
     }
 
-    text == "$HOME"
-        || text.starts_with("$HOME/")
-        || text == "${HOME}"
-        || text.starts_with("${HOME}/")
+    // Absolute paths are judged regardless of quotes: rm -rf "/" is just as
+    // deadly as rm -rf /.
+    text.starts_with('/') && absolute_path_is_critical(text)
+}
+
+/// Split a path into components, or `None` when any component could change
+/// what the path names at runtime (expansion, globbing, `..`).
+fn static_path_components(path: &str) -> Option<Vec<&str>> {
+    let components: Vec<&str> = path
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect();
+    let dynamic = components.iter().any(|component| {
+        *component == ".."
+            || component
+                .bytes()
+                .any(|byte| matches!(byte, b'$' | b'`' | b'*' | b'?' | b'[' | b'{' | b'~' | b'\\'))
+    });
+    (!dynamic).then_some(components)
+}
+
+/// `rest` is what follows a home root. Deep means two or more static
+/// components whose first is not a dotfile tree like `.ssh` or `.config`.
+fn path_is_deep_below_home(rest: &str) -> bool {
+    static_path_components(rest)
+        .is_some_and(|components| components.len() >= 2 && !components[0].starts_with('.'))
+}
+
+fn absolute_path_is_critical(path: &str) -> bool {
+    let Some(mut components) = static_path_components(path) else {
+        return true;
+    };
+    // Git-bash / MSYS spell a Windows drive root as `/c/...`; judge the rest
+    // exactly as if it started at `/`.
+    if components
+        .first()
+        .is_some_and(|first| first.len() == 1 && first.as_bytes()[0].is_ascii_alphabetic())
+    {
+        components.remove(0);
+    }
+    match components.as_slice() {
+        [] | [_] => true,
+        [first, ..] if CRITICAL_TOP_LEVEL_DIRS.contains(first) => true,
+        [parent, _user, rest @ ..] if HOME_PARENT_DIRS.contains(parent) => {
+            rest.len() < 2 || rest[0].starts_with('.')
+        }
+        _ => false,
+    }
 }
 
 /// Create the core filesystem pack.
@@ -750,7 +4505,7 @@ pub fn create_pack() -> Pack {
     Pack {
         id: "core.filesystem".to_string(),
         name: "Core Filesystem",
-        description: "Protects against dangerous rm -rf commands and equivalent destruction (find -delete, unlink) outside temp directories",
+        description: "Protects against recursive rm commands and equivalent filesystem destruction outside literal temp subdirectories",
         // `find` is included so the quick-reject filter doesn't drop
         // commands like `find / -delete` — which is bytewise-equivalent
         // to `rm -rf /` and used to bypass dcg entirely (the agent learns
@@ -769,10 +4524,125 @@ pub fn create_pack() -> Pack {
         // temp-family paths followed by forced recursive deletion.
         // Mirror entries MUST also exist in src/packs/mod.rs::PACK_ENTRIES
         // (the duplicate-source-of-truth that gates execution).
+        // `tee`, `sponge`, `install`, `sed`, and `perl` are the non-redirect
+        // writers `credential-file-write` classifies (`cp`, `mv`, `ln`, and
+        // `dd` are already here).
+        // These gate whether the pack is consulted at all, so a shape missing
+        // from here is invisible to every pattern below it. `.git/` is listed
+        // for `redirect-truncate-git-internals-relative`: a relative target
+        // carries none of the other redirect keywords, because it starts with
+        // a dot or a directory name rather than `/`, `~`, `$` or a quote, so
+        // `cat > .git/config` and `cat > sub/.git/config` reached no pattern at
+        // all and the rule never ran (GitHub #407).
+        //
+        // The credential-directory anchors that follow it are there for the
+        // same reason and the same issue: `credential-file-write` now judges a
+        // relative path through one of them, but a bare redirect carries no
+        // other keyword, so `echo k > .ssh/authorized_keys` would be dropped
+        // before the classifier ran. The non-redirect writers (`tee`, `cp`, …)
+        // are already keywords under their own names and do not need these.
         keywords: &[
-            "rm", "find", "unlink", "truncate", "shred", "tar", "dd", "mv", "cp", "ln", "rsync",
-            ">/", "> /", ">~", "> ~", ">$", "> $", ">\"", "> \"", ">'", "> '", "&>", ">&", ">|",
-            "1>", "2>",
+            "rm",
+            "find",
+            "unlink",
+            "truncate",
+            "shred",
+            "tar",
+            "dd",
+            "mv",
+            "cp",
+            "ln",
+            "rsync",
+            "tee",
+            "sponge",
+            "install",
+            "sed",
+            "perl",
+            // Windows disk-destruction verbs (cross-platform baseline, #451).
+            // Case variants are listed because the boundary-aware quick-reject
+            // matcher is case-sensitive, exactly as `windows.system` does.
+            "Format-Volume",
+            "format-volume",
+            "FORMAT-VOLUME",
+            "Clear-Disk",
+            "clear-disk",
+            "CLEAR-DISK",
+            "vssadmin",
+            "VSSADMIN",
+            "wmic",
+            "WMIC",
+            "Win32_ShadowCopy",
+            "win32_shadowcopy",
+            "WIN32_SHADOWCOPY",
+            ".git/",
+            ".ssh/",
+            ".gnupg/",
+            ".aws/",
+            ".kube/",
+            ".docker/",
+            ".bashrc.d/",
+            ".zshrc.d/",
+            // The same anchors spelled the Windows way. A PowerShell or cmd
+            // caller writes `.ssh\authorized_keys`, which carries none of the
+            // forward-slash entries above, so a bare redirect to it selected
+            // no pack and the rule never ran. Path resolution already handles
+            // `\` — the identical targets deny as soon as any writer word is
+            // present (`copy`, `Set-Content`) — so this is purely the
+            // candidate gate, which is the mechanism #407 added these anchors
+            // for in the first place.
+            ".git\\",
+            ".ssh\\",
+            ".gnupg\\",
+            ".aws\\",
+            ".kube\\",
+            ".docker\\",
+            ".bashrc.d\\",
+            ".zshrc.d\\",
+            // The login-shell startup files, for the same reason: a bare
+            // `echo x > .bashrc` carries no other keyword in this row.
+            ".bashrc",
+            ".bash_profile",
+            ".bash_login",
+            ".profile",
+            ".zshrc",
+            ".zshenv",
+            ".zprofile",
+            ".zlogin",
+            ">/",
+            "> /",
+            ">~",
+            "> ~",
+            ">$",
+            "> $",
+            ">\"",
+            "> \"",
+            ">'",
+            "> '",
+            // An escaped first character (`> \/etc/passwd`) is the same
+            // path to the shell, and carried none of the entries above, so
+            // the pack was never a candidate and the write was allowed.
+            ">\\",
+            "> \\",
+            // A target that climbs out of the working directory
+            // (`> ../../../etc/sudoers`) or is spelled by a backquote
+            // substitution carried none of the entries above either.
+            ">..",
+            "> ..",
+            ">./..",
+            "> ./..",
+            ">`",
+            "> `",
+            "&>",
+            ">&",
+            ">|",
+            "1>",
+            "2>",
+            ">%",
+            "> %",
+            ">!",
+            "> !",
+            ">^",
+            "> ^",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
@@ -784,60 +4654,75 @@ pub fn create_pack() -> Pack {
 
 #[allow(clippy::too_many_lines)]
 fn create_safe_patterns() -> Vec<SafePattern> {
-    vec![
+    // Every temp exemption below carries an optional `(?:--\s+)?` immediately
+    // before its operand list (issue #395) — `rm`, `find`, `unlink` and
+    // `truncate` alike. Six of them were missed on the first pass, so
+    // `unlink -- /tmp/scratch` and `truncate -s 0 -- /tmp/scratch` denied while
+    // their bare spellings were exempt. `--` is the POSIX end-of-options
+    // marker a careful script writes so an operand beginning with `-` cannot be
+    // read as a flag; it makes the command strictly safer and must not cost the
+    // exemption. The trailing `\s+` means only a bare `--` matches, so
+    // `--no-preserve-root` and every other long option still fall through to the
+    // destructive rules, and a second `--` would have to satisfy the
+    // temp-operand group (it cannot), so `rm -rf -- -- /tmp/x` keeps denying.
+    let mut patterns = vec![
+        // The baseline Format-Volume / Clear-Disk rules (#451) mirror
+        // windows.system's regexes, so they take its preview carve-out too:
+        // a bare `-WhatIf` is a preview, `-WhatIf:$false` is not.
+        crate::packs::windows::system::storage_whatif_safe_pattern(),
         // rm -rf in /tmp (combined flags)
         safe_pattern!(
             "rm-rf-tmp",
-            r"^rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+(?:/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
+            r"^rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+(?:--\s+)?(?:(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
         ),
         safe_pattern!(
             "rm-fr-tmp",
-            r"^rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+(?:/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
+            r"^rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+(?:--\s+)?(?:(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
         ),
         // rm -rf in /var/tmp (combined flags)
         safe_pattern!(
             "rm-rf-var-tmp",
-            r"^rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+(?:/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
+            r"^rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+(?:--\s+)?(?:(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
         ),
         safe_pattern!(
             "rm-fr-var-tmp",
-            r"^rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+(?:/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
+            r"^rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+(?:--\s+)?(?:(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
         ),
         // rm -r -f (separate flags) in /tmp
         safe_pattern!(
             "rm-r-f-tmp",
-            r"^rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f\s+(?:/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
+            r"^rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f\s+(?:--\s+)?(?:(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
         ),
         safe_pattern!(
             "rm-f-r-tmp",
-            r"^rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]\s+(?:/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
+            r"^rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]\s+(?:--\s+)?(?:(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
         ),
         // rm -r -f (separate flags) in /var/tmp
         safe_pattern!(
             "rm-r-f-var-tmp",
-            r"^rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f\s+(?:/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
+            r"^rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f\s+(?:--\s+)?(?:(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
         ),
         safe_pattern!(
             "rm-f-r-var-tmp",
-            r"^rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]\s+(?:/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
+            r"^rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]\s+(?:--\s+)?(?:(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
         ),
         // rm --recursive --force (long flags) in /tmp
         safe_pattern!(
             "rm-recursive-force-tmp",
-            r"^rm\s+.*--recursive.*--force\s+(?:/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
+            r"^rm\s+.*--recursive.*--force\s+(?:--\s+)?(?:(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
         ),
         safe_pattern!(
             "rm-force-recursive-tmp",
-            r"^rm\s+.*--force.*--recursive\s+(?:/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
+            r"^rm\s+.*--force.*--recursive\s+(?:--\s+)?(?:(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
         ),
         // rm --recursive --force (long flags) in /var/tmp
         safe_pattern!(
             "rm-recursive-force-var-tmp",
-            r"^rm\s+.*--recursive.*--force\s+(?:/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
+            r"^rm\s+.*--recursive.*--force\s+(?:--\s+)?(?:(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
         ),
         safe_pattern!(
             "rm-force-recursive-var-tmp",
-            r"^rm\s+.*--force.*--recursive\s+(?:/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
+            r"^rm\s+.*--force.*--recursive\s+(?:--\s+)?(?:(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*(?:\s+|$))+$"
         ),
         // -----------------------------------------------------------------
         // `find ... -delete` safe whitelist for temp directories.
@@ -872,16 +4757,64 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         //   find /tmp/foo /etc -delete
         // from short-circuiting through (the `/etc` would also be deleted).
         //
+        // Every <tmp-path> names something BELOW the temp root, as the
+        // `rm -rf` temp exemption does: `find /tmp -delete` (also `/tmp/`,
+        // `/tmp/.`, `/tmp//./`) empties the whole shared temp directory, every
+        // other process's files and sockets included, so it is not scratch the
+        // caller owns (dev-qgoxf1). Redundant `/` and `.` components do not
+        // count as the descendant, and neither does a first component that
+        // starts with a glob (`/tmp/*`, `/tmp/.*`, `/tmp/[a-z]*`): it names
+        // any child of the root (dev-hs30uj). `/tmp/build-*` names only the
+        // caller's own prefix and stays exempt.
+        //
+        // The root itself stays exempt when the expression selects what goes
+        // before it deletes (`find /tmp -name '*.log' -delete`, `-mtime +7`), as
+        // v0.6.7 allowed: the `-filtered-root` patterns below. A selector after
+        // the action, a bare `-name '*'`, `-mindepth`/`-type` alone, or any
+        // `-o`/`!`/`,` that could undo the selection leaves the whole root
+        // reviewed (dcg#7 REV C2). A name selector needs a literal character
+        // past any glob (`'?*'`, `'[a-z]*'` select everything), and the `-exec
+        // rm` forms take no recursive flag, since a selector can name the root
+        // itself.
+        //
         // `-delete` must terminate the command (followed by end-of-string
         // or only more non-path flags).
         // -----------------------------------------------------------------
         safe_pattern!(
             "find-delete-tmp",
-            r"^(?![^|;&]*[\\$`])find\s+/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
+            r"^(?![^|;&]*[\\$`])find\s+(?:--\s+)?/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*(?:\s+(?:/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
+        ),
+        safe_pattern!(
+            "find-delete-tmp-filtered-root",
+            r"^(?![^|;&]*[\\$`])find\s+(?:--\s+)?/tmp(?:/+\.?)*(?=\s)(?![^|;&]*\s(?:-o|-or|-not|!|,)(?:\s|$))(?=(?:(?!\s-(?:delete|exec|execdir)(?:\s|$))[^|;&])*\s-(?:empty(?:\s|$)|(?:i?name|i?path|i?wholename|i?regex|i?lname|[acm]min|[acm]time|newer[a-zA-Z]*|anewer|cnewer|size|user|uid|group|gid|perm|links|inum|samefile|used)\s+['\x22]?(?:[*?.]|\[[^\]\s]*\])*[^*?.\[\]\s'\x22|;&]))(?:\s+(?:/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
         ),
         safe_pattern!(
             "find-delete-var-tmp",
-            r"^(?![^|;&]*[\\$`])find\s+/var/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?(?:\s+(?:/var/tmp(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S*)?|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
+            r"^(?![^|;&]*[\\$`])find\s+(?:--\s+)?/var/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*(?:\s+(?:/var/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
+        ),
+        safe_pattern!(
+            "find-delete-var-tmp-filtered-root",
+            r"^(?![^|;&]*[\\$`])find\s+(?:--\s+)?/var/tmp(?:/+\.?)*(?=\s)(?![^|;&]*\s(?:-o|-or|-not|!|,)(?:\s|$))(?=(?:(?!\s-(?:delete|exec|execdir)(?:\s|$))[^|;&])*\s-(?:empty(?:\s|$)|(?:i?name|i?path|i?wholename|i?regex|i?lname|[acm]min|[acm]time|newer[a-zA-Z]*|anewer|cnewer|size|user|uid|group|gid|perm|links|inum|samefile|used)\s+['\x22]?(?:[*?.]|\[[^\]\s]*\])*[^*?.\[\]\s'\x22|;&]))(?:\s+(?:/var/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?)*\s*$"
+        ),
+        // The `-exec rm … {}` spelling of the same temp-only delete. Since
+        // `find-delete-*` learned that action it denied here while `-delete`
+        // was allowed. Same literal temp roots; the only backslash admitted is
+        // the terminating `\;`.
+        safe_pattern!(
+            "find-exec-rm-tmp",
+            r"^(?![^|;&]*[$`])(?![^|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*(?:\s+(?:(?:/private)?/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-zA-Z]+)*\s+\{\}\s+(?:\\;|\+)\s*$"
+        ),
+        safe_pattern!(
+            "find-exec-rm-tmp-filtered-root",
+            r"^(?![^|;&]*[$`])(?![^|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/tmp(?:/+\.?)*(?=\s)(?![^|;&]*\s(?:-o|-or|-not|!|,)(?:\s|$))(?=(?:(?!\s-(?:delete|exec|execdir)(?:\s|$))[^|;&])*\s-(?:empty(?:\s|$)|(?:i?name|i?path|i?wholename|i?regex|i?lname|[acm]min|[acm]time|newer[a-zA-Z]*|anewer|cnewer|size|user|uid|group|gid|perm|links|inum|samefile|used)\s+['\x22]?(?:[*?.]|\[[^\]\s]*\])*[^*?.\[\]\s'\x22|;&]))(?:\s+(?:(?:/private)?/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-qs-zA-QS-Z]+)*\s+\{\}\s+(?:\\;|\+)\s*$"
+        ),
+        safe_pattern!(
+            "find-exec-rm-var-tmp",
+            r"^(?![^|;&]*[$`])(?![^|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/var/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*(?:\s+(?:(?:/private)?/var/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-zA-Z]+)*\s+\{\}\s+(?:\\;|\+)\s*$"
+        ),
+        safe_pattern!(
+            "find-exec-rm-var-tmp-filtered-root",
+            r"^(?![^|;&]*[$`])(?![^|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/var/tmp(?:/+\.?)*(?=\s)(?![^|;&]*\s(?:-o|-or|-not|!|,)(?:\s|$))(?=(?:(?!\s-(?:delete|exec|execdir)(?:\s|$))[^|;&])*\s-(?:empty(?:\s|$)|(?:i?name|i?path|i?wholename|i?regex|i?lname|[acm]min|[acm]time|newer[a-zA-Z]*|anewer|cnewer|size|user|uid|group|gid|perm|links|inum|samefile|used)\s+['\x22]?(?:[*?.]|\[[^\]\s]*\])*[^*?.\[\]\s'\x22|;&]))(?:\s+(?:(?:/private)?/var/tmp/+(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))(?:\./+)*(?!\.(?:/|\s|$))(?!\.?[*?\[])[^/\s]\S*|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-qs-zA-QS-Z]+)*\s+\{\}\s+(?:\\;|\+)\s*$"
         ),
         // -----------------------------------------------------------------
         // `unlink <file>` safe whitelist for temp directories.
@@ -895,11 +4828,11 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // -----------------------------------------------------------------
         safe_pattern!(
             "unlink-tmp",
-            r"^(?![^|;&]*[\\$`])unlink\s+/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
+            r"^(?![^|;&]*[\\$`])unlink\s+(?:--\s+)?(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
         ),
         safe_pattern!(
             "unlink-var-tmp",
-            r"^(?![^|;&]*[\\$`])unlink\s+/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
+            r"^(?![^|;&]*[\\$`])unlink\s+(?:--\s+)?(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
         ),
         // unlink invoked with --help / --version is read-only.
         safe_pattern!("unlink-help", r"^unlink\s+(?:--help|--version)\s*$"),
@@ -920,21 +4853,22 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         safe_pattern!("truncate-help", r"^truncate\s+(?:--help|--version)\s*$"),
         // Growing operations: -s +<N>, --size=+<N> (pure growth — no
         // data destroyed). We only whitelist the explicit `+` form because
-        // absolute sizes can shrink existing files. The `-s` short form
-        // takes its value as a separate token (`-s +1G`); `--size=` packs
-        // value into the same token (`--size=+1G`).
+        // absolute sizes can shrink existing files. getopt accepts the size
+        // in every spelling -- `-s +1G`, `-s+1G`, `-cs +1G` (bundled with
+        // `-c`/`-o`), `--size=+1G`, `--size +1G` -- and the safe and
+        // destructive rules below must agree on all of them.
         safe_pattern!(
             "truncate-grow",
-            r"^truncate\s+(?:-s\s+\+\S+|--size=\+\S+)\s+\S+\s*$"
+            r"^truncate\s+(?:-[co]*s\s*\+\S+|--size(?:=|\s+)\+\S+)\s+\S+\s*$"
         ),
         // Temp-directory truncate (any size).
         safe_pattern!(
             "truncate-tmp",
-            r"^(?![^|;&]*[\\$`])truncate\s+(?:-s\s+\S+|--size=\S+)\s+/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
+            r"^(?![^|;&]*[\\$`])truncate\s+(?:-[co]*s\s*\S+|--size(?:=|\s+)\S+)\s+(?:--\s+)?(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
         ),
         safe_pattern!(
             "truncate-var-tmp",
-            r"^(?![^|;&]*[\\$`])truncate\s+(?:-s\s+\S+|--size=\S+)\s+/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
+            r"^(?![^|;&]*[\\$`])truncate\s+(?:-[co]*s\s*\S+|--size(?:=|\s+)\S+)\s+(?:--\s+)?(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
         ),
         // -r/--reference <ref-file> <file> uses the size of ref-file.
         // This is a copy-size, not a destruction primitive — allowed when
@@ -956,11 +4890,11 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         safe_pattern!("shred-help", r"^shred\s+(?:--help|--version)\s*$"),
         safe_pattern!(
             "shred-tmp",
-            r"^(?![^|;&]*[\\$`])shred(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
+            r"^(?![^|;&]*[\\$`])shred(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
         ),
         safe_pattern!(
             "shred-var-tmp",
-            r"^(?![^|;&]*[\\$`])shred(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
+            r"^(?![^|;&]*[\\$`])shred(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
         ),
         // -----------------------------------------------------------------
         // `tar --remove-files` safe whitelist.
@@ -986,11 +4920,11 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // -----------------------------------------------------------------
         safe_pattern!(
             "tar-remove-files-tmp",
-            r"^(?![^|;&]*[\\$`])tar(?=\s+[^|;&]*--remove-files\b)(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
+            r"^(?![^|;&]*[\\$`])tar(?=\s+[^|;&]*--remove-files\b)(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
         ),
         safe_pattern!(
             "tar-remove-files-var-tmp",
-            r"^(?![^|;&]*[\\$`])tar(?=\s+[^|;&]*--remove-files\b)(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
+            r"^(?![^|;&]*[\\$`])tar(?=\s+[^|;&]*--remove-files\b)(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s*$"
         ),
         // -----------------------------------------------------------------
         // `dd` safe whitelist.
@@ -1018,11 +4952,11 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // -----------------------------------------------------------------
         safe_pattern!(
             "dd-tmp",
-            r#"^(?![^|;&]*[\\$`])dd(?=\s+[^|;&]*\bof=)(?:\s+(?:[a-zA-Z]+=\S+|--?[a-zA-Z][a-zA-Z0-9\-]*(?:=\S+)?))*\s+of=['"]?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:(?!of=)[a-zA-Z]+=\S+|--?[a-zA-Z][a-zA-Z0-9\-]*(?:=\S+)?))*\s*$"#
+            r#"^(?![^|;&]*[\\$`])dd(?=\s+[^|;&]*\bof=)(?:\s+(?:[a-zA-Z]+=\S+|--?[a-zA-Z][a-zA-Z0-9\-]*(?:=\S+)?))*\s+of=['"]?(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:(?!of=)[a-zA-Z]+=\S+|--?[a-zA-Z][a-zA-Z0-9\-]*(?:=\S+)?))*\s*$"#
         ),
         safe_pattern!(
             "dd-var-tmp",
-            r#"^(?![^|;&]*[\\$`])dd(?=\s+[^|;&]*\bof=)(?:\s+(?:[a-zA-Z]+=\S+|--?[a-zA-Z][a-zA-Z0-9\-]*(?:=\S+)?))*\s+of=['"]?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:(?!of=)[a-zA-Z]+=\S+|--?[a-zA-Z][a-zA-Z0-9\-]*(?:=\S+)?))*\s*$"#
+            r#"^(?![^|;&]*[\\$`])dd(?=\s+[^|;&]*\bof=)(?:\s+(?:[a-zA-Z]+=\S+|--?[a-zA-Z][a-zA-Z0-9\-]*(?:=\S+)?))*\s+of=['"]?(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+(?:\s+(?:(?!of=)[a-zA-Z]+=\S+|--?[a-zA-Z][a-zA-Z0-9\-]*(?:=\S+)?))*\s*$"#
         ),
         // dd invoked with --help / --version is read-only.
         safe_pattern!("dd-help", r"^dd\s+(?:--help|--version)\s*$"),
@@ -1048,17 +4982,211 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // -----------------------------------------------------------------
         safe_pattern!(
             "mv-tmp",
-            r"^(?![^|;&]*[\\$`])mv(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+(?:/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s+)+/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
+            r"^(?![^|;&]*[\\$`])mv(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+(?:(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s+)+(?:/private)?/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
         ),
         safe_pattern!(
             "mv-var-tmp",
-            r"^(?![^|;&]*[\\$`])mv(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+(?:/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s+)+/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
+            r"^(?![^|;&]*[\\$`])mv(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s|;&]*)?|--[a-z\-]+(?:=\S+|\s+[^/~$\-\s][^\s|;&]*)?))*\s+(?:(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s+)+(?:/private)?/var/tmp/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))\S+\s*$"
         ),
         // mv invoked with --help / --version is read-only.
         safe_pattern!("mv-help", r"^mv\s+(?:--help|--version)\s*$"),
-    ]
+        // -----------------------------------------------------------------
+        // `mv` into the platform Trash directory (#244).
+        //
+        // dcg's own rm-rf remediation suggests "Move to trash instead:
+        // mv path ~/.local/share/Trash/", so that exact soft-delete must
+        // not then be blocked by `mv-sensitive-source-root-home` (whose
+        // regex trips on the `~` in the destination). Sources are limited
+        // to files *under* a home directory, tmp family, or relative
+        // paths — never a bare `~`, a whole `/home/<user>` or
+        // `/Users/<user>` root, or a sensitive system tree — and both
+        // sides carry the standard `..`-traversal guard. Dynamic paths
+        // (`$`, backticks, backslashes) fall through to the fail-closed
+        // rules, and so does an unquoted `{`: bash expands a brace list
+        // before mv runs, past the `..` guard, so
+        // `mv ~/a/{..,b}/{..,c}/{..,d}/etc ~/.Trash/` moved `/etc`.
+        // -----------------------------------------------------------------
+        safe_pattern!(
+            "mv-to-trash",
+            r"^(?![^|;&]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:~/|/home/[^/\s{]+/|/Users/[^/\s{]+/|(?:/private)?(?:/var)?/tmp/|\./)?(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[A-Za-z0-9._][^\s;|&{]*)+[ \t]+(?:~/\.local/share/Trash|~/\.Trash)(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[^\s;|&{]*)?\s*$"
+        ),
+        // -----------------------------------------------------------------
+        // `mv` into the platform Trash, with quoted paths and a resolved
+        // home directory.
+        //
+        // `mv-to-trash` above reads only bare, unquoted words, but the
+        // destructive rule it rescues from is quote-tolerant: its path
+        // alternation is prefixed by `['\"\\]?`. Quoting therefore only ever
+        // moves a command toward deny, and a personal file whose name
+        // contains a space MUST be quoted -- so the soft-delete dcg itself
+        // recommends is unreachable for exactly the files most likely to
+        // need it. The same asymmetry hides the resolved spelling: an agent
+        // that has already expanded `~` writes `/Users/<user>/.Trash`, which
+        // the `~`-only destination above cannot match.
+        //
+        // The source class is deliberately identical to `mv-to-trash` (home
+        // subpath, tmp family, or relative path -- never a bare `~`, a whole
+        // `/home/<user>` or `/Users/<user>` root, nor a sensitive system
+        // tree), only with quoted variants added. The destination is still a
+        // Trash directory, so the rescued operation stays recoverable.
+        //
+        // Quoted sources read `;`, `|` and `&` as file-name bytes, as
+        // `mv-within-home` does (GitHub #552): `mv "~/Documents/a & b.txt"
+        // ~/.Trash/` was denied while the same name with a space was allowed.
+        // That needs the regex to read quoting exactly as the shell does, so
+        // the dynamic-byte guard scans the whole text (no backslash anywhere
+        // means a quote closes only on its own kind), and an unquoted source
+        // may contain no quote character and no `{` (bash brace expansion,
+        // which would get past the `..` guard). Unquoted user names carry the
+        // component restrictions too.
+        // -----------------------------------------------------------------
+        safe_pattern!(
+            "mv-to-trash-quoted",
+            r#"^(?![\s\S]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:~/|/home/[^/\s'"$`;|&{]+/|/Users/[^/\s'"$`;|&{]+/|(?:/private)?(?:/var)?/tmp/|\./)?(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[A-Za-z0-9._][^\s;|&'"{]*|"(?:~/|/home/[^/"]+/|/Users/[^/"]+/|(?:/private)?(?:/var)?/tmp/|\./)?(?!\.\.(?:/|")|[^"]*/\.\.(?:/|"))[A-Za-z0-9._][^"$`]*"|'(?:~/|/home/[^/']+/|/Users/[^/']+/|(?:/private)?(?:/var)?/tmp/|\./)?(?!\.\.(?:/|')|[^']*/\.\.(?:/|'))[A-Za-z0-9._][^'$`]*'))+[ \t]+(?:(?:~|/home/[^/\s'"$`;|&{]+|/Users/[^/\s'"$`;|&{]+)(?:/\.local/share/Trash|/\.Trash)(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[^\s;|&"'{]*)?|"(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)(?:/\.local/share/Trash|/\.Trash)(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[^\s;|&"']*)?"|'(?:~|/home/[^/\s'"]+|/Users/[^/\s'"]+)(?:/\.local/share/Trash|/\.Trash)(?:/(?!\.\.(?:/|\s|$)|[^\s]*/\.\.(?:/|\s|$))[^\s;|&"']*)?')[ \t]*$"#
+        ),
+        // -----------------------------------------------------------------
+        // Ordinary renames and moves *inside* one home subtree.
+        //
+        // `mv-sensitive-source-root-home` fires on any mv whose command line
+        // mentions `/Users/...` or `/home/...`, so every rename under a home
+        // directory is denied -- and the escapes the two home rules
+        // recommend to each other close the loop: that rule points at
+        // `cp -a <src> <src>.bak && diff -r ... && <recursive delete of
+        // src>`, whose cleanup step `rm-rf-root-home` denies, and
+        // `rm-rf-root-home` points back at
+        // `mv <dir> /tmp/delete-me-<timestamp>`, which this rule denies. No
+        // sanctioned path completes, so routine file organisation under
+        // `~/Documents` needs a per-command `dcg allow-once`.
+        //
+        // What this rescues is strictly a rename within one user's own
+        // visible content, which cannot be the cross-segment
+        // relocate-then-delete bypass the rule exists for: both sides stay
+        // under the same home-root form, so nothing leaves the home tree and
+        // no recursive delete of the destination is allowed either.
+        //
+        // The boundaries, each load-bearing:
+        // - A source needs at least TWO components below the home root, so a
+        //   home root itself (`~`, `/Users/<user>`) and a top-level home
+        //   directory (`~/Documents`) can never be the thing being moved. A
+        //   destination needs one, because moving *into* `~/Desktop` is
+        //   ordinary while moving `~/Desktop` away is a restructure.
+        // - The first component below the home root may not begin with `.`,
+        //   so every dotfile tree -- `~/.ssh`, `~/.aws`, `~/.config`,
+        //   `~/.claude` -- keeps the deny on both sides.
+        // - `..` is rejected in every later component, so no token can climb
+        //   out of the home tree it names.
+        // - Dynamic expansion (`$`, backticks, backslashes) is excluded
+        //   anywhere in the command and inside every path token, so
+        //   `$HOME/...` and command substitution still fall through to the
+        //   fail-closed rules. Flags may not take a value, which keeps
+        //   `mv -t /etc ...` and `--target-directory=/etc` out.
+        // - Brace expansion is expansion too: an unquoted `{` withholds the
+        //   rescue. Bash expands the token before mv sees it, past both checks
+        //   above: `~/{..,a}/{..,b}/etc` becomes `~/../../etc`, and
+        //   `~/{Documents,.ssh}/id_rsa` becomes a dotfile path. Inside quotes
+        //   a brace is literal and stays allowed.
+        // - Anchored whole-command, so a compound that appends a destructive
+        //   second segment is not rescued: an unquoted `;`, `|` or `&` can
+        //   appear in no token, including the home-root user name.
+        //
+        // Inside a quoted token, `;`, `|` and `&` are file-name bytes, not
+        // separators (GitHub #552): `mv "~/Downloads/a & b.pdf" ...` is one
+        // two-operand mv, and the segmenter that hands this pattern its text
+        // already keeps it whole. The quoted classes used to exclude them,
+        // which denied any personal file named with `&` while the same name
+        // under /tmp, or with any other punctuation, was allowed. That
+        // exclusion was only needed because the dynamic-expansion lookahead
+        // stopped scanning at the first `;|&`; it now scans the whole text.
+        // With no backslash anywhere, a quote can only be closed by its own
+        // kind, so each quoted token this pattern reads is exactly the word
+        // the shell reads, and no unquoted separator can hide inside one.
+        // -----------------------------------------------------------------
+        safe_pattern!(
+            "mv-within-home",
+            r#"^(?![\s\S]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:~|/home/[^/\s'"$`;|&{]+|/Users/[^/\s'"$`;|&{]+)/(?!\.)[^/\s'"$`;|&{]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&{]+)+/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`]+(?:/(?!\.\.(?:/|"))[^/"$`]+)+/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`]+(?:/(?!\.\.(?:/|'))[^/'$`]+)+/?'))+[ \t]+(?:(?:~|/home/[^/\s'"$`;|&{]+|/Users/[^/\s'"$`;|&{]+)/(?!\.)[^/\s'"$`;|&{]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&{]+)*/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`]+(?:/(?!\.\.(?:/|"))[^/"$`]+)*/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`]+(?:/(?!\.\.(?:/|'))[^/'$`]+)*/?')[ \t]*$"#
+        ),
+        // -----------------------------------------------------------------
+        // The same ordinary rename, written with a relative source.
+        //
+        // `mv-sensitive-source-root-home` fires on any mv whose command line
+        // *mentions* a home path, and `mv-within-home` above only rescues the
+        // command when BOTH operands are home-rooted. So moving a file into a
+        // home directory from the directory it already sits in was denied
+        // while the identical move with an absolute source was allowed
+        // (GitHub #422):
+        //
+        //     mv a.md /home/u/project/x/docs/a.md            denied
+        //     mv /home/u/project/x/a.md /home/u/project/x/docs/a.md   allowed
+        //     mv a.md docs/a.md                              allowed
+        //
+        // The rule keys on a spelling, not on a risk. The boundary it states
+        // — that a top-level home directory can never be the thing being
+        // moved — does not hold today either: `mv Documents backup/` run from
+        // `$HOME` does exactly that and is allowed, because no absolute home
+        // path appears in it. Accepting a relative source here therefore adds
+        // no exposure that spelling both operands relatively does not already
+        // have.
+        //
+        // The source side is constrained to what cannot reach out of the
+        // working directory or name a hidden tree:
+        // - `(?![-~.])` on the first component refuses a flag (`-t`), a
+        //   home-rooted path (`~/...`), and every dotfile tree (`.ssh`,
+        //   `.aws`), while `(?:\./)?` still permits the ordinary `./x`.
+        // - A leading `/` cannot match at all: the component class excludes
+        //   it, so absolute sources keep going through `mv-within-home`.
+        // - `..` is refused in every later component, so no source can climb
+        //   out of the tree it names, and an unquoted `{` withholds the
+        //   rescue on both sides, since `{..,a}/x` expands to `../x`.
+        // - Dynamic expansion is excluded anywhere in the command and inside
+        //   every token, and the whole command is anchored, so a compound
+        //   that appends a destructive second segment is not rescued.
+        // - Quoted tokens read `;`, `|` and `&` as the file-name bytes they
+        //   are, exactly as `mv-within-home` does (GitHub #552).
+        // The destination alternation is lifted verbatim from
+        // `mv-within-home` so the two cannot disagree about what a
+        // home-rooted target is.
+        // -----------------------------------------------------------------
+        safe_pattern!(
+            "mv-relative-into-home",
+            r#"^(?![\s\S]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:\./)?(?![-~.])[^/\s'"$`;|&{]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&{]+)*/?|"(?:\./)?(?![-~.])[^/"$`]+(?:/(?!\.\.(?:/|"))[^/"$`]+)*/?"|'(?:\./)?(?![-~.])[^/'$`]+(?:/(?!\.\.(?:/|'))[^/'$`]+)*/?'))+[ \t]+(?:(?:~|/home/[^/\s'"$`;|&{]+|/Users/[^/\s'"$`;|&{]+)/(?!\.)[^/\s'"$`;|&{]+(?:/(?!\.\.(?:/|\s|$))[^/\s'"$`;|&{]+)*/?|"(?:~|/home/[^/"]+|/Users/[^/"]+)/(?!\.)[^/"$`]+(?:/(?!\.\.(?:/|"))[^/"$`]+)*/?"|'(?:~|/home/[^/']+|/Users/[^/']+)/(?!\.)[^/'$`]+(?:/(?!\.\.(?:/|'))[^/'$`]+)*/?')[ \t]*$"#
+        ),
+    ];
+    // Every possible safe match still runs its complete authored regex. The
+    // opt-in proof only avoids compiling/running an anchored backtracking
+    // pattern when its required literal prefix cannot match (#555).
+    for pattern in &mut patterns {
+        pattern.regex.enable_anchored_prefix_filter();
+    }
+    patterns
 }
 
+/// The destructive patterns for `core.filesystem`.
+///
+/// # A pattern here cannot match an argv operand
+///
+/// This pack and `core.git` are the two the evaluator treats as argv-inert.
+/// `command_pattern_match_is_inert_quoted_data` rejects any match from them
+/// whose first alphanumeric byte lands in a span `offset_is_quoted_data`
+/// classifies as `SpanKind::Data` **or** `SpanKind::Argument` — that is, any
+/// operand, quoted or not. Only the two rules named by
+/// `is_core_filesystem_redirect_rule` are exempt.
+///
+/// This is deliberate and load-bearing: it is what keeps
+/// `git commit -m "rm -rf /"` from being read as the command it quotes. Do not
+/// weaken it to rescue a single rule.
+///
+/// The consequence for authors is concrete. A rule whose match begins at the
+/// command word (`rm …`, a redirect operator) works. A rule that keys on a
+/// *path in argv* — `tee .git/config`, `cp x .git/config` — will match the
+/// regex, pass `Pack::check`, pass `Pack::might_match`, pass the registry gate,
+/// pass every pack-level test, and then be discarded by the evaluator, so it
+/// decides nothing for a user. `tee-git-internals` shipped that way (#460).
+///
+/// A path-keyed writer therefore belongs in the `credential_files.rs`
+/// classifier, which inspects resolved operands, not in a pattern here. And a
+/// new rule of that shape is only proven by an assertion through
+/// `evaluate_command` — see
+/// `the_evaluator_actually_decides_every_command_its_rules_must_reach`.
 fn create_destructive_patterns() -> Vec<DestructivePattern> {
     // Severity levels:
     // - Critical: Most dangerous, irreversible, high-confidence detections
@@ -1077,6 +5205,15 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             High,
             "Use a literal sed replacement or inspect the fully rendered shell command before allowing execution. Backreferences, '&', and an empty `e` command depend on runtime input."
         ),
+        // Emitted by the bounded tar helper semantic pass, never by a raw
+        // command regex. Keep metadata available for diagnostics and review.
+        destructive_pattern!(
+            "tar-exec-unverified",
+            r"(?!)",
+            "GNU tar executes a helper whose command or executable input dcg cannot statically verify.",
+            High,
+            "Inspect the fully resolved tar helper and any archive data it executes before using an exact-command allow-once review. Prefer literal helper commands; archive bytes are not verified shell or database input."
+        ),
         // ----- cross-segment sensitive propagation before rm fallbacks -----
         //
         // These patterns must run before the general rm rules below. Otherwise
@@ -1085,7 +5222,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // chain can be classified.
         destructive_pattern!(
             "cp-sensitive-then-delete",
-            r#"\bcp\b[^|;&]*(?:\s(?:-[A-Za-z]*a[A-Za-z]*|--archive)\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)[^|;&\s'"]*[^|;&]*(?:&&|;|\|\|)[^|;&]*\brm\b[^|;&]*\s(?:-[A-Za-z]*[rR][A-Za-z]*f[A-Za-z]*|-[A-Za-z]*f[A-Za-z]*[rR][A-Za-z]*|-[rR]\s+-f|-f\s+-[rR]|--recursive\s+--force|--force\s+--recursive)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)"#,
+            r#"\bcp\b[^|;&]*(?:\s(?:-[A-Za-z]*a[A-Za-z]*|--archive)\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)[^|;&\s'"]*[^|;&]*(?:&&|;|\|\|)[^|;&]*\brm\b[^|;&]*\s(?:-[A-Za-z]*[rR][A-Za-z]*f[A-Za-z]*|-[A-Za-z]*f[A-Za-z]*[rR][A-Za-z]*|-[rR]\s+-f|-f\s+-[rR]|--recursive\s+--force|--force\s+--recursive)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)"#,
             "archive copy of a sensitive path into temp followed by forced recursive deletion is a cross-segment data-loss bypass. EXTREMELY DANGEROUS.",
             Critical,
             "`cp -al /etc /tmp/x && rm -rf /tmp/x` is a propagation variant of the \
@@ -1100,7 +5237,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "ln-symlink-sensitive-then-delete",
-            r#"\bln\b[^|;&]*\s-[A-Za-z]*s[A-Za-z]*[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)[^|;&\s'"]*[^|;&]*(?:&&|;|\|\|)[^|;&]*\brm\b[^|;&]*\s(?:-[A-Za-z]*[rR][A-Za-z]*f[A-Za-z]*|-[A-Za-z]*f[A-Za-z]*[rR][A-Za-z]*|-[rR]\s+-f|-f\s+-[rR]|--recursive\s+--force|--force\s+--recursive)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)"#,
+            r#"\bln\b[^|;&]*\s-[A-Za-z]*s[A-Za-z]*[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)[^|;&\s'"]*[^|;&]*(?:&&|;|\|\|)[^|;&]*\brm\b[^|;&]*\s(?:-[A-Za-z]*[rR][A-Za-z]*f[A-Za-z]*|-[A-Za-z]*f[A-Za-z]*[rR][A-Za-z]*|-[rR]\s+-f|-f\s+-[rR]|--recursive\s+--force|--force\s+--recursive)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)"#,
             "symlink from a sensitive path into temp followed by forced recursive deletion can traverse and destroy the target. EXTREMELY DANGEROUS.",
             Critical,
             "`ln -s /etc /tmp/x && rm -rf /tmp/x/.` can turn an apparently safe temp \
@@ -1114,7 +5251,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "rsync-sensitive-then-delete",
-            r#"\brsync\b[^|;&]*(?:\s(?:-[A-Za-z]*a[A-Za-z]*|--archive)\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)[^|;&\s'"]*[^|;&]*(?:&&|;|\|\|)[^|;&]*\brm\b[^|;&]*\s(?:-[A-Za-z]*[rR][A-Za-z]*f[A-Za-z]*|-[A-Za-z]*f[A-Za-z]*[rR][A-Za-z]*|-[rR]\s+-f|-f\s+-[rR]|--recursive\s+--force|--force\s+--recursive)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)"#,
+            r#"\brsync\b[^|;&]*(?:\s(?:-[A-Za-z]*a[A-Za-z]*|--archive)\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)[^|;&\s'"]*[^|;&]*(?:&&|;|\|\|)[^|;&]*\brm\b[^|;&]*\s(?:-[A-Za-z]*[rR][A-Za-z]*f[A-Za-z]*|-[A-Za-z]*f[A-Za-z]*[rR][A-Za-z]*|-[rR]\s+-f|-f\s+-[rR]|--recursive\s+--force|--force\s+--recursive)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/tmp/|/var/tmp/|\$TMPDIR/|\$\{TMPDIR\}/)"#,
             "rsync archive of a sensitive path into temp followed by forced recursive deletion is a cross-segment data-loss bypass. EXTREMELY DANGEROUS.",
             Critical,
             "`rsync -a /etc/ /tmp/dest/ && rm -rf /tmp/dest` is the rsync form of the \
@@ -1126,6 +5263,30 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Use `rm -ri` for manual cleanup of derived temp trees.",
             SENSITIVE_PROPAGATION_DELETE_SUGGESTIONS
         ),
+        // `rsync --delete` into a system directory or a home root MIRRORS the
+        // source over the destination, DELETING every destination file the
+        // source does not have. `rsync --delete /empty/ /etc/` wipes /etc as
+        // surely as `rm -rf /etc`, yet it carried no rule. Keyed on the
+        // DESTINATION only: `--delete` into an ordinary backup dir, or into a
+        // subdirectory of a home (`~/backup/`, `/home/u/proj/`), is a routine
+        // operation and stays allowed, as does any `--dry-run`. A sensitive
+        // path as the SOURCE (`rsync --delete /etc/ /backup/`) is unaffected.
+        destructive_pattern!(
+            "rsync-delete-sensitive-dest",
+            r#"\brsync\b(?![^|;&\r\n]*(?:--dry-run\b|\s-[A-Za-z]*n[A-Za-z]*(?:\s|$)))(?=[^|;&\r\n]*\s--del(?:ete(?:-(?:after|before|during|delay|excluded))?)?\b)[^|;&\r\n]*[\s=](?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|sys|proc|dev|opt)(?:/[^\s;&|<>()'"]*)?|/(?:home|Users)(?:/[^/\s;&|<>()'"]+)?/?|/|~/?|\$\{?HOME\}?/?)\s*(?:$|[;&|<>)])"#,
+            "rsync --delete into a system directory or home root mirror-deletes its contents. EXTREMELY DANGEROUS.",
+            Critical,
+            "rsync --delete makes the destination match the source, so it DELETES every \
+             file in the destination that is not present in the source. Aimed at /, /etc, \
+             /usr, a home root, or another system path, an empty or wrong source empties \
+             that directory — the same catastrophe as `rm -rf` on it, with no undo.\n\n\
+             Safer alternatives:\n\
+             - Preview first: add `--dry-run` (or `-n`) and read the deletion list.\n\
+             - Drop `--delete` to copy without removing extra destination files.\n\
+             - Mirror into a dedicated, non-system directory you own.\n\
+             - Back the destination up before a real mirror into it.",
+            SENSITIVE_PROPAGATION_DELETE_SUGGESTIONS
+        ),
         // rm -rf on root or home paths (CRITICAL - catastrophic, never allow)
         // Target set covers:
         //   - literal `/` or `~` (optionally quoted/backslash-escaped)
@@ -1133,7 +5294,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         //     expands to the user's home directory before rm sees it
         destructive_pattern!(
             "rm-rf-root-home",
-            r#"rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+['"\\]?(?:[/~]|\$\{?HOME\b)|rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+['"\\]?(?:[/~]|\$\{?HOME\b)"#,
+            r#"(?:^|[^A-Za-z0-9_.-])rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+['"\\]?(?:[/~]|\$\{?HOME\b)|(?:^|[^A-Za-z0-9_.-])rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+['"\\]?(?:[/~]|\$\{?HOME\b)"#,
             "rm -rf on root or home paths is EXTREMELY DANGEROUS. This command will NOT be executed. Ask the user to run it manually if truly needed.",
             Critical,
             "This command would recursively delete files starting from the root filesystem (/) \
@@ -1144,10 +5305,20 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Boot files, making the system unbootable\n\n\
              There is NO recovery without backups. Even with backups, full restoration \
              takes hours to days.\n\n\
-             If you need to delete specific files, use explicit paths:\n  \
-             rm -rf /path/to/specific/directory\n\n\
-             Always preview what would be deleted first:\n  \
-             find /path/to/directory -type f | head -20",
+             dcg auto-allows recursive deletion only for literal temp paths:\n  \
+             rm -rf /tmp/<subdir>/scratch\n\n\
+             For any other directory, preview first, then either delete interactively \
+             or move the tree aside. dcg allows all three forms, the Trash move only \
+             for a source under a home directory, under a temp directory, or a relative \
+             path, not for any other absolute path (`mv /opt/<x> ~/.Trash/` stays \
+             denied by `mv-sensitive-source-root-home`):\n  \
+             find /path/to/directory -type f | head -20\n  \
+             rm -ri /path/to/directory   # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
+             mv /path/to/directory ~/.Trash/            # macOS soft-delete, recoverable\n  \
+             mv /path/to/directory ~/.local/share/Trash/ # Linux soft-delete, recoverable\n\n\
+             Under a home directory, prefer the Trash move: relocating into /tmp is \
+             itself denied there (`mv-sensitive-source-root-home`), because \
+             relocate-then-delete is the bypass that rule exists to stop.",
             RM_RF_ROOT_HOME_SUGGESTIONS
         ),
         // Same root/home catastrophe but with SEPARATE flags (`rm -r -f /`,
@@ -1157,29 +5328,39 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // Critical root deletion.
         destructive_pattern!(
             "rm-r-f-separate-root-home",
-            r#"rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f\s+['"\\]?(?:[/~]|\$\{?HOME\b)|rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]\s+['"\\]?(?:[/~]|\$\{?HOME\b)"#,
+            r#"(?:^|[^A-Za-z0-9_.-])rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f\s+['"\\]?(?:[/~]|\$\{?HOME\b)|(?:^|[^A-Za-z0-9_.-])rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]\s+['"\\]?(?:[/~]|\$\{?HOME\b)"#,
             "rm with separate -r -f flags targeting root or home is EXTREMELY DANGEROUS.",
             Critical,
             "Separate `-r -f` flags on `/` or `~` have identical effect to `rm -rf /`: \
              recursive, forced, silent deletion of the entire filesystem or home directory.\n\n\
-             There is NO recovery without backups. Run only if truly intended.",
+             There is NO recovery without backups. Run only if truly intended.\n\n\
+             For a specific directory, preview first, then either delete interactively \
+             or move the tree aside (dcg allows both forms):\n  \
+             ls -la /path/to/directory\n  \
+             rm -ri /path/to/directory   # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
+             mv /path/to/directory /tmp/delete-me-<literal-timestamp>",
             RM_RF_ROOT_HOME_SUGGESTIONS
         ),
         // Same root/home catastrophe but with LONG flags
         // (`rm --recursive --force /`, `rm --force --recursive /`).
         destructive_pattern!(
             "rm-recursive-force-root-home",
-            r#"rm\s+.*--recursive.*--force\s+['"\\]?(?:[/~]|\$\{?HOME\b)|rm\s+.*--force.*--recursive\s+['"\\]?(?:[/~]|\$\{?HOME\b)"#,
+            r#"(?:^|[^A-Za-z0-9_.-])rm\s+.*--recursive.*--force\s+['"\\]?(?:[/~]|\$\{?HOME\b)|(?:^|[^A-Za-z0-9_.-])rm\s+.*--force.*--recursive\s+['"\\]?(?:[/~]|\$\{?HOME\b)"#,
             "rm --recursive --force targeting root or home is EXTREMELY DANGEROUS.",
             Critical,
             "The long-flag form has identical effect to `rm -rf /`: recursive, forced, \
-             silent deletion. Run only if truly intended.",
+             silent deletion. Run only if truly intended.\n\n\
+             For a specific directory, preview first, then either delete interactively \
+             or move the tree aside (dcg allows both forms):\n  \
+             ls -la /path/to/directory\n  \
+             rm -ri /path/to/directory   # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
+             mv /path/to/directory /tmp/delete-me-<literal-timestamp>",
             RM_RF_ROOT_HOME_SUGGESTIONS
         ),
         // General rm -rf (caught after safe patterns) - High because temp paths are allowed
         destructive_pattern!(
             "rm-rf-general",
-            r"rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f|rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR]",
+            r"(?:^|[^A-Za-z0-9_.-])rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f|(?:^|[^A-Za-z0-9_.-])rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR]",
             "rm -rf is destructive and requires human approval. Explain what you want to delete and why, then ask the user to run the command manually.",
             High,
             "rm -rf recursively removes files and directories without confirmation prompts. \
@@ -1191,8 +5372,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Wildcards can expand to match more than expected\n\
              - No undo mechanism exists\n\n\
              Safe alternatives:\n\
-             - rm -ri: Interactive mode, confirms each file\n\
-             - trash-cli: Moves files to trash instead of deleting\n\
+             - rm -ri: Interactive mode, confirms each file. Needs a terminal: with stdin closed, as under an agent hook, it prompts, deletes nothing, and exits 0\n\
+             - mv <path> /tmp/delete-me-<literal-timestamp>: Move the tree aside instead of deleting it (dcg allows this form)\n\
+             - trash-cli (Linux) or mv <path> ~/.Trash/ (macOS): Moves files to trash instead of deleting\n\
              - rm -rf in literal /tmp or /var/tmp subdirectories: Allowed\n\
              - Variable-rooted paths such as $TMPDIR: Reviewed because the environment may point anywhere\n\n\
              Preview what would be deleted:\n  \
@@ -1200,10 +5382,35 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              ls -la /path/to/delete               # List contents",
             RM_RF_GENERAL_SUGGESTIONS
         ),
+        // Globbed rm under a home directory, with or without -r/-f (#247).
+        //
+        // From a data-loss standpoint the glob IS the recursion:
+        // `rm -f ~/Downloads/*` destroys approximately the same file set as
+        // the already-blocked `rm -rf ~/Downloads`, and unlike a named file
+        // the *shell*, not the author, decides the file set at run time. An
+        // unquoted glob is required — a quoted `"~/x/*.md"` never expands, so
+        // the root alternation deliberately accepts no quote prefix. Bounded,
+        // single-file deletes like `rm -f ~/Downloads/one-file.md` are
+        // untouched.
+        destructive_pattern!(
+            "rm-glob-home",
+            r"(?:^|[^\w-])rm\b[^|;&\n]*?[ \t](?:~|/Users|/home|\$\{?HOME\}?)/[^|;&\s]*[*?\[]",
+            "rm with an unexpanded glob under a home directory deletes an unbounded, shell-chosen file set and requires human approval.",
+            High,
+            "The glob is expanded by the shell at execution time, so the author cannot \
+             review the exact file set being deleted: `rm -f ~/Downloads/*.md` removes \
+             every matching file, exactly like the already-blocked recursive forms.\n\n\
+             Safer alternatives:\n\
+             - Preview the expansion first: `ls ~/Downloads/*.md`\n\
+             - Delete explicitly named files: `rm ~/Downloads/one-file.md`\n\
+             - Move to trash instead: `mv ~/Downloads/*.md ~/.Trash/` on macOS, \
+             `mv ~/Downloads/*.md ~/.local/share/Trash/` on Linux",
+            RM_RF_GENERAL_SUGGESTIONS
+        ),
         // rm -r -f (separate flags)
         destructive_pattern!(
             "rm-r-f-separate",
-            r"rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f|rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]",
+            r"(?:^|[^A-Za-z0-9_.-])rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f|(?:^|[^A-Za-z0-9_.-])rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]",
             "rm with separate -r -f flags is destructive and requires human approval.",
             High,
             "rm with separate -r and -f flags has the same effect as rm -rf: recursive \
@@ -1213,6 +5420,12 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - rm -f -r path\n\
              - rm -r -f -v path (verbose but still forced)\n\n\
              All carry the same risks as rm -rf: immediate, silent, irreversible deletion.\n\n\
+             This rule matches the -r/-f flag PAIR, not a filesystem path, so it also \
+             fires when `rm` is another tool's subcommand (`git rm -r -f`, \
+             `bq rm -r -f`). The recursive-force semantics still apply, but to that \
+             tool's objects — tracked files and index entries for git, a dataset and \
+             everything in it for bq — not to a directory tree. Enable that tool's pack \
+             for guidance written for it; this rule is the backstop when it is not.\n\n\
              Safer approach for temporary directories:\n\
              - rm -r -f /tmp/mydir    # Allowed - temp directories are safe\n\
              - Resolve and inspect $TMPDIR before using it as a deletion root\n\n\
@@ -1223,7 +5436,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // rm --recursive --force (long flags)
         destructive_pattern!(
             "rm-recursive-force-long",
-            r"rm\s+.*--recursive.*--force|rm\s+.*--force.*--recursive",
+            r"(?:^|[^A-Za-z0-9_.-])rm\s+.*--recursive.*--force|(?:^|[^A-Za-z0-9_.-])rm\s+.*--force.*--recursive",
             "rm --recursive --force is destructive and requires human approval.",
             High,
             "rm --recursive --force is the long-form equivalent of rm -rf. While more \
@@ -1237,18 +5450,40 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Use absolute paths to avoid ambiguity\n\
              - Consider using trash-cli for recoverable deletion\n\n\
              Preview command:\n  \
-             find /path --maxdepth 2 -ls | head -30",
+             find /path -maxdepth 2 -ls | head -30\n\n\
+             Forms dcg accepts instead:\n  \
+             rm --recursive --force /tmp/<subdir>   # literal temp paths are allowed\n  \
+             rm -ri /path/to/directory              # needs a terminal; with stdin closed it deletes nothing and exits 0\n  \
+             mv /path/to/directory /tmp/delete-me-<literal-timestamp>",
             RM_RECURSIVE_FORCE_SUGGESTIONS
         ),
         // ----- `find ... -delete` (Critical: root/home target) -----
         //
-        // `find <sensitive-path> -delete` recursively removes everything
-        // under the path — bytewise-equivalent to `rm -rf <sensitive-path>`.
+        // `find <sensitive-path> -delete` removes everything its predicate
+        // matches under the path; unfiltered, that is `rm -rf <sensitive-path>`.
         // This rule exists to close the most common dcg-bypass pattern in
         // the wild: agents that learn `rm -rf` is blocked simply swap it
         // for `find -delete`. Without this rule, dcg's protection against
         // catastrophic root/home deletion is one Google search away from
         // useless.
+        //
+        // What the rule actually keys on is a sensitive path token appearing
+        // anywhere between `find` and `-delete`. That is deliberately coarse in
+        // two directions, and the user-facing text must not overstate either:
+        //
+        //   - It does not evaluate `-name`/`-maxdepth`/`-type`, so a narrowly
+        //     scoped delete under home is gated like an unfiltered one (#418).
+        //   - It does not require the sensitive path to be the search ROOT, so
+        //     `find /tmp/x -newer /etc/passwd -delete` denies even though only
+        //     `/tmp/x` is searched.
+        //
+        // Claiming the scoped form is "bytewise-equivalent to rm -rf on
+        // root/home" was false, and the old text additionally advised
+        // re-rooting "under a more specific subdir", which does not lift the
+        // rule while that subdir is still under home. Both cost the reporter of
+        // #418 real diagnosis time, so say what is true: dcg gates on the paths
+        // the command names, and a denial is not a measurement of its blast
+        // radius.
         //
         // The regex matches `find` at any word boundary (so it fires
         // inside compound commands like `echo foo; find /etc -delete`,
@@ -1268,21 +5503,38 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             // `(find /etc -delete)` and `find /etc -delete | tee log`
             // both fire. Without `)` in the set, subshell forms
             // silently bypass.
-            r#"\bfind\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)[^|;&]*?\s-delete(?:\s|$|[;&|)\n])"#,
-            "find <sensitive-path> -delete is bytewise-equivalent to rm -rf on root/home and is EXTREMELY DANGEROUS. This command will NOT be executed.",
+            // The action is `-delete` or `-exec`/`-execdir rm … {}`: the second
+            // is the same deletion of the found files spelled the older way,
+            // and was allowed. `{}` may be quoted or escaped.
+            r#"\bfind\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)[^|;&]*?\s(?:-delete(?:\s|$|[;&|)\n])|-exec(?:dir)?\s+(?:[^\s;&|]*/)?rm(?:\s+-\S+)*\s+(?:['"]?\{\}['"]?|\\\{\\\})(?:\s|$))"#,
+            "find ... -delete naming root, home, or a system directory requires explicit approval. dcg gates on the paths the command names, not on the -name/-maxdepth filters that may narrow what it deletes. This command will NOT be executed.",
             Critical,
-            "`find <path> -delete` is the bytewise-equivalent of `rm -rf <path>`: \
-             it recursively removes every file and (when -depth is implied) every \
-             directory matched by the predicate. Targeting `/`, `~`, `$HOME`, or any \
-             top-level system directory (`/etc`, `/usr`, `/var`, `/home`, `/boot`, \
-             `/dev`, `/proc`, `/sys`, `/lib`, `/lib64`, `/opt`, `/root`) destroys \
-             the operating system or user data the same way `rm -rf` would.\n\n\
-             There is NO recovery without backups.\n\n\
-             If you only need to delete files matching a pattern, use a much more \
-             specific path:\n  \
-             find /path/to/specific/subdir -name '*.tmp' -delete\n\n\
+            "`find <path> -delete` removes every file the predicate matches beneath \
+             `<path>`, and with `-depth` implied it removes matched directories too. \
+             Rooted at `/`, `~`, `$HOME`, or a top-level system directory (`/etc`, \
+             `/usr`, `/var`, `/home`, `/boot`, `/dev`, `/proc`, `/sys`, `/lib`, \
+             `/lib64`, `/opt`, `/root`), the unfiltered form destroys the operating \
+             system or the user's data exactly as `rm -rf` would, and there is NO \
+             recovery without backups. It is also the most common way an agent \
+             works around a blocked `rm -rf`.\n\n\
+             This rule fires on a sensitive path appearing anywhere between `find` \
+             and `-delete`, and it is deliberately coarse in two ways. It does not \
+             evaluate `-name`, `-maxdepth`, `-type`, or any other predicate, so a \
+             narrowly filtered delete under home is gated like an unfiltered one — \
+             a predicate is easy to get wrong, and the blast radius of a wrong one \
+             is the whole subtree. It also does not require the sensitive path to be \
+             the search root, so `find /tmp/x -newer /etc/passwd -delete` is gated \
+             even though only `/tmp/x` is searched.\n\n\
+             So a denial here is NOT a measurement of what this particular command \
+             would have removed. It reports which paths the command names.\n\n\
+             To delete inside root or home, pick one:\n  \
+             find /tmp/<subdir> -delete                       # literal temp roots are allowed\n  \
+             dcg allow-once <code>                            # one-shot, from the code in this denial\n  \
+             dcg allowlist add-command '<exact command>' -r \"reviewed\" --user\n\n\
+             Re-rooting under a more specific subdirectory does NOT lift this rule \
+             while that subdirectory is still under root or home.\n\n\
              Always preview first:\n  \
-             find /path -type f | head -20",
+             find <path> -type f | head -20",
             FIND_DELETE_SUGGESTIONS
         ),
         // ----- `find ... -delete` (High: any other target) -----
@@ -1300,7 +5552,11 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             // `\b`) so `-delete-this-not-a-flag` — where `\b` happily
             // allows the following `-` — does NOT false-positive, while
             // shell separators and subshell-close are still accepted.
-            r"\bfind\b[^|;&]*\s-delete(?:\s|$|[;&|)\n])",
+            // `-exec rm {} \;` / `-execdir rm -f {} +` deletes the found files,
+            // the same deletion as `-delete`; only `-delete` was recognised,
+            // so the older, more common spelling walked straight through. An
+            // `-exec rm` of a fixed operand (not `{}`) is left to the rm rules.
+            r#"\bfind\b[^|;&]*\s(?:-delete(?:\s|$|[;&|)\n])|-exec(?:dir)?\s+(?:[^\s;&|]*/)?rm(?:\s+-\S+)*\s+(?:['"]?\{\}['"]?|\\\{\\\})(?:\s|$))"#,
             "find ... -delete is destructive (bytewise-equivalent to rm -rf on the matched tree) and requires human approval.",
             High,
             "`find ... -delete` recursively deletes every path matched by the find \
@@ -1325,14 +5581,20 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // is one-shot data destruction with no recovery and no recursion
         // budget to slow it down.
         //
-        // The regex matches `unlink` at any word boundary (so it fires in
-        // compound forms and after `sudo`/`env` wrappers, and on
-        // path-prefixed binaries via PATH_NORMALIZER), then a sensitive
-        // path token. Single argument only — multi-arg unlink isn't
-        // standard.
+        // The executed-argv classifier supplies a bare command word for
+        // literal quoted/path-prefixed spellings. These patterns retain the
+        // established rule IDs and sensitive-path attribution, with executable
+        // scoping on the legacy raw-text fallback. Single argument only —
+        // multi-arg unlink isn't standard.
+        //
+        // The scope also names the programs that run a command line on
+        // another host or in a container (`ssh host unlink …`, `docker exec
+        // c unlink …`, `kubectl exec pod -- unlink …`) and `toybox`, which
+        // runs an applet as `busybox` does. The unscoped rules denied those,
+        // and scoping to argv0 (#550) had let them through.
         destructive_pattern!(
             "unlink-root-home",
-            r#"\bunlink\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
+            r#"\bunlink\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
             "unlink on a sensitive system or home path is one-shot data destruction with no recovery. EXTREMELY DANGEROUS.",
             Critical,
             "`unlink <file>` is the raw POSIX unlink(2) primitive: it removes a single \
@@ -1346,7 +5608,11 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                `unlink <file>.deleted-...` after a few days.\n\
              - `cp <file> <file>.bak && unlink <file>` to keep an explicit backup.\n\
              - `unlink /tmp/<subdir>/scratch` is allowed (temp dirs).",
-            UNLINK_SUGGESTIONS
+            UNLINK_SUGGESTIONS,
+            executables = [
+                "unlink", "ssh", "toybox", "docker", "podman", "nerdctl", "kubectl", "oc", "lxc",
+                "incus"
+            ]
         ),
         // ----- `unlink <file>` (High: any other target) -----
         //
@@ -1365,7 +5631,11 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Make a backup: `cp <file> <file>.bak`.\n\
              - For temp scratch: `unlink /tmp/<subdir>/scratch` is allowed.\n\
              - Use `mv <file> /tmp/quarantine-<file>` if you want a delayed delete.",
-            UNLINK_SUGGESTIONS
+            UNLINK_SUGGESTIONS,
+            executables = [
+                "unlink", "ssh", "toybox", "docker", "podman", "nerdctl", "kubectl", "oc", "lxc",
+                "incus"
+            ]
         ),
         // ----- destructive `truncate -s/--size` (Critical: root/home/system) -----
         //
@@ -1380,7 +5650,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // `truncate-grow` safe pattern above.
         destructive_pattern!(
             "truncate-zero-root-home",
-            r#"\btruncate\b[^|;&]*?(?:\s-s\s+(?!\+)\S+|\s--size=(?!\+)\S+)[^|;&]*?\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
+            r#"\btruncate\b[^|;&]*?(?:\s-[co]*s\s*(?!\+)\S+|\s--size(?:=|\s+)(?!\+)\S+)[^|;&]*?\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
             "truncate with a potentially shrinking size on a sensitive system or home path destroys data. EXTREMELY DANGEROUS.",
             Critical,
             "`truncate -s 0 <file>` zeros a file in place. `truncate -s -<N> <file>` \
@@ -1397,7 +5667,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // ----- destructive `truncate -s/--size` (High: any other target) -----
         destructive_pattern!(
             "truncate-zero-general",
-            r"\btruncate\b[^|;&]*?(?:\s-s\s+(?!\+)\S+|\s--size=(?!\+)\S+)",
+            r"\btruncate\b[^|;&]*?(?:\s-[co]*s\s*(?!\+)\S+|\s--size(?:=|\s+)(?!\+)\S+)",
             "truncate with an absolute or shrinking size can destroy file content and requires human approval.",
             High,
             "`truncate -s 0 <file>` zeros a file in place; `truncate -s -<N> <file>` \
@@ -1423,7 +5693,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // sensitive paths.
         destructive_pattern!(
             "shred-root-home",
-            r#"\bshred\b[^|;&]*?\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
+            r#"\bshred\b[^|;&]*?\s+['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=\s|$|['"]))|/(?=\s|$|['"])|~(?=\s|$|/)|\$\{?HOME\b)"#,
             "shred on a sensitive system or home path destroys data beyond forensic recovery. EXTREMELY DANGEROUS.",
             Critical,
             "`shred` overwrites file content with random data (DoD-style multi-pass by \
@@ -1489,7 +5759,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // latent gap; closing it pack-wide is tracked separately.
         destructive_pattern!(
             "tar-remove-files-root-home",
-            r#"\btar\b[^|;&]*?\s--remove-files\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)|\btar\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)[^|;&]*?\s--remove-files\b"#,
+            r#"\btar\b[^|;&]*?\s--remove-files\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)|\btar\b[^|;&]*?(?:\s|=)['"\\]?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)[^|;&]*?\s--remove-files\b"#,
             "tar --remove-files on a sensitive system or home path is recursive deletion masquerading as an archive operation. EXTREMELY DANGEROUS.",
             Critical,
             "`tar --remove-files -cf <archive> <source>` first archives the source paths \
@@ -1547,7 +5817,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // `(dd if=/dev/zero of=/etc/passwd)` still classify as Critical.
         destructive_pattern!(
             "dd-overwrite-root-home",
-            r#"\bdd\b[^|;&]*?\bof=['"\\]?(?!/dev/)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
+            r#"\bdd\b[^|;&]*?\bof=['"\\]?(?!/dev/)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
             "dd of=<sensitive-path> overwrites file contents in place. EXTREMELY DANGEROUS on a system or home file.",
             Critical,
             "`dd if=/dev/zero of=<file>` and `dd if=/dev/urandom of=<file>` overwrite the \
@@ -1628,9 +5898,17 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // path forms. Without these, `mv $'/etc' /tmp/x` slipped
         // through as a HIGH-impact bypass since mv has no general
         // tier to fall back on.
+        //
+        // `mv` must be a whole shell word (#550): `\bmv\b` also matched it
+        // inside a hyphenated or dotted token, so `git checkout -b
+        // fix-mv-handling /home/u/repo`, `tool x-mv …` and `tool --no-mv
+        // /etc/hosts` were denied as moves. A quoted or path-prefixed `mv`
+        // still counts, and so does a word the shell still reads as `mv`:
+        // empty quotes glued to it (`mv"" /etc /x`) or a redirection glued
+        // to it (`mv>/dev/null /etc /x`), both of which run mv.
         destructive_pattern!(
             "mv-sensitive-source-root-home",
-            r#"\bmv\b[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
+            r#"(?<![\w.-])['"\\]?mv(?:\.exe)?(?=[\s;&|)<>'"]|$)[^|;&]*?(?:\s|=)(?:['"\\]|\$['"])?(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
             "mv touching a sensitive system or home path is the cross-segment recursive-force-delete bypass. EXTREMELY DANGEROUS.",
             Critical,
             "`mv /etc /tmp/x && rm -rf /tmp/x` is the canonical cross-segment bypass: \
@@ -1641,20 +5919,34 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              `/usr`, `/var`, `/home`, `~`, `$HOME`, ...) blocks here, including \
              in-place renames within /etc.\n\n\
              Safer alternatives:\n\
-             - Backup with copy + verify + delete:\n  \
-               `cp -a <source> <source>.bak && diff -r <source> <source>.bak && rm -rf <source>`\n\
-             - Soft-delete via in-place rename: `mv <file> <file>.deleted-YYYYMMDD` \
-               (use `dcg allow-once` for the rename, then a follow-up `rm` after a soak period).\n\
-             - Pure tmp-to-tmp moves: `mv /tmp/<a> /tmp/<b>` is allowed.",
+             - Rename or move within one home subtree — allowed, quoted or not:\n  \
+               `mv ~/Documents/<a> ~/Documents/<b>` (both sides at least two components \
+               below the home root, no dotfile tree, no `..`).\n\
+             - Soft-delete into the platform Trash (recoverable; allowed for a source \
+               under a home directory, under a temp directory, or a relative path, not \
+               for any other absolute path):\n  \
+               `mv <path> ~/.Trash/` on macOS, `mv <path> ~/.local/share/Trash/` on Linux.\n\
+             - Soft-delete via in-place rename: `mv <file> <file>.deleted-YYYYMMDD`.\n\
+             - Copy first and verify, then delete the copy's source only with explicit \
+               approval: `cp -a <source> <source>.bak && diff -r <source> <source>.bak` \
+               (the recursive delete of a home or system source stays gated).\n\
+             - Pure tmp-to-tmp moves: `mv /tmp/<a> /tmp/<b>` is allowed.\n\
+             - Moving a home root, a top-level home directory, or a dotfile tree is \
+               still gated: use `dcg allow-once` for those.",
             MV_SENSITIVE_SUGGESTIONS
         ),
         // Any shell-expanded mv path can resolve to `/`, `/etc`, or another
         // sensitive tree. `mv` intentionally has no broad general tier, so it
         // needs an explicit fail-closed rule for variables, command
-        // substitutions, and backslash-obfuscated path traversal.
+        // substitutions, and backslash-obfuscated path traversal. A
+        // backslash immediately followed by LF (or CRLF) is a shell line
+        // continuation, not part of any path token, so it is excluded from
+        // the backslash evidence (#356). A doubled backslash before a newline
+        // still matches at the first backslash, as it is a real escaped byte.
+        // The same whole-word `mv` boundary as above (#550).
         destructive_pattern!(
             "mv-dynamic-path",
-            r"\bmv\b[^|;&]*[\\$`]",
+            r#"(?<![\w.-])['"\\]?mv(?:\.exe)?(?=[\s;&|)<>'"]|$)[^|;&]*(?:[$`]|\\(?:[^\r\n]|$|\r(?:[^\n]|$)))"#,
             "mv with a shell-expanded or escaped path cannot be verified before execution.",
             High,
             "Shell variables and command substitutions are controlled by the calling environment and may resolve to `/`, `/etc`, a home directory, or another persistent tree. Backslash escapes can also hide traversal from lexical path checks, so dcg cannot safely classify this move.\n\n\
@@ -1662,7 +5954,90 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Resolve and inspect every path before moving it.\n\
              - Use an explicit literal `/tmp/<subdir>` or `/var/tmp/<subdir>` path.\n\
              - Use `dcg allow-once` only after verifying the resolved source and destination.",
-            MV_SENSITIVE_SUGGESTIONS
+            MV_DYNAMIC_SUGGESTIONS
+        ),
+        // ----- credential / login-file writes (Critical, semantic) -----
+        //
+        // Evaluated by `core::credential_files` inside the evaluator's
+        // per-segment pass, ahead of every redirect and command rule below,
+        // so it outranks `redirect-truncate-root-home` and the #390
+        // absent-file carve-out (which only stands that one rule down). The
+        // regex is intentionally unsatisfiable, exactly like
+        // `sed-exec-unverified`: the entry exists so the rule has a stable id
+        // for allowlists, `dcg rules`, the generated docs, and the authored
+        // guidance below.
+        destructive_pattern!(
+            "credential-file-write",
+            r"(?!)",
+            "writing a credential, private-key, login-shell startup, or system authentication file (`~/.ssh/*`, `~/.aws/credentials`, `~/.netrc`, `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`, `~/.docker/config.json`, `~/.kube/config`, `~/.gnupg/*`, `~/.config/gh/hosts.yml`, the token stores of cargo, gem, Vault, Terraform, gcloud, Azure, s3cmd/boto, pass and hub, `~/.pgpass`, `~/.my.cnf`, the shell rc files and `~/.bashrc.d`/`~/.zshrc.d`, `/etc/sudoers*`, `/etc/passwd`, `/etc/shadow`, `/etc/group`, `/etc/ssh/*`) with `>`, `>>`, `tee`, `cp`/`mv`/`install`/`ln`, `dd of=`, or `sed -i` — or, from PowerShell or Cmd, `Add-Content`, `Set-Content`, `Clear-Content`, `Out-File`, `Tee-Object`, `New-Item`, `Copy-Item`, `Move-Item`, `copy`, or `move` — installs persistent access or replaces the trust this machine runs on, whether or not the file exists yet. Reads and `chmod`/`chown` are unaffected; appending to `~/.ssh/known_hosts` stays allowed.",
+            Critical,
+            "These files decide who can log in, which keys and tokens act as this user, and what \
+             code every new shell runs. Writing one of them — even creating it where it did not \
+             exist — is not data loss in the `rm -rf` sense; it is persistence: an authorized_keys \
+             line grants login, a `.zshrc` line runs on every shell start, an `.npmrc`/`.netrc` \
+             entry publishes and pulls as this user, a sudoers drop-in changes who becomes root. \
+             The write is judged by the path the shell will open, so quoted, escaped, `$HOME`, \
+             `~user`, `/home/<user>`, and `$ZDOTDIR`-style spellings are all recognised, and a \
+             brace, glob, or alternation that could still expand into one of these paths is \
+             treated as if it did. A PowerShell or Cmd payload is read with that shell's own \
+             quoting and variables (`$env:USERPROFILE`, `%USERPROFILE%`, `C:\\Users\\<user>`), \
+             whichever host dcg runs on.\n\n\
+             What stays allowed:\n\
+             - Reading them (`cat`, `grep`, `diff`, `ssh -F`, `source`).\n\
+             - `chmod 600` / `chown` on them.\n\
+             - `>>` (or `tee -a`) to `~/.ssh/known_hosts`, which is what `ssh` itself does; \
+               truncating or replacing that trust store is still denied.\n\
+             - Writing `~/.ssh/*.pub` and every file that is not on the list.\n\n\
+             Safer alternatives:\n\
+             - Show the user the exact line or file you want to add and let them apply it.\n\
+             - Write the proposed content to a scratch file under `/tmp/<subdir>/` and point \
+               the user at it.\n\
+             - For a one-off the user has approved, use `dcg allow-once`.\n\
+             - For a project that must manage one of these files, allowlist \
+               `core.filesystem:credential-file-write` in that project's dcg config with a reason.",
+            super::credential_files::CREDENTIAL_FILE_WRITE_SUGGESTIONS
+        ),
+        // ----- `.git/` writes (Critical, semantic) -----
+        //
+        // Same classifier, same unsatisfiable-regex arrangement, separate id.
+        // A project that must rewrite `.git/config` allowlists this without
+        // also granting itself `~/.ssh/authorized_keys`, which is the whole
+        // reason it is not folded into `credential-file-write` (#457).
+        //
+        // Redirects are NOT decided here: `> .git/x` and `>> .git/x` keep
+        // `redirect-truncate-git-internals-relative` and
+        // `redirect-append-git-internals-relative`, so no existing allowlist
+        // entry changes meaning. This id covers the writers those two rules
+        // cannot see.
+        destructive_pattern!(
+            "git-internals-write",
+            r"(?!)",
+            "writing inside a `.git` directory with `tee`, `sponge`, `cp`/`mv`/`install`, `sed -i`, `perl -i`, `dd of=`, or an embedded-code sink rewrites repository state: `.git/config` carries remotes, `insteadOf` rewrites and credential helpers, `.git/hooks/*` run on ordinary git commands, and refs and objects are the history itself. Reads are unaffected, and `.gitignore`, `.gitattributes`, `.gitmodules` and `.github/` are not this rule.",
+            Critical,
+            "`.git` is not a secret, it is the repository. Three of its contents \
+             change what later commands do rather than what they see: `config` \
+             names the remotes a push reaches and can install a credential \
+             helper or an `insteadOf` rewrite that silently redirects a fetch; \
+             `hooks/*` execute on commit, push and checkout, so writing one is \
+             arbitrary code execution at the next ordinary git command; refs \
+             and objects are the history, and rewriting them by hand loses work \
+             in a way `git reflog` cannot always recover.\n\n\
+             The write is judged by the path the shell will open, so a \
+             checkout-relative `.git/config`, a nested `repo/.git/config`, and \
+             a quoted or escaped spelling are all recognised.\n\n\
+             What stays allowed:\n\
+             - Reading anything under `.git/` (`cat`, `grep`, `git config --list`).\n\
+             - Every git porcelain command; this rule never sees them.\n\
+             - `.gitignore`, `.gitattributes`, `.gitmodules`, `.github/` — none \
+               of these are inside `.git/`.\n\n\
+             Safer alternatives:\n\
+             - `git config <key> <value>` edits config with git's own validation.\n\
+             - `git remote set-url` changes a remote without touching the file.\n\
+             - Show the user the exact change and let them apply it, or use \
+               `dcg allow-once` for a one-off.\n\
+             - For a project that genuinely manages `.git` files, allowlist \
+               `core.filesystem:git-internals-write` with a reason.",
+            super::credential_files::GIT_INTERNALS_WRITE_SUGGESTIONS
         ),
         // ----- `> <sensitive>` (Critical: shell redirect truncate) -----
         //
@@ -1704,12 +6079,41 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // pain we can add a safe pattern later.
         // Two carve-outs in the regex below worth understanding:
         //
-        //   1. `(?!/dev/(?:null|zero|full)\b)` — never fire on the
-        //      universal "discard output" sinks. `cmd > /dev/null` and
-        //      `cmd 2>&1 > /dev/null` are the most common shell idioms
-        //      in existence; without this carve-out the `dev` element
-        //      of the sensitive set would block essentially every
-        //      script that suppresses output.
+        //   1. `(?!/dev/(?:null|zero|full|tty)\b)` — never fire on the
+        //      genuinely write-safe character devices. `cmd > /dev/null` and
+        //      `cmd 2>&1 > /dev/null` are the most common shell idioms in
+        //      existence, and `/dev/null`, `/dev/zero`, `/dev/full`, and the
+        //      controlling terminal `/dev/tty` are ALWAYS character devices —
+        //      opening them with O_TRUNC cannot destroy persistent data
+        //      (#324). `/dev/stdout`, `/dev/stderr`, and `/dev/fd/N` are
+        //      deliberately NOT carved out: they are symlinks to whatever fd
+        //      0/1/2/N currently point at, which may be a regular file (e.g.
+        //      after `exec > logfile` or an inherited redirect), where
+        //      O_TRUNC truncates that real file. The #324 carve-out for them
+        //      rested on a false premise (that they are always character
+        //      devices) and reopened a data-loss path; the guard's
+        //      zero-false-negatives posture blocks them instead. The `\b`
+        //      keeps `/dev/tty0`..`/dev/ttyN` (consoles / other terminals)
+        //      blocked as before.
+        //
+        //      `/dev/tcp/<host>/<port>` and `/dev/udp/<host>/<port>` join the
+        //      carve-out for a different reason (#404): they are not files at
+        //      all. Bash intercepts those two prefixes in its *own* redirect
+        //      parser and opens a socket — no `open(2)`, no `O_TRUNC`, and no
+        //      such path exists on disk to truncate. `echo > /dev/tcp/h/p` is
+        //      the standard "is this port open" idiom on a host without `nc`,
+        //      and denying it as file destruction sent operators to rewrite it
+        //      in Python.
+        //
+        //      The exemption is scoped to the exact shape bash recognises —
+        //      one host segment, one port/service segment, nothing after it —
+        //      and refuses a `.`/`..` segment. That matters because only
+        //      *bash* intercepts these paths: under `sh`/`dash` the same word
+        //      is an ordinary filename, so `> /dev/tcp/../../etc/passwd`
+        //      would really open `/etc/passwd` with `O_TRUNC`. It stays
+        //      denied, as does `/dev/tcpdump` and every other real node under
+        //      `/dev` — `/dev/sda` is exactly what this rule exists to
+        //      protect.
         //
         //   2. `(?:['"\\]|\$['"])?` — extends the historical optional
         //      single-char quote prefix to also accept the two-byte
@@ -1718,8 +6122,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         //      bypass with `> $'/etc/passwd'` or `> $"/etc/passwd"`.
         destructive_pattern!(
             "redirect-truncate-root-home",
-            r#"(?<![<>])(?:&>|>&|[12]?>\|?)\s*(?:['"\\]|\$['"])?(?!/dev/(?:null|zero|full)\b)(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
-            "shell redirect (>, >|, &>, >&, 1>, 2>) to a sensitive system or home path truncates the file to zero bytes. EXTREMELY DANGEROUS.",
+            r#"(?<![<>])(?:&>|>&|\*>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>\|?)\s*(?:['"\\]|\$['"])?(?!/dev/(?:(?:null|zero|full|tty)\b|(?:tcp|udp)/(?!\.\.?(?:/|$))[^/\s]+/[A-Za-z0-9_-]+(?=[\s;|&)'"]|$)))(?:/(?:etc|usr|bin|sbin|root|boot|lib|lib64|var|home|Users|sys|proc|dev|opt)(?:/|(?=[\s\)'"]|$))|/(?=[\s\)'"]|$)|~(?=\s|$|/|\))|\$\{?HOME\b)"#,
+            "shell truncating redirect (including arbitrary numeric, named, and PowerShell all-stream forms) to an existing sensitive system or home path destroys the previous file contents. A currently absent literal target under the home directory with an existing parent is allowed (creation, not truncation — the same thing `>>` would do); existing files, dynamic paths, symlinks, missing parents, system paths, and .git internals stay blocked.",
             Critical,
             "`> /etc/passwd` (or `: > /etc/passwd`, `echo > /etc/passwd`, etc.) opens \
              the target file with O_WRONLY|O_CREAT|O_TRUNC — the contents are destroyed \
@@ -1729,17 +6133,140 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              There is NO recovery without backups.\n\n\
              Safer alternatives:\n\
              - Use append (`>>`) to preserve existing content: `echo line >> <file>`.\n\
-             - Make a backup: `cp <file> <file>.bak && echo data > <file>`.\n\
+             - A literal, currently absent destination under your home directory whose parent \
+               directory exists is allowed (nothing to truncate). Existing files, symlinks, \
+               dynamic paths, missing parents, system paths, and `.git` internals remain blocked.\n\
+             - For race-free exclusive creation, resolve a literal path and use:\n  \
+               `producer | dcg create-new <path>` (existing files, directories, and symlinks are refused).\n\
+             - Make a backup, then write via a temp file:\n  \
+               `cp <file> <file>.bak && echo data > /tmp/<subdir>/out && cp -f /tmp/<subdir>/out <file>`\n  \
+               (a truncating redirect straight back onto a home/system path is denied \
+               by this same rule).\n\
              - For temp scratch: `> /tmp/<subdir>/scratch` is allowed.\n\
              - Read redirects (`< <file>`) are not affected — they don't truncate.",
             REDIRECT_TRUNCATE_SUGGESTIONS
         ),
+        // A truncating redirect into a `.git` directory, named relatively.
+        //
+        // `redirect-truncate-root-home` matches the literal text of the
+        // target, so it only ever saw the absolute spelling. The same write to
+        // the same file was allowed the moment it was written relatively, which
+        // included the `.git` internals that rule's own reason promises to
+        // protect (GitHub #407):
+        //
+        //     cat > /home/u/proj/.git/config     denied
+        //     cat > .git/config                  ALLOWED, same file
+        //     echo x > .git/hooks/pre-commit     ALLOWED, and that one executes
+        //
+        // A relative target cannot be resolved in general — dcg does not know
+        // the working directory, and denying every relative redirect would
+        // deny `> out.txt`. But a `.git/` path *component* names a git
+        // internal wherever the shell happens to be standing, so this one case
+        // is decidable without the cwd and is worth deciding.
+        //
+        // `.gitignore`, `.gitattributes` and `.github/` are untouched: the
+        // component must be exactly `.git` followed by a separator. Append
+        // (`>>`) does not truncate, so it is matched by the sibling rule
+        // below rather than by this one.
+        destructive_pattern!(
+            "redirect-truncate-git-internals-relative",
+            r#"(?<![<>])(?:&>|>&|\*>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>\|?)\s*(?:['"\\]|\$['"])?(?:\./)?(?:[^\s;&|'"]*/)?\.git/"#,
+            "shell truncating redirect into a .git directory rewrites repository internals; a relative spelling names the same file an absolute one does.",
+            Critical,
+            "`> .git/<path>` opens the file with O_WRONLY|O_CREAT|O_TRUNC, so the \
+             previous contents are gone before anything is written. Inside `.git` that \
+             means repository state, not a working file:\n\
+             - `.git/config` carries remotes, hooks configuration and credentials helpers.\n\
+             - `.git/HEAD` and `.git/refs/**` decide which commits are reachable; \
+               truncating them can orphan history that only the reflog still names.\n\
+             - `.git/hooks/**` is executed by git, so a write there is code execution \
+               on the next commit, merge or checkout.\n\n\
+             The absolute spelling of this same path is already denied; naming it \
+             relatively does not make it a different file.\n\n\
+             Safer alternatives:\n\
+             - Change configuration through git, which writes atomically and validates: \
+               `git config <key> <value>`, `git remote set-url <name> <url>`.\n\
+             - Move a ref with `git update-ref <ref> <sha>` rather than by writing the file.\n\
+             - To inspect rather than replace, read it: `cat .git/config`.\n\
+             - If a file genuinely must be rewritten, write it beside the repository and \
+               copy it in after review: `… > /tmp/<subdir>/config && cp /tmp/<subdir>/config .git/config`.",
+            GIT_INTERNALS_WRITE_SUGGESTIONS
+        ),
+        // An appending redirect into a `.git` directory, named relatively or
+        // otherwise.
+        //
+        // The truncating sibling above leaves `>>` out on purpose, and every
+        // other redirect rule in this pack is drawn on the same axis: `>`
+        // destroys the previous contents, `>>` does not. Inside `.git` that is
+        // the wrong axis. Git reads these files whole, so adding to one is how
+        // it is subverted rather than a milder way of replacing it (#457):
+        //
+        //     echo '[url "…"]'      >> .git/config     rewrites where fetches go
+        //     echo 'pager = sh -c …' >> .git/config    runs on the next git command
+        //     echo 'curl … | sh'     >> .git/hooks/pre-commit
+        //
+        // None of those truncate anything, and the third executes on the next
+        // commit exactly as an overwritten hook would. `.gitignore` and
+        // `.github/` stay untouched for the same reason as above: the
+        // component must be exactly `.git` followed by a separator.
+        destructive_pattern!(
+            "redirect-append-git-internals-relative",
+            r#"(?<![<>])(?:&>>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>>)\s*(?:['"\\]|\$['"])?(?:\./)?(?:[^\s;&|'"]*/)?\.git/"#,
+            "shell appending redirect into a .git directory adds repository configuration or hook code that git runs on its next invocation.",
+            Critical,
+            "`>> .git/<path>` leaves the existing contents in place and adds to them, \
+             which is what makes it useful against a repository rather than what makes \
+             it safe:\n\
+             - A `[url \"…\"] insteadOf` or `[credential] helper` section appended to \
+               `.git/config` redirects the next fetch or hands over a token; the \
+               sections already there keep working, so nothing looks broken.\n\
+             - `[core] pager`, `[core] editor` and `[alias]` entries name commands git \
+               runs, so appending one is code execution on the next git invocation.\n\
+             - A line appended to `.git/hooks/**` runs on the next commit, merge or \
+               checkout just as a rewritten hook would.\n\n\
+             Truncating the same file is already denied. Appending to it reaches the \
+             same end state by a route that preserves the evidence.\n\n\
+             Safer alternatives:\n\
+             - Add configuration through git, which validates the key and writes \
+               atomically: `git config <key> <value>`, `git remote add <name> <url>`.\n\
+             - Install a hook from a reviewed file rather than by appending lines.\n\
+             - To inspect rather than extend, read it: `cat .git/config`.",
+            GIT_INTERNALS_WRITE_SUGGESTIONS
+        ),
+        // There is deliberately no `tee`/`sponge` rule here, and the reason is
+        // a property of this pack rather than of the writer (#457, #460).
+        //
+        // A `core.filesystem` destructive regex whose match lies wholly inside
+        // argv does not reach the evaluator. Measured three ways against a
+        // built binary: the rule spelled with the command word, the same rule
+        // executable-scoped with `executables = ["tee", "sponge"]`, and the
+        // rule reduced to the bare literal `\.git/` all allow
+        // `tee .git/config`, while `cat > .git/config` denies throughout and
+        // `truncate -s 0 .git/config` — a regex whose match BEGINS at the
+        // command word — denies too. `tee .ssh/id_rsa` denies as well, through
+        // `credential-file-write`, which is a classifier and does not go
+        // through the regex pass at all.
+        //
+        // So the supported way to guard a non-redirect writer of a literal
+        // path in this pack is the credential classifier, not a pattern. That
+        // is a larger change than #457 (it needs a per-entry rule name so a
+        // `.git` denial does not report as `credential-file-write`, and it
+        // decides the `cp`/`install` posture at the same time), so the writer
+        // gap stays open rather than being closed by a rule that passes its
+        // pack-level test and never fires in production.
+        //
         // The shell expands redirect targets at runtime. A variable, command
         // substitution, or backslash-obfuscated suffix can therefore resolve
         // outside an apparent temp path before O_TRUNC opens the file.
+        //
+        // `(?!>)` after the operator keeps an append out (#575): the
+        // lookbehind already stops a match from starting at the second `>` of
+        // `>>`, but without it a match could start at the first one and let
+        // the target class swallow the second (`>>"$LOG"`, `2>>$LOG`,
+        // `&>>"$LOG"`), so only the spaced spelling was treated as an append.
         destructive_pattern!(
             "redirect-truncate-dynamic-path",
-            r"(?<![<>])(?:&>|>&|[12]?>\|?)\s*[^|;&\s]*[\\$`]",
+            r#"(?<![<>])(?:&>|>&|\*>|(?:[0-9]+|\{[A-Za-z_][A-Za-z0-9_]*\})?>\|?)(?!>)\s*(?:[^|;&\s]*[\\$`]|~[A-Za-z_][^|;&\s]*|(?!(?:/tmp|/var/tmp)(?:/|(?=[\s|;&]|$)))/[^|;&\s]*['"?*\[][^|;&\s]*|[%!][^|;&\s]*|\^(?!(?:/tmp|/var/tmp)(?:/|(?=[\s|;&]|$)))[^|;&\s]+)"#,
             "shell redirect to a dynamic or escaped path may truncate a sensitive file and requires human approval.",
             High,
             "The redirect target is expanded by the shell at runtime, so dcg cannot prove where it points before the file is opened with O_TRUNC.\n\n\
@@ -1749,6 +6276,111 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Use append (`>>`) when preserving existing content is acceptable.",
             REDIRECT_TRUNCATE_SUGGESTIONS
         ),
+        // Classic fork bomb: a no-argument function whose body pipes itself
+        // into itself in the background, immediately invoked
+        // (`:(){ :|:& };:` and word-named variants). The backreferences
+        // enforce that all three identifiers are the same, which is what
+        // separates a fork bomb from an ordinary function definition — this
+        // deliberately selects the backtracking engine. Differently shaped
+        // bombs (`while true; do (x) & done`) are out of scope: the regex
+        // crate family cannot enforce those without unbounded false
+        // positives, and the canonical form is the one agents actually
+        // reproduce (issue #302).
+        //
+        // The name starts where a word starts and is taken whole: a shorter
+        // name would be followed by a name character, which `\s*\(` cannot
+        // match, so the atomic group gives up nothing that could match. Tried
+        // from every byte and every length, the search ran out of its
+        // backtracking budget on a long program (every `f()` call in a large
+        // Python heredoc forces this pack), which left the whole command
+        // unverified (#555). A name inside a longer word (`x:` of `x:()`)
+        // defines another function, which no bomb is.
+        destructive_pattern!(
+            "fork-bomb",
+            r"(?<![A-Za-z0-9_:])((?>[A-Za-z0-9_:]+))\s*\(\s*\)\s*\{\s*\1\s*\|\s*\1\s*&\s*;?\s*\}\s*;\s*\1",
+            "This is a fork bomb: it recursively spawns processes until the system is unusable.",
+            Critical,
+            "A fork bomb defines a function that pipes itself into itself in the \
+             background and then calls it. Process count grows exponentially until \
+             the kernel can no longer schedule anything; the machine typically \
+             needs a hard reboot, losing all unsaved work in every application.\n\n\
+             There is no legitimate reason to run this shape. If you are testing \
+             process limits, use `ulimit -u` in a disposable VM or container."
+        ),
+        // ----- Windows disk-destruction verbs (cross-platform baseline, #451/#252) -----
+        //
+        // The full Windows coverage lives in the `windows.system` pack, which is
+        // compiled everywhere but only DEFAULT-ENABLED on `cfg(windows)`
+        // (`packs/windows/mod.rs`). So on a macOS/Linux dcg driving a Windows box
+        // — over SSH, or a cross-platform agent — these verbs pass. These core
+        // rows give the highest-severity, zero-false-positive ones a baseline
+        // that is enabled everywhere, exactly as `powershell-remove-item-recursive`
+        // does for recursive `Remove-Item`. They are meaningless outside Windows,
+        // so matching them in any dialect (including the `powershell -Command
+        // '...'` / `cmd /c '...'` wrapper that re-evaluates its payload) is safe.
+        // Regexes are kept byte-identical to `windows.system`'s so the two cannot
+        // diverge silently; `windows.system` owns the fuller set (diskpart,
+        // Remove-Partition, cipher, bcdedit, …) for a real Windows build.
+        destructive_pattern!(
+            "format-volume",
+            r"(?i)\bformat-volume\b",
+            "PowerShell Format-Volume erases a volume and everything on it.",
+            Critical,
+            "`Format-Volume` reformats a volume, destroying every file on it with no undo. \
+             Under an agent hook this must be run by a human who has confirmed the target \
+             drive.\n\n\
+             Safer alternatives:\n\
+             - Confirm the volume first: `Get-Volume`.\n\
+             - Add `-WhatIf` to report what would happen without doing it."
+        ),
+        destructive_pattern!(
+            "clear-disk",
+            r"(?i)\bclear-disk\b",
+            "PowerShell Clear-Disk removes a disk's partitions and data.",
+            Critical,
+            "`Clear-Disk -RemoveData` deletes all partitions and data from a disk. There is \
+             no undo.\n\n\
+             Safer alternatives:\n\
+             - Inspect the disk first: `Get-Disk`.\n\
+             - Add `-WhatIf` to preview without changing anything."
+        ),
+        destructive_pattern!(
+            "vssadmin-delete-shadows",
+            r"(?i)\bvssadmin(?:\.exe)?\s+(?:[^|&\r\n]*\s+)?delete\s+shadows\b",
+            "vssadmin delete shadows destroys Volume Shadow Copies (System Restore and backups).",
+            Critical,
+            "`vssadmin delete shadows /all` removes the Volume Shadow Copies that System \
+             Restore and many backup tools depend on — a hallmark of ransomware, because it \
+             destroys the local means of recovery.\n\n\
+             Safer alternatives:\n\
+             - List them first: `vssadmin list shadows`.\n\
+             - Manage restore points through System Protection instead."
+        ),
+        destructive_pattern!(
+            "wmic-shadowcopy-delete",
+            r"(?i)\bwmic(?:\.exe)?\s+shadowcopy\s+delete\b",
+            "wmic shadowcopy delete destroys Volume Shadow Copies.",
+            Critical,
+            "`wmic shadowcopy delete` removes Volume Shadow Copies — the same \
+             recovery-destroying operation as `vssadmin delete shadows`, through a different \
+             tool.\n\n\
+             Safer alternatives:\n\
+             - List them first: `vssadmin list shadows`."
+        ),
+        // The PowerShell spelling of the same deletion (see the twin in
+        // `windows.system`): `Win32_ShadowCopy` instances piped into
+        // Remove-WmiObject/Remove-CimInstance or deleted with `.Delete()`.
+        destructive_pattern!(
+            "wmi-shadowcopy-delete",
+            r"(?i)\bwin32_shadowcopy\b[^\r\n;]*?(?:\|\s*(?:remove-wmiobject|rwmi|remove-ciminstance|rcim)\b|\.delete\s*\()",
+            "Deleting Win32_ShadowCopy instances destroys Volume Shadow Copies.",
+            Critical,
+            "Piping `Win32_ShadowCopy` into `Remove-WmiObject` / `Remove-CimInstance`, or \
+             calling `.Delete()` on its instances, removes Volume Shadow Copies: the same \
+             recovery-destroying operation as `vssadmin delete shadows`, through PowerShell.\n\n\
+             Safer alternatives:\n\
+             - List them first: `Get-CimInstance Win32_ShadowCopy` or `vssadmin list shadows`."
+        ),
     ]
 }
 
@@ -1757,6 +6389,249 @@ mod tests {
     use super::*;
     use crate::packs::Severity;
     use crate::packs::test_helpers::*;
+
+    #[test]
+    fn cd_to_root_or_an_ancestor_of_a_protected_root_is_recognised() {
+        for command in [
+            "cd / && echo x >> etc/sudoers",
+            "cd // && x",
+            "cd /usr/.. && x",
+            "cd -P / && x",
+            "cd '/' && x",
+            "pushd /var && x",
+            "cd /home && x",
+            "cd /private && x",
+            "cd /volume1 && x",
+            "x; cd /; y",
+        ] {
+            assert!(cd_reaches_a_protected_ancestor(command), "{command:?}");
+        }
+        for command in [
+            "cd /tmp && x",
+            "cd /home/u/proj && x",
+            "cd src && x",
+            "abcd / && x",
+            "echo cd",
+            "cd",
+            "cd /usr/local && x",
+        ] {
+            assert!(!cd_reaches_a_protected_ancestor(command), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn dequote_rm_flag_token_collapses_balanced_quotes() {
+        // bd-5xgt: balanced quotes inside a flag are shell concatenation.
+        for (input, want) in [
+            ("-r'f'", "-rf"),
+            ("-'r'f", "-rf"),
+            ("-r\"f\"", "-rf"),
+            ("'-r'f", "-rf"),
+            ("'-rf'", "-rf"),
+            ("-rf''", "-rf"),
+            ("'-'r'f'", "-rf"),
+            ("-r\\f", "-rf"),
+            // Bash ANSI-C and locale quoting.
+            ("$'-rf'", "-rf"),
+            ("-$'\\x72'f", "-rf"),
+            ("-$'\\162'f", "-rf"),
+            ("-$'\\562'f", "-rf"),
+            ("$\"-rf\"", "-rf"),
+            ("--recursive", "--recursive"),
+            ("-rf", "-rf"),
+        ] {
+            assert_eq!(
+                dequote_rm_flag_token(input).as_ref(),
+                want,
+                "input {input:?}"
+            );
+        }
+        // An unbalanced quote is a syntax error: leave it opaque so it matches
+        // no flag (never "repair" it into a destructive one).
+        for opaque in ["-r'f", "-r\"f", "-rf\\", "$'-rf", "$\"-rf"] {
+            assert_eq!(
+                dequote_rm_flag_token(opaque).as_ref(),
+                opaque,
+                "unbalanced {opaque:?} must stay opaque"
+            );
+        }
+        // A token with no quotes is borrowed unchanged.
+        assert!(matches!(
+            dequote_rm_flag_token("-rf"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    /// A bare redirect to a Windows-spelled relative anchor must select the
+    /// pack (#451).
+    ///
+    /// `.ssh/authorized_keys` and `.git/config` are keywords because a bare
+    /// redirect to them carries no other one (#407). A PowerShell or cmd
+    /// caller writes `.ssh\authorized_keys`, which matched none of them, so
+    /// the quick-reject dropped the command before core.filesystem was a
+    /// candidate and the relative half of `credential-file-write` never ran.
+    ///
+    /// Resolution was never the problem: the same targets deny as soon as any
+    /// writer word is present. This asserts the gate itself.
+    #[test]
+    fn windows_spelled_relative_anchors_select_the_pack_issue_451() {
+        let pack = create_pack();
+        let bs = char::from(92);
+        for target in [
+            format!(".ssh{bs}authorized_keys"),
+            format!(".git{bs}config"),
+            format!(".aws{bs}credentials"),
+            format!(".gnupg{bs}secring.gpg"),
+            format!(".kube{bs}config"),
+            format!(".docker{bs}config.json"),
+        ] {
+            let command = format!("echo x > {target}");
+            assert!(
+                pack.might_match(&command),
+                "a bare redirect to a Windows-spelled anchor must select the pack: {command}"
+            );
+        }
+
+        // Negative control: an ordinary relative Windows path carries none of
+        // these anchors, so the quick-reject must still drop it. Without this
+        // the assertions above would pass on a keyword row so broad that the
+        // gate stopped meaning anything.
+        for target in [
+            format!("build{bs}out.txt"),
+            format!("docs{bs}readme.md"),
+            format!("src{bs}main.rs"),
+        ] {
+            let command = format!("echo x > {target}");
+            assert!(
+                !pack.might_match(&command),
+                "an ordinary relative Windows path must not select the pack: {command}"
+            );
+        }
+    }
+
+    /// Issue #302: the canonical fork bomb and word-named variants are
+    /// blocked; ordinary function definitions that merely pipe two different
+    /// commands are not. Evaluator-level reachability is handled by
+    /// `filesystem_semantic_scan_required` (an empty paren pair forces the
+    /// pack), not by a pack keyword — see the empty_paren_pair tests and the
+    /// evaluator's `fork_bomb_denies_through_full_pipeline_issue_302`.
+    #[test]
+    fn fork_bomb_is_blocked_issue_302() {
+        let pack = create_pack();
+        // The fork-bomb rule spans shell separators, so it is matched
+        // whole-command (never through `Pack::check`, which is keyword-gated
+        // and per-segment). Test the compiled regex and the force check
+        // directly; the end-to-end deny is in the evaluator test.
+        let fork_bomb = pack
+            .destructive_patterns
+            .iter()
+            .find(|p| p.name == Some("fork-bomb"))
+            .expect("fork-bomb rule must exist");
+        for bomb in [
+            ":(){ :|:& };:",
+            "bomb(){ bomb|bomb& };bomb",
+            ": () { : | : & ; } ; :",
+            "b(){ b|b&;};b",
+            // Spaced paren pair — the literal `()` keyword missed this; the
+            // space-tolerant force check reaches it.
+            ":( ){ :|:& };:",
+        ] {
+            assert!(
+                filesystem_semantic_scan_required(bomb, ShellDialect::Posix),
+                "fork bomb must force the pack via semantic scan: {bomb}"
+            );
+            assert!(
+                fork_bomb.regex.is_match(bomb),
+                "fork-bomb regex must match: {bomb}"
+            );
+        }
+        // Same-shape functions piping two DIFFERENT commands are not bombs,
+        // nor is a function whose name only ends in the piped one (`x:`
+        // pipes the `:` builtin).
+        for benign in [
+            "serve(){ python|tee & };logs",
+            "f(){ a|b& };f",
+            "retry(){ curl -s x|jq . ; };retry",
+            "x:(){ :|:& };:",
+        ] {
+            assert!(
+                !fork_bomb.regex.is_match(benign),
+                "non-self-referential function must not match fork-bomb: {benign}"
+            );
+        }
+        // A long program full of calls (each `f()` forces this pack) is
+        // searched within the backtracking budget, and a bomb after it is
+        // still found (#555). Tried at every length of every name, this
+        // 36 KB program took several times the budget.
+        let program = "    value_from_the_configuration_file = read_text()\n".repeat(700);
+        for (command, bomb) in [
+            (program.clone(), false),
+            (format!("{program}:(){{ :|:& }};:"), true),
+        ] {
+            let scope = crate::packs::regex_engine::RegexEvaluationScope::enter();
+            assert_eq!(fork_bomb.regex.is_match(&command), bomb);
+            assert!(
+                !scope.has_failed(),
+                "the fork-bomb search must finish on a long program"
+            );
+        }
+    }
+
+    /// The space-tolerant empty-paren detector that gives the fork-bomb rule
+    /// its evaluator reachability (issue #302).
+    #[test]
+    fn empty_paren_pair_detection_issue_302() {
+        for present in [":(){ :;}", "foo() {}", ":( ){ }", "x(  )", "arr=()", "$()"] {
+            assert!(
+                command_contains_empty_paren_pair(present),
+                "empty paren pair expected: {present}"
+            );
+        }
+        for absent in [
+            "echo hi", "(ls)", "foo(bar)", "$(date)", "$((1+1))", "a || b",
+        ] {
+            assert!(
+                !command_contains_empty_paren_pair(absent),
+                "no empty paren pair expected: {absent}"
+            );
+        }
+    }
+
+    /// The `-r`/`-f` rules match the FLAG PAIR, not an argv0, so they also
+    /// cover `rm` used as another tool's subcommand. That is deliberate and
+    /// load-bearing: `core.filesystem` is always on, whereas the packs that
+    /// would otherwise own these commands are opt-in (`database.bigquery`) or
+    /// nonexistent (there is no `git rm` rule in `core.git`). Scoping these
+    /// rules to `executables = ["rm"]` would read as a clean attribution fix
+    /// and silently turn all three of these into ALLOW.
+    ///
+    /// If you are here because you want that scoping (bead bd-pwvp), first add
+    /// the replacement coverage — otherwise this test is the record that you
+    /// removed a backstop.
+    #[test]
+    fn subcommand_rm_stays_covered_by_the_flag_pair_rules() {
+        let pack = create_pack();
+        for command in [
+            "rm -r -f /var/data/old",
+            "git rm -r -f src/legacy",
+            "bq rm -r -f my_project:my_dataset",
+        ] {
+            assert!(
+                pack.check(command).is_some(),
+                "core.filesystem must keep covering `{command}` — it is the \
+                 always-on backstop for recursive-force deletion"
+            );
+        }
+
+        // NOTE on layering: these regexes are `rm\s+...` with no argv0 anchor,
+        // so at the PACK level they also match inside a longer word —
+        // `pack.check("charm -r -f build")` returns Some. End to end those are
+        // correctly ALLOWED, because the evaluator resolves argv0 before the
+        // denial stands. Asserting `is_none()` here would therefore be
+        // testing the wrong layer, which is exactly the mistake that produced
+        // a false positive in the bigquery pack until its regexes were
+        // anchored. Tracked separately as a defense-in-depth cleanup.
+    }
 
     #[test]
     fn test_pack_creation() {
@@ -1834,13 +6709,97 @@ mod tests {
         // path argument matters; safe pattern must NOT short-circuit if
         // a second argument is sensitive (test below).
         for cmd in [
-            "find /tmp -delete",
             "find /tmp/foo -delete",
             "find /tmp/foo -name '*.log' -delete",
-            "find /var/tmp -delete",
+            "find /tmp/.cache -delete",
             "find /var/tmp/dir -type f -delete",
+            "find /tmp/foo -exec rm {} \\;",
         ] {
             assert_safe_pattern_matches(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn a_glob_of_a_temp_roots_children_blocks() {
+        let pack = create_pack();
+        // dev-hs30uj: a first component that starts with a glob names any child
+        // of the shared temp root.
+        for cmd in [
+            "find /tmp/* -delete",
+            "find /tmp/.* -delete",
+            "find /var/tmp/[a-z]* -delete",
+            "find /tmp/*-cache -delete",
+            "find /tmp/* -exec rm {} \\;",
+            "rm -rf /tmp/*",
+            "rm -rf /tmp/.*",
+            "rm -rf /tmp/?",
+            "rm -rf /tmp/[a-z]*",
+            "rm -rf /private/tmp/*",
+            "rm -rf /var/tmp/*",
+            "rm -rf /tmp/build /tmp/*",
+        ] {
+            assert!(
+                pack.check(cmd).is_some(),
+                "{cmd} must not pass the temp exemption"
+            );
+        }
+        for cmd in [
+            "find /tmp/build/* -delete",
+            "find /tmp/build-* -delete",
+            "rm -rf /tmp/build/*",
+            "rm -rf /tmp/sigtest*",
+            "rm -rf /tmp/.cache-x*",
+            "rm -rf \"/tmp/[build]\"",
+        ] {
+            assert!(pack.check(cmd).is_none(), "{cmd} stays exempt");
+        }
+    }
+
+    #[test]
+    fn a_filtered_find_under_a_temp_root_stays_exempt() {
+        let pack = create_pack();
+        // v0.6.7 allowed these; only the unfiltered root is the whole-/tmp wipe
+        // (dcg#7 REV C2).
+        for cmd in [
+            "find /tmp -name '*.log' -delete",
+            "find /tmp -mindepth 1 -mtime +7 -delete",
+            "find /var/tmp -user bob -delete",
+            "find /tmp/ -empty -delete",
+            "find /tmp -name '*.o' -exec rm {} \\;",
+        ] {
+            assert_safe_pattern_matches(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn find_delete_of_a_temp_root_blocks() {
+        let pack = create_pack();
+        // A selector can name the root itself; a recursive rm then removes it.
+        assert_blocks(&pack, "find /tmp -name tmp -exec rm -rf {} +", "rm -rf");
+        // dev-qgoxf1: the temp root itself is every process's temp directory, not
+        // scratch the caller owns, so it never matches the temp exemption, however
+        // the root is spelled.
+        for cmd in [
+            "find /tmp -delete",
+            "find /tmp/ -delete",
+            "find /tmp/. -delete",
+            "find /tmp//./ -delete",
+            "find /tmp/foo /tmp -delete",
+            "find /tmp -mindepth 1 -delete",
+            "find /tmp -type f -delete",
+            "find /tmp -name '*' -delete",
+            "find /tmp -delete -name keep",
+            "find /tmp -name keep -o -delete",
+            "find /tmp ! -name keep -delete",
+            "find /tmp -name '*.o' -o -exec rm {} \\;",
+            "find /tmp -name '?*' -delete",
+            "find /tmp -name '[a-z]*' -delete",
+            "find /var/tmp -delete",
+            "find /tmp -exec rm {} \\;",
+            "find /private/tmp -exec rm -f {} +",
+            "find /var/tmp/ -exec rm {} \\;",
+        ] {
+            assert_blocks(&pack, cmd, "find");
         }
     }
 
@@ -1978,11 +6937,9 @@ mod tests {
         // invocation. This is the intended trade-off (see
         // find_temp_compound_blocks_conservatively for rationale).
         for cmd in [
-            "find /tmp -delete",
             "find /tmp/foo -delete",
-            "find /tmp -name '*.log' -delete",
             "find /tmp/foo -name '*.tmp' -delete",
-            "find /var/tmp -delete",
+            "find /var/tmp/foo -delete",
         ] {
             assert_safe_pattern_matches(&pack, cmd);
         }
@@ -2105,6 +7062,149 @@ mod tests {
     }
 
     #[test]
+    fn mv_rules_match_the_whole_command_word_issue_550() {
+        let pack = create_pack();
+        for command in [
+            "git checkout -b fix-mv-handling /home/user/repo",
+            "tool x-mv /home/user/repo",
+            "tool mv-y /home/user/repo",
+            "tool --no-mv /etc/hosts",
+            "tool x.mv /etc/hosts",
+            "tool --mv=/etc/hosts",
+            "tool fix-mv-$x",
+        ] {
+            assert_no_match(&pack, command);
+        }
+        for (command, rule) in [
+            ("mv /home/user/repo /tmp/r", "mv-sensitive-source-root-home"),
+            (
+                "'mv' /home/user/repo /tmp/r",
+                "mv-sensitive-source-root-home",
+            ),
+            ("\"mv\" /etc/hosts /tmp/h", "mv-sensitive-source-root-home"),
+            ("/bin/mv /etc/hosts /tmp/h", "mv-sensitive-source-root-home"),
+            ("sudo mv /etc /tmp/x", "mv-sensitive-source-root-home"),
+            (
+                "find . -exec mv {} /etc/ \\;",
+                "mv-sensitive-source-root-home",
+            ),
+            ("mv \"$src\" d/", "mv-dynamic-path"),
+            ("'mv' $src d/", "mv-dynamic-path"),
+            // Empty quotes or a redirection glued to the word still run mv.
+            ("mv\"\" /etc /tmp/x", "mv-sensitive-source-root-home"),
+            (
+                "mv'' /home/user/repo /tmp/r",
+                "mv-sensitive-source-root-home",
+            ),
+            ("mv>/dev/null /etc /tmp/x", "mv-sensitive-source-root-home"),
+            ("mv</dev/null /etc /tmp/x", "mv-sensitive-source-root-home"),
+            ("mv\"\" \"$src\" d/", "mv-dynamic-path"),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
+    }
+
+    #[test]
+    fn unlink_rules_are_scoped_to_the_executed_command_issue_550() {
+        let pack = create_pack();
+
+        for command in [
+            "ob sync-unlink --path /home/user/vault",
+            "foo --unlink /tmp/x",
+            "cat unlink /tmp/x",
+            "printf '%s' unlink /etc/passwd",
+            "echo 'unlink' /etc/passwd",
+            "cat '/tmp/unlink /etc/passwd'",
+            "command -v 'unlink'",
+            "'un link' /etc/passwd",
+            r"'un\link' /etc/passwd",
+        ] {
+            assert_no_match(&pack, command);
+        }
+
+        for command in [
+            "'unlink' /home/user/notes.txt",
+            "\"unlink\" /etc/passwd",
+            "'unlink' '/etc/passwd'",
+            "u'n'link /etc/passwd",
+            "u'n'l'i'n'k' /etc/passwd",
+            r"un\link /etc/passwd",
+            r"$'\165nlink' /etc/passwd",
+            "'/usr/bin/unlink' /etc/shadow",
+            "\"/usr/bin/unlink\" /etc/passwd",
+            "('/usr/bin/unlink' /etc/passwd)",
+            "/usr/bin/unlink /etc/shadow",
+            "sudo unlink /etc/sudoers",
+            "sudo 'unlink' /etc/sudoers",
+            "env FOO=bar unlink /etc/passwd",
+            "env FOO=bar 'unlink' /etc/passwd",
+            "command unlink /etc/passwd",
+            "command -- 'unlink' /etc/passwd",
+            "u'n'l'i'n'k'>/tmp/unlink.log /etc/passwd",
+            ">/tmp/unlink.log u'n'l'i'n'k' /etc/passwd",
+        ] {
+            assert_blocks(&pack, command, "unlink");
+        }
+    }
+
+    #[test]
+    fn quoted_unlink_preserves_literal_temp_and_information_exceptions() {
+        let pack = create_pack();
+        for command in [
+            "'unlink' /tmp/scratch",
+            "\"/usr/bin/unlink\" /var/tmp/cache",
+            "u'n'l'i'n'k' -- /private/tmp/cache",
+            "command -- 'unlink' /private/var/tmp/cache",
+            "'unlink' --help",
+            "u'n'l'i'n'k' --version",
+        ] {
+            assert_safe_pattern_matches(&pack, command);
+            assert_allows(&pack, command);
+        }
+        // Quoted operands are a POSIX-only proof. The standalone Pack API has
+        // no dialect and must not grant new exemptions for Cmd expansion,
+        // quote removal, or Windows path normalization.
+        for command in [
+            "'unlink' '/tmp/file with spaces'",
+            "'unlink' /tmp/\"literal;name\"",
+            r#"unlink "/tmp/%DCG_ESCAPE%/notes.txt""#,
+            r#"unlink /tmp/"%DCG_ESCAPE%/notes.txt""#,
+            "unlink /tmp/%DCG_ESCAPE%/notes.txt",
+            r#"unlink "/tmp/!DCG_ESCAPE!/notes.txt""#,
+            "unlink /tmp/!DCG_ESCAPE!/notes.txt",
+            r#"unlink "/tmp/"^.^."/Users/user/notes.txt""#,
+            "unlink /tmp/^.^./Users/user/notes.txt",
+            r#"unlink "/tmp/.. /Users/user/notes.txt""#,
+            r#"unlink "/tmp/.../Users/user/notes.txt""#,
+            "unlink /tmp/.../Users/user/notes.txt",
+            r#"'unlink' "/tmp/cache./notes.txt""#,
+            "unlink /tmp/cache./notes.txt",
+        ] {
+            assert!(
+                unlink_command_for_pattern_matching(command, ShellDialect::Posix)
+                    .is_some_and(|command| command.safe),
+                "known POSIX literal operand: {command}"
+            );
+            assert_no_safe_match(&pack, command);
+            assert_blocks(&pack, command, "unlink");
+        }
+        for command in [
+            "'unlink' /tmp/../etc/passwd",
+            "'unlink' /tmp/\"../etc/passwd\"",
+            r"unlink /tmp/cache\..\..\Users/user/notes.txt",
+            r#""unlink" "/tmp/cache/..\..\Users/user/notes.txt""#,
+            r"'unlink' '/tmp/cache/..\..\Users/user/notes.txt'",
+            "'unlink' \"$TMPDIR/scratch\"",
+            "'unlink' /tmp/scratch /etc/passwd",
+            "'unlink' /tmp/scratch; 'unlink' /etc/passwd",
+        ] {
+            assert_no_safe_match(&pack, command);
+            assert_blocks(&pack, command, "unlink");
+        }
+        assert_no_safe_match(&pack, "'unlink'>/etc/passwd /tmp/scratch");
+    }
+
+    #[test]
     fn unlink_path_prefixed_normalizes_to_bare() {
         // PATH_NORMALIZER strips `/usr/bin/unlink` to bare `unlink`.
         // Pin the contract — if `unlink` is dropped from the capture,
@@ -2223,6 +7323,37 @@ mod tests {
             "truncate --reference=ref.bin out.bin",
         ] {
             assert_no_match(&pack, cmd);
+        }
+    }
+
+    /// getopt accepts the size attached (`-s0`), separated from a long option
+    /// (`--size 0`), and bundled (`-cs0`). Only `-s 0` and `--size=0` were
+    /// recognised, so the other spellings zeroed a key or /etc/passwd
+    /// unexamined -- and the safe rules had the same blind spot, so both
+    /// sides move together.
+    #[test]
+    fn truncate_every_size_spelling_is_judged_alike() {
+        let pack = create_pack();
+        for cmd in [
+            "truncate -s0 ~/.ssh/id_ed25519",
+            "truncate --size 0 ~/.ssh/id_ed25519",
+            "truncate -cs0 /etc/passwd",
+            "truncate -c -s0 /etc/shadow",
+            "truncate -s-100 ~/.bashrc",
+        ] {
+            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
+        }
+        for cmd in ["truncate -s0 ./data.bin", "truncate --size 0 build/out.log"] {
+            assert_blocks_with_severity(&pack, cmd, Severity::High);
+        }
+        for cmd in [
+            "truncate -s+1G ./disk.img",
+            "truncate --size +1G ./disk.img",
+            "truncate -cs+4K ./sparse.bin",
+            "truncate -s0 /tmp/scratch/out.log",
+            "truncate --size 0 /var/tmp/job.log",
+        ] {
+            assert_safe_pattern_matches(&pack, cmd);
         }
     }
 
@@ -2721,6 +7852,27 @@ mod tests {
     }
 
     #[test]
+    fn mv_literal_operands_with_line_continuations_are_allowed_issue_356() {
+        let pack = create_pack();
+        for cmd in [
+            "mv fileA.md fileB.md \\\n               fileC.md \\\n               destdir/",
+            "mv fileA.md fileB.md \\\r\n               fileC.md \\\r\n               destdir/",
+        ] {
+            assert_no_match(&pack, cmd);
+        }
+
+        // Only the shell's backslash-newline join is inert. Runtime
+        // expansion and in-path escaping remain unverifiable and blocked.
+        for cmd in [
+            "mv fileA.md \\\n               $DEST/",
+            r"mv fileA\ name.md destdir/",
+            "mv fileA\\\rdest.md destdir/",
+        ] {
+            assert_blocks_with_pattern(&pack, cmd, "mv-dynamic-path");
+        }
+    }
+
+    #[test]
     fn sensitive_propagation_then_delete_blocks_critical() {
         let pack = create_pack();
         for (cmd, pattern) in [
@@ -2906,8 +8058,14 @@ mod tests {
             // Numbered FDs.
             "echo x 1> /etc/passwd",
             "echo x 2> /etc/passwd",
+            "echo x 0> /etc/passwd",
+            "echo x 3> /etc/passwd",
+            "echo x 17>| /etc/passwd",
             "echo x 1>| /etc/passwd",
             "echo x 2>| /etc/passwd",
+            // Bash named descriptors and PowerShell's all-stream redirect.
+            "echo x {audit}> /etc/passwd",
+            "Write-Output x *> /etc/passwd",
             // Home variants.
             "echo x > ~/.ssh/id_ed25519",
             "echo x > $HOME/.aws/credentials",
@@ -2934,10 +8092,40 @@ mod tests {
     }
 
     #[test]
+    fn redirect_truncate_rules_suggest_exclusive_create_new_sink() {
+        let pack = create_pack();
+        for rule_name in [
+            "redirect-truncate-root-home",
+            "redirect-truncate-dynamic-path",
+            "redirect-truncate-git-internals-relative",
+            "redirect-append-git-internals-relative",
+        ] {
+            let rule = pack
+                .destructive_patterns
+                .iter()
+                .find(|pattern| pattern.name == Some(rule_name))
+                .unwrap_or_else(|| panic!("missing {rule_name} rule"));
+            assert!(
+                rule.suggestions.iter().any(|suggestion| {
+                    suggestion.command == "producer | dcg create-new {path}"
+                        && suggestion.description.contains("only if no file")
+                }),
+                "{rule_name} must expose the non-overwriting positive capability"
+            );
+        }
+    }
+
+    #[test]
     fn redirect_append_is_allowed() {
         // `>>` is append (non-destructive); the destructive regex's
         // negative lookbehind `(?<![<>])` excludes it. Even on
         // sensitive paths, append must NOT block.
+        //
+        // `.git/` is the one exception, and it is not a hole in this rule but
+        // a different judgement about a different target: git reads its
+        // internals whole, so adding to one runs on the next git command
+        // without destroying anything (#457). See
+        // `append_into_git_internals_is_denied_issue_457`.
         let pack = create_pack();
         for cmd in [
             "echo line >> /etc/syslog",
@@ -2949,6 +8137,148 @@ mod tests {
             "echo x &>> /etc/log",
             "echo x 1>> /etc/passwd",
             "echo x 2>> /etc/passwd",
+            "echo x 17>> /etc/passwd",
+            "echo x {audit}>> /etc/passwd",
+            "Write-Output x *>> /etc/passwd",
+        ] {
+            assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn unspaced_append_to_dynamic_path_is_not_a_truncation_575() {
+        // The dynamic-path rule ignored `>> "$LOG"` but read `>>"$LOG"` as a
+        // truncating `>` whose target began with the second `>`.
+        let pack = create_pack();
+        let dynamic_path = pack
+            .destructive_patterns
+            .iter()
+            .find(|pattern| pattern.name == Some("redirect-truncate-dynamic-path"))
+            .expect("redirect-truncate-dynamic-path rule");
+        for cmd in [
+            "echo done >>\"$LOG\"",
+            "echo done >>$LOG",
+            "echo done 2>>\"$LOG\"",
+            "echo done 2>>$LOG",
+            "echo done &>>\"$LOG\"",
+            "echo done >>\"$HOME/notes.txt\"",
+            "echo done >>${LOG}",
+            "echo done >>`pwd`/log",
+        ] {
+            assert!(
+                !dynamic_path.regex.is_match(cmd),
+                "append must not be read as a truncating redirect: {cmd:?}"
+            );
+        }
+        // Truncating spellings of the same targets still deny, including a
+        // truncation that shares the line with an append.
+        for cmd in [
+            "echo done >\"$LOG\"",
+            "echo done > \"$LOG\"",
+            "echo done >|\"$LOG\"",
+            "echo done 2>\"$LOG\"",
+            "echo done &>\"$LOG\"",
+            "echo done >$LOG",
+            "echo a >>/tmp/x >\"$LOG\"",
+            "echo a >\"$LOG\" >>/tmp/x",
+        ] {
+            assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-dynamic-path");
+        }
+    }
+
+    #[test]
+    fn append_into_git_internals_is_denied_issue_457() {
+        // The truncating spelling of each of these was already denied; the
+        // appending one reaches the same end state and was allowed. Appending
+        // is the more useful primitive against a repository, not the milder
+        // one: a section added to `.git/config` runs on the next fetch and
+        // leaves everything already there working.
+        let pack = create_pack();
+        for cmd in [
+            "cat >> .git/config",
+            "echo x >>.git/config",
+            "echo x >> ./.git/config",
+            "echo x >> sub/.git/config",
+            "echo x >> /home/u/proj/.git/hooks/pre-commit",
+            "echo x >> \"$HOME/proj/.git/config\"",
+            "echo x 1>> .git/config",
+            "echo x &>> .git/config",
+            "echo x {audit}>> .git/config",
+        ] {
+            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
+            assert_blocks_with_pattern(&pack, cmd, "redirect-append-git-internals-relative");
+        }
+    }
+
+    #[test]
+    fn a_pack_regex_cannot_reach_a_tee_operand_issue_460() {
+        // Why there is no `tee-git-internals` rule. A pack-level `check` DOES
+        // match a rule spelled for `tee <path>` — this test proves the regex
+        // is fine — and the same rule then never fires in the evaluator, which
+        // is the exact shape #407/#441/#444 were about, one layer deeper: the
+        // keyword admits the pack, the pack agrees, and production still
+        // allows the command.
+        //
+        // Keeping the rule with this test passing would have shipped a green
+        // assertion of coverage that does not exist, so the rule is out and
+        // #460 carries the evaluator gap. This test stays as the guard: if the
+        // regex ever stops matching here, the reasoning above is stale.
+        let pack = create_pack();
+        let candidate = DestructivePattern {
+            regex: crate::packs::regex_engine::LazyCompiledRegex::new(
+                r#"\b(?:tee|sponge)\b(?:\s+(?:[^\s"'\\;&|<>]|\\[^\r\n]|'[^']*'|"[^"]*")+)*\s+['"]?(?:\./)?(?:[^\s'";&|<>]*/)?\.git/"#,
+            ),
+            reason: "candidate rule retained only as this test's fixture",
+            name: Some("tee-git-internals-candidate"),
+            severity: Severity::Critical,
+            explanation: None,
+            suggestions: &[],
+            executables: None,
+        };
+        for cmd in [
+            "tee .git/config",
+            "tee -a .git/config",
+            "echo x | tee .git/hooks/pre-commit",
+            "sponge .git/config",
+            "tee sub/.git/config",
+        ] {
+            assert!(
+                candidate.matches_command(cmd),
+                "the candidate regex must still match {cmd}; if it does not, the \
+                 #460 reasoning needs re-measuring rather than trusting"
+            );
+        }
+        assert!(
+            !pack
+                .destructive_patterns
+                .iter()
+                .any(|pattern| pattern.name == Some("tee-git-internals")),
+            "the rule must stay out of the pack until the evaluator can reach it (#460)"
+        );
+    }
+
+    #[test]
+    fn ordinary_git_adjacent_writes_stay_allowed_issue_457() {
+        // The component must be exactly `.git` followed by a separator, and
+        // reading a git internal into a writer is not writing one. `cp` and
+        // `install` stay allowed on purpose: staging a file and copying it in
+        // is the reviewed path the `.git` denial text itself recommends.
+        let pack = create_pack();
+        for cmd in [
+            "echo x >> .gitignore",
+            "echo x >> .gitattributes",
+            "echo x >> .github/workflows/ci.yml",
+            "echo x >> notes/git.md",
+            "cat .git/config | tee /tmp/backup",
+            "git ls-files | tee .gitignore",
+            // A commit message that discusses these rules is covered by the
+            // EVALUATOR's string-data sanitization, not by the pack, so its
+            // pin lives in `tests/repro_407_relative_git_internals_redirect`
+            // where the hook actually runs. Asserting it here fails, correctly:
+            // `pack.check` sees the raw text and the append rule matches it.
+            "tee /tmp/scratch/config",
+            "cp /tmp/x .git/config",
+            "install -m 644 /tmp/x .git/config",
         ] {
             assert_no_match(&pack, cmd);
         }
@@ -2986,8 +8316,28 @@ mod tests {
             "echo data>$LOG_FILE",
             r"echo data > /tmp/.\./etc/passwd",
             "echo data 2> `dynamic-path`",
+            ": > ~root/.ssh/authorized_keys",
+            ": > /e''tc/passwd",
+            ": > /e\"tc\"/passwd",
+            ": > /et?/passwd",
+            "echo x >%TARGET%",
+            "echo x >!TARGET!",
+            "echo x >^/etc/passwd",
         ] {
             assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-dynamic-path");
+        }
+
+        for cmd in [
+            r#": > "/tmp/literal""#,
+            ": > '/tmp/literal'",
+            ": > /tmp/e''tc/passwd",
+            ": > /tmp/et?/passwd",
+            "echo x >^/tmp/output",
+            "echo x >>%TARGET%",
+            "echo x <>%TARGET%",
+            "echo x 3>&1",
+        ] {
+            assert_no_match(&pack, cmd);
         }
     }
 
@@ -3017,6 +8367,9 @@ mod tests {
             "command 2>&1 | tee log.txt",
             "echo x >&2",
             "exec >&-",
+            "echo x 3>&1",
+            "echo x {audit}>&1",
+            "Write-Output x *>&1",
         ] {
             assert_no_match(&pack, cmd);
         }
@@ -3066,17 +8419,121 @@ mod tests {
 
     #[test]
     fn redirect_to_dev_devices_still_blocks() {
-        // The /dev/{null,zero,full} carve-out must NOT relax actual
-        // device destruction (`> /dev/sda` etc.) — only the safe sinks.
+        // The write-safe-device carve-out must NOT relax actual device
+        // destruction (`> /dev/sda` etc.) — only the safe sinks. This
+        // includes near-misses of the #324 carve-out: `/dev/st0` is a
+        // TAPE device (truncate-adjacent name, real data), `/dev/tty0`
+        // and `/dev/ttys002` are other terminals/consoles, and
+        // `/dev/fd/N` for N > 2 can dup a regular-file descriptor where
+        // O_TRUNC truncates a real file.
         let pack = create_pack();
         for cmd in [
             "> /dev/sda",
             "echo zero > /dev/sda1",
             "command > /dev/sdb",
             "echo > /dev/nvme0n1",
+            "echo > /dev/st0",
+            "echo > /dev/tty0",
+            "echo > /dev/ttys002",
+            "echo x > /dev/fd/3",
+            "echo x > /dev/fd/7",
+            "echo x > /dev/fd/12",
+            "echo x > /dev/stdouts",
         ] {
             assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
         }
+    }
+
+    #[test]
+    fn redirect_to_controlling_terminal_is_allowed() {
+        // `/dev/tty` is the controlling terminal — always a character
+        // device, never a regular file — so opening it with O_TRUNC cannot
+        // destroy persistent data. It stays carved out alongside
+        // /dev/null|zero|full.
+        let pack = create_pack();
+        for cmd in [
+            "echo prompt > /dev/tty",
+            "read -p x < /dev/tty > /dev/tty",
+            "echo x > /dev/null",
+            "echo x > /dev/zero",
+            "echo x > /dev/full",
+        ] {
+            assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn redirect_to_std_stream_symlinks_blocks() {
+        // `/dev/stdout`, `/dev/stderr`, and `/dev/fd/N` are symlinks to
+        // whatever fd 0/1/2/N currently point at — which may be a regular
+        // file (after `exec > logfile`, or an inherited redirect). Opening
+        // them with O_TRUNC then truncates that real file, so the #324
+        // carve-out for them was unsound and is removed: the guard blocks
+        // them under its zero-false-negatives posture.
+        let pack = create_pack();
+        for cmd in [
+            "gh pr view 204 --json number,title > /dev/stdout",
+            "command > /dev/stdout",
+            "command >/dev/stdout",
+            "command > /dev/stderr",
+            "echo warn 1> /dev/stderr",
+            "echo warn 2> /dev/stdout",
+            "command &> /dev/stdout",
+            "echo x > /dev/fd/0",
+            "echo x > /dev/fd/1",
+            "echo x >/dev/fd/2",
+        ] {
+            assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
+        }
+    }
+
+    #[test]
+    fn redirect_truncate_macos_home_spelling_blocks() {
+        // #325: tools hand agents absolute resolved paths, so the macOS
+        // home spelling `/Users/<user>/...` is what a truncating
+        // redirect actually names in practice. The rm family already
+        // treated /Users as sensitive; the redirect rule must agree
+        // with it or the guard blocks the uncertain form
+        // (`> $D/.zshrc`) while allowing the exactly-named one.
+        let pack = create_pack();
+        for cmd in [
+            "echo x > /Users/jemanuel/.zshrc",
+            "echo x >/Users/jemanuel/.zshrc",
+            ": > /Users/jemanuel/.zshrc",
+            "echo x >| /Users/jemanuel/.zshrc",
+            "echo x 2> /Users/jemanuel/.zshrc",
+            "echo x &> /Users/jemanuel/.zshrc",
+            "printf x > /Users/jemanuel/.ssh/config",
+            "echo x > \"/Users/jemanuel/.zshrc\"",
+            "echo x > /Users",
+            "echo x > /Users/Shared/notes.txt",
+        ] {
+            assert_blocks_with_severity(&pack, cmd, Severity::Critical);
+            assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
+        }
+
+        // `/Users` must only match as a complete path component.
+        for cmd in ["echo x > /Usersland/file.txt", "echo x > ./Users/file.txt"] {
+            assert_no_match(&pack, cmd);
+        }
+    }
+
+    #[test]
+    fn mv_sensitive_source_macos_home_spelling_blocks() {
+        // #325 sibling: mv-sensitive-source-root-home shares the
+        // sensitive-path alternation and must carry the macOS spelling
+        // too (platform parity with the Linux `/home` posture).
+        let pack = create_pack();
+        assert_blocks_with_pattern(
+            &pack,
+            "mv /Users/jemanuel/.zshrc /tmp/x",
+            "mv-sensitive-source-root-home",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "mv /home/user/.zshrc /tmp/x",
+            "mv-sensitive-source-root-home",
+        );
     }
 
     #[test]
@@ -3102,6 +8559,18 @@ mod tests {
         ] {
             assert_blocks_with_pattern(&pack, cmd, "redirect-truncate-root-home");
         }
+        // A relative target is a redirection too; the split used to require
+        // a rooted or quoted one, so these were masked as echo data.
+        assert_blocks_with_pattern(
+            &pack,
+            "echo x >.git/config",
+            "redirect-truncate-git-internals-relative",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            "printf x >.git/HEAD",
+            "redirect-truncate-git-internals-relative",
+        );
     }
 
     #[test]
@@ -3173,6 +8642,26 @@ mod tests {
         }
     }
 
+    /// The rm regexes are anchored on the executable (bd-migo): `rm` inside a
+    /// longer word is not an invocation, even for a caller that uses
+    /// `Pack::check` without the evaluator's argv0 gating. Path-qualified and
+    /// subcommand spellings still match.
+    #[test]
+    fn rm_regexes_do_not_match_inside_a_longer_word() {
+        let pack = create_pack();
+        for command in [
+            "charm -r -f build",
+            "swarm -r -f nodes",
+            "charm -rf /",
+            "swarm --recursive --force nodes",
+            "farm -fr ~/",
+        ] {
+            assert_allows(&pack, command);
+        }
+        assert_blocks_with_pattern(&pack, "/bin/rm -rf build", "rm-rf-general");
+        assert_blocks_with_pattern(&pack, "echo ok; rm -rf build", "rm-rf-general");
+    }
+
     #[test]
     fn test_rm_rf_root_critical() {
         let pack = create_pack();
@@ -3187,6 +8676,476 @@ mod tests {
         assert_blocks_with_severity(&pack, "rm -rf '/'", Severity::Critical);
         assert_blocks_with_severity(&pack, "rm -rf \"~/\"", Severity::Critical);
         assert_blocks_with_severity(&pack, "rm -rf '/etc'", Severity::Critical);
+    }
+
+    #[test]
+    fn private_tmp_is_equivalent_to_tmp_on_macos() {
+        // Regression for #244 part A: /tmp and /var/tmp are symlinks to
+        // /private/tmp and /private/var/tmp on macOS, so the canonical form
+        // must enjoy the same literal-temp allowance.
+        let pack = create_pack();
+        for cmd in [
+            "rm -rf /private/tmp/some/subdir/file",
+            "rm -fr /private/tmp/build",
+            "rm -r -f /private/tmp/scratch",
+            "rm -rf /private/var/tmp/build",
+            "rm --recursive --force /private/tmp/cache",
+        ] {
+            assert!(
+                pack.check(cmd).is_none(),
+                "macOS-canonical private tmp path must be allowed: {cmd}"
+            );
+        }
+        // Traversal out of the private tmp tree stays blocked.
+        assert!(pack.check("rm -rf /private/tmp/../etc").is_some());
+        assert!(pack.check("rm -rf /private/etc").is_some());
+    }
+
+    #[test]
+    fn windows_user_temp_subpaths_are_equivalent_to_tmp() {
+        // Regression for #285: the per-user Windows temp directory is the
+        // platform's /tmp, in both the native drive spelling and the Git
+        // Bash / MSYS2 spelling Claude Code's Bash tool emits on Windows.
+        // Windows paths are case-insensitive.
+        let pack = create_pack();
+        for cmd in [
+            r"rm -rf /c/Users/u/AppData/Local/Temp/some/subdir/file",
+            r"rm -rf /C/users/U/appdata/local/temp/x",
+            r"rm -rf C:\Users\u\AppData\Local\Temp\some\file",
+            r"rm -rf C:\Users\u\AppData\Local\TEMP\build",
+            r#"rm -rf "C:\Users\u\AppData\Local\Temp\x""#,
+            r"rm -fr /c/Users/u/AppData/Local/Temp/build",
+            r"rm -r -f C:/Users/u/AppData/Local/Temp/scratch",
+        ] {
+            assert!(
+                pack.check(cmd).is_none(),
+                "literal per-user Windows temp subpath must be allowed: {cmd}"
+            );
+        }
+        // The carve-out must stay bounded: the temp root itself, non-temp
+        // user paths, prefix confusion, traversal, multi-target smuggling,
+        // the machine-wide C:\Windows\Temp, and dynamic roots (the $TMPDIR
+        // policy) all stay blocked.
+        for cmd in [
+            r"rm -rf C:\Users\u\AppData\Local\Temp",
+            r"rm -rf /c/Users/u/Documents/x",
+            r"rm -rf /c/Users/u/AppData/Local/Tempx/y",
+            r"rm -rf C:\Users\u\AppData\Local\Temp\..\..\Documents",
+            r"rm -rf C:\Users\u\AppData\Local\Temp\x /etc",
+            r"rm -rf C:\Windows\Temp\x",
+            r#"rm -rf "$TEMP/some/subdir/file""#,
+            r"rm -rf $TMP/build",
+            r"rm -rf $env:TEMP\x",
+        ] {
+            assert!(
+                pack.check(cmd).is_some(),
+                "Windows temp carve-out must stay bounded: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_user_temp_carve_out_rejects_dot_and_trailing_dot_components() {
+        // The component filter must reject every dot-only component, not just
+        // `.` and `..`: cmd resolves `...` as repeated parent traversal in
+        // some contexts, so it can leave the temp subtree. Win32 also strips
+        // trailing dots and spaces from a component, so `Temp.` and `Temp `
+        // name a different directory than the one the carve-out proved.
+        for path in [
+            r"C:\Users\u\AppData\Local\Temp\...\...\...\...\Windows\System32",
+            r"C:\Users\u\AppData\Local\Temp\....\x",
+            r"/c/Users/u/AppData/Local/Temp/.../.../.../.../Windows/System32",
+            r"C:\Users\u\AppData\Local\Temp.\x",
+            r"C:\Users\u\AppData\Local\Temp \x",
+            r"C:\Users\u\AppData\Local\Temp\sub.\x",
+            r"C:\Users\u\AppData\Local\Temp\sub \x",
+            r"C:\Users.\u\AppData\Local\Temp\x",
+        ] {
+            assert!(
+                !windows_literal_user_temp_subpath(path),
+                "dot-only or trailing dot/space component must not be carved out: {path}"
+            );
+        }
+        // A dot inside a component is ordinary and stays carved out.
+        for path in [
+            r"C:\Users\u\AppData\Local\Temp\build.tmp\x",
+            r"/c/Users/u/AppData/Local/Temp/a.b/c",
+        ] {
+            assert!(
+                windows_literal_user_temp_subpath(path),
+                "an interior dot must keep the carve-out: {path}"
+            );
+        }
+
+        let pack = create_pack();
+        for cmd in [
+            r"rm -rf C:\Users\u\AppData\Local\Temp\...\...\...\...\Windows\System32",
+            r"rm -rf /c/Users/u/AppData/Local/Temp/.../.../.../.../Windows/System32",
+            r"rm -rf C:\Users\u\AppData\Local\Temp\sub.\x",
+        ] {
+            assert!(
+                pack.check(cmd).is_some(),
+                "dot-component temp path must stay blocked: {cmd}"
+            );
+        }
+        assert!(matches!(
+            parse_powershell_remove_item_segment(
+                r"Remove-Item -Recurse -Force C:\Users\u\AppData\Local\Temp\...\...\...\...\Windows\System32",
+                false,
+            ),
+            RmParseDecision::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn powershell_remove_item_literal_user_temp_subpath_is_allowed() {
+        // #285, PowerShell dialect: Remove-Item with every proven target a
+        // literal per-user temp subpath is temp cleanup, like rm -rf /tmp/x.
+        for cmd in [
+            r"Remove-Item -Recurse -Force C:\Users\u\AppData\Local\Temp\some\subdir\file",
+            r"Remove-Item -Recurse c:\users\u\appdata\local\TEMP\x",
+            r"Remove-Item -Recurse -Force 'C:\Users\u\AppData\Local\Temp\x'",
+            r"Remove-Item -Recurse -Force -Path:C:\Users\u\AppData\Local\Temp\x",
+        ] {
+            assert!(
+                matches!(
+                    parse_powershell_remove_item_segment(cmd, false),
+                    RmParseDecision::Allow
+                ),
+                "literal temp Remove-Item must be allowed: {cmd}"
+            );
+        }
+        // Dynamic roots keep the $TMPDIR review policy, and non-temp or
+        // mixed targets stay denied.
+        for cmd in [
+            r"Remove-Item -Recurse -Force $env:TEMP\some\subdir\file",
+            r"Remove-Item -Recurse -Force C:\Users\u",
+            r"Remove-Item -Recurse -Force C:\Users\u\AppData\Local\Temp",
+            r"Remove-Item -Recurse -Force C:\Users\u\AppData\Local\Temp\x C:\Windows\System32",
+            r"Remove-Item -Recurse -Force C:\Users\u\AppData\Local\Temp\x,C:\Windows",
+            r"Remove-Item -Recurse -Force C:\Windows\Temp\x",
+        ] {
+            assert!(
+                matches!(
+                    parse_powershell_remove_item_segment(cmd, false),
+                    RmParseDecision::Deny(_)
+                ),
+                "Remove-Item outside the literal temp carve-out must stay denied: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn mv_to_trash_is_allowed_and_stays_bounded() {
+        // Regression for #244 part B: dcg's own rm-rf remediation suggests
+        // moving files into the Trash, so that exact command must be allowed.
+        let pack = create_pack();
+        for cmd in [
+            "mv /private/tmp/some/subdir/file ~/.local/share/Trash/",
+            "mv /tmp/scratch.txt ~/.local/share/Trash/",
+            "mv ~/Downloads/junk.md ~/.local/share/Trash/",
+            "mv ~/Downloads/junk.md ~/.Trash/",
+            "mv /Users/alice/Downloads/old.pdf ~/.Trash/",
+            "mv /home/alice/notes/old.txt ~/.local/share/Trash/files/",
+            "mv report.bak ~/.Trash",
+        ] {
+            assert!(
+                pack.check(cmd).is_none(),
+                "move into the platform Trash must be allowed: {cmd}"
+            );
+        }
+        // The carve-out must not become a general bypass: whole homes,
+        // sensitive system trees, traversal, and dynamic paths stay blocked.
+        for cmd in [
+            "mv /etc ~/.local/share/Trash/",
+            "mv ~/ ~/.Trash/",
+            "mv /Users/alice/ ~/.Trash/",
+            "mv /tmp/../etc ~/.Trash/",
+            "mv ~/Downloads/x ~/.Trash/../../etc",
+            "mv \"$f\" ~/.local/share/Trash/",
+            // A shell separator hidden inside a whitespace-free token must
+            // not let the whole-command safe match rescue a sensitive
+            // sibling segment.
+            "mv /etc;x ~/.Trash/",
+        ] {
+            assert!(
+                pack.check(cmd).is_some(),
+                "Trash carve-out must stay bounded: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn mv_within_home_reads_quoted_separators_as_file_name_bytes_issue_552() {
+        // GitHub #552: inside a quoted operand `&`, `;` and `|` are bytes of
+        // the file name, not separators. The home-subtree rescues excluded
+        // them from their quoted token classes, so the move allowed with `x`,
+        // `(` or `#` in the name was denied with `&`.
+        let pack = create_pack();
+        for cmd in [
+            r#"mv "/home/tester/Downloads/a & b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a ; b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a | b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a b.pdf" "/home/tester/Downloads/c & d.pdf""#,
+            r"mv '/home/tester/Downloads/a & b.pdf' '/home/tester/Downloads/c.pdf'",
+            r"mv '/home/tester/Downloads/a;b|c&d.pdf' /home/tester/Downloads/e.pdf",
+            // The reported real-world name, apostrophe included.
+            r#"mv "/Users/tanjeriel/Library/CloudStorage/Drive/My Drive/Kevin & Linh's Wedding - A Comprehensive Guide.pdf" "/Users/tanjeriel/Library/CloudStorage/Drive/My Drive/Archive/""#,
+            r#"mv -v "~/Documents/a&b.txt" "~/Documents/a;b.txt" ~/Documents/dest/"#,
+            // The other punctuation the report found allowed stays allowed.
+            r#"mv "/home/tester/Downloads/a x b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a ( b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a ) b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a ' b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a , b.pdf" "/home/tester/Downloads/c.pdf""#,
+            r#"mv "/home/tester/Downloads/a # b.pdf" "/home/tester/Downloads/c.pdf""#,
+            // `mv-relative-into-home` shares the destination alternation and
+            // reads its quoted source the same way.
+            r#"mv "a & b.pdf" /home/tester/Downloads/c.pdf"#,
+            r#"mv a.pdf "/home/tester/Downloads/c | d.pdf""#,
+        ] {
+            assert_safe_pattern_matches(&pack, cmd);
+            assert!(
+                pack.check(cmd).is_none(),
+                "a quoted separator inside a home-subtree operand is file-name data: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn mv_within_home_still_ends_at_unquoted_separators_issue_552() {
+        // The #552 fix must not widen the rescue: an unquoted `;`, `|` or `&`
+        // still ends the mv, every home-root, dotfile and `..` boundary still
+        // holds inside quotes, and dynamic or escaped text still withholds it.
+        let pack = create_pack();
+        for cmd in [
+            // A second segment after a real separator is never rescued.
+            "mv ~/Downloads/a ~/Downloads/b; rm -rf ~",
+            "mv ~/Downloads/a & mv /etc /tmp/x",
+            r#"mv "/home/tester/Downloads/a & b.pdf" "/home/tester/Downloads/c.pdf" & rm -rf ~"#,
+            r#"mv "/home/tester/Downloads/a & b.pdf" "/home/tester/Downloads/c.pdf"; mv /etc /tmp/x"#,
+            r#"mv "/home/tester/Downloads/a" & "/home/tester/Downloads/b""#,
+            r#"mv "/home/tester/Downloads/a"&"/home/tester/Downloads/b" "/home/tester/Downloads/c""#,
+            // An unquoted separator in the home-root user name is a separator
+            // too. The regex used to read each of these as one rescued mv;
+            // only the segmenter kept them from being exempt.
+            "mv /home/x;/Documents/a/b /home/u/Documents/c",
+            "mv /home/a&b/Docs/x/y /home/a&b/Docs/z",
+            "mv /home/a|b/Docs/x/y /home/a/Docs/z",
+            // Home roots, top-level home directories, dotfile trees and `..`
+            // stay gated when the name carries a quoted separator.
+            r#"mv "/home/tester & x" "/home/tester/Downloads/c""#,
+            r#"mv "/home/tester/Downloads & x" "/home/tester/Docs/y""#,
+            r#"mv "/home/tester/Downloads/x" "/home/tester/.ssh""#,
+            r#"mv "/home/tester/Downloads/a & b" "/home/tester/.ssh/authorized_keys""#,
+            r#"mv "/home/tester/.ssh/id_rsa & x" "/home/tester/Downloads/c""#,
+            r#"mv "/home/tester/Downloads/a & b/../../.ssh/k" "/home/tester/Downloads/c""#,
+            r#"mv a.pdf "/home/tester/.ssh/x & y""#,
+            r#"mv ../a.pdf "/home/tester/Downloads/c & d.pdf""#,
+            r#"mv .ssh/id_rsa "/home/tester/Downloads/c & d""#,
+            // Leaving the home tree is still the relocate half of the bypass.
+            r#"mv "/home/tester/Downloads/a & b.pdf" /tmp/x"#,
+            // Expansion after a quoted separator is still seen.
+            r#"mv "/home/tester/Downloads/a & b" "/home/tester/Downloads/$(rm -rf ~)""#,
+            r#"mv "/home/tester/Downloads/a & b" "/home/tester/Downloads/`id`""#,
+            r#"mv "/home/tester/Downloads/a & b" "/home/tester/Downloads/$USER""#,
+            // A backslash anywhere withholds the rescue: with one, a quote can
+            // be escaped and the regex could no longer track where quoting
+            // ends. `mv-dynamic-path` treats every in-path escape as
+            // unverifiable (#356), so the escaped spelling stays denied too.
+            r#"mv "/home/tester/Downloads/a & b" "/home/tester/Downloads/c\" ; rm -rf ~ ; \"""#,
+            r"mv /home/tester/Downloads/a\ \&\ b.pdf /home/tester/Downloads/c.pdf",
+        ] {
+            assert_no_safe_match(&pack, cmd);
+            assert!(
+                pack.check(cmd).is_some(),
+                "home-subtree rescue must stay bounded: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn mv_within_home_withholds_the_rescue_on_brace_expansion() {
+        // Bash expands an unquoted brace list before mv runs, so the `..` and
+        // dotfile checks on the written token never see the real operands:
+        // `~/{..,a}/{..,b}/etc` is `~/../../etc ~/../b/etc ~/a/../etc
+        // ~/a/b/etc`, and the move of `/etc` was allowed while the spelled-out
+        // `mv ~/../../etc ~/Documents/x` was denied.
+        let pack = create_pack();
+        for cmd in [
+            "mv ~/{..,a}/{..,b}/etc ~/Documents/x",
+            "mv /home/tester/{..,x}/{..,y}/opt/homebrew /home/tester/Documents/x",
+            "mv ~/{Documents,.ssh}/id_rsa ~/Documents/y",
+            "mv ~/Documents/a ~/{Documents,.ssh}",
+            "mv /home/{tester,root}/Documents/a/b /home/tester/Documents/c",
+            "mv {..,a}/{..,b}/x /home/tester/Documents/y",
+            "mv a.md ~/Documents/{..,x}/{..,y}/{..,z}/etc/cron.d",
+            // The accepted cost: an ordinary brace list loses the rescue too
+            // and needs its operands spelled out (or quoted, if literal).
+            "mv ~/Documents/{a,b}.txt ~/Documents/dir/",
+        ] {
+            assert_no_safe_match(&pack, cmd);
+            assert!(
+                pack.check(cmd).is_some(),
+                "brace expansion must not ride the home-subtree rescue: {cmd}"
+            );
+        }
+        // Inside quotes a brace is a literal byte, and a lone `}` never
+        // starts an expansion.
+        for cmd in [
+            r#"mv "/home/tester/Documents/{draft}.txt" "/home/tester/Documents/final.txt""#,
+            r"mv '/home/tester/Documents/a{1,2}.txt' /home/tester/Documents/dir/",
+            r#"mv "a{..,b}.md" /home/tester/Documents/x.md"#,
+            "mv ~/Documents/a} ~/Documents/b",
+        ] {
+            assert_safe_pattern_matches(&pack, cmd);
+            assert!(
+                pack.check(cmd).is_none(),
+                "a literal brace inside a home-subtree operand is file-name data: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_separator_cannot_hide_a_later_operand_issue_552_follow_up() {
+        // Rules that stay inside one command scan with `[^|;&]*`, which
+        // stopped at a quoted or escaped separator: every operand after it was
+        // invisible, so the canonical relocate-then-delete bypass and
+        // `find / -delete` were allowed whenever an earlier operand was named
+        // `a;b`. Each command below is denied with a quoted space instead.
+        let pack = create_pack();
+        for (cmd, rule) in [
+            (r#"mv "a & b" /etc /tmp/x"#, "mv-sensitive-source-root-home"),
+            (r#"mv "a & b" /etc/hosts"#, "mv-sensitive-source-root-home"),
+            (
+                r#"mv "a;b" ~/Documents /tmp/x"#,
+                "mv-sensitive-source-root-home",
+            ),
+            (
+                r#"mv -- "a & b" /home/tester /tmp/x"#,
+                "mv-sensitive-source-root-home",
+            ),
+            (r#"mv "a & b" $X /tmp/y"#, "mv-dynamic-path"),
+            (r#"find "a;b" / -delete"#, "find-delete-root-home"),
+            (
+                r#"find "a|b" /home/tester -delete"#,
+                "find-delete-root-home",
+            ),
+            (r"find a\;b / -delete", "find-delete-root-home"),
+            (
+                r#"cp -a "a & b" /etc /tmp/x && rm -rf /tmp/x"#,
+                "cp-sensitive-then-delete",
+            ),
+            (
+                r#"ln -s "a & b" /etc /tmp/x && rm -rf /tmp/x/."#,
+                "ln-symlink-sensitive-then-delete",
+            ),
+            (
+                r#"rsync -a "a;b" /etc/ /tmp/d/ && rm -rf /tmp/d"#,
+                "rsync-sensitive-then-delete",
+            ),
+            (
+                r#"rsync -a --delete "a & b" /tmp/src/ /etc/"#,
+                "rsync-delete-sensitive-dest",
+            ),
+            (r#"dd "if=a&b" of=/etc/hosts"#, "dd-overwrite-root-home"),
+        ] {
+            assert_blocks_with_pattern(&pack, cmd, rule);
+        }
+        // Harmless commands carrying the same quoted separators stay allowed:
+        // the masked view only lets a scan read its own command further.
+        for cmd in [
+            r#"mv "a & b" c"#,
+            r#"mv "a;b" /tmp/x/"#,
+            r#"mv "/home/tester/Documents/a & b" ~/Documents/x ~/Documents/y"#,
+            r#"mv "a & b" /home/tester/Documents/y"#,
+            r#"cp -a "a & b" /tmp/x && rm -rf /tmp/x"#,
+            r#"rsync -a "a & b" /tmp/dst/"#,
+            r#"find . -name "a;b" -print"#,
+            r#"grep "a|b" file"#,
+            r#"echo "x;y" > /tmp/out"#,
+            r"find /tmp/build -name x -exec rm {} \;",
+        ] {
+            assert!(
+                pack.check(cmd).is_none(),
+                "a quoted separator in a harmless command must stay data: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn trash_rescues_read_quoted_separators_and_refuse_brace_expansion() {
+        // #552 for the Trash soft-delete: a quoted `&`, `;` or `|` is a
+        // file-name byte, exactly like the space that was already allowed.
+        let pack = create_pack();
+        for cmd in [
+            r#"mv "/Users/u/Documents/a & b.txt" ~/.Trash/"#,
+            r"mv '/Users/u/Documents/a;b.txt' '/Users/u/.Trash/'",
+            r#"mv "/home/u/docs/a | b.txt" /home/u/.local/share/Trash/"#,
+            r#"mv "a & b" ~/.Trash/"#,
+            r#"mv "/Users/u/Documents/{a,b}.txt" ~/.Trash/"#,
+        ] {
+            assert_safe_pattern_matches(&pack, cmd);
+            assert!(
+                pack.check(cmd).is_none(),
+                "a quoted separator in a Trash move is file-name data: {cmd}"
+            );
+        }
+        // An unquoted brace list expands past the `..` guard before mv runs,
+        // and the quote-aware reading must not let a real separator through.
+        for cmd in [
+            "mv ~/a/{..,b}/{..,c}/{..,d}/etc ~/.Trash/",
+            "mv /Users/{u,root}/Documents/x ~/.Trash/",
+            "mv ~/Documents/x ~/.Trash/{..,a}",
+            r#"mv ~/D/a" "/Users/u/D/b & rm -rf ~ & x" ~/.Trash/"#,
+            r#"mv "/Users/u/Documents/a & b.txt" ~/.Trash/ & rm -rf ~"#,
+            r#"mv "/Users/u/Documents/../../../etc & x" ~/.Trash/"#,
+            r#"mv "$HOME/a & b" ~/.Trash/"#,
+            r#"mv "/etc/a & b" ~/.Trash/"#,
+        ] {
+            assert_no_safe_match(&pack, cmd);
+            assert!(
+                pack.check(cmd).is_some(),
+                "the Trash rescue must stay bounded: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn globbed_rm_under_home_is_blocked() {
+        // Regression for #247: the glob IS the recursion. `rm -f ~/x/*`
+        // destroys approximately the same file set as `rm -rf ~/x`, but only
+        // the latter was caught.
+        let pack = create_pack();
+        for cmd in [
+            "rm -f /Users/kaitaylor/Downloads/*.md",
+            "rm -f /Users/kaitaylor/Downloads/*",
+            "rm -f /Users/kaitaylor/*.md",
+            "rm /Users/kaitaylor/Documents/*.pdf",
+            "rm -f /home/alice/reports/*.csv",
+            "rm ~/Downloads/*.md",
+            "rm -f ~/notes/draft?.txt",
+            "rm $HOME/Downloads/*.md",
+            "rm -f /Users/*/Downloads/junk.md",
+        ] {
+            assert_blocks_with_pattern(&pack, cmd, "rm-glob-home");
+        }
+        // Bounded single-file deletes and quoted (non-expanding) globs are
+        // untouched, and the walker must not bridge a newline from a benign
+        // rm on one line into a home glob on a later line.
+        for cmd in [
+            "rm -f /Users/kaitaylor/Downloads/one-file.md",
+            "rm ~/Downloads/specific.md",
+            "rm -f \"/Users/kaitaylor/Downloads/*.md\"",
+            "rm -f ./build/*.o",
+            "rm -f /tmp/scratch.txt\nls ~/Downloads/*.md",
+            "docker run --rm -v ~/data/*.json:/data img",
+        ] {
+            assert!(
+                pack.check(cmd).is_none(),
+                "bounded or non-expanding delete must stay allowed: {cmd}"
+            );
+        }
     }
 
     #[test]
@@ -3378,6 +9337,296 @@ mod tests {
         }
     }
 
+    /// A non-recursive `rm` of a protected credential file denies (#469).
+    ///
+    /// `rm /etc/shadow` and `rm ~/.ssh/authorized_keys` were allowed while
+    /// `unlink`, `shred -u` and `truncate -s 0` denied the same nine targets,
+    /// and so did all six embedded languages. Every `rm` rule required a
+    /// recursive flag, and `-r` is exactly the flag you do not need to delete
+    /// one file.
+    #[test]
+    fn rm_of_a_protected_credential_file_denies_issue_469() {
+        for target in [
+            "/home/user/.ssh/id_rsa",
+            "/home/user/.ssh/authorized_keys",
+            "/home/user/.bashrc",
+            "/home/user/.gnupg/secring.gpg",
+            "/home/user/.aws/credentials",
+            "/etc/shadow",
+            "/etc/passwd",
+            "/etc/sudoers",
+            "/root/.ssh/id_rsa",
+        ] {
+            assert_rm_parser_denies(
+                &format!("rm {target}"),
+                RM_PROTECTED_FILE_NAME,
+                Severity::Critical,
+            );
+        }
+
+        // The flag and spelling surface measured as allowed before the fix.
+        for command in [
+            "rm -f /home/user/.ssh/id_rsa",
+            "rm -v /home/user/.ssh/id_rsa",
+            "rm -- /home/user/.ssh/id_rsa",
+            r#"rm "/home/user/.ssh/id_rsa""#,
+            "/bin/rm /home/user/.ssh/id_rsa",
+            "rm ~/.ssh/id_rsa",
+            "rm $HOME/.aws/credentials",
+            // One protected operand among benign ones is still a deletion of
+            // the protected one.
+            "rm /home/user/notes.txt /home/user/.ssh/id_rsa",
+        ] {
+            assert_rm_parser_denies(command, RM_PROTECTED_FILE_NAME, Severity::Critical);
+        }
+    }
+
+    /// The boundaries #469 must not cross, and the reason it is a new predicate
+    /// rather than a reuse of `path_is_root_home`.
+    ///
+    /// `path_is_root_home` matches anything under `/home`, `/etc` or `/var`.
+    /// Reusing it here would deny `rm /home/user/notes.txt` and
+    /// `rm /home/user/project/src/main.rs` — the single most common operation
+    /// an agent performs in its own tree. Those two rows are the countermetric
+    /// for this rule: if either ever starts denying, the predicate has been
+    /// widened into the one that was measured unusable.
+    #[test]
+    fn rm_of_an_ordinary_file_still_allows_issue_469() {
+        for command in [
+            // Relative paths carry no anchor at all.
+            "rm ./build/stamp",
+            "rm target/debug/app",
+            "rm node_modules/.cache/x",
+            // Temp, which the sibling rules already carve out.
+            "rm /tmp/scratch.txt",
+            "rm /var/tmp/x.log",
+            // The rows the obvious fix breaks.
+            "rm /home/user/notes.txt",
+            "rm /home/user/project/src/main.rs",
+            "rm ~/notes.txt",
+            // Under a protected prefix but not protected files: `unlink`
+            // denies both of these, and that breadth deliberately does not
+            // transfer to `rm`.
+            "rm /etc/hosts",
+            "rm /var/log/app.log",
+            // Public key material is not credential loss (`ssh_entry`).
+            "rm ~/.ssh/id_rsa.pub",
+        ] {
+            assert_rm_parser_no_match(command);
+        }
+    }
+
+    /// `-I` prompts only for more than three files, or when recursing (#481).
+    ///
+    /// `prompts()` treated `-I` exactly like `-i`, so every rule that stands
+    /// down for an interactive command stood down for a deletion GNU performs
+    /// silently. `rm -I <private key>` deleted the key with no prompt at all
+    /// and was allowed on the strength of one that never happens.
+    ///
+    /// From `man rm`: "-I, --interactive=once — prompt once before removing
+    /// more than three files, or when removing recursively".
+    ///
+    /// The boundary is asserted on both sides at three-versus-four operands,
+    /// because a fix that simply dropped the carve-out would pass a
+    /// deny-only test and break the case the flag exists for.
+    #[test]
+    fn interactive_once_prompts_only_past_three_files_issue_481() {
+        const KEY: &str = "/home/user/.ssh/id_rsa";
+
+        // One, two and three named files: GNU does not prompt, so the rule
+        // that guards the protected file must still decide.
+        for operands in [
+            "",
+            " /home/user/.ssh/a",
+            " /home/user/.ssh/a /home/user/.ssh/b",
+        ] {
+            for flag in ["-I", "--interactive=once"] {
+                let command = format!("rm {flag} {KEY}{operands}");
+                assert_rm_parser_denies(&command, RM_PROTECTED_FILE_NAME, Severity::Critical);
+            }
+        }
+
+        // Four operands: GNU prompts once, and with stdin closed under a hook
+        // that prompt deletes nothing, so the carve-out is right here.
+        assert_rm_parser_no_match(&format!(
+            "rm -I {KEY} /home/user/.ssh/a /home/user/.ssh/b /home/user/.ssh/c"
+        ));
+
+        // `-i` prompts before every file whatever the count, so it keeps the
+        // carve-out at one operand. This is the row that proves the fix reads
+        // the two modes differently rather than deleting the carve-out.
+        assert_rm_parser_no_match(&format!("rm -i {KEY}"));
+        assert_rm_parser_no_match(&format!("rm -i {KEY} /home/user/.ssh/a"));
+
+        // A later `-f` still wins over either, so the command is not
+        // interactive at all.
+        assert_rm_parser_denies(
+            &format!("rm -I -f {KEY}"),
+            RM_PROTECTED_FILE_NAME,
+            Severity::Critical,
+        );
+    }
+
+    /// A literal brace alternation is two named files, not an unknown one
+    /// (#482).
+    #[test]
+    fn rm_of_a_braced_protected_file_denies_issue_482() {
+        for command in [
+            "rm /home/user/.ssh/{id_rsa,id_ed25519}",
+            "rm /home/user/{.ssh,.aws}/credentials",
+            "rm ~/.ssh/{notes.txt,id_rsa}",
+            "rm -f $HOME/.ssh/{a,b,authorized_keys}",
+            "rm /home/user/{.ssh/id_rsa,notes.txt}",
+        ] {
+            assert_rm_parser_denies(command, RM_PROTECTED_FILE_NAME, Severity::Critical);
+        }
+        for command in [
+            // No comma: bash keeps `{id_rsa}` literally, a file of that name.
+            "rm /home/user/.ssh/{id_rsa}",
+            // Every alternative ordinary.
+            "rm /home/user/{notes,todo}.txt",
+            "rm ~/.ssh/{id_rsa,id_ed25519}.pub",
+            // Quoted braces do not expand (and a quoted name under `.ssh/` is
+            // judged as that literal file); dynamic ones are not provable.
+            "rm \"/home/user/{notes,id_rsa}\"",
+            "rm /home/user/.ssh/{$a,$b}",
+        ] {
+            assert_rm_parser_no_match(command);
+        }
+
+        assert_eq!(
+            literal_brace_expansions("a{b,c}d{1,2}"),
+            Some(vec![
+                "abd1".to_string(),
+                "abd2".to_string(),
+                "acd1".to_string(),
+                "acd2".to_string()
+            ])
+        );
+        assert_eq!(literal_brace_expansions("a{b}c"), None);
+        assert_eq!(literal_brace_expansions("a{b,{c,d}}"), None);
+        assert_eq!(literal_brace_expansions("{1..3}"), None);
+    }
+
+    /// The prompt predicate itself, at the boundary (#481).
+    ///
+    /// Asserted directly as well as through the parser because the parser can
+    /// only reach it with operands a rule cares about, and the recursive arm is
+    /// the one whose answer must NOT change.
+    #[test]
+    fn interactive_once_prompt_predicate_issue_481() {
+        use RmInteractiveMode::{Always, Default as Dflt, Never, Once};
+
+        // Non-recursive: the count decides, and the boundary is "more than".
+        for operands in 0..=3 {
+            assert!(
+                !Once.prompts_for(false, operands),
+                "-I does not prompt for {operands} files"
+            );
+        }
+        assert!(Once.prompts_for(false, 4), "-I prompts past three files");
+
+        // Recursive: `-I` prompts regardless of count, which is why the
+        // recursive rules are unaffected by this fix.
+        for operands in 0..=4 {
+            assert!(
+                Once.prompts_for(true, operands),
+                "-I prompts when recursing, at {operands} operands"
+            );
+        }
+
+        // The other three modes do not depend on either fact.
+        for recursive in [false, true] {
+            for operands in [0usize, 1, 4] {
+                assert!(Always.prompts_for(recursive, operands));
+                assert!(!Never.prompts_for(recursive, operands));
+                assert!(!Dflt.prompts_for(recursive, operands));
+            }
+        }
+    }
+
+    /// The shapes a one-group `.ssh` alternation does not reach (#482).
+    ///
+    /// `rm_of_a_braced_protected_file_denies_issue_482` covers the canonical
+    /// key-pair spelling. These are the rows around it: the product of two
+    /// groups reaching the parser (not just the expander), a braced operand
+    /// that is not the only operand, and the Etc-rooted and home-dotfile
+    /// entries, whose classifier arms are separate from the `.ssh` one.
+    #[test]
+    fn a_brace_alternation_names_each_path_it_expands_to_issue_482() {
+        for command in [
+            "rm /home/user/{.ssh,.aws}/{credentials,id_rsa}",
+            "rm /tmp/x /home/user/.ssh/{id_rsa,b}",
+            "rm /etc/{shadow,passwd}",
+            "rm /home/user/{.bashrc,.profile}",
+        ] {
+            assert_rm_parser_denies(command, RM_PROTECTED_FILE_NAME, Severity::Critical);
+        }
+
+        // Each row here is a shape where expanding would be WRONG, so a fix
+        // that expanded eagerly would pass the rows above and start denying
+        // commands that touch nothing protected.
+        for command in [
+            // A nested brace is legal shell this pass deliberately does not
+            // read; declining leaves the operand judged as written.
+            "rm /home/user/x/{a,{b,c}}",
+            // An unmatched brace is not an alternation at all.
+            "rm /home/user/x/{a,b",
+            // Ordinary braces stay ordinary.
+            "rm /tmp/{a,b}",
+            "rm ./build/{a.o,b.o}",
+        ] {
+            assert_rm_parser_no_match(command);
+        }
+    }
+
+    /// The expander's own bound, and the spellings it refuses outright (#482).
+    ///
+    /// The cap matters because the product of N two-way groups is 2^N and this
+    /// runs on the path of every `rm`; nothing else asserts where it falls.
+    #[test]
+    fn brace_expansion_is_bounded_issue_482() {
+        // Six two-way groups is exactly 64 and still expands; seven is 128 and
+        // is refused, so the bound is inclusive and is reached, not exceeded.
+        let at_bound = literal_brace_expansions(&"{a,b}".repeat(6))
+            .expect("six two-way groups sit on the bound");
+        assert_eq!(at_bound.len(), 64);
+        assert_eq!(literal_brace_expansions(&"{a,b}".repeat(7)), None);
+
+        // An escape means the brace may not be a brace, so the word is not one
+        // this pass can prove; same for a group that is never closed.
+        assert_eq!(literal_brace_expansions(r"a\{b,c}"), None);
+        assert_eq!(literal_brace_expansions("a{b,c"), None);
+    }
+
+    /// The recursive rules keep their own attribution (#467's invariant).
+    ///
+    /// `rm -rf ~/.ssh/id_rsa` must still report `rm-rf-root-home` and not also
+    /// the new rule: two blocking ids for one command would mean an allowlist
+    /// entry for the reported one leaves it denied under the other. The new
+    /// rule is reachable only when `flags.resolve()` yields `None`, which is
+    /// exactly the non-recursive case, so this is structural — the test pins it.
+    #[test]
+    fn recursive_rm_keeps_its_own_rule_issue_469() {
+        assert_rm_parser_denies(
+            "rm -rf /home/user/.ssh/id_rsa",
+            RM_RF_ROOT_HOME_NAME,
+            Severity::Critical,
+        );
+        assert_rm_parser_denies(
+            "rm -r /etc/shadow",
+            RM_RECURSIVE_ROOT_HOME_NAME,
+            Severity::Critical,
+        );
+        assert_rm_parser_denies(
+            "rm -r -f /etc/shadow",
+            RM_R_F_SEPARATE_ROOT_HOME_NAME,
+            Severity::Critical,
+        );
+        // And the temp exemption for recursive rm is untouched.
+        assert_rm_parser_allows("rm -rf /tmp/build");
+    }
+
     #[test]
     fn test_rm_parser_rejects_variable_tmpdir_roots() {
         assert_rm_parser_denies(
@@ -3484,9 +9733,24 @@ mod tests {
 
     #[test]
     fn test_rm_parser_option_terminator() {
+        // `--` before the flags means `-rf` is an operand (a file literally named
+        // `-rf`), so no recursive flag is set and nothing matches.
         assert_rm_parser_no_match("rm -- -rf /tmp/safe");
-        assert_rm_parser_denies("rm -rf -- /tmp/safe", RM_RF_GENERAL_NAME, Severity::High);
+
+        // `--` after the flags does NOT cost the literal-temp exemption (#395).
+        // It is the POSIX end-of-options marker a careful script writes so an
+        // operand beginning with `-` cannot be read as a flag; it makes the
+        // command strictly safer and never changes what an operand names, so the
+        // terminator spelling must match the bare spelling exactly.
+        assert_rm_parser_allows("rm -rf -- /tmp/safe");
+        assert_rm_parser_allows("rm -fr -- /var/tmp/safe");
+        assert_rm_parser_allows("rm -r -f -- /tmp/safe");
+        assert_rm_parser_allows("rm --recursive --force -- /private/tmp/safe");
+
+        // Criticality is decided by operand content, so a root or home operand
+        // after the terminator keeps its Critical rule id (5f8bcad).
         assert_rm_parser_denies("rm -rf -- /", RM_RF_ROOT_HOME_NAME, Severity::Critical);
+        assert_rm_parser_denies("rm -rf -- /etc", RM_RF_ROOT_HOME_NAME, Severity::Critical);
         assert_rm_parser_denies(
             "rm -r -f -- /",
             RM_R_F_SEPARATE_ROOT_HOME_NAME,
@@ -3497,5 +9761,1738 @@ mod tests {
             RM_RECURSIVE_FORCE_ROOT_HOME_NAME,
             Severity::Critical,
         );
+
+        // A non-temp operand after the terminator still denies, which is what
+        // keeps the widened syntax from widening the exemption: only the operand
+        // set decides, and every operand must be a literal temp path.
+        assert_rm_parser_denies("rm -rf -- ./build", RM_RF_GENERAL_NAME, Severity::High);
+        assert_rm_parser_denies(
+            "rm -rf -- /tmp/x /etc",
+            RM_RF_ROOT_HOME_NAME,
+            Severity::Critical,
+        );
+        // A second `--` is an ordinary operand named `--`, not a temp path.
+        assert_rm_parser_denies("rm -rf -- -- /tmp/x", RM_RF_GENERAL_NAME, Severity::High);
+        // Traversal out of the temp root is still refused.
+        assert_rm_parser_denies(
+            "rm -rf -- /tmp/../etc",
+            RM_RF_ROOT_HOME_NAME,
+            Severity::Critical,
+        );
+    }
+
+    /// #196 case 2: any absolute path used to get the "destroy your entire
+    /// operating system" rule, including a build directory inside a project.
+    /// Deep project paths now deny under the general rule; everything that can
+    /// reach the OS or a whole home directory stays Critical.
+    #[test]
+    fn root_home_severity_is_reserved_for_root_home_issue_196() {
+        for command in [
+            "rm -rf /home/ubuntu/proj/dist",
+            "rm -rf ~/proj/dist",
+            "rm -rf $HOME/proj/dist",
+            r#"rm -rf "${HOME}/proj/node_modules""#,
+            "rm -rf ~alice/proj/dist",
+            "rm -rf /Users/alice/code/app/build",
+            "rm -rf /data/projects/app/target",
+            "rm -rf /c/Users/bob/src/app/out",
+        ] {
+            assert_rm_parser_denies(command, RM_RF_GENERAL_NAME, Severity::High);
+        }
+        assert_rm_parser_denies(
+            "rm -r /home/ubuntu/proj/dist",
+            RM_RECURSIVE_GENERAL_NAME,
+            Severity::High,
+        );
+
+        for command in [
+            // Root, top-level dirs, and home roots.
+            "rm -rf /",
+            "rm -rf /data",
+            "rm -rf /home",
+            "rm -rf /home/ubuntu",
+            "rm -rf /root/proj/dist",
+            "rm -rf ~",
+            "rm -rf ~/",
+            "rm -rf ~alice",
+            "rm -rf $HOME",
+            // A home's top-level entries and dotfile trees.
+            "rm -rf ~/Documents",
+            "rm -rf /home/ubuntu/proj",
+            "rm -rf ~/.config/app",
+            "rm -rf /home/ubuntu/.ssh/keys",
+            // System and mount directories at any depth.
+            "rm -rf /usr/local/lib",
+            "rm -rf /var/lib/docker",
+            "rm -rf /etc/nginx/sites",
+            "rm -rf /mnt/backup/2026",
+            "rm -rf /Volumes/Backup/photos",
+            "rm -rf /c/Windows/System32",
+            "rm -rf /c/Users/bob/Desktop",
+            // Anything that can expand or climb to a shallower directory.
+            "rm -rf ~/proj/../..",
+            "rm -rf /home/ubuntu/proj/../../..",
+            "rm -rf ~/$DIR/dist",
+            "rm -rf /home/ubuntu/*/dist",
+            "rm -rf ~/{a,b}/dist",
+            "rm -rf /data/`pwd`/dist",
+        ] {
+            assert_rm_parser_denies(command, RM_RF_ROOT_HOME_NAME, Severity::Critical);
+        }
+    }
+
+    #[test]
+    fn test_rm_parser_blocks_recursive_only_deletion() {
+        for command in [
+            "rm -r ./build",
+            "rm -R Desktop",
+            "rm --recursive ./tree",
+            "rm --rec ./tree",
+            "rm ./build -r",
+            "rm -rv ./build",
+        ] {
+            assert_rm_parser_denies(command, RM_RECURSIVE_GENERAL_NAME, Severity::High);
+        }
+
+        for command in [
+            "rm -r /",
+            "rm -R /etc",
+            "rm --recursive ~/Documents",
+            "rm -r $HOME",
+            "rm -r /Users/alice/Desktop",
+        ] {
+            assert_rm_parser_denies(command, RM_RECURSIVE_ROOT_HOME_NAME, Severity::Critical);
+        }
+    }
+
+    #[test]
+    fn test_rm_parser_preserves_force_rule_ids() {
+        for command in ["rm -rf ./build", "rm -fr ./build", "rm -rvf ./build"] {
+            assert_rm_parser_denies(command, RM_RF_GENERAL_NAME, Severity::High);
+        }
+        for command in [
+            "rm -r -f ./build",
+            "rm -f -R ./build",
+            "rm -r --force ./build",
+            "rm --recursive -f ./build",
+        ] {
+            assert_rm_parser_denies(command, RM_R_F_SEPARATE_NAME, Severity::High);
+        }
+        for command in [
+            "rm --recursive --force ./build",
+            "rm --force --recursive ./build",
+            "rm --rec --fo ./build",
+        ] {
+            assert_rm_parser_denies(command, RM_RECURSIVE_FORCE_NAME, Severity::High);
+        }
+    }
+
+    #[test]
+    fn test_rm_parser_interactive_and_force_are_order_sensitive() {
+        for command in [
+            "rm -r -i ./build",
+            "rm -r -I ./build",
+            "rm -rfi ./build",
+            "rm -rfI ./build",
+            "rm -r -f --interactive=once ./build",
+            "rm -r --force --interactive=always ./build",
+            "rm -r --interactive ./build",
+            "rm -r --interactive=o ./build",
+            "rm -r --interactive=y ./build",
+            "rm ./build -r -i",
+        ] {
+            assert_rm_parser_allows(command);
+        }
+
+        for command in ["rm -rif ./build", "rm -rIf ./build"] {
+            assert_rm_parser_denies(command, RM_RF_GENERAL_NAME, Severity::High);
+        }
+        for command in [
+            "rm -r -i --force ./build",
+            "rm -r --interactive=once -f ./build",
+            "rm -r -i -f ./build",
+            "rm -r -I --force ./build",
+            "rm -r --interactive=always -f ./build",
+        ] {
+            assert_rm_parser_denies(command, RM_R_F_SEPARATE_NAME, Severity::High);
+        }
+        for command in [
+            "rm -r --interactive=never ./build",
+            "rm -r --interactive=no ./build",
+            "rm -r --interactive=none ./build",
+        ] {
+            assert_rm_parser_denies(command, RM_RECURSIVE_GENERAL_NAME, Severity::High);
+        }
+    }
+
+    #[test]
+    fn test_rm_parser_recursive_only_temp_and_non_execution_forms() {
+        for command in [
+            "rm -r /tmp/build",
+            "rm -R /var/tmp/cache",
+            r#"rm --recursive "/tmp/build artifacts""#,
+        ] {
+            assert_rm_parser_allows(command);
+        }
+
+        for command in [
+            "rm -r",
+            "rm --recursive",
+            "rm ./build --version -r",
+            "rm --recursive-x ./build",
+            "rm --v ./build -r",
+            "rm -rz ./build",
+        ] {
+            assert_rm_parser_no_match(command);
+        }
+
+        // Parity with the bare spelling above: the end-of-options marker does not
+        // cost the literal-temp exemption (#395).
+        assert_rm_parser_allows("rm -r -- /tmp/build");
+        assert_rm_parser_denies(
+            "rm -r -- ./build",
+            RM_RECURSIVE_GENERAL_NAME,
+            Severity::High,
+        );
+        assert_rm_parser_no_match("rm -- -r ./build");
+    }
+
+    #[test]
+    fn test_rm_parser_models_apple_option_stop_after_first_operand() {
+        // GNU getopt permutes these trailing tokens into options: --help and
+        // --version terminate, while -i/--interactive enable prompts. Apple's
+        // getopt stops at the first operand, so the same tokens are additional
+        // paths and the preceding recursive deletion still executes.
+        let pack = create_pack();
+        for (command, expected_rule) in [
+            ("rm -r ./build --help", RM_RECURSIVE_GENERAL_NAME),
+            ("rm -r ./build --version", RM_RECURSIVE_GENERAL_NAME),
+            ("rm -r ./build -i", RM_RECURSIVE_GENERAL_NAME),
+            ("rm -r ./build -I", RM_RECURSIVE_GENERAL_NAME),
+            ("rm -rf ./build -i", RM_RF_GENERAL_NAME),
+            (
+                "rm -r ./build --interactive=always",
+                RM_RECURSIVE_GENERAL_NAME,
+            ),
+            ("rm -r /tmp/build --help", RM_RECURSIVE_GENERAL_NAME),
+        ] {
+            assert_rm_parser_denies(command, expected_rule, Severity::High);
+            assert!(pack.check(command).is_some(), "pack must deny: {command}");
+        }
+
+        assert_rm_parser_denies(
+            "rm -r /etc -i",
+            RM_RECURSIVE_ROOT_HOME_NAME,
+            Severity::Critical,
+        );
+        assert_rm_parser_denies(
+            "rm -rf $HOME --interactive=always",
+            RM_RF_ROOT_HOME_NAME,
+            Severity::Critical,
+        );
+
+        // Neither supported grammar deletes recursively here: GNU reaches a
+        // terminal option, while Apple stopped scanning before it ever saw -r.
+        for command in [
+            "rm ./build --help -r",
+            "rm ./build --version -R",
+            "rm --recursive ./build --help",
+        ] {
+            assert_rm_parser_no_match(command);
+        }
+
+        // Both grammars retain a real prompt, even though only GNU sees the
+        // recursive flag that follows the first operand.
+        assert_rm_parser_allows("rm -i ./build -r");
+    }
+
+    #[test]
+    fn test_rm_parser_temp_exception_requires_real_subdirectory() {
+        let pack = create_pack();
+        let root_only_paths = [
+            "/tmp/",
+            "/tmp//",
+            "/tmp/./",
+            "/var/tmp/",
+            "/var/tmp//",
+            "/var/tmp/./",
+            r#""/tmp/""#,
+            r#""/tmp//""#,
+            r#""/tmp/./""#,
+            r#""/var/tmp/""#,
+            r#""/var/tmp//""#,
+            r#""/var/tmp/./""#,
+        ];
+
+        for flags in ["-r", "-rf"] {
+            for path in root_only_paths {
+                let command = format!("rm {flags} {path}");
+                assert!(
+                    matches!(parse_rm_command(&command), RmParseDecision::Deny(_)),
+                    "temp root without a real subdirectory must be denied: {command}"
+                );
+                assert!(
+                    pack.check(&command).is_some(),
+                    "pack must deny temp root without a real subdirectory: {command}"
+                );
+            }
+        }
+
+        for command in [
+            "rm -r /tmp/foo",
+            "rm -r /var/tmp/foo",
+            r#"rm -r "/tmp/foo""#,
+            r#"rm -r "/var/tmp/foo""#,
+            "rm -rf /tmp/foo",
+            "rm -rf /var/tmp/foo",
+            r#"rm -rf "/tmp/foo""#,
+            r#"rm -rf "/var/tmp/foo""#,
+        ] {
+            assert_rm_parser_allows(command);
+            assert!(
+                pack.check(command).is_none(),
+                "literal temp subdirectory must remain allowed: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rm_parser_interactive_prompts_require_terminal_stdin() {
+        for command in [
+            "yes | rm -r -i ./tree",
+            "yes | rm -rI ./tree",
+            "printf 'y\\n' | rm --recursive --interactive=always ./tree",
+            "rm -ri ./tree < answers.txt",
+            "rm -rI ./tree <<< y",
+            "rm --recursive --interactive=always ./tree 0<answers.txt",
+            "< answers.txt rm -ri ./tree",
+            "0<answers.txt rm -rI ./tree",
+            "yes | { rm -ri ./tree; }",
+            "yes | ( rm -ri ./tree )",
+            "yes | { echo ready; rm -ri ./tree; }",
+            "yes | while true; do rm -ri ./tree; break; done",
+            "yes | if true; then rm -ri ./tree; fi",
+            "yes | { # }\n rm -ri ./tree; }",
+            "exec < answers.txt; rm -ri ./tree",
+            "exec 0<answers.txt; rm -rI ./tree",
+        ] {
+            assert_rm_parser_denies(command, RM_RECURSIVE_GENERAL_NAME, Severity::High);
+        }
+
+        let heredoc_group = "yes | { cat <<'EOF'\n}\nEOF\nrm -ri ./tree; }";
+        let rm_start = heredoc_group
+            .find("rm -ri")
+            .expect("test command contains rm segment");
+        assert!(rm_segment_receives_automated_stdin(
+            heredoc_group,
+            rm_start,
+            ShellDialect::Posix,
+        ));
+
+        for command in [
+            "rm -ri ./tree",
+            "rm -rI ./tree",
+            "rm --recursive --interactive=always ./tree",
+            "printf 'y\\n' | { cat; }; rm -ri ./tree",
+            "(exec < answers.txt; true); rm -ri ./tree",
+            "exec 3<answers.txt; rm -ri ./tree",
+            "exec <> answers.txt; rm -ri ./tree",
+        ] {
+            assert_rm_parser_allows(command);
+        }
+    }
+
+    // The unfiltered implementation before #555. Keep this independent of the
+    // context facts so the differential tests catch an over-eager exclusion.
+    fn reference_rm_segment_receives_automated_stdin(
+        command: &str,
+        segment_start: usize,
+        dialect: ShellDialect,
+    ) -> bool {
+        let Some(prefix) = command.get(..segment_start) else {
+            return false;
+        };
+        let prefix = prefix.trim_end();
+        if prefix.ends_with("|&") || (prefix.ends_with('|') && !prefix.ends_with("||")) {
+            return true;
+        }
+        if !matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+            return false;
+        }
+        posix_pipeline_group_is_active(command, segment_start)
+            || prior_posix_exec_redirects_stdin(command, segment_start)
+    }
+
+    #[test]
+    fn stdin_context_matches_legacy_at_every_source_boundary_issue_555() {
+        for command in [
+            "",
+            "ls -la",
+            "rm -ri ./tree",
+            "yes | rm -ri ./tree",
+            "printf y |& rm -rI ./tree",
+            "true || rm -ri ./tree",
+            "printf '%s' '|'; rm -ri ./tree",
+            r"printf \|; rm -ri ./tree",
+            "yes | { echo ready; rm -ri ./tree; }",
+            "yes | ( echo ready; rm -ri ./tree )",
+            "yes | while true; do rm -ri ./tree; break; done",
+            "yes | if true; then rm -ri ./tree; else true; fi",
+            "yes | { # }\n rm -ri ./tree; }",
+            "yes | { cat <<'EOF'\n}\nEOF\nrm -ri ./tree; }",
+            "yes | { cat <<-'EOF'\n\t}\n\tEOF\nrm -ri ./tree; }",
+            "printf y | { cat; }; rm -ri ./tree",
+            "printf '%s' \"$(yes | { rm -ri ./tree; })\"",
+            "printf '%s' `yes | rm -ri ./tree`",
+            "exec < answers.txt; rm -ri ./tree",
+            "exec 0<answers.txt; rm -rI ./tree",
+            "'exec' 0<answers.txt; rm -ri ./tree",
+            "\"/bin/exec\" 0<answers.txt; rm -ri ./tree",
+            r"\exec 0<answers.txt; rm -ri ./tree",
+            "e''xec 0<answers.txt; rm -ri ./tree",
+            "FOO=bar exec <answers.txt; rm -ri ./tree",
+            "exec 0<&3; rm -ri ./tree",
+            "exec 0<&-; rm -ri ./tree",
+            "exec 3<answers.txt; rm -ri ./tree",
+            "exec <>answers.txt; rm -ri ./tree",
+            "(exec < answers.txt; true); rm -ri ./tree",
+            "(exec < answers.txt; rm -ri ./tree); true",
+            "echo 'exec <answers.txt'; rm -ri ./tree",
+            "cat <<'EOF'\nexec <answers.txt\nEOF\nrm -ri ./tree",
+            "python3 - <<'PY'\nvalue = 'λ雪'\nprint(value)\nPY\nrm -ri ./tree",
+            "printf '%s' '雪'\r\nexec <answers.txt\r\nrm -ri ./tree",
+            "yes | { cat <<'EOF'\nunterminated body\nrm -ri ./tree",
+            "printf '%s' \"$(exec <answers; rm -ri ./tree",
+            "Get-Content answers.txt | Remove-Item -Recurse ./tree",
+            "type answers.txt | del tree",
+            "echo ^| literal & del tree",
+        ] {
+            let context = RmStdinContext::new(command);
+            for dialect in [
+                ShellDialect::Posix,
+                ShellDialect::PowerShell,
+                ShellDialect::Cmd,
+                ShellDialect::Unknown,
+            ] {
+                // Walk backwards as well as querying offsets outside the
+                // source: callers do not promise monotonic segment order.
+                for offset in (0..=command.len() + 1).rev() {
+                    if offset < command.len() && !command.is_char_boundary(offset) {
+                        continue;
+                    }
+                    let expected =
+                        reference_rm_segment_receives_automated_stdin(command, offset, dialect);
+                    assert_eq!(
+                        context.segment_receives_automated_stdin(offset, dialect),
+                        expected,
+                        "context: dialect={dialect:?}, offset={offset}, source={command:?}",
+                    );
+                    assert_eq!(
+                        rm_segment_receives_automated_stdin(command, offset, dialect),
+                        expected,
+                        "standalone: dialect={dialect:?}, offset={offset}, source={command:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stdin_context_preserves_multiline_interactive_verdicts_issue_555() {
+        use std::fmt::Write as _;
+
+        for lines in [1, 40, 300] {
+            let mut body = String::from("python3 - <<'PY'\n");
+            for index in 0..lines {
+                writeln!(body, "value_{index} = {index}").expect("write fixture line");
+            }
+            body.push_str("PY\n");
+            for (prefix, suffix, automated) in [
+                ("", "rm -ri ./tree", false),
+                ("yes | { ", "rm -ri ./tree; }", true),
+                ("exec 0<answers; ", "rm -ri ./tree", true),
+            ] {
+                let command = format!("{prefix}{body}{suffix}");
+                let context = RmStdinContext::new(&command);
+                for segment in crate::packs::split_command_segments(&command) {
+                    let start = segment.as_ptr() as usize - command.as_ptr() as usize;
+                    assert_eq!(
+                        context.segment_receives_automated_stdin(start, ShellDialect::Posix),
+                        reference_rm_segment_receives_automated_stdin(
+                            &command,
+                            start,
+                            ShellDialect::Posix,
+                        ),
+                        "lines={lines}, prefix={prefix:?}, start={start}",
+                    );
+                }
+                let rm_start = command.rfind("rm -ri").expect("explicit final rm");
+                assert_eq!(
+                    context.segment_receives_automated_stdin(rm_start, ShellDialect::Posix),
+                    automated,
+                );
+                match parse_rm_command(&command) {
+                    RmParseDecision::Allow if !automated => {}
+                    RmParseDecision::Deny(hit) if automated => {
+                        assert_eq!(hit.pattern_name, RM_RECURSIVE_GENERAL_NAME);
+                        assert_eq!(hit.severity, Severity::High);
+                    }
+                    decision => panic!(
+                        "interactive verdict changed: lines={lines}, automated={automated}, \
+                         decision={decision:?}"
+                    ),
+                }
+            }
+            let destructive = format!("{body}rm -rf /");
+            assert!(matches!(
+                parse_rm_command(&destructive),
+                RmParseDecision::Deny(hit) if hit.pattern_name == RM_RF_ROOT_HOME_NAME
+            ));
+        }
+    }
+
+    #[test]
+    #[ignore = "paired in-process legacy/context timing; run in release mode with --nocapture"]
+    fn paired_stdin_provenance_benchmark_issue_555() {
+        use std::fmt::Write as _;
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        for lines in [40, 300, 1_000] {
+            let mut command = String::from("python3 - <<'PY'\n");
+            for index in 0..lines {
+                writeln!(command, "value_{index} = {index}").expect("write fixture line");
+            }
+            command.push_str("print('ready')\nPY");
+            let offsets: Vec<_> = crate::packs::split_command_segments(&command)
+                .iter()
+                .map(|segment| segment.as_ptr() as usize - command.as_ptr() as usize)
+                .collect();
+            let reference = || {
+                offsets
+                    .iter()
+                    .filter(|&&offset| {
+                        reference_rm_segment_receives_automated_stdin(
+                            black_box(&command),
+                            offset,
+                            ShellDialect::Posix,
+                        )
+                    })
+                    .count()
+            };
+            let candidate = || {
+                let context = RmStdinContext::new(black_box(&command));
+                offsets
+                    .iter()
+                    .filter(|&&offset| {
+                        context.segment_receives_automated_stdin(offset, ShellDialect::Posix)
+                    })
+                    .count()
+            };
+            assert_eq!(reference(), candidate());
+            let mut reference_ns = Vec::new();
+            let mut candidate_ns = Vec::new();
+            for iteration in 0..7 {
+                for use_reference in [iteration % 2 == 0, iteration % 2 != 0] {
+                    let start = Instant::now();
+                    let result = if use_reference {
+                        black_box(reference())
+                    } else {
+                        black_box(candidate())
+                    };
+                    let elapsed = start.elapsed().as_nanos();
+                    assert_eq!(result, 0);
+                    if use_reference {
+                        reference_ns.push(elapsed);
+                    } else {
+                        candidate_ns.push(elapsed);
+                    }
+                }
+            }
+            reference_ns.sort_unstable();
+            candidate_ns.sort_unstable();
+            let reference_ns = reference_ns[reference_ns.len() / 2];
+            let candidate_ns = candidate_ns[candidate_ns.len() / 2];
+            eprintln!(
+                "stdin_provenance lines={lines} segments={} legacy_p50_us={:.3} \
+                 context_p50_us={:.3} speedup={:.2}x",
+                offsets.len(),
+                reference_ns as f64 / 1_000.0,
+                candidate_ns as f64 / 1_000.0,
+                reference_ns as f64 / candidate_ns.max(1) as f64,
+            );
+        }
+    }
+
+    #[test]
+    fn test_rm_parser_normalizes_segment_local_wrappers_and_executables() {
+        for command in [
+            "echo ok; sudo rm -r ./tree",
+            "yes | env rm -ri ./tree",
+            "yes | FOO=bar rm -ri ./tree",
+            "command rm -r ./tree",
+            r"\rm -r ./tree",
+            "exec rm -r ./tree",
+            "nohup rm -r ./tree",
+            "time rm -r ./tree",
+            "/bin/rm -r ./tree",
+            r#""/bin/rm" -r ./tree"#,
+            r"'/usr/bin/rm' -r ./tree",
+            "nice rm -r ./tree",
+            "nice -n 5 sudo rm -r ./tree",
+            "ionice -c 3 rm -r ./tree",
+            "ionice -tc3 /bin/rm -r ./tree",
+            "setsid -fw rm -r ./tree",
+            "timeout --signal KILL 10 rm -r ./tree",
+            "timeout -k5 10 nice rm -r ./tree",
+            "/bin/busybox rm -r ./tree",
+            "busybox nice rm -r ./tree",
+        ] {
+            assert_rm_parser_denies(command, RM_RECURSIVE_GENERAL_NAME, Severity::High);
+        }
+    }
+
+    #[test]
+    fn automated_stdin_candidates_preserve_full_reader_results() {
+        let large = format!(
+            "python3 - <<'EOF'\n{}EOF\nrm -ri ./tree",
+            "print('ordinary data')\n".repeat(300)
+        );
+        let cases = [
+            large.as_str(),
+            "yes | { echo x; rm -ri ./tree; }",
+            "yes | (echo x; rm -ri ./tree)",
+            "yes | if true; then rm -ri ./tree; fi",
+            "yes | { cat <<'EOF'\n}\nEOF\nrm -ri ./tree; }",
+            "exec 0<answers.txt; rm -ri ./tree",
+            "'exec' <answers.txt; rm -ri ./tree",
+            "exec <<<yes; rm -ri ./tree",
+            "exec 3<answers.txt; rm -ri ./tree",
+            "(exec <answers.txt; true); rm -ri ./tree",
+            "printf '| exec <'\nrm -ri ./tree",
+            "cat <<'EOF'\nexec <answers.txt\nEOF\nrm -ri ./tree",
+            "echo café && rm -ri ./tree",
+        ];
+        // Compare to the incumbent readers at every extracted segment,
+        // including heredoc lines and nested segments. This catches a
+        // candidate gate hiding a shape those readers already recognized.
+        for command in cases {
+            for segment in crate::packs::split_command_segments(command) {
+                let start = segment.as_ptr() as usize - command.as_ptr() as usize;
+                let prefix = command[..start].trim_end();
+                let direct =
+                    prefix.ends_with("|&") || (prefix.ends_with('|') && !prefix.ends_with("||"));
+                for dialect in [
+                    ShellDialect::Posix,
+                    ShellDialect::Unknown,
+                    ShellDialect::Cmd,
+                    ShellDialect::PowerShell,
+                ] {
+                    let incumbent = direct
+                        || (matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
+                            && (posix_pipeline_group_is_active(command, start)
+                                || prior_posix_exec_redirects_stdin(command, start)));
+                    assert_eq!(
+                        rm_segment_receives_automated_stdin(command, start, dialect),
+                        incumbent,
+                        "{dialect:?} at {start}: {command}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_rm_parser_skips_leading_posix_assignments_before_executable() {
+        for command in [
+            "FOO=bar rm -r ./tree",
+            "FOO=bar /bin/rm -r ./tree",
+            "FOO=bar sudo rm -r ./tree",
+            "x=$(printf ok) rm -r ./tree",
+            "FOO=bar x=$(printf ok) command rm -r ./tree",
+            "x=$(rm -r /tmp/cache) rm -r ./tree",
+        ] {
+            assert_rm_parser_denies(command, RM_RECURSIVE_GENERAL_NAME, Severity::High);
+        }
+
+        for command in [
+            "FOO=bar rm -r /tmp/foo",
+            "x=$(printf ok) /bin/rm -r /var/tmp/foo",
+            r#"FOO="a b" sudo rm -r "/tmp/foo""#,
+        ] {
+            assert_rm_parser_allows(command);
+        }
+    }
+
+    #[test]
+    fn test_rm_parser_wrapper_normalization_preserves_safe_controls() {
+        for command in [
+            "echo ok; sudo rm -r /tmp/foo",
+            "env rm -r /var/tmp/foo",
+            r#""/bin/rm" -r "/tmp/foo""#,
+            "nice -n 5 rm -r /tmp/foo",
+            "ionice -c3 rm -r /var/tmp/foo",
+            "setsid rm -r /tmp/foo",
+            "timeout 10 rm -r /var/tmp/foo",
+            "busybox rm -r /tmp/foo",
+        ] {
+            assert_rm_parser_allows(command);
+        }
+
+        for command in [
+            "command -v rm",
+            "command -V rm",
+            "echo 'sudo rm -r ./tree'",
+            "echo FOO=bar rm -r ./tree",
+            r#"echo "/bin/rm -r ./tree""#,
+            "printf '%s\\n' 'yes | rm -ri ./tree'",
+        ] {
+            assert_rm_parser_no_match(command);
+        }
+    }
+
+    #[test]
+    fn test_rm_parser_follows_explicit_xargs_and_find_exec_argv() {
+        for command in [
+            "printf './tree\\n' | xargs rm -r",
+            "xargs -0 -n 1 /bin/rm -r",
+            "xargs nice rm -r",
+            "xargs rm",
+            r#"xargs "$cmd" -r"#,
+            r"find ./root -exec rm -r {} \;",
+            "find ./root -exec /bin/rm -r {} +",
+            r"find ./root -execdir sudo rm -r {} \;",
+            r#"find ./root -exec "$cmd" -r {} \;"#,
+            r"find /bin/rm -maxdepth 0 -exec {} -r ./tree \;",
+            r"find /bin/rm -maxdepth 0 -execdir {} -r ./tree +",
+            r"find /bin/rm -maxdepth 0 -exec \{\} -r ./tree \;",
+            r"find /bin/rm -maxdepth 0 -exec '{''}' -r ./tree \;",
+        ] {
+            assert!(
+                matches!(parse_rm_command(command), RmParseDecision::Deny(_)),
+                "explicit argv frontend must preserve recursive rm detection: {command}"
+            );
+        }
+
+        for command in [
+            "printf './tree\\n' | xargs echo 'rm -r ./tree'",
+            "xargs rm --",
+            r"find ./root -exec rm -r /tmp/foo \;",
+            r"find ./root -exec /bin/rm -r /var/tmp/foo \;",
+            r"find ./root -exec echo 'rm -r ./tree' \;",
+            r"find ./root -exec echo \{\} -r ./tree \;",
+        ] {
+            assert_rm_parser_no_match(command);
+        }
+
+        for command in [
+            r"find /bin/rm -maxdepth 0 -exec {} -r ./tree \;",
+            r"find /bin/rm -maxdepth 0 -execdir {} -r ./tree +",
+        ] {
+            match parse_rm_command(command) {
+                RmParseDecision::Deny(hit) => {
+                    assert_eq!(hit.pattern_name, RM_RECURSIVE_UNVERIFIED_NAME);
+                    assert_eq!(hit.severity, Severity::High);
+                }
+                other => unreachable!(
+                    "placeholder executable must be attributed as unverified: {command}: {other:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn test_rm_parser_dialect_aware_dynamic_executable_seam() {
+        for (command, dialect) in [
+            (r"r$x -r ./tree", ShellDialect::Posix),
+            (r#""$cmd" -r ./tree"#, ShellDialect::Posix),
+            (r"$(printf rm) -r ./tree", ShellDialect::Posix),
+            (r"%DELETE_CMD% -r ./tree", ShellDialect::Cmd),
+            (r"& $cmd -r ./tree", ShellDialect::PowerShell),
+            (r"& ('r'+'m') -r ./tree", ShellDialect::PowerShell),
+            (r"& $('rm') -r ./tree", ShellDialect::PowerShell),
+            (
+                r"& @('noop', ('r'+'m'))[1] -r ./tree",
+                ShellDialect::PowerShell,
+            ),
+        ] {
+            match parse_rm_command_segment_in_dialect(command, false, dialect) {
+                RmParseDecision::Deny(hit) => {
+                    assert_eq!(hit.pattern_name, RM_RECURSIVE_UNVERIFIED_NAME);
+                    assert_eq!(hit.severity, Severity::High);
+                }
+                other => unreachable!(
+                    "dynamic executable with recursive rm argv must be denied: {command}: {other:?}"
+                ),
+            }
+        }
+
+        for (command, dialect) in [
+            (r"not$x -r ./tree", ShellDialect::Posix),
+            (r"'$cmd' -r ./tree", ShellDialect::Posix),
+            (r#"echo "$cmd" -r ./tree"#, ShellDialect::Posix),
+            (r#"rm -- "$cmd" -r ./tree"#, ShellDialect::Posix),
+            (r#""$cmd" -r /tmp/foo"#, ShellDialect::Posix),
+            (r"echo %DELETE_CMD% -r ./tree", ShellDialect::Cmd),
+            (r"& '$cmd' -r ./tree", ShellDialect::PowerShell),
+            (r"& @('echo', 'printf')[1] ./tree", ShellDialect::PowerShell),
+            (r"$cmd = 'rm'", ShellDialect::PowerShell),
+            ("$text = @'\n@params\n'@", ShellDialect::PowerShell),
+            (r"${global:cmd} += 'rm'", ShellDialect::PowerShell),
+        ] {
+            assert!(
+                matches!(
+                    parse_rm_command_segment_in_dialect(command, false, dialect),
+                    RmParseDecision::NoMatch
+                ),
+                "inert, impossible, post-terminator, or temp-safe dynamic data must not deny: {command}"
+            );
+        }
+
+        assert_eq!(
+            rm_executable_certainty("rm", ShellDialect::Posix),
+            RmExecutableCertainty::Exact
+        );
+        assert_eq!(
+            rm_executable_certainty(r"r$x", ShellDialect::Posix),
+            RmExecutableCertainty::MayBeRm
+        );
+        assert_eq!(
+            rm_executable_certainty(r"not$x", ShellDialect::Posix),
+            RmExecutableCertainty::Other
+        );
+    }
+
+    #[test]
+    fn test_powershell_remove_item_recurse_is_dialect_correct() {
+        for command in [
+            "rm -Recurse ./tree",
+            "ri -r ./tree",
+            "Remove-Item -Recurse ./tree",
+            "REMOVE-ITEM ./tree -Rec",
+            "Remove-Item -Path ./tree -Recurse",
+            "rm -r /tmp/dcg-powershell-tree",
+            "Remove`-Item -Recurse ./tree",
+            "Remove-Item -Rec`urse ./tree",
+            "r`m -R ./tree",
+            "Remove-Item -Recurse -Path (Resolve-Path ./tree)",
+            "Remove-Item -Recurse (Get-Item ./tree)",
+        ] {
+            match parse_rm_command_segment_in_dialect(
+                command,
+                command.contains('|'),
+                ShellDialect::PowerShell,
+            ) {
+                RmParseDecision::Deny(hit) => {
+                    assert_eq!(hit.pattern_name, POWERSHELL_REMOVE_ITEM_RECURSIVE_NAME);
+                    assert_eq!(hit.severity, Severity::Critical);
+                }
+                other => unreachable!(
+                    "PowerShell recursive Remove-Item must be denied: {command}: {other:?}"
+                ),
+            }
+        }
+
+        match parse_rm_command_segment_in_dialect(
+            "Remove-Item -Recurse",
+            true,
+            ShellDialect::PowerShell,
+        ) {
+            RmParseDecision::Deny(hit) => {
+                assert_eq!(hit.pattern_name, POWERSHELL_REMOVE_ITEM_RECURSIVE_NAME);
+            }
+            other => unreachable!(
+                "pipeline-fed PowerShell Remove-Item must be denied without a positional path: {other:?}"
+            ),
+        }
+
+        for command in [
+            "Remove-Item -Recurse ./tree -WhatIf",
+            "rm -r ./tree -WhatIf:$true",
+            "ri -Recurse -Path ./tree -WhatIf",
+        ] {
+            let decision =
+                parse_rm_command_segment_in_dialect(command, false, ShellDialect::PowerShell);
+            assert!(
+                matches!(decision, RmParseDecision::Allow),
+                "proven PowerShell WhatIf must remain a non-executing preview: {command}: {decision:?}"
+            );
+        }
+
+        for command in [
+            "Remove-Item -Recurse ./tree -WhatIf:$false",
+            "rm -r ./tree -WhatIf:$value",
+            "ri -WhatIf ./tree -Recurse -WhatIf:$false",
+        ] {
+            assert!(
+                matches!(
+                    parse_rm_command_segment_in_dialect(command, false, ShellDialect::PowerShell),
+                    RmParseDecision::Deny(_)
+                ),
+                "disabled or unproven WhatIf must not rescue recursive deletion: {command}"
+            );
+        }
+
+        assert!(matches!(
+            parse_rm_command_segment_in_dialect(
+                "Remove-Item ./one.txt",
+                false,
+                ShellDialect::PowerShell
+            ),
+            RmParseDecision::NoMatch
+        ));
+
+        match parse_rm_command_segment_in_dialect(
+            "Remove-Item @params",
+            false,
+            ShellDialect::PowerShell,
+        ) {
+            RmParseDecision::Deny(hit) => {
+                assert_eq!(hit.pattern_name, RM_RECURSIVE_UNVERIFIED_NAME);
+            }
+            other => unreachable!(
+                "PowerShell splatting must fail closed because it can inject -Recurse and -Path: {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn test_dialect_escaped_rm_command_words_and_candidate_signal() {
+        match parse_rm_command_segment_in_dialect("r^m -r ./tree", false, ShellDialect::Cmd) {
+            RmParseDecision::Deny(hit) => {
+                assert_eq!(hit.pattern_name, RM_RECURSIVE_GENERAL_NAME);
+                assert_eq!(hit.severity, Severity::High);
+            }
+            other => unreachable!("Cmd caret-decoded rm must be denied: {other:?}"),
+        }
+
+        for (command, dialect) in [
+            ("r`m -R ./tree", ShellDialect::PowerShell),
+            ("Remove`-Item -Recurse ./tree", ShellDialect::PowerShell),
+            ("& ('r'+'m') -r ./tree", ShellDialect::PowerShell),
+            ("Remove-Item @params", ShellDialect::PowerShell),
+            ("r^m -r ./tree", ShellDialect::Cmd),
+            ("%DELETE_CMD% -r ./tree", ShellDialect::Cmd),
+            ("echo x >%TARGET%", ShellDialect::Cmd),
+        ] {
+            assert!(
+                filesystem_semantic_scan_required(command, dialect),
+                "dialect-obfuscated rm must force core.filesystem candidate selection: {command}"
+            );
+        }
+
+        for (command, dialect) in [
+            ("Write-Output 'r`m -r ./tree'", ShellDialect::PowerShell),
+            ("echo r^m -r ./tree", ShellDialect::Cmd),
+            ("rm -r ./tree", ShellDialect::Posix),
+        ] {
+            assert!(
+                !filesystem_semantic_scan_required(command, dialect),
+                "inert data or ordinary POSIX syntax must not require a dialect fallback scan: {command}"
+            );
+        }
+    }
+
+    /// A relative redirect after a `cd` spells no pack keyword, so without the
+    /// override the quick-reject drops it before the evaluator can anchor the
+    /// target to the directory (#480).
+    #[test]
+    fn a_cd_then_relative_redirect_forces_the_scan_issue_480() {
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            for command in [
+                "cd ~/.ssh && echo k > authorized_keys",
+                "cd /etc; printf x >sudoers",
+                "pushd $HOME/.aws && echo x >> credentials",
+            ] {
+                assert!(
+                    filesystem_semantic_scan_required(command, dialect),
+                    "{command:?} ({dialect:?}) must reach core.filesystem"
+                );
+            }
+        }
+        // No `cd`, no redirect, or a directory that cannot be protected.
+        // (Unknown also reads each line as PowerShell, whose own triggers
+        // are not this rule's to pin.)
+        for command in [
+            "echo k > out.log",
+            "cd ~/.ssh && ls",
+            "cd src && echo x > out.log",
+        ] {
+            assert!(
+                !filesystem_semantic_scan_required(command, ShellDialect::Posix),
+                "{command:?} must stay quick-rejectable"
+            );
+        }
+    }
+
+    /// #451: the PLAIN cmdlet spellings must force candidate selection too.
+    ///
+    /// These carry no obfuscation character, which is exactly why they were
+    /// missed: the removed prefilter assumed the bytewise keyword index would
+    /// have caught anything unobfuscated, but `Remove-Item`/`ri`/`del`/`rd` are
+    /// not core.filesystem keywords. The consequence was inverted coverage —
+    /// `Remove-Item -Recurse -Force $HOME` blocked because of the `$`, while the
+    /// plain literal target did not.
+    #[test]
+    fn plain_powershell_removal_cmdlets_force_candidate_selection_issue_451() {
+        for command in [
+            "Remove-Item -Recurse ./tree",
+            "Remove-Item -Recurse -Force /etc",
+            "Remove-Item -Path /etc -Recurse -Force",
+            "ri -Recurse -Force /etc",
+            "del -Recurse ./tree",
+            "rd -Recurse ./tree",
+            "erase -Recurse ./tree",
+            "Get-Process; Remove-Item -Recurse ./tree",
+        ] {
+            assert!(
+                filesystem_semantic_scan_required(command, ShellDialect::PowerShell),
+                "a plain PowerShell removal cmdlet must force core.filesystem \
+                 candidate selection even with no obfuscation character: {command}"
+            );
+        }
+    }
+
+    /// Negative control for the test above: dropping the prefilter must not make
+    /// the signal fire for every PowerShell command, or core.filesystem would be
+    /// force-selected on every payload and the quick-reject would stop meaning
+    /// anything.
+    #[test]
+    fn ordinary_powershell_commands_still_skip_the_semantic_scan_issue_451() {
+        for command in [
+            "Get-ChildItem -Path C:\\Users",
+            "Write-Output 'hello'",
+            "Set-Location C:\\src",
+            "Copy-Item a.txt b.txt",
+            "New-Item -ItemType Directory ./build",
+            "Get-Content log.txt | Select-String error",
+            // Mentions a cmdlet name as DATA, not as the command word.
+            "Write-Output 'Remove-Item -Recurse ./tree'",
+        ] {
+            assert!(
+                !filesystem_semantic_scan_required(command, ShellDialect::PowerShell),
+                "an ordinary PowerShell command must not force a semantic scan: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_filesystem_keyword_candidate_requires_command_word_boundaries() {
+        for command in [
+            "rm -rf ./tree",
+            "/usr/bin/find . -delete",
+            r#""C:\Tools\cp.exe" -a /etc /tmp/etc"#,
+            "echo ready && rsync -a /etc/ /tmp/etc/",
+            "echo data > /etc/passwd",
+            "ECHO data 2> C:\\logs\\error.txt",
+            "CP --help",
+            // `credential-file-write` writers with a protected-root spelling.
+            "echo x | tee -a ~/.zshrc",
+            "sudo tee /etc/sudoers.d/agent",
+            "install -m 600 key $HOME/.ssh/id_ed25519",
+            "sed -i 's/a/b/' /home/bob/.bashrc",
+            "perl -pi -e 's/a/b/' /Users/bob/.zshrc",
+            "gtee /root/.ssh/authorized_keys",
+        ] {
+            assert!(
+                filesystem_keyword_candidate(command),
+                "real filesystem command or redirect must remain a candidate: {command}"
+            );
+        }
+
+        for command in [
+            "scp report.csv analyst@external.example:/incoming/",
+            "pscp report.csv analyst@external.example:/incoming/",
+            "winscp.exe /help",
+            "echo xcp",
+            "printf 'carpet'",
+            // Writer words without any protected-root spelling must not
+            // cold-initialise the pack (`npm install` is every session).
+            "npm install",
+            "cargo install ripgrep",
+            "pip install -r requirements.txt",
+            "sed -n 1,10p README.md | tee /tmp/out.txt",
+            "perl -e 'print 1'",
+            "install -d build/out",
+        ] {
+            assert!(
+                !filesystem_keyword_candidate(command),
+                "embedded keyword substring must not initialize core.filesystem: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_interactive_recursive_rm_does_not_shadow_destructive_redirect() {
+        let pack = create_pack();
+        for command in [
+            "rm -ri ./tree <> /etc/passwd",
+            "rm -ri ./tree 0<> /etc/passwd",
+            "rm -r /tmp/foo <> /etc/passwd",
+            "rm -r /var/tmp/foo 0<> /etc/passwd",
+            "rm -ri ./tree 3>/etc/passwd",
+            "rm -ri ./tree 0> /etc/passwd",
+            "rm -ri ./tree *> /etc/passwd",
+            "rm -ri ./tree {audit}> /etc/passwd",
+        ] {
+            assert_rm_parser_allows(command);
+        }
+        assert_rm_parser_denies(
+            "rm -r ./tree <> /etc/passwd",
+            RM_RECURSIVE_GENERAL_NAME,
+            Severity::High,
+        );
+
+        assert_blocks_with_pattern(
+            &pack,
+            "rm -rfi ./build > /etc/passwd",
+            "redirect-truncate-root-home",
+        );
+        assert_blocks_with_pattern(
+            &pack,
+            r#"rm -r -i ./build > "$HOME/.profile""#,
+            "redirect-truncate-root-home",
+        );
+        for command in [
+            "rm -ri ./tree 3>/etc/passwd",
+            "rm -ri ./tree 0> /etc/passwd",
+            "rm -ri ./tree *> /etc/passwd",
+            "rm -ri ./tree {audit}> /etc/passwd",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "redirect-truncate-root-home");
+        }
+    }
+}
+
+/// The rm classifier never walks `destructive_patterns`, so its denials must
+/// find their guidance by rule name (#348). These tests prove every rule it
+/// can emit resolves to authored text, and that the rule list they iterate
+/// cannot silently fall behind the constants it mirrors.
+#[cfg(test)]
+mod classifier_guidance_tests {
+    use super::*;
+
+    const PLACEHOLDER: &str = "No additional explanation is available yet";
+
+    /// Forms dcg accepts, either unconditionally or for literal temp paths.
+    /// An explanation that names none of them tells the caller only that it
+    /// lost.
+    const ACCEPTED_FORMS: &[&str] = &["rm -ri", "/tmp/delete-me-", "ls -la", "-WhatIf"];
+
+    #[test]
+    fn every_classifier_rule_resolves_to_authored_guidance() {
+        let pack = create_pack();
+        for &name in CLASSIFIER_RULE_NAMES {
+            let (explanation, suggestions) = pack.rule_guidance(name);
+            let explanation =
+                explanation.unwrap_or_else(|| panic!("classifier rule {name} has no explanation"));
+            assert!(
+                !explanation.contains(PLACEHOLDER),
+                "classifier rule {name} resolves to the placeholder"
+            );
+            assert!(
+                ACCEPTED_FORMS.iter().any(|form| explanation.contains(form)),
+                "classifier rule {name} names no command dcg accepts: {explanation}"
+            );
+            assert!(
+                !suggestions.is_empty(),
+                "classifier rule {name} offers no safer alternative"
+            );
+            for suggestion in suggestions {
+                assert!(
+                    !suggestion.command.contains("--maxdepth"),
+                    "{name}: find takes -maxdepth, not --maxdepth"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn classifier_rule_explanations_are_distinct() {
+        // One shared blurb attached to every rule would satisfy the test
+        // above while telling a PowerShell caller about `rm -ri`.
+        let pack = create_pack();
+        let mut seen: Vec<(&str, &str)> = Vec::new();
+        for &name in CLASSIFIER_RULE_NAMES {
+            let explanation = pack.rule_guidance(name).0.expect("explanation");
+            if let Some((other, _)) = seen.iter().find(|(_, text)| *text == explanation) {
+                panic!("{name} reuses the explanation authored for {other}");
+            }
+            seen.push((name, explanation));
+        }
+    }
+
+    #[test]
+    fn classifier_only_guidance_covers_exactly_the_pattern_less_rules() {
+        // A rule with a regex pattern carries its text on the pattern; the
+        // classifier-only table must cover the rest and nothing else, or a
+        // row is dead (shadowed by the pattern) or a rule is mute.
+        let pack = create_pack();
+        for &name in CLASSIFIER_RULE_NAMES {
+            let has_pattern = pack
+                .destructive_patterns
+                .iter()
+                .any(|pattern| pattern.name == Some(name));
+            let has_table_row = classifier_rule_guidance(name).is_some();
+            assert!(
+                has_pattern != has_table_row,
+                "{name}: pattern={has_pattern} table={has_table_row}; exactly one must hold"
+            );
+        }
+        assert!(classifier_rule_guidance("no-such-rule").is_none());
+    }
+
+    #[test]
+    fn classifier_rule_name_list_mirrors_the_constants() {
+        // The list is hand-maintained; tie it to the `*_NAME` constants in
+        // this module so a new classifier rule cannot ship without a row in
+        // the list (and therefore without the guidance checks above).
+        let declared: Vec<&str> = include_str!("filesystem.rs")
+            .lines()
+            .filter(|line| line.starts_with("const ") && line.contains("_NAME: &str"))
+            .collect();
+        assert_eq!(
+            declared.len(),
+            CLASSIFIER_RULE_NAMES.len(),
+            "this module declares {} rule-name constants but CLASSIFIER_RULE_NAMES lists {}: \
+             add the new rule to the list and author its guidance.\n{declared:#?}",
+            declared.len(),
+            CLASSIFIER_RULE_NAMES.len()
+        );
+    }
+
+    #[test]
+    fn rm_suggestions_no_longer_advertise_linux_trash_on_macos() {
+        // #348: `~/.local/share/Trash` does not exist on macOS; every rm rule
+        // that offers a trash move must offer the Finder trash for macOS.
+        let pack = create_pack();
+        let trash_rules = [RM_RF_GENERAL_NAME, RM_RECURSIVE_GENERAL_NAME];
+        for name in trash_rules {
+            let (_, suggestions) = pack.rule_guidance(name);
+            assert!(
+                suggestions.iter().any(|suggestion| {
+                    suggestion.platform == Platform::MacOS
+                        && suggestion.command.contains("~/.Trash")
+                }),
+                "{name} offers no macOS trash suggestion"
+            );
+        }
+    }
+
+    /// #334: a bare `*` handed to non-recursive rm wipes an unbounded,
+    /// shell-chosen file set and must be reviewed; reviewable shapes (suffix
+    /// globs, named files, quoted literals, interactive) stay allowed.
+    #[test]
+    fn bare_glob_rm_is_denied_and_reviewable_shapes_stay_allowed() {
+        let pack = create_pack();
+        for (command, rule) in [
+            ("rm -f *", RM_BARE_GLOB_NAME),
+            ("rm *", RM_BARE_GLOB_NAME),
+            ("rm -f ./*", RM_BARE_GLOB_NAME),
+            ("rm -fv *", RM_BARE_GLOB_NAME),
+            ("cd /srv/app && rm -f *", RM_BARE_GLOB_NAME),
+            ("rm /*", RM_BARE_GLOB_ROOT_NAME),
+            ("rm -f /*", RM_BARE_GLOB_ROOT_NAME),
+        ] {
+            let matched = pack
+                .check(command)
+                .unwrap_or_else(|| panic!("{command} must be denied"));
+            assert_eq!(matched.name, Some(rule), "{command}");
+            assert!(
+                matched.explanation.is_some(),
+                "{command}: bare-glob denial must carry guidance"
+            );
+        }
+
+        for command in [
+            "rm *.log",
+            "rm -f *.env",
+            "rm build/*",
+            "rm -f build/*",
+            "rm '*'",
+            "rm \"*\"",
+            "rm -i *",
+            "rm ./file-one ./file-two",
+            "rm -f notes.txt",
+            "echo *",
+            "ls *",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command} must stay allowed, matched {:?}",
+                pack.check(command).and_then(|matched| matched.name)
+            );
+        }
+
+        // Recursive spellings keep their established, more specific rules.
+        assert_eq!(
+            pack.check("rm -rf *").and_then(|matched| matched.name),
+            Some(RM_RF_GENERAL_NAME)
+        );
+    }
+
+    /// Windows disk-destruction verbs are caught on a non-Windows build too, so
+    /// a macOS/Linux dcg driving a Windows box does not miss them (#451). The
+    /// fuller set lives in the `cfg(windows)`-default-enabled `windows.system`
+    /// pack; these are its highest-severity, zero-false-positive baseline.
+    #[test]
+    fn windows_disk_destruction_verbs_block_cross_platform() {
+        let pack = create_pack();
+        for (command, rule) in [
+            ("Format-Volume -DriveLetter C", "format-volume"),
+            ("format-volume -driveletter c", "format-volume"),
+            ("FORMAT-VOLUME -DriveLetter D", "format-volume"),
+            ("Clear-Disk -Number 0 -RemoveData", "clear-disk"),
+            (
+                "vssadmin delete shadows /all /quiet",
+                "vssadmin-delete-shadows",
+            ),
+            (
+                "vssadmin.exe Delete Shadows /All",
+                "vssadmin-delete-shadows",
+            ),
+            ("wmic shadowcopy delete", "wmic-shadowcopy-delete"),
+            (
+                "Get-WmiObject Win32_ShadowCopy | Remove-WmiObject",
+                "wmi-shadowcopy-delete",
+            ),
+            (
+                "GET-CIMINSTANCE WIN32_SHADOWCOPY | REMOVE-CIMINSTANCE",
+                "wmi-shadowcopy-delete",
+            ),
+            (
+                "(Get-WmiObject Win32_ShadowCopy).Delete()",
+                "wmi-shadowcopy-delete",
+            ),
+        ] {
+            assert!(
+                filesystem_keyword_candidate(command),
+                "{command} must reach the pack"
+            );
+            let matched = pack
+                .check(command)
+                .unwrap_or_else(|| panic!("{command} must be denied"));
+            assert_eq!(matched.name, Some(rule), "{command}");
+            assert_eq!(matched.severity, Severity::Critical, "{command}");
+        }
+
+        // The read-only / unrelated spellings of the same tools stay allowed —
+        // only the destructive subcommand blocks.
+        for command in [
+            "vssadmin list shadows",
+            "wmic process list",
+            "Get-Volume",
+            "Get-Disk",
+            "git format-patch -1",
+            // A bare -WhatIf is a preview (windows.system's carve-out).
+            "Format-Volume -DriveLetter D -WhatIf",
+            "Clear-Disk -Number 1 -RemoveData -WhatIf",
+            "Get-CimInstance Win32_ShadowCopy",
+            "Get-WmiObject Win32_ShadowCopy | Select-Object ID, InstallDate",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command} must stay allowed, matched {:?}",
+                pack.check(command).and_then(|matched| matched.name)
+            );
+        }
+        // `-WhatIf:$false` turns the preview off: the volume is formatted.
+        for command in [
+            "Format-Volume -DriveLetter D -WhatIf:$false",
+            "Clear-Disk -Number 1 -RemoveData -WhatIf:$false",
+        ] {
+            assert!(pack.check(command).is_some(), "{command} must be denied");
+        }
+    }
+
+    /// `rsync --delete` into a system directory or home root mirror-deletes it,
+    /// the same catastrophe as `rm -rf` on that path, and was previously
+    /// fail-open. Keyed on the DESTINATION, so backups and `--dry-run` stay
+    /// allowed and a sensitive SOURCE is unaffected.
+    #[test]
+    fn rsync_delete_into_sensitive_destination_blocks() {
+        let pack = create_pack();
+        for command in [
+            "rsync -a --delete /src/ /etc/",
+            "rsync -a --delete src/ /",
+            "rsync -avz --delete /tmp/x/ /usr/",
+            "rsync -a --delete /empty/ /var/",
+            "rsync -a --delete /e/ /boot/",
+            "rsync -a --delete-after /s/ /etc/",
+            "rsync -a --delete-excluded /s/ /etc/",
+            "rsync -a --del /s/ /etc/",
+            "rsync -a --delete /s/ ~/",
+            "rsync -a --delete /s/ $HOME/",
+            "rsync -a --delete /s/ /home/",
+            "rsync -a --delete /s/ /home/user/",
+            "rsync -a --delete /s/ /root/",
+            "rsync --delete /s/ /etc/",
+        ] {
+            assert_eq!(
+                pack.check(command).and_then(|matched| matched.name),
+                Some("rsync-delete-sensitive-dest"),
+                "{command}"
+            );
+        }
+
+        // Backups, home subdirectories, dry runs, a sensitive SOURCE, and
+        // plain (no --delete) rsync all stay allowed.
+        for command in [
+            "rsync -a --delete src/ dest/",
+            "rsync -a --delete /tmp/a/ /tmp/b/",
+            "rsync -a --delete /project/ /home/user/backup/",
+            "rsync -a --delete /project/ ~/backup/",
+            "rsync -a --dry-run --delete /src/ /etc/",
+            "rsync -avn --delete /src/ /etc/",
+            "rsync -a --delete /etc/ /backup/",
+            "rsync -a /src/ /etc/",
+            "rsync -avz /src/ backup:/dst/",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command} must stay allowed, matched {:?}",
+                pack.check(command).and_then(|matched| matched.name)
+            );
+        }
+    }
+
+    /// `find … -exec rm {}` deletes every found file — the same deletion as
+    /// the already-denied `find … -delete` — and was allowed, because each
+    /// `-exec` child was judged as a lone non-recursive `rm`.
+    #[test]
+    fn find_exec_rm_of_the_found_files_is_a_find_delete() {
+        let pack = create_pack();
+        for (command, rule) in [
+            (r"find . -type f -exec rm {} \;", "find-delete-general"),
+            ("find . -type f -exec rm -f {} +", "find-delete-general"),
+            (
+                r"find src -name '*.rs' -execdir rm '{}' \;",
+                "find-delete-general",
+            ),
+            (r"find . -exec /bin/rm -f \{\} \;", "find-delete-general"),
+            (
+                r"find ~ -name '*.log' -exec rm {} \;",
+                "find-delete-root-home",
+            ),
+            (
+                "find /etc -type f -exec rm -f {} +",
+                "find-delete-root-home",
+            ),
+        ] {
+            assert_eq!(
+                pack.check(command).and_then(|matched| matched.name),
+                Some(rule),
+                "{command}"
+            );
+        }
+        // A fixed operand is the rm rules' business, and non-deleting actions
+        // over the found files stay allowed.
+        for command in [
+            r"find . -name '*.txt' -exec cat {} \;",
+            r"find . -type f -exec grep -l rm {} +",
+            r"find ./root -exec rm /tmp/scratch/marker \;",
+            "find . -name '*.rs' -print",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command} must stay allowed, matched {:?}",
+                pack.check(command).and_then(|matched| matched.name)
+            );
+        }
+        // Inside literal temp roots `-exec rm {}` is allowed exactly as
+        // `-delete` is; a climb, a variable, or a backslash anywhere but the
+        // terminating `\;` keeps the deny.
+        for command in [
+            r"find /tmp/build -name '*.o' -exec rm {} \;",
+            "find /tmp/build -type f -exec rm -f {} +",
+            r"find /var/tmp/cache -exec /bin/rm {} \;",
+        ] {
+            crate::packs::test_helpers::assert_allows(&pack, command);
+        }
+        for command in [
+            r"find /tmp/../etc -exec rm {} \;",
+            r"find /tmp/$D -exec rm {} \;",
+            r"find /tmp/x\ /etc -exec rm {} \;",
+        ] {
+            assert!(pack.check(command).is_some(), "{command} must stay denied");
+        }
+    }
+}
+
+#[cfg(test)]
+mod powershell_protected_file_tests {
+    use super::*;
+
+    /// A non-recursive PowerShell delete of a protected file (#451).
+    ///
+    /// `rm ~/.ssh/id_rsa` denies under `rm-protected-file`; the PowerShell
+    /// spelling of the very same deletion was allowed on every host and every
+    /// pack set, because this parser returned `NoMatch` for anything that did
+    /// not recurse. Measured before the fix: all six protected targets below,
+    /// and all five delete verbs, allowed with and without `-Force`.
+    #[test]
+    fn powershell_delete_of_a_protected_file_denies_issue_451() {
+        for target in [
+            "$HOME\\.ssh\\id_rsa",
+            "$HOME/.ssh/id_rsa",
+            "$HOME\\.ssh\\authorized_keys",
+            "$HOME\\.aws\\credentials",
+            "$HOME\\.bashrc",
+            "/etc/shadow",
+            "~/.ssh/id_rsa",
+            // Windows spells home `%USERPROFILE%`, and dcg's own path
+            // resolution treats it as the home directory (bd-b2b1).
+            "$env:USERPROFILE\\.ssh\\id_rsa",
+            "$env:userprofile\\.ssh\\id_rsa",
+        ] {
+            for verb in ["Remove-Item", "ri", "del", "erase", "rm"] {
+                for command in [
+                    format!("{verb} {target}"),
+                    format!("{verb} -Force {target}"),
+                ] {
+                    match parse_rm_command_segment_in_dialect(
+                        &command,
+                        false,
+                        ShellDialect::PowerShell,
+                    ) {
+                        RmParseDecision::Deny(hit) => {
+                            assert_eq!(
+                                hit.pattern_name, RM_PROTECTED_FILE_NAME,
+                                "{command} must deny under the same rule the POSIX twin uses"
+                            );
+                            assert_eq!(hit.severity, Severity::Critical);
+                        }
+                        other => unreachable!(
+                            "PowerShell delete of a protected file must deny: {command}: {other:?}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    /// The rule turns on the TARGET, not on the verb (#451).
+    ///
+    /// Without these the test above would pass on a blanket deny of
+    /// `Remove-Item`, which is the failure mode a new rule arm invites.
+    #[test]
+    fn powershell_protected_delete_still_turns_on_the_target_issue_451() {
+        for command in [
+            // Ordinary files are nobody's business.
+            "Remove-Item ./notes.txt",
+            "Remove-Item -Force ./build/app.exe",
+            "Remove-Item C:\\temp\\scratch.log",
+            "Remove-Item $HOME\\Documents\\report.docx",
+            // `*.pub` is the public half of a key pair: protected directory,
+            // exempt file. The shared classifier owns that carve-out.
+            "Remove-Item $HOME\\.ssh\\id_rsa.pub",
+            // `-WhatIf` reports the removal without performing it, the same
+            // carve-out the recursive arm makes.
+            "Remove-Item $HOME\\.ssh\\id_rsa -WhatIf",
+            "Remove-Item -WhatIf $HOME\\.ssh\\id_rsa",
+            // A non-delete cmdlet that merely names the path.
+            "Get-Content $HOME\\.ssh\\id_rsa",
+            "Get-ChildItem $HOME\\.ssh",
+        ] {
+            assert!(
+                matches!(
+                    parse_rm_command_segment_in_dialect(command, false, ShellDialect::PowerShell),
+                    RmParseDecision::NoMatch | RmParseDecision::Allow
+                ),
+                "{command} must stay allowed"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod cmd_protected_file_tests {
+    use super::*;
+
+    /// A plain cmd `del` of a protected file (#451).
+    ///
+    /// The cmd decoder only runs for commands carrying `^`, so the ordinary
+    /// spelling reached no protected-file judgment at all. Measured before the
+    /// fix: five protected targets and every `del`/`erase` switch combination
+    /// allowed, while `rm ~/.ssh/id_rsa` denied.
+    #[test]
+    fn cmd_delete_of_a_protected_file_denies_issue_451() {
+        for target in [
+            "%USERPROFILE%\\.ssh\\id_rsa",
+            "%USERPROFILE%\\.ssh\\authorized_keys",
+            "%USERPROFILE%\\.aws\\credentials",
+            "%USERPROFILE%\\.bashrc",
+            "%HOMEPATH%\\.ssh\\id_rsa",
+            "%userprofile%\\.ssh\\id_rsa",
+            // POSIX spellings reach cmd too: a caller can pass either.
+            "~/.ssh/id_rsa",
+            "$HOME/.ssh/id_rsa",
+        ] {
+            for verb in ["del", "erase", "del /f", "del /q", "del /f /q"] {
+                let command = format!("{verb} {target}");
+                match parse_rm_command_segment_in_dialect(&command, false, ShellDialect::Cmd) {
+                    RmParseDecision::Deny(hit) => {
+                        assert_eq!(
+                            hit.pattern_name, RM_PROTECTED_FILE_NAME,
+                            "{command} must deny under the same rule the POSIX twin uses"
+                        );
+                        assert_eq!(hit.severity, Severity::Critical);
+                    }
+                    other => unreachable!(
+                        "cmd delete of a protected file must deny: {command}: {other:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// The removed `['^', '%', '!']` prefilter must not make the signal fire
+    /// for every cmd command (#451).
+    ///
+    /// Negative control for dropping it: if this were always true,
+    /// core.filesystem would be force-selected on every cmd payload and the
+    /// quick-reject would stop meaning anything.
+    #[test]
+    fn ordinary_cmd_commands_still_skip_the_semantic_scan_issue_451() {
+        for command in [
+            "dir C:\\src",
+            "type C:\\app\\x.conf",
+            "echo hello",
+            "copy a.txt b.txt",
+            "move a.txt b.txt",
+            "cd %USERPROFILE%",
+            "set PATH=%PATH%;C:\\bin",
+        ] {
+            assert!(
+                !crate::packs::core::filesystem::filesystem_semantic_scan_required(
+                    command,
+                    ShellDialect::Cmd
+                ),
+                "an ordinary cmd command must not force core.filesystem selection: {command}"
+            );
+        }
+        for command in ["del %USERPROFILE%\\.ssh\\id_rsa", "erase ~/.ssh/id_rsa"] {
+            assert!(
+                crate::packs::core::filesystem::filesystem_semantic_scan_required(
+                    command,
+                    ShellDialect::Cmd
+                ),
+                "a cmd delete verb must force core.filesystem selection: {command}"
+            );
+        }
+    }
+
+    /// The cmd rule turns on the TARGET, not on the verb (#451).
+    #[test]
+    fn cmd_protected_delete_still_turns_on_the_target_issue_451() {
+        for command in [
+            "del C:\\temp\\scratch.log",
+            "del /q .\\build\\app.exe",
+            "del %USERPROFILE%\\Documents\\report.docx",
+            // The public half of a key pair stays exempt.
+            "del %USERPROFILE%\\.ssh\\id_rsa.pub",
+            // Reading is not deleting.
+            "type %USERPROFILE%\\.ssh\\id_rsa",
+            "dir %USERPROFILE%\\.ssh",
+            // `rd`/`rmdir` remove a directory; the recursive rules own those.
+            "rd /s /q %USERPROFILE%\\.ssh",
+        ] {
+            assert!(
+                matches!(
+                    parse_rm_command_segment_in_dialect(command, false, ShellDialect::Cmd),
+                    RmParseDecision::NoMatch | RmParseDecision::Allow
+                ),
+                "{command} must not deny under {RM_PROTECTED_FILE_NAME}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod git_internals_rm_reason_tests {
+    //! #533: `rm .git/index.lock` was denied as "a protected credential or
+    //! login-startup file". The decision and rule id stay; only the reason
+    //! now names the repository state actually at risk.
+    use super::*;
+
+    fn deny(command: &str, dialect: ShellDialect) -> RmParseMatch {
+        match parse_rm_command_segment_in_dialect(command, false, dialect) {
+            RmParseDecision::Deny(hit) => hit,
+            other => unreachable!("{command} must stay denied: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rm_of_git_internals_denies_with_a_git_reason_issue_533() {
+        for command in [
+            "rm .git/index.lock",
+            "rm -f .git/index.lock",
+            "rm repo/.git/index.lock",
+            "rm .git/HEAD.lock",
+            "rm .git/notes.txt",
+        ] {
+            let hit = deny(command, ShellDialect::Posix);
+            assert_eq!(hit.pattern_name, RM_PROTECTED_FILE_NAME, "{command}");
+            assert_eq!(hit.severity, Severity::Critical, "{command}");
+            assert_eq!(hit.reason, RM_PROTECTED_GIT_INTERNAL_REASON, "{command}");
+        }
+    }
+
+    #[test]
+    fn rm_of_credentials_keeps_the_credential_reason_issue_533() {
+        for command in [
+            "rm ~/.ssh/id_rsa",
+            "rm ~/.aws/credentials",
+            "rm /etc/shadow",
+        ] {
+            let hit = deny(command, ShellDialect::Posix);
+            assert_eq!(hit.pattern_name, RM_PROTECTED_FILE_NAME, "{command}");
+            assert_eq!(hit.reason, RM_PROTECTED_FILE_REASON, "{command}");
+        }
+    }
+
+    #[test]
+    fn a_credential_anywhere_keeps_the_credential_reason_issue_533() {
+        // The git operand comes first, so the reported span is the git path;
+        // the reason must still not understate the credential deletion.
+        let hit = deny("rm .git/index.lock ~/.ssh/id_rsa", ShellDialect::Posix);
+        assert_eq!(hit.pattern_name, RM_PROTECTED_FILE_NAME);
+        assert_eq!(hit.reason, RM_PROTECTED_FILE_REASON);
+    }
+
+    #[test]
+    fn unprotected_lock_files_stay_allowed_issue_533() {
+        for command in ["rm index.lock", "rm notes.lock", "rm lock", "rm .gitignore"] {
+            assert!(
+                matches!(
+                    parse_rm_command_segment_in_dialect(command, false, ShellDialect::Posix),
+                    RmParseDecision::NoMatch
+                ),
+                "{command} must not deny under {RM_PROTECTED_FILE_NAME}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_deletes_of_git_internals_use_the_git_reason_issue_533() {
+        for (command, dialect) in [
+            ("Remove-Item .git\\index.lock", ShellDialect::PowerShell),
+            ("del .git\\index.lock", ShellDialect::Cmd),
+        ] {
+            let hit = deny(command, dialect);
+            assert_eq!(hit.pattern_name, RM_PROTECTED_FILE_NAME, "{command}");
+            assert_eq!(hit.reason, RM_PROTECTED_GIT_INTERNAL_REASON, "{command}");
+        }
+        for (command, dialect) in [
+            ("Remove-Item $HOME\\.ssh\\id_rsa", ShellDialect::PowerShell),
+            (
+                "Remove-Item .git\\index.lock $HOME\\.ssh\\id_rsa",
+                ShellDialect::PowerShell,
+            ),
+            ("del %USERPROFILE%\\.ssh\\id_rsa", ShellDialect::Cmd),
+        ] {
+            let hit = deny(command, dialect);
+            assert_eq!(hit.reason, RM_PROTECTED_FILE_REASON, "{command}");
+        }
     }
 }

@@ -6,7 +6,6 @@
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-. (Join-Path $repoRoot 'uninstall.ps1') -LoadFunctionsOnly
 
 $script:failures = 0
 function Check([bool]$cond, [string]$msg) {
@@ -17,7 +16,49 @@ function Test-NoBom([string]$p) {
     $b = [System.IO.File]::ReadAllBytes($p)
     -not ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF)
 }
-$dcg = 'C:\Users\me\.local\bin\dcg.exe'
+$dcg = "C:\Users\O'Brien\.local\bin\dcg.exe"
+$escapedDcg = $dcg.Replace("'", "''")
+
+$ompSelectorNames = @('OMP_PROFILE', 'PI_PROFILE', 'PI_CONFIG_DIR', 'PI_CODING_AGENT_DIR')
+$savedOmpSelectors = @{}
+foreach ($name in $ompSelectorNames) {
+    $savedOmpSelectors[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+    # Seed first so this fence is mutation-sensitive on hosts whose ambient
+    # environment happens to be clean.
+    Microsoft.PowerShell.Management\Set-Item -LiteralPath "Env:$name" -Value "dcg-test-ambient-$name"
+}
+foreach ($name in $ompSelectorNames) {
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+}
+
+try {
+    $unclearedOmpSelectors = @($ompSelectorNames | Where-Object {
+        Test-Path -LiteralPath "Env:$_"
+    })
+    if ($unclearedOmpSelectors.Count -ne 0) {
+        throw "OMP test selector fence failed: $($unclearedOmpSelectors -join ', ')"
+    }
+    Check $true "OMP path/profile selectors are scrubbed before loading uninstaller functions"
+
+    . (Join-Path $repoRoot 'uninstall.ps1') -LoadFunctionsOnly
+
+Write-Host "Test 0: Claude (Bash|PowerShell|Monitor wrapper) - remove dcg, keep Bash-only hook"
+$h0 = New-Tmp; New-Item -ItemType Directory -Path $h0 -Force | Out-Null
+try {
+    $f = Join-Path $h0 'settings.json'
+    @{ hooks = @{ PreToolUse = @(
+        @{ matcher = 'Bash|PowerShell|Monitor'; hooks = @(
+            @{ type = 'command'; command = "& '$escapedDcg'"; shell = 'powershell' }) },
+        @{ matcher = 'Bash'; hooks = @(
+            @{ type = 'command'; command = 'keep-bash-only' }) })
+    } } | ConvertTo-Json -Depth 20 | Set-Content $f
+    Check ((Remove-DcgHooksFromJsonFile -Path $f) -eq $true) "Claude: returns true (removed)"
+    $cfg = Get-Content -Raw $f | ConvertFrom-Json
+    $entries = @($cfg.hooks.PreToolUse)
+    Check ($entries.Count -eq 1) "Claude: emptied combined matcher pruned"
+    Check ($entries[0].matcher -eq 'Bash') "Claude: Bash-only matcher preserved"
+    Check ($entries[0].hooks[0].command -eq 'keep-bash-only') "Claude: coexisting command preserved"
+} finally { Remove-Item -Recurse -Force $h0 -ErrorAction SilentlyContinue }
 
 Write-Host "Test 1: Gemini (BeforeTool/run_shell_command) - remove dcg, keep coexisting"
 $h1 = New-Tmp; New-Item -ItemType Directory -Path (Join-Path $h1 '.gemini') -Force | Out-Null
@@ -26,7 +67,7 @@ try {
     @{ hooks = @{ BeforeTool = @(@{ matcher = 'run_shell_command'; hooks = @(
         @{ command = $dcg; name = 'dcg'; timeout = 5000 }, @{ command = 'other-tool'; name = 'other' }) }) } } |
         ConvertTo-Json -Depth 20 | Set-Content $f
-    Check ((Remove-DcgHooksFromJsonFile -Path $f -EventName 'BeforeTool' -Matcher 'run_shell_command' -DeleteEmptyFile) -eq $true) "returns true (removed)"
+    Check ((Remove-DcgHooksFromJsonFile -Path $f -EventName 'BeforeTool' -DeleteEmptyFile) -eq $true) "returns true (removed)"
     Check (Test-NoBom $f) "rewritten without BOM"
     $cmds = @((Get-Content -Raw $f | ConvertFrom-Json).hooks.BeforeTool[0].hooks | ForEach-Object { $_.command })
     Check (-not ($cmds -contains $dcg)) "dcg removed"
@@ -111,6 +152,626 @@ try {
     Check ((Remove-DcgHooksFromJsonFile -Path $f) -eq $false) "invalid JSON -> false (untouched)"
     Check ((Get-Content -Raw $f) -eq '{ not json') "invalid file content unchanged"
 } finally { Remove-Item -Recurse -Force $h7 -ErrorAction SilentlyContinue }
+
+Write-Host "Test 8: wrong-matcher dcg hook is removed, sibling survives"
+$h8 = New-Tmp; New-Item -ItemType Directory -Path $h8 -Force | Out-Null
+try {
+    $f = Join-Path $h8 'settings.json'
+    @{ hooks = @{ PreToolUse = @(@{ matcher = 'Write'; hooks = @(
+        @{ type = 'command'; command = $dcg },
+        @{ type = 'command'; command = 'keep-write-hook' }) }) } } |
+        ConvertTo-Json -Depth 20 | Set-Content $f
+    Check ((Remove-DcgHooksFromJsonFile -Path $f) -eq $true) "wrong-matcher hook: returns true"
+    $hooks = @((Get-Content -Raw $f | ConvertFrom-Json).hooks.PreToolUse[0].hooks)
+    Check ($hooks.Count -eq 1 -and $hooks[0].command -eq 'keep-write-hook') "wrong-matcher sibling preserved"
+} finally { Remove-Item -Recurse -Force $h8 -ErrorAction SilentlyContinue }
+
+Write-Host "Test 9: keep-config and keep-history are independent"
+$h9 = New-Tmp
+try {
+    $config = Join-Path $h9 '.config/dcg'
+    $data = Join-Path $h9 '.local/share/dcg'
+    New-Item -ItemType Directory -Path $config -Force | Out-Null
+    New-Item -ItemType Directory -Path $data -Force | Out-Null
+    Set-Content (Join-Path $config 'config.toml') 'mode = "deny"'
+    Set-Content (Join-Path $config 'history.db') 'history'
+    Set-Content (Join-Path $config 'history.db-wal') 'wal'
+    New-Item -ItemType Directory -Path (Join-Path $config 'backups') -Force | Out-Null
+    Set-Content (Join-Path $config 'backups/dcg.exe') 'backup'
+    Set-Content (Join-Path $data 'blocked.log') 'log'
+    Remove-DcgStateDirectories -ConfigDir $config -DataDir $data -KeepHistory
+    Check (-not (Test-Path (Join-Path $config 'config.toml'))) "KeepHistory removes config"
+    Check (Test-Path (Join-Path $config 'history.db')) "KeepHistory preserves history database"
+    Check (Test-Path (Join-Path $config 'history.db-wal')) "KeepHistory preserves SQLite sidecar"
+    Check (Test-Path (Join-Path $config 'backups/dcg.exe')) "KeepHistory preserves release backups"
+    Check (Test-Path $data) "KeepHistory preserves data directory"
+
+    Set-Content (Join-Path $config 'config.toml') 'mode = "deny"'
+    Remove-DcgStateDirectories -ConfigDir $config -DataDir $data -KeepConfig
+    Check (Test-Path (Join-Path $config 'config.toml')) "KeepConfig preserves config"
+    Check (-not (Test-Path (Join-Path $config 'history.db'))) "KeepConfig removes history database"
+    Check (-not (Test-Path (Join-Path $config 'history.db-wal'))) "KeepConfig removes SQLite sidecar"
+    Check (-not (Test-Path (Join-Path $config 'backups'))) "KeepConfig removes release backups"
+    Check (-not (Test-Path $data)) "KeepConfig removes data directory"
+} finally { Remove-Item -Recurse -Force $h9 -ErrorAction SilentlyContinue }
+
+Write-Host "Test 10: Copilot PascalCase PreToolUse dcg entry removed, coexisting survives (#253)"
+$h10 = New-Tmp
+try {
+    $hookDir = Join-Path $h10 'hooks'; New-Item -ItemType Directory -Path $hookDir -Force | Out-Null
+    @{ version = 1; hooks = @{ PreToolUse = @(
+        @{ type = 'command'; bash = $dcg; powershell = $dcg; cwd = '.'; timeoutSec = 30 },
+        @{ type = 'command'; bash = 'linter'; powershell = 'linter.exe' }) } } |
+        ConvertTo-Json -Depth 20 | Set-Content (Join-Path $hookDir 'dcg.json')
+    Check ((Unconfigure-CopilotHook -CopilotHome $h10) -eq $true) "PascalCase key: returns true (removed)"
+    $cfg = Get-Content -Raw (Join-Path $hookDir 'dcg.json') | ConvertFrom-Json
+    $preKeys = @($cfg.hooks.PSObject.Properties.Name | Where-Object { $_.ToLowerInvariant() -eq 'pretooluse' })
+    Check (($preKeys.Count -eq 1) -and ($preKeys[0] -ceq 'PreToolUse')) "existing PascalCase spelling kept (got: $($preKeys -join ', '))"
+    $entries = @($cfg.hooks.PSObject.Properties['PreToolUse'].Value)
+    Check ($null -eq ($entries | Where-Object { $_.bash -eq $dcg -or $_.powershell -eq $dcg })) "PascalCase dcg entry removed"
+    Check (@($entries | Where-Object { $_.bash -eq 'linter' }).Count -eq 1) "coexisting non-dcg entry survives"
+} finally { Remove-Item -Recurse -Force $h10 -ErrorAction SilentlyContinue }
+
+Write-Host "Test 11: Oh My Pi marker-owned extension removed, user extension preserved"
+$h11 = New-Tmp
+try {
+    $extDir = Join-Path (Join-Path (Join-Path $h11 '.omp') 'agent') 'extensions'
+    New-Item -ItemType Directory -Path $extDir -Force | Out-Null
+    $extension = Join-Path $extDir 'dcg-guard.ts'
+    Set-Content -Path $extension -Value '// dcg-omp-extension: generated'
+    Check ((Unconfigure-OmpExtension -HomeDir $h11 -RepoRoot $h11) -eq $true) "OMP: marker-owned extension removed"
+    Check (-not (Test-Path $extension)) "OMP: generated extension no longer exists"
+
+    Set-Content -Path $extension -Value 'export default function mine() {}'
+    Check ((Unconfigure-OmpExtension -HomeDir $h11 -RepoRoot $h11) -eq $false) "OMP: user extension not claimed"
+    Check (Test-Path $extension) "OMP: user-authored extension preserved"
+
+    $nearMarkers = @(
+        [pscustomobject]@{ Name = 'uppercase marker'; Content = '// DCG-OMP-EXTENSION: user-authored' },
+        [pscustomobject]@{ Name = 'one-character marker mutation'; Content = '// dcg-omp-extensio: user-authored' },
+        [pscustomobject]@{ Name = 'punctuation marker mutation'; Content = '// dcg_omp_extension: user-authored' }
+    )
+    foreach ($case in $nearMarkers) {
+        [System.IO.File]::WriteAllText($extension, $case.Content)
+        $before = [System.IO.File]::ReadAllBytes($extension)
+        Check ((Unconfigure-OmpExtension -HomeDir $h11 -RepoRoot $h11) -eq $false) "OMP: $($case.Name) is not claimed"
+        Check ([System.IO.File]::Exists($extension)) "OMP: $($case.Name) file is preserved"
+        $after = [System.IO.File]::ReadAllBytes($extension)
+        Check ([System.Convert]::ToBase64String($before) -ceq [System.Convert]::ToBase64String($after)) "OMP: $($case.Name) bytes are unchanged"
+    }
+} finally { Remove-Item -Recurse -Force $h11 -ErrorAction SilentlyContinue }
+
+Write-Host "Test 12: Oh My Pi inactive profiles and exact-cwd project extension are removed"
+$h12 = New-Tmp
+$savedLocation = (Get-Location).Path
+$workProfile = $null
+$userProfile = $null
+$workAttributes = $null
+$userAttributes = $null
+try {
+    $defaultExtension = Join-Path $h12 '.omp/agent/extensions/dcg-guard.ts'
+    $workExtension = Join-Path $h12 '.omp/profiles/work/agent/extensions/dcg-guard.ts'
+    $teamExtension = Join-Path $h12 '.omp/profiles/team/agent/extensions/dcg-guard.ts'
+    $userExtension = Join-Path $h12 '.omp/profiles/personal/agent/extensions/dcg-guard.ts'
+    $repo = Join-Path $h12 'repo'
+    $nested = Join-Path $repo 'a/b'
+    $ancestorProjectExtension = Join-Path $repo '.omp/extensions/dcg-guard.ts'
+    $activeProjectExtension = Join-Path $nested '.omp/extensions/dcg-guard.ts'
+    foreach ($path in @($defaultExtension, $workExtension, $teamExtension, $userExtension, $ancestorProjectExtension, $activeProjectExtension)) {
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
+    }
+    New-Item -ItemType Directory -Force -Path (Join-Path $repo '.git'), $nested | Out-Null
+    foreach ($path in @($defaultExtension, $workExtension, $teamExtension, $ancestorProjectExtension, $activeProjectExtension)) {
+        Set-Content -Path $path -Value '// dcg-omp-extension: generated'
+    }
+    Set-Content -Path $userExtension -Value '// DCG-OMP-EXTENSION: user-authored'
+    $ancestorProjectBytes = [System.IO.File]::ReadAllBytes($ancestorProjectExtension)
+
+    if ([System.IO.Path]::DirectorySeparatorChar -eq '\') {
+        $workProfile = Join-Path $h12 '.omp/profiles/work'
+        $userProfile = Join-Path $h12 '.omp/profiles/personal'
+        $workAttributes = [System.IO.File]::GetAttributes($workProfile)
+        $userAttributes = [System.IO.File]::GetAttributes($userProfile)
+        [System.IO.File]::SetAttributes(
+            $workProfile,
+            [System.IO.FileAttributes]($workAttributes -bor [System.IO.FileAttributes]::Hidden -bor [System.IO.FileAttributes]::System)
+        )
+        [System.IO.File]::SetAttributes(
+            $userProfile,
+            [System.IO.FileAttributes]($userAttributes -bor [System.IO.FileAttributes]::Hidden)
+        )
+        $profiles = @(Get-OmpProfileDirectories -Path (Join-Path $h12 '.omp/profiles'))
+        Check (@($profiles | Where-Object {
+            [string]::Equals($_, $workProfile, [System.StringComparison]::OrdinalIgnoreCase)
+        }).Count -eq 1) "OMP: Hidden/System inactive profile is enumerated on Windows"
+        Check (@($profiles | Where-Object {
+            [string]::Equals($_, $userProfile, [System.StringComparison]::OrdinalIgnoreCase)
+        }).Count -eq 1) "OMP: hidden foreign-profile candidate is enumerated on Windows"
+    }
+
+    Set-Location -LiteralPath $nested
+    Check ((Unconfigure-OmpExtension -HomeDir $h12) -eq $true) "OMP: profile/project sweep removed generated extensions"
+    Check (-not (Test-Path $defaultExtension)) "OMP: default extension removed"
+    Check (-not (Test-Path $workExtension)) "OMP: inactive work profile removed"
+    Check (-not (Test-Path $teamExtension)) "OMP: inactive team profile removed"
+    Check (-not (Test-Path -LiteralPath $activeProjectExtension)) "OMP: exact-cwd project extension removed"
+    Check (Test-Path -LiteralPath $ancestorProjectExtension) "OMP: Git-ancestor extension preserved from nested cwd"
+    $ancestorProjectBytesAfter = [System.IO.File]::ReadAllBytes($ancestorProjectExtension)
+    Check ([System.Convert]::ToBase64String($ancestorProjectBytes) -ceq [System.Convert]::ToBase64String($ancestorProjectBytesAfter)) "OMP: preserved Git-ancestor extension remains byte-identical"
+    Check (Test-Path $userExtension) "OMP: inactive near-marker user extension is preserved, including from a hidden Windows profile"
+} finally {
+    Set-Location $savedLocation
+    if ([System.IO.Path]::DirectorySeparatorChar -eq '\') {
+        if (($null -ne $workAttributes) -and [System.IO.Directory]::Exists($workProfile)) {
+            [System.IO.File]::SetAttributes($workProfile, $workAttributes)
+        }
+        if (($null -ne $userAttributes) -and [System.IO.Directory]::Exists($userProfile)) {
+            [System.IO.File]::SetAttributes($userProfile, $userAttributes)
+        }
+    }
+    Remove-Item -Recurse -Force $h12 -ErrorAction SilentlyContinue
+}
+
+Write-Host "Test 13: Oh My Pi project cleanup treats wildcard characters literally"
+$h13 = New-Tmp
+$savedLocation = (Get-Location).Path
+try {
+    $repo = Join-Path $h13 'repo[one]'
+    $nested = Join-Path $repo 'nested[active]'
+    $projectExtension = Join-Path $nested '.omp/extensions/dcg-guard.ts'
+    [void][System.IO.Directory]::CreateDirectory((Join-Path $repo '.git'))
+    [void][System.IO.Directory]::CreateDirectory($nested)
+    [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $projectExtension))
+    [System.IO.File]::WriteAllText($projectExtension, '// dcg-omp-extension: generated')
+
+    Set-Location -LiteralPath $nested
+    Check ((Get-DcgRepositoryRoot) -eq $repo) "OMP: repository root with brackets is discovered literally"
+    Check ((Unconfigure-OmpExtension -HomeDir $h13) -eq $true) "OMP: exact bracketed-cwd project extension is removed"
+    Check (-not (Test-Path -LiteralPath $projectExtension)) "OMP: no exact-cwd project extension remains"
+} finally {
+    Set-Location $savedLocation
+    Remove-Item -Recurse -Force $h13 -ErrorAction SilentlyContinue
+}
+
+Write-Host "Test 13a: Oh My Pi profile enumeration keeps hidden-directory compatibility"
+$ompProfileEnumerator = (Get-Command Get-OmpProfileDirectories).ScriptBlock.ToString()
+$compatibleDirectoryCall = '[System.IO.Directory]::GetDirectories($Path)'
+Check ($ompProfileEnumerator.IndexOf($compatibleDirectoryCall, [System.StringComparison]::Ordinal) -ge 0) "OMP: profile sweep uses the compatible Directory.GetDirectories overload"
+Check ($ompProfileEnumerator.IndexOf('Get-ChildItem', [System.StringComparison]::OrdinalIgnoreCase) -lt 0) "OMP: profile sweep cannot silently omit Hidden/System directories via Get-ChildItem"
+Check ($ompProfileEnumerator.IndexOf('EnumerationOptions', [System.StringComparison]::OrdinalIgnoreCase) -lt 0) "OMP: profile sweep does not require newer EnumerationOptions on Windows PowerShell 5.1"
+$ompUnconfigure = (Get-Command Unconfigure-OmpExtension).ScriptBlock.ToString()
+$ordinalOwnershipCheck = '.IndexOf(''dcg-omp-extension'', [System.StringComparison]::Ordinal)'
+Check ($ompUnconfigure.IndexOf($ordinalOwnershipCheck, [System.StringComparison]::Ordinal) -ge 0) "OMP: broader profile inventory remains gated by the exact case-sensitive ownership marker"
+
+if ([System.IO.Path]::DirectorySeparatorChar -ne '\') {
+    Write-Host "Test 13b: Oh My Pi cleanup preserves literal backslashes in POSIX roots"
+    $h13a = New-Tmp
+    try {
+        $literalHome = [System.IO.Path]::Combine($h13a, 'home\literal')
+        $literalRepo = [System.IO.Path]::Combine($h13a, 'repo\literal')
+        $intendedHomeExtension = [System.IO.Path]::Combine([string[]]@($literalHome, '.omp', 'agent', 'extensions', 'dcg-guard.ts'))
+        $intendedProjectExtension = [System.IO.Path]::Combine($literalRepo, '.omp', 'extensions', 'dcg-guard.ts')
+        $decoyHomeExtension = [System.IO.Path]::Combine([string[]]@($h13a, 'home', 'literal', '.omp', 'agent', 'extensions', 'dcg-guard.ts'))
+        $decoyProjectExtension = [System.IO.Path]::Combine([string[]]@($h13a, 'repo', 'literal', '.omp', 'extensions', 'dcg-guard.ts'))
+        foreach ($path in @($intendedHomeExtension, $intendedProjectExtension, $decoyHomeExtension, $decoyProjectExtension)) {
+            [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($path))
+            [System.IO.File]::WriteAllText($path, '// dcg-omp-extension: generated')
+        }
+
+        Check ((Unconfigure-OmpExtension -HomeDir $literalHome -RepoRoot $literalRepo) -eq $true) "OMP: literal-backslash roots are cleaned"
+        Check (-not [System.IO.File]::Exists($intendedHomeExtension)) "OMP: literal-backslash HOME extension is removed"
+        Check (-not [System.IO.File]::Exists($intendedProjectExtension)) "OMP: literal-backslash project extension is removed"
+        Check ([System.IO.File]::Exists($decoyHomeExtension)) "OMP: separator-normalized HOME decoy is preserved"
+        Check ([System.IO.File]::Exists($decoyProjectExtension)) "OMP: separator-normalized project decoy is preserved"
+    } finally {
+        if ([System.IO.Directory]::Exists($h13a)) {
+            [System.IO.Directory]::Delete($h13a, $true)
+        }
+    }
+}
+
+if ([System.IO.Path]::DirectorySeparatorChar -eq '\') {
+    Write-Host "Test 13c: Oh My Pi cleanup removes read-only generated extensions on Windows"
+    $h13b = New-Tmp
+    $readOnlyExtension = [System.IO.Path]::Combine([string[]]@($h13b, '.omp', 'agent', 'extensions', 'dcg-guard.ts'))
+    try {
+        [void][System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($readOnlyExtension))
+        [System.IO.File]::WriteAllText($readOnlyExtension, '// dcg-omp-extension: generated')
+        $attributes = [System.IO.File]::GetAttributes($readOnlyExtension)
+        [System.IO.File]::SetAttributes(
+            $readOnlyExtension,
+            [System.IO.FileAttributes]($attributes -bor [System.IO.FileAttributes]::ReadOnly)
+        )
+
+        Check ((Unconfigure-OmpExtension -HomeDir $h13b -RepoRoot $h13b) -eq $true) "OMP: read-only Windows extension is cleaned"
+        Check (-not [System.IO.File]::Exists($readOnlyExtension)) "OMP: read-only Windows extension is removed"
+    } finally {
+        if ([System.IO.File]::Exists($readOnlyExtension)) {
+            [System.IO.File]::SetAttributes($readOnlyExtension, [System.IO.FileAttributes]::Normal)
+        }
+        Remove-Item -LiteralPath $h13b -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Write-Host "Test 14: Oh My Pi cleanup does not claim a failed deletion"
+$h14 = New-Tmp
+$savedRemoveOmpExtensionFile = (Get-Command Remove-OmpExtensionFile).ScriptBlock
+try {
+    $defaultExtension = Join-Path $h14 '.omp/agent/extensions/dcg-guard.ts'
+    $profileExtension = Join-Path $h14 '.omp/profiles/work/agent/extensions/dcg-guard.ts'
+    [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $defaultExtension))
+    [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $profileExtension))
+    [System.IO.File]::WriteAllText($defaultExtension, '// dcg-omp-extension: generated')
+    [System.IO.File]::WriteAllText($profileExtension, '// dcg-omp-extension: generated')
+
+    function Remove-OmpExtensionFile {
+        [CmdletBinding()]
+        param([string]$Path)
+        if ($Path -eq $profileExtension) { throw "simulated locked file: $Path" }
+        [System.IO.File]::Delete($Path)
+    }
+
+    Check ((Unconfigure-OmpExtension -HomeDir $h14 -RepoRoot $h14) -eq $false) "OMP: partial deletion is not reported as complete"
+    Check (-not (Test-Path -LiteralPath $defaultExtension)) "OMP: removable extension is still cleaned up"
+    Check (Test-Path -LiteralPath $profileExtension) "OMP: failed deletion leaves the extension in place"
+} finally {
+    Set-Item -LiteralPath 'Function:\Remove-OmpExtensionFile' -Value $savedRemoveOmpExtensionFile
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath $h14 -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host "Test 14a: Oh My Pi cleanup verifies deletion postconditions"
+$h14a = New-Tmp
+$savedRemoveOmpExtensionFile = (Get-Command Remove-OmpExtensionFile).ScriptBlock
+$savedWriteWarn = (Get-Command Write-Warn).ScriptBlock
+try {
+    $extension = Join-Path $h14a '.omp/agent/extensions/dcg-guard.ts'
+    [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $extension))
+    [System.IO.File]::WriteAllText($extension, '// dcg-omp-extension: generated')
+    $before = [System.IO.File]::ReadAllBytes($extension)
+    $script:ompRemovalWarnings = @()
+
+    function Remove-OmpExtensionFile {
+        [CmdletBinding()]
+        param([string]$Path)
+    }
+    function Write-Warn {
+        param([string]$Message)
+        $script:ompRemovalWarnings += $Message
+    }
+
+    Check ((Unconfigure-OmpExtension -HomeDir $h14a -RepoRoot $h14a) -eq $false) "OMP: successful no-op removal is not reported as complete"
+    Check ([System.IO.File]::Exists($extension)) "OMP: no-op remover leaves the extension in place"
+    $after = [System.IO.File]::ReadAllBytes($extension)
+    Check ([System.Convert]::ToBase64String($before) -ceq [System.Convert]::ToBase64String($after)) "OMP: no-op remover leaves extension bytes unchanged"
+    Check ($script:ompRemovalWarnings.Count -eq 1) "OMP: failed deletion is reported exactly once"
+    Check ($script:ompRemovalWarnings[0] -like "Could not remove Oh My Pi extension at ${extension}:*") "OMP: no-op deletion warning names the exact extension"
+} finally {
+    Set-Item -LiteralPath 'Function:\Remove-OmpExtensionFile' -Value $savedRemoveOmpExtensionFile
+    Set-Item -LiteralPath 'Function:\Write-Warn' -Value $savedWriteWarn
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath $h14a -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host "Test 15: Oh My Pi cleanup does not claim success when profile enumeration fails"
+$h15 = New-Tmp
+$savedGetOmpProfileDirectories = (Get-Command Get-OmpProfileDirectories).ScriptBlock
+try {
+    $defaultExtension = Join-Path $h15 '.omp/agent/extensions/dcg-guard.ts'
+    $profileExtension = Join-Path $h15 '.omp/profiles/work/agent/extensions/dcg-guard.ts'
+    $profilesRoot = Join-Path $h15 '.omp/profiles'
+    [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $defaultExtension))
+    [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $profileExtension))
+    [System.IO.File]::WriteAllText($defaultExtension, '// dcg-omp-extension: generated')
+    [System.IO.File]::WriteAllText($profileExtension, '// dcg-omp-extension: generated')
+
+    function Get-OmpProfileDirectories {
+        [CmdletBinding()]
+        param([string]$Path)
+        if ($Path -eq $profilesRoot) { throw "simulated unreadable profiles directory: $Path" }
+        [System.IO.Directory]::GetDirectories($Path)
+    }
+
+    Check ((Unconfigure-OmpExtension -HomeDir $h15 -RepoRoot $h15) -eq $false) "OMP: profile enumeration failure is not reported as complete"
+    Check (-not (Test-Path -LiteralPath $defaultExtension)) "OMP: known default extension is still cleaned up"
+    Check (Test-Path -LiteralPath $profileExtension) "OMP: unenumerated profile extension remains in place"
+} finally {
+    Set-Item -LiteralPath 'Function:\Get-OmpProfileDirectories' -Value $savedGetOmpProfileDirectories
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath $h15 -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host "Test 16: Oh My Pi config root rejects Windows drive-qualified overrides"
+$savedPiConfigDir = $env:PI_CONFIG_DIR
+try {
+    $env:PI_CONFIG_DIR = 'C:\omp-outside-home'
+    $threw = $false
+    try {
+        [void](Get-OmpConfigRoot -HomeDir 'C:\Users\tester' -WindowsSemantics $true)
+    } catch {
+        $threw = $true
+    }
+    Check $threw "OMP: drive-qualified PI_CONFIG_DIR is rejected under Windows semantics"
+} finally {
+    $env:PI_CONFIG_DIR = $savedPiConfigDir
+}
+
+Write-Host "Test 16a: Oh My Pi config root follows native Node path-join classes"
+$savedPiConfigDir = $env:PI_CONFIG_DIR
+try {
+    $nativeWindows = [System.IO.Path]::DirectorySeparatorChar -eq '\'
+    $oracleHome = if ($nativeWindows) { 'C:\Users\u' } else { '/home/u' }
+    $cases = if ($nativeWindows) {
+        @(
+            [pscustomobject]@{ Name = '.omp'; Agent = 'C:\Users\u\.omp\agent' },
+            [pscustomobject]@{ Name = 'default'; Agent = 'C:\Users\u\default\agent' },
+            [pscustomobject]@{ Name = '\.omp'; Agent = 'C:\Users\u\.omp\agent' },
+            [pscustomobject]@{ Name = '/.omp'; Agent = 'C:\Users\u\.omp\agent' },
+            [pscustomobject]@{ Name = 'a//b'; Agent = 'C:\Users\u\a\b\agent' },
+            [pscustomobject]@{ Name = 'a/./b'; Agent = 'C:\Users\u\a\b\agent' },
+            [pscustomobject]@{ Name = 'a/../b'; Agent = 'C:\Users\u\b\agent' },
+            [pscustomobject]@{ Name = 'a/../../b'; Agent = 'C:\Users\b\agent' },
+            [pscustomobject]@{ Name = '../../../../../../../../../../../../x'; Agent = 'C:\x\agent' },
+            [pscustomobject]@{ Name = 'a/'; Agent = 'C:\Users\u\a\agent' },
+            [pscustomobject]@{ Name = '/'; Agent = 'C:\Users\u\agent' },
+            [pscustomobject]@{ Name = '.'; Agent = 'C:\Users\u\agent' },
+            [pscustomobject]@{ Name = '..'; Agent = 'C:\Users\agent' }
+        )
+    } else {
+        @(
+            [pscustomobject]@{ Name = '.omp'; Agent = '/home/u/.omp/agent' },
+            [pscustomobject]@{ Name = 'default'; Agent = '/home/u/default/agent' },
+            [pscustomobject]@{ Name = '\.omp'; Agent = '/home/u/\.omp/agent' },
+            [pscustomobject]@{ Name = '/.omp'; Agent = '/home/u/.omp/agent' },
+            [pscustomobject]@{ Name = 'a//b'; Agent = '/home/u/a/b/agent' },
+            [pscustomobject]@{ Name = 'a/./b'; Agent = '/home/u/a/b/agent' },
+            [pscustomobject]@{ Name = 'a/../b'; Agent = '/home/u/b/agent' },
+            [pscustomobject]@{ Name = 'a/../../b'; Agent = '/home/b/agent' },
+            [pscustomobject]@{ Name = '../../../../../../../../../../../../x'; Agent = '/x/agent' },
+            [pscustomobject]@{ Name = 'a/'; Agent = '/home/u/a/agent' },
+            [pscustomobject]@{ Name = '/'; Agent = '/home/u/agent' },
+            [pscustomobject]@{ Name = '.'; Agent = '/home/u/agent' },
+            [pscustomobject]@{ Name = '..'; Agent = '/home/agent' },
+            [pscustomobject]@{ Name = 'C:\omp'; Agent = '/home/u/C:\omp/agent' }
+        )
+    }
+    foreach ($case in $cases) {
+        $env:PI_CONFIG_DIR = $case.Name
+        $root = Get-OmpConfigRoot -HomeDir $oracleHome -WindowsSemantics $nativeWindows
+        $agent = Get-OmpAgentDir -HomeDir $oracleHome
+        Check ([string]::Equals($agent, $case.Agent, [System.StringComparison]::Ordinal)) "OMP: PI_CONFIG_DIR '$($case.Name)' resolves to '$($case.Agent)' (root '$root', got '$agent')"
+    }
+} finally {
+    $env:PI_CONFIG_DIR = $savedPiConfigDir
+}
+
+Write-Host "Test 17: Oh My Pi cleanup identifies marker inspection failures"
+$h17 = New-Tmp
+$savedWriteWarn = (Get-Command Write-Warn).ScriptBlock
+$savedReadOmpExtensionText = (Get-Command Read-OmpExtensionText).ScriptBlock
+try {
+    $defaultExtension = Join-Path $h17 '.omp/agent/extensions/dcg-guard.ts'
+    $profileExtension = Join-Path $h17 '.omp/profiles/work/agent/extensions/dcg-guard.ts'
+    [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $defaultExtension))
+    [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $profileExtension))
+    [System.IO.File]::WriteAllText($defaultExtension, '// dcg-omp-extension: generated')
+    [System.IO.File]::WriteAllText($profileExtension, '// dcg-omp-extension: generated')
+    $script:ompInspectionWarning = ''
+
+    function Read-OmpExtensionText {
+        [CmdletBinding()]
+        param([string]$Path)
+        if ($Path -eq $profileExtension) { throw "simulated unreadable marker: $Path" }
+        [System.IO.File]::ReadAllText($Path)
+    }
+    function Write-Warn {
+        param([string]$Message)
+        $script:ompInspectionWarning = $Message
+    }
+
+    Check ((Unconfigure-OmpExtension -HomeDir $h17 -RepoRoot $h17) -eq $false) "OMP: marker inspection failure is not reported as complete"
+    Check (-not (Test-Path -LiteralPath $defaultExtension)) "OMP: marker-readable extension is still cleaned up"
+    Check (Test-Path -LiteralPath $profileExtension) "OMP: unreadable extension remains in place"
+    Check ($script:ompInspectionWarning -like "Could not inspect Oh My Pi extension at ${profileExtension}:*") "OMP: warning distinguishes inspection from deletion failure"
+} finally {
+    Set-Item -LiteralPath 'Function:\Read-OmpExtensionText' -Value $savedReadOmpExtensionText
+    Set-Item -LiteralPath 'Function:\Write-Warn' -Value $savedWriteWarn
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath $h17 -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host "Test 18: Oh My Pi suppresses only exact stale profile-derived agent dirs"
+$h18 = New-Tmp
+$env:PI_CONFIG_DIR = '.custom-omp'
+$configRoot18 = Join-Path $h18 '.custom-omp'
+$defaultAgent18 = Join-Path $configRoot18 'agent'
+$derivedAgent18 = Join-Path (Join-Path (Join-Path $configRoot18 'profiles') 'work') 'agent'
+$env:PI_PROFILE = 'work'
+foreach ($defaultSelector in @('', 'default')) {
+    $env:OMP_PROFILE = $defaultSelector
+    $env:PI_CODING_AGENT_DIR = $derivedAgent18
+    $resolved = Get-OmpAgentDir -HomeDir $h18
+    Check ([string]::Equals($resolved, $defaultAgent18, [System.StringComparison]::Ordinal)) "OMP: '$defaultSelector' suppresses exact stale derivation"
+}
+
+$env:PI_CONFIG_DIR = 'outer/../normalized-omp'
+$normalizedRoot18 = Join-Path $h18 'normalized-omp'
+$normalizedDefault18 = Join-Path $normalizedRoot18 'agent'
+$normalizedDerived18 = Join-Path (Join-Path (Join-Path $normalizedRoot18 'profiles') 'work') 'agent'
+$env:OMP_PROFILE = 'default'
+$env:PI_PROFILE = 'work'
+$env:PI_CODING_AGENT_DIR = $normalizedDerived18
+$resolved = Get-OmpAgentDir -HomeDir $h18
+Check ([string]::Equals($resolved, $normalizedDefault18, [System.StringComparison]::Ordinal)) "OMP: normalized config root participates in exact stale provenance"
+$env:PI_CONFIG_DIR = '.custom-omp'
+
+$separator18 = [System.IO.Path]::DirectorySeparatorChar
+$nearMatches18 = @(
+    (Join-Path (Join-Path (Join-Path $configRoot18 'profiles') 'work') 'agent-sibling'),
+    (Join-Path (Join-Path (Join-Path $configRoot18 'profiles') 'Work') 'agent'),
+    ($configRoot18 + $separator18 + 'profiles' + $separator18 + '.' + $separator18 + 'work' + $separator18 + 'agent'),
+    ($configRoot18 + $separator18 + 'profiles' + $separator18 + $separator18 + 'work' + $separator18 + 'agent'),
+    ($derivedAgent18 + $separator18)
+)
+foreach ($nearMatch in $nearMatches18) {
+    $env:OMP_PROFILE = 'default'
+    $env:PI_PROFILE = 'work'
+    $env:PI_CODING_AGENT_DIR = $nearMatch
+    $resolved = Get-OmpAgentDir -HomeDir $h18
+    Check ([string]::Equals($resolved, $nearMatch, [System.StringComparison]::Ordinal)) "OMP: near-match override remains custom: $nearMatch"
+}
+
+$env:OMP_PROFILE = 'default'
+$env:PI_PROFILE = 'Upper'
+$upperAgent18 = Join-Path (Join-Path (Join-Path $configRoot18 'profiles') 'Upper') 'agent'
+$env:PI_CODING_AGENT_DIR = $upperAgent18
+$resolved = Get-OmpAgentDir -HomeDir $h18
+Check ([string]::Equals($resolved, $upperAgent18, [System.StringComparison]::Ordinal)) "OMP: invalid losing profile supplies no stale provenance"
+
+Microsoft.PowerShell.Management\Remove-Item -LiteralPath 'Env:PI_PROFILE' -ErrorAction SilentlyContinue
+$env:PI_CODING_AGENT_DIR = $derivedAgent18
+$resolved = Get-OmpAgentDir -HomeDir $h18
+Check ([string]::Equals($resolved, $derivedAgent18, [System.StringComparison]::Ordinal)) "OMP: profile-shaped override without provenance survives"
+
+$env:OMP_PROFILE = 'invalid/profile'
+$env:PI_PROFILE = 'work'
+$env:PI_CODING_AGENT_DIR = $derivedAgent18
+$resolved = Get-OmpAgentDir -HomeDir $h18
+Check ([string]::Equals($resolved, $derivedAgent18, [System.StringComparison]::Ordinal)) "OMP: invalid active selector is not treated as default provenance"
+
+$env:OMP_PROFILE = 'work'
+$env:PI_PROFILE = 'other'
+$env:PI_CODING_AGENT_DIR = (Join-Path $h18 'ignored-custom-agent')
+$resolved = Get-OmpAgentDir -HomeDir $h18
+Check ([string]::Equals($resolved, $derivedAgent18, [System.StringComparison]::Ordinal)) "OMP: named active profile ignores the override"
+
+$env:OMP_PROFILE = ''
+Microsoft.PowerShell.Management\Remove-Item -LiteralPath 'Env:PI_PROFILE' -ErrorAction SilentlyContinue
+Microsoft.PowerShell.Management\Remove-Item -LiteralPath 'Env:PI_CODING_AGENT_DIR' -ErrorAction SilentlyContinue
+$resolved = Get-OmpAgentDir -HomeDir $h18
+Check ([string]::Equals($resolved, $defaultAgent18, [System.StringComparison]::Ordinal)) "OMP: empty override resolves to default agent dir"
+
+Write-Host "Test 19: Oh My Pi profile grammar and presence precedence are exact"
+$customAgent19 = Join-Path $h18 'operator-custom-agent'
+$profileCases19 = @(
+    [pscustomobject]@{ Name = 'both selectors absent'; OmpPresent = $false; Omp = ''; PiPresent = $false; Pi = ''; Override = $customAgent19; Expected = $customAgent19 },
+    [pscustomobject]@{ Name = 'empty legacy selector'; OmpPresent = $false; Omp = ''; PiPresent = $true; Pi = ''; Override = $customAgent19; Expected = $customAgent19 },
+    [pscustomobject]@{ Name = 'whitespace legacy selector'; OmpPresent = $false; Omp = ''; PiPresent = $true; Pi = '  '; Override = $customAgent19; Expected = $customAgent19 },
+    [pscustomobject]@{ Name = 'lowercase legacy default sentinel'; OmpPresent = $false; Omp = ''; PiPresent = $true; Pi = 'default'; Override = $customAgent19; Expected = $customAgent19 },
+    [pscustomobject]@{ Name = 'uppercase legacy default is invalid'; OmpPresent = $false; Omp = ''; PiPresent = $true; Pi = 'DEFAULT'; Override = $customAgent19; Expected = $customAgent19 },
+    [pscustomobject]@{ Name = 'valid lowercase legacy profile'; OmpPresent = $false; Omp = ''; PiPresent = $true; Pi = 'work'; Override = $customAgent19; Expected = $derivedAgent18 },
+    [pscustomobject]@{ Name = 'uppercase legacy profile is invalid'; OmpPresent = $false; Omp = ''; PiPresent = $true; Pi = 'Work'; Override = $customAgent19; Expected = $customAgent19 },
+    [pscustomobject]@{ Name = 'empty modern selector suppresses legacy'; OmpPresent = $true; Omp = ''; PiPresent = $true; Pi = 'work'; Override = $customAgent19; Expected = $customAgent19 },
+    [pscustomobject]@{ Name = 'whitespace modern selector suppresses legacy'; OmpPresent = $true; Omp = '  '; PiPresent = $true; Pi = 'work'; Override = $customAgent19; Expected = $customAgent19 },
+    [pscustomobject]@{ Name = 'lowercase modern default suppresses stale derivation'; OmpPresent = $true; Omp = 'default'; PiPresent = $true; Pi = 'work'; Override = $derivedAgent18; Expected = $defaultAgent18 },
+    [pscustomobject]@{ Name = 'uppercase modern default is invalid'; OmpPresent = $true; Omp = 'DEFAULT'; PiPresent = $true; Pi = 'work'; Override = $derivedAgent18; Expected = $derivedAgent18 },
+    [pscustomobject]@{ Name = 'valid lowercase modern profile'; OmpPresent = $true; Omp = 'work'; PiPresent = $true; Pi = 'other'; Override = $customAgent19; Expected = $derivedAgent18 },
+    [pscustomobject]@{ Name = 'uppercase modern profile is invalid and suppresses legacy'; OmpPresent = $true; Omp = 'Work'; PiPresent = $true; Pi = 'work'; Override = $customAgent19; Expected = $customAgent19 },
+    [pscustomobject]@{ Name = 'invalid modern grammar suppresses legacy'; OmpPresent = $true; Omp = 'invalid/profile'; PiPresent = $true; Pi = 'work'; Override = $customAgent19; Expected = $customAgent19 }
+)
+foreach ($case in $profileCases19) {
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath 'Env:OMP_PROFILE' -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath 'Env:PI_PROFILE' -ErrorAction SilentlyContinue
+    if ($case.OmpPresent) { $env:OMP_PROFILE = $case.Omp }
+    if ($case.PiPresent) { $env:PI_PROFILE = $case.Pi }
+    $env:PI_CODING_AGENT_DIR = $case.Override
+
+    $resolved = Get-OmpAgentDir -HomeDir $h18
+    Check ([string]::Equals($resolved, $case.Expected, [System.StringComparison]::Ordinal)) "OMP: $($case.Name) resolves to '$($case.Expected)' (got '$resolved')"
+}
+
+Write-Host "Test R: Reasonix (#358) - primary, legacy and project settings lose only dcg"
+$hr = New-Tmp; New-Item -ItemType Directory -Path $hr -Force | Out-Null
+$savedReasonixHome = $env:REASONIX_HOME
+$savedAppData = $env:APPDATA
+try {
+    $env:REASONIX_HOME = $null
+    $env:APPDATA = Join-Path $hr 'Roaming'
+    $primary = Join-Path (Join-Path $env:APPDATA 'reasonix') 'settings.json'
+    $legacy = Join-Path (Join-Path $hr '.reasonix') 'settings.json'
+    $repo = Join-Path $hr 'repo'
+    $project = Join-Path (Join-Path $repo '.reasonix') 'settings.json'
+    foreach ($p in @($primary, $legacy, $project)) {
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $p) | Out-Null
+        @{ theme = 'dark'; hooks = @{ PreToolUse = @(
+            @{ match = 'bash|pwsh'; command = "`"$dcg`""; timeout = 5000 },
+            @{ match = 'bash'; command = 'node check.js' }) } } |
+            ConvertTo-Json -Depth 20 | Set-Content $p
+    }
+    Check ((Unconfigure-ReasonixHook -HomeDir $hr -RepoRoot $repo) -eq $true) "Reasonix: returns true (removed)"
+    foreach ($p in @($primary, $legacy, $project)) {
+        $cfg = Get-Content -Raw $p | ConvertFrom-Json
+        $cmds = @($cfg.hooks.PreToolUse | ForEach-Object { $_.command })
+        Check (($cmds -join ',') -eq 'node check.js') "Reasonix: only the coexisting hook remains in $p (got '$($cmds -join ',')')"
+        Check ($cfg.theme -eq 'dark') "Reasonix: unrelated keys kept in $p"
+        Check (Test-NoBom $p) "Reasonix: $p written without a BOM"
+    }
+    Check ((Unconfigure-ReasonixHook -HomeDir $hr -RepoRoot $repo) -eq $false) "Reasonix: second run is a noop"
+
+    $env:REASONIX_HOME = Join-Path $hr 'isolated'
+    $paths = @(Get-ReasonixSettingsPaths -HomeDir $hr)
+    Check ($paths[0] -eq (Join-Path $env:REASONIX_HOME 'settings.json')) "Reasonix: REASONIX_HOME is cleaned first"
+    Check ($paths -contains $legacy -and $paths -contains $primary) "Reasonix: default locations are cleaned too"
+    $env:REASONIX_HOME = '  ~/rx '
+    Check ((@(Get-ReasonixSettingsPaths -HomeDir $hr))[0] -eq (Join-Path (Join-Path $hr 'rx') 'settings.json')) "Reasonix: REASONIX_HOME is trimmed and ~ expanded"
+} finally {
+    $env:REASONIX_HOME = $savedReasonixHome
+    $env:APPDATA = $savedAppData
+    Remove-Item -Recurse -Force $hr -ErrorAction SilentlyContinue
+}
+} finally {
+    foreach ($name in $ompSelectorNames) {
+        if ($null -eq $savedOmpSelectors[$name]) {
+            Microsoft.PowerShell.Management\Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+        } else {
+            Microsoft.PowerShell.Management\Set-Item -LiteralPath "Env:$name" -Value $savedOmpSelectors[$name]
+        }
+    }
+}
+
+$savedClaudeConfigDir = $env:CLAUDE_CONFIG_DIR
+$claudeHome = New-Tmp
+New-Item -ItemType Directory -Force $claudeHome | Out-Null
+Push-Location $claudeHome
+try {
+    foreach ($form in @('absolute', 'relative', 'tilde', 'home', 'empty', 'unset')) {
+        switch ($form) {
+            'absolute' { $env:CLAUDE_CONFIG_DIR = Join-Path $claudeHome 'absolute config'; $expected = $env:CLAUDE_CONFIG_DIR }
+            'relative' { $env:CLAUDE_CONFIG_DIR = 'relative config'; $expected = Join-Path $claudeHome 'relative config' }
+            'tilde' { $env:CLAUDE_CONFIG_DIR = '~/alternate config'; $expected = Join-Path $claudeHome 'alternate config' }
+            'home' { $env:CLAUDE_CONFIG_DIR = '~'; $expected = $claudeHome }
+            'empty' { $env:CLAUDE_CONFIG_DIR = ''; $expected = Join-Path $claudeHome '.claude' }
+            'unset' { $env:CLAUDE_CONFIG_DIR = $null; $expected = Join-Path $claudeHome '.claude' }
+        }
+        $settings = Join-Path (Get-ClaudeConfigDir -HomeDir $claudeHome) 'settings.json'
+        Check ($settings -eq (Join-Path $expected 'settings.json')) "Claude uninstall resolver: $form"
+        New-Item -ItemType Directory -Force $expected | Out-Null
+        [System.IO.File]::WriteAllText($settings, '{"theme":"dark","hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"dcg"},{"type":"command","command":"unrelated"}]}]}}')
+        Check (Remove-DcgHooksFromJsonFile -Path $settings -EventName 'PreToolUse') "Claude uninstall removed active hook: $form"
+        $value = Get-Content -Raw $settings | ConvertFrom-Json
+        Check ($value.theme -eq 'dark' -and $value.hooks.PreToolUse[0].hooks[0].command -eq 'unrelated') "Claude uninstall preserved settings: $form"
+    }
+} finally { Pop-Location; $env:CLAUDE_CONFIG_DIR = $savedClaudeConfigDir }
+
+Write-Host "Test Droid: conservative inventory and missing-binary safety"
+$droidHome = New-Tmp
+$droidDir = Join-Path $droidHome '.factory'
+New-Item -ItemType Directory -Force -Path (Join-Path $droidDir 'hooks') | Out-Null
+$missingDcg = Join-Path $droidHome 'missing-dcg.exe'
+Check (Unconfigure-DroidHook -Binary $missingDcg -HomeDir $droidHome) "Droid: empty Factory config does not require a binary"
+foreach ($relative in @('hooks.json', 'settings.json', 'settings.local.json', 'hooks/hooks.json')) {
+    $candidate = Join-Path $droidDir $relative
+    $fixture = '{"hooks":{"PreToolUse":[{"matcher":"Execute","hooks":[{"command":"dcg --agent droid"}]}]}}'
+    [System.IO.File]::WriteAllText($candidate, $fixture)
+    Check (Test-DroidDcgRegistration -FactoryDir $droidDir) "Droid: inventory includes $relative"
+    Check (-not (Unconfigure-DroidHook -Binary $missingDcg -HomeDir $droidHome)) "Droid: missing binary cannot claim successful cleanup of $relative"
+    Check ([System.IO.File]::ReadAllText($candidate) -ceq $fixture) "Droid: failed cleanup leaves $relative byte-for-byte unchanged"
+    [System.IO.File]::WriteAllText($candidate, '{"theme":"dark"}')
+}
+Check (-not (Test-DroidDcgRegistration -FactoryDir $droidDir)) "Droid: unrelated Factory settings do not require cleanup"
+Check (Unconfigure-DroidHook -Binary $missingDcg -HomeDir $droidHome) "Droid: unrelated settings permit uninstall without a new DCG binary"
+$escapedDroidSettings = Join-Path $droidDir 'settings.json'
+$escapedDroidFixture = '{"hooks":{"PreToolUse":[{"matcher":"Execute","hooks":[{"type":"command","command":"/opt/\u0064\u0063\u0067 --agent droid"}]}]}}'
+[System.IO.File]::WriteAllText($escapedDroidSettings, $escapedDroidFixture)
+Check (Test-DroidDcgRegistration -FactoryDir $droidDir) "Droid: JSON-escaped executable names still require native inspection"
+Check (-not (Unconfigure-DroidHook -Binary $missingDcg -HomeDir $droidHome)) "Droid: escaped names cannot skip cleanup when the binary is missing"
+Check ([System.IO.File]::ReadAllText($escapedDroidSettings) -ceq $escapedDroidFixture) "Droid: escaped configuration remains unchanged on cleanup failure"
 
 if ($script:failures -gt 0) { Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red; exit 1 }
 Write-Host "All uninstall parity tests passed." -ForegroundColor Green

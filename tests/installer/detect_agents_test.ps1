@@ -6,7 +6,6 @@
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-. (Join-Path $repoRoot 'install.ps1') -LoadFunctionsOnly
 
 $script:failures = 0
 function Check([bool]$cond, [string]$msg) {
@@ -19,10 +18,46 @@ function New-TempHome {
 }
 
 $savedPath = $env:PATH
+$savedClaudeConfigDir = $env:CLAUDE_CONFIG_DIR
 $savedGrok = $env:GROK_SESSION_ID
+$savedHermesHome = $env:HERMES_HOME
+$savedLocalAppData = $env:LOCALAPPDATA
+$savedOs = $env:OS
+$savedReasonixHome = $env:REASONIX_HOME
+$savedAppData = $env:APPDATA
+$ompSelectorNames = @('OMP_PROFILE', 'PI_PROFILE', 'PI_CONFIG_DIR', 'PI_CODING_AGENT_DIR')
+$savedOmpSelectors = @{}
+foreach ($name in $ompSelectorNames) {
+    $savedOmpSelectors[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+    # Seed a non-vacuous ambient value before proving the fixture fence clears
+    # it. This catches a missing scrub even on otherwise clean CI hosts.
+    Microsoft.PowerShell.Management\Set-Item -LiteralPath "Env:$name" -Value "dcg-test-ambient-$name"
+}
+foreach ($name in $ompSelectorNames) {
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+}
 try {
+    $unclearedOmpSelectors = @($ompSelectorNames | Where-Object {
+        Test-Path -LiteralPath "Env:$_"
+    })
+    if ($unclearedOmpSelectors.Count -ne 0) {
+        throw "OMP test selector fence failed: $($unclearedOmpSelectors -join ', ')"
+    }
+    Check $true "OMP path/profile selectors are scrubbed before loading installer functions"
+
+    . (Join-Path $repoRoot 'install.ps1') -LoadFunctionsOnly
+
     $env:PATH = ''                 # no CLI probing leaks
+    $env:CLAUDE_CONFIG_DIR = $null
     $env:GROK_SESSION_ID = $null
+    $env:HERMES_HOME = $null       # no Hermes home-resolution leaks (issue #270)
+    $env:LOCALAPPDATA = $null
+    $env:OS = $null
+    $env:PI_CONFIG_DIR = $null
+    $env:CRUSH_GLOBAL_CONFIG = $null  # no Crush config-path override leaks (#388)
+    $env:XDG_CONFIG_HOME = $null
+    $env:REASONIX_HOME = $null     # no Reasonix home leaks (#358)
+    $env:APPDATA = $null
 
     Write-Host "Test 1: detects only the agents whose config dir is present"
     $h1 = New-TempHome
@@ -38,9 +73,153 @@ try {
     Check ($a['Copilot'] -eq $false) "Copilot NOT detected (no ~/.copilot, no copilot CLI)"
     Check ($a['Agy'] -eq $false) "Agy NOT detected (no agy on PATH)"
     Check ($a['Hermes'] -eq $false) "Hermes NOT detected"
+    Check ($a['Posit'] -eq $false) "Posit Assistant NOT detected"
+    Check ($a['Omp'] -eq $false) "Oh My Pi NOT detected"
+    Check ($a['Crush'] -eq $false) "Crush NOT detected (no ~/.config/crush, no crush on PATH)"
+    Check ($a['Reasonix'] -eq $false) "Reasonix NOT detected (no Reasonix home, no reasonix on PATH)"
+    Check ($a['Droid'] -eq $false) "Factory Droid NOT detected (no ~/.factory, no droid on PATH)"
     $names = Get-DetectedAgentNames $a
     Check (($names -join ',') -eq 'Claude,Gemini,Grok') "summary lists detected agents in config order (got '$($names -join ',')')"
     Remove-Item -Recurse -Force $h1 -ErrorAction SilentlyContinue
+
+    Write-Host "Test 1a: Factory Droid detected from ~/.factory"
+    $droidHome = New-TempHome
+    New-Item -ItemType Directory -Path (Join-Path $droidHome '.factory') | Out-Null
+    $droidAgents = Detect-Agents -HomeDir $droidHome
+    Check ($droidAgents['Droid'] -eq $true) "Factory Droid detected (~/.factory present)"
+    Check (((Get-DetectedAgentNames $droidAgents) -join ',') -eq 'Droid') "summary lists only Droid"
+
+    Write-Host "Test 1b: Posit Assistant detected from ~/.posit/assistant"
+    $h1b = New-TempHome
+    New-Item -ItemType Directory -Force -Path (Join-Path (Join-Path $h1b '.posit') 'assistant') | Out-Null
+    $a1b = Detect-Agents -HomeDir $h1b
+    Check ($a1b['Posit'] -eq $true) "Posit detected (~/.posit/assistant present)"
+    $names1b = Get-DetectedAgentNames $a1b
+    Check (($names1b -join ',') -eq 'Posit') "summary lists only Posit (got '$($names1b -join ',')')"
+    Remove-Item -Recurse -Force $h1b -ErrorAction SilentlyContinue
+
+    Write-Host "Test 1c: a bare ~/.posit directory is not enough"
+    $h1c = New-TempHome
+    New-Item -ItemType Directory -Force -Path (Join-Path $h1c '.posit') | Out-Null
+    $a1c = Detect-Agents -HomeDir $h1c
+    Check ($a1c['Posit'] -eq $false) "Posit NOT detected from ~/.posit alone (other Posit tools share it)"
+    Remove-Item -Recurse -Force $h1c -ErrorAction SilentlyContinue
+
+    Write-Host "Test 1d: legacy ~/.positai counts as Posit Assistant"
+    $h1d = New-TempHome
+    New-Item -ItemType Directory -Force -Path (Join-Path $h1d '.positai') | Out-Null
+    $a1d = Detect-Agents -HomeDir $h1d
+    Check ($a1d['Posit'] -eq $true) "Posit detected via legacy ~/.positai"
+    Remove-Item -Recurse -Force $h1d -ErrorAction SilentlyContinue
+
+    Write-Host "Test 1e: Oh My Pi detected from ~/.omp"
+    $h1e = New-TempHome
+    New-Item -ItemType Directory -Force -Path (Join-Path $h1e '.omp') | Out-Null
+    $a1e = Detect-Agents -HomeDir $h1e
+    Check ($a1e['Omp'] -eq $true) "Oh My Pi detected via ~/.omp"
+    $names1e = Get-DetectedAgentNames $a1e
+    Check (($names1e -join ',') -eq 'Omp') "summary lists only Omp (got '$($names1e -join ',')')"
+    Remove-Item -Recurse -Force $h1e -ErrorAction SilentlyContinue
+
+    Write-Host "Test 1g: Crush detected from ~/.config/crush"
+    $h1g = New-TempHome
+    New-Item -ItemType Directory -Force -Path (Join-Path (Join-Path $h1g '.config') 'crush') | Out-Null
+    $a1g = Detect-Agents -HomeDir $h1g
+    Check ($a1g['Crush'] -eq $true) "Crush detected via ~/.config/crush"
+    $names1g = Get-DetectedAgentNames $a1g
+    Check (($names1g -join ',') -eq 'Crush') "summary lists only Crush (got '$($names1g -join ',')')"
+    Remove-Item -Recurse -Force $h1g -ErrorAction SilentlyContinue
+
+    Write-Host "Test 1h: Crush detected from the CRUSH_GLOBAL_CONFIG directory override"
+    $h1h = New-TempHome
+    $crushOverride = Join-Path $h1h 'crush-global'
+    New-Item -ItemType Directory -Force -Path $crushOverride | Out-Null
+    $env:CRUSH_GLOBAL_CONFIG = $crushOverride
+    $a1h = Detect-Agents -HomeDir $h1h
+    Check ($a1h['Crush'] -eq $true) "Crush detected via CRUSH_GLOBAL_CONFIG"
+    $env:CRUSH_GLOBAL_CONFIG = $null
+    Remove-Item -Recurse -Force $h1h -ErrorAction SilentlyContinue
+
+    Write-Host "Test 1i: Reasonix detected from each home it reads (#358)"
+    $h1i = New-TempHome
+    New-Item -ItemType Directory -Force -Path (Join-Path $h1i '.reasonix') | Out-Null
+    $a1i = Detect-Agents -HomeDir $h1i
+    Check ($a1i['Reasonix'] -eq $true) "Reasonix detected via the legacy ~/.reasonix"
+    $names1i = Get-DetectedAgentNames $a1i
+    Check (($names1i -join ',') -eq 'Reasonix') "summary lists only Reasonix (got '$($names1i -join ',')')"
+    Remove-Item -Recurse -Force $h1i -ErrorAction SilentlyContinue
+
+    $h1j = New-TempHome
+    $env:APPDATA = Join-Path $h1j 'Roaming'
+    New-Item -ItemType Directory -Force -Path (Join-Path $env:APPDATA 'reasonix') | Out-Null
+    Check ((Detect-Agents -HomeDir $h1j)['Reasonix'] -eq $true) "Reasonix detected via %APPDATA%\reasonix"
+    $env:APPDATA = $null
+    $env:REASONIX_HOME = Join-Path $h1j 'isolated'
+    New-Item -ItemType Directory -Force -Path $env:REASONIX_HOME | Out-Null
+    Check ((Detect-Agents -HomeDir $h1j)['Reasonix'] -eq $true) "Reasonix detected via REASONIX_HOME"
+    New-Item -ItemType Directory -Force -Path (Join-Path $h1j 'tilde-home') | Out-Null
+    $env:REASONIX_HOME = ' ~/tilde-home '
+    Check ((Detect-Agents -HomeDir $h1j)['Reasonix'] -eq $true) "Reasonix detected via a trimmed, tilde REASONIX_HOME"
+    $env:REASONIX_HOME = $null
+    Remove-Item -Recurse -Force $h1j -ErrorAction SilentlyContinue
+
+    Write-Host "Test 1f: Oh My Pi detected from PI_CONFIG_DIR"
+    $h1f = New-TempHome
+    $env:PI_CONFIG_DIR = '.custom-omp'
+    New-Item -ItemType Directory -Force -Path (Join-Path $h1f '.custom-omp') | Out-Null
+    $a1f = Detect-Agents -HomeDir $h1f
+    Check ($a1f['Omp'] -eq $true) "Oh My Pi detected via PI_CONFIG_DIR"
+    $env:PI_CONFIG_DIR = $null
+    Remove-Item -Recurse -Force $h1f -ErrorAction SilentlyContinue
+
+    Write-Host "Test 1g: Oh My Pi detection treats wildcard characters in HOME literally"
+    $h1g = Join-Path ([System.IO.Path]::GetTempPath()) ("dcg_detect_[omp]_" + [Guid]::NewGuid().ToString('N'))
+    [void][System.IO.Directory]::CreateDirectory((Join-Path $h1g '.omp'))
+    $a1g = Detect-Agents -HomeDir $h1g
+    Check ($a1g['Omp'] -eq $true) "Oh My Pi detected when HOME contains brackets"
+
+    Write-Host "Test 1h: Windows drive-qualified PI_CONFIG_DIR cannot escape HOME"
+    $env:PI_CONFIG_DIR = 'C:\omp-outside-home'
+    Check ($null -eq (Get-OmpConfigRootForDetection -HomeDir $h1g -WindowsSemantics $true)) "drive-qualified OMP config root rejected for Windows detection"
+
+    Write-Host "Test 1i: OMP detection config root follows native Node path joining"
+    $nativeWindows = [System.IO.Path]::DirectorySeparatorChar -eq '\'
+    $oracleHome = if ($nativeWindows) { 'C:\Users\u' } else { '/home/u' }
+    $env:PI_CONFIG_DIR = 'outer/../normalized-omp'
+    $normalizedRoot = Get-OmpConfigRootForDetection -HomeDir $oracleHome -WindowsSemantics $nativeWindows
+    $expectedNormalizedRoot = if ($nativeWindows) { 'C:\Users\u\normalized-omp' } else { '/home/u/normalized-omp' }
+    Check ([string]::Equals($normalizedRoot, $expectedNormalizedRoot, [System.StringComparison]::Ordinal)) "detection normalizes dot and parent components"
+    $env:PI_CONFIG_DIR = '../../../../../../../../../../../../x'
+    $clampedRoot = Get-OmpConfigRootForDetection -HomeDir $oracleHome -WindowsSemantics $nativeWindows
+    $expectedClampedRoot = if ($nativeWindows) { 'C:\x' } else { '/x' }
+    Check ([string]::Equals($clampedRoot, $expectedClampedRoot, [System.StringComparison]::Ordinal)) "detection clamps excess parent components at the filesystem root"
+    if (-not $nativeWindows) {
+        $env:PI_CONFIG_DIR = '\.literal-backslash'
+        $backslashRoot = Get-OmpConfigRootForDetection -HomeDir $oracleHome -WindowsSemantics $false
+        Check ([string]::Equals($backslashRoot, '/home/u/\.literal-backslash', [System.StringComparison]::Ordinal)) "POSIX detection preserves leading backslash literally (got '$backslashRoot')"
+
+        $backslashHome = New-TempHome
+        try {
+            $literalConfigRoot = [System.IO.Path]::Combine($backslashHome, '\.literal-backslash')
+            $normalizedDecoyRoot = [System.IO.Path]::Combine($backslashHome, '.literal-backslash')
+            [void][System.IO.Directory]::CreateDirectory($literalConfigRoot)
+            $literalAgents = Detect-Agents -HomeDir $backslashHome
+            Check ($literalAgents['Omp'] -eq $true) "POSIX detection finds the literal-backslash config root"
+
+            [System.IO.Directory]::Delete($literalConfigRoot, $true)
+            [void][System.IO.Directory]::CreateDirectory($normalizedDecoyRoot)
+            $decoyAgents = Detect-Agents -HomeDir $backslashHome
+            Check ($decoyAgents['Omp'] -eq $false) "POSIX detection does not probe a separator-normalized decoy"
+        } finally {
+            if ([System.IO.Directory]::Exists($backslashHome)) {
+                [System.IO.Directory]::Delete($backslashHome, $true)
+            }
+        }
+    }
+    $env:PI_CONFIG_DIR = $null
+    $names1g = Get-DetectedAgentNames $a1g
+    Check (($names1g -join ',') -eq 'Omp') "bracketed HOME summary lists only Omp (got '$($names1g -join ',')')"
+    Remove-Item -LiteralPath $h1g -Recurse -Force -ErrorAction SilentlyContinue
 
     Write-Host "Test 2: empty home -> nothing detected"
     $h2 = New-TempHome
@@ -58,6 +237,18 @@ try {
     Check ($a3WithCopilot['Copilot'] -eq $true) "Copilot detected from ~/.copilot"
     Remove-Item -Recurse -Force $h3 -ErrorAction SilentlyContinue
 
+    Write-Host 'Test 3b: CLAUDE_CONFIG_DIR selects a new config directory without ~/.claude'
+    $h3b = New-TempHome
+    try {
+        $env:CLAUDE_CONFIG_DIR = Join-Path $h3b 'new-claude-config'
+        $a3b = Detect-Agents -HomeDir $h3b
+        Check ($a3b['Claude'] -eq $true) 'Claude detected from an explicit new configuration directory'
+        Check ($a3b['Grok'] -eq $false) 'Claude override does not imply Grok detection'
+    } finally {
+        $env:CLAUDE_CONFIG_DIR = $null
+        Remove-Item -Recurse -Force $h3b -ErrorAction SilentlyContinue
+    }
+
     Write-Host "Test 4: GROK_SESSION_ID env triggers Grok detection without ~/.grok"
     $h4 = New-TempHome
     $env:GROK_SESSION_ID = 'sess-123'
@@ -65,9 +256,36 @@ try {
     Check ($a4['Grok'] -eq $true) "Grok detected via GROK_SESSION_ID env"
     $env:GROK_SESSION_ID = $null
     Remove-Item -Recurse -Force $h4 -ErrorAction SilentlyContinue
+
+    Write-Host "Test 5: native-Windows Hermes (%LOCALAPPDATA%\hermes) detected without ~/.hermes (issue #270)"
+    $h5 = New-TempHome
+    $lad5 = Join-Path $h5 'AppData/Local'
+    New-Item -ItemType Directory -Force -Path (Join-Path $lad5 'hermes') | Out-Null
+    $env:OS = 'Windows_NT'
+    $env:LOCALAPPDATA = $lad5
+    $a5 = Detect-Agents -HomeDir $h5
+    Check ($a5['Hermes'] -eq $true) "Hermes detected via LOCALAPPDATA\hermes"
+    $env:OS = $null
+    $env:LOCALAPPDATA = $null
+    $a5b = Detect-Agents -HomeDir $h5
+    Check ($a5b['Hermes'] -eq $false) "Hermes NOT detected once the native dir is out of scope"
+    Remove-Item -Recurse -Force $h5 -ErrorAction SilentlyContinue
 } finally {
+    $env:CLAUDE_CONFIG_DIR = $savedClaudeConfigDir
     $env:PATH = $savedPath
     $env:GROK_SESSION_ID = $savedGrok
+    $env:HERMES_HOME = $savedHermesHome
+    $env:LOCALAPPDATA = $savedLocalAppData
+    $env:OS = $savedOs
+    $env:REASONIX_HOME = $savedReasonixHome
+    $env:APPDATA = $savedAppData
+    foreach ($name in $ompSelectorNames) {
+        if ($null -eq $savedOmpSelectors[$name]) {
+            Microsoft.PowerShell.Management\Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+        } else {
+            Microsoft.PowerShell.Management\Set-Item -LiteralPath "Env:$name" -Value $savedOmpSelectors[$name]
+        }
+    }
 }
 
 if ($script:failures -gt 0) { Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red; exit 1 }

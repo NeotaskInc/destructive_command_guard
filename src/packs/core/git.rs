@@ -2,11 +2,5567 @@
 //!
 //! This includes patterns for:
 //! - Work destruction (reset --hard, checkout --, restore)
-//! - History rewriting (push --force, branch -D)
+//! - History rewriting (push --force, branch deletion/forced ref updates)
 //! - Stash destruction (stash drop, stash clear)
 
+use crate::normalize::{
+    NormalizeTokenKind, ShellDialect, ShellTokenDecoder, ShellTokenRole, tokenize_for_shell_dialect,
+};
 use crate::packs::{DestructivePattern, Pack, PatternSuggestion, SafePattern};
 use crate::{destructive_pattern, safe_pattern};
+use smallvec::SmallVec;
+use std::collections::{HashMap, HashSet};
+
+const MAX_GIT_SEMANTIC_BYTES: usize = 64 * 1024;
+const MAX_GIT_SEMANTIC_TOKENS: usize = 512;
+
+/// This pack, used to decide which reading of an ambiguous dashed built-in to
+/// present in the matching view (#428). Built once: the path is rare (it needs
+/// a symbolic executable with a `git-` prefix) but must not pay for pack
+/// construction each time it is taken.
+static AMBIGUITY_ARBITER: std::sync::LazyLock<Pack> = std::sync::LazyLock::new(create_pack);
+const MAX_GIT_ALIAS_DEPTH: usize = 64;
+
+pub(crate) const GIT_ALIAS_UNVERIFIED_RULE: &str = "git-alias-semantic-unverified";
+pub(crate) const GIT_ALIAS_UNVERIFIED_REASON: &str = "The invoked Git alias depends on shell expansion, contains a cycle, or exceeds dcg's bounded semantic analysis.";
+pub(crate) const BRANCH_DYNAMIC_RULE: &str = "branch-dynamic-token";
+/// `git branch -d` / `--delete` without any force: Git itself refuses to
+/// delete a branch it does not consider merged. Split from
+/// [`BRANCH_FORCE_DELETE_RULE`] so policy can treat the two differently (#509).
+pub(crate) const BRANCH_DELETE_RULE: &str = "branch-delete";
+/// `-D`, `--delete --force`, `-f`/`--force`, `-M`, `-C`: forms that skip
+/// Git's merge check or overwrite an existing ref.
+pub(crate) const BRANCH_FORCE_DELETE_RULE: &str = "branch-force-delete";
+pub(crate) const BRANCH_DYNAMIC_REASON: &str = "A dynamic shell expansion in this git branch command can expand into a deletion or forced ref update. Quote the branch name or add `--` to make it a literal creation.";
+
+/// A visible Git shell alias together with the arguments Git will append when
+/// it invokes that alias. The shell body is deliberately not tokenized here:
+/// shell aliases accept the complete shell grammar, which the evaluator must
+/// inspect recursively in the caller-proven dialect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InvokedGitShellAlias {
+    pub(crate) shell_body: String,
+    pub(crate) invoked_args: Vec<String>,
+}
+
+/// The exact Git argv produced by a non-shell alias chain. The evaluator
+/// recursively checks `git <subcommand> <arguments...>` so aliases that expand
+/// to destructive builtins do not disappear merely because the terminal word
+/// is a known Git command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExpandedGitAlias {
+    pub(crate) subcommand: String,
+    pub(crate) arguments: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InvokedGitAliasDecision {
+    NoMatch,
+    Shell(InvokedGitShellAlias),
+    Expanded(ExpandedGitAlias),
+    Unverified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BranchCommandDecision {
+    NotBranch,
+    NonDestructive,
+    /// A literal forced deletion or forced ref update was proven (`-D`,
+    /// `--delete --force`, `-f`, `-M`, `-C`). Attributed to
+    /// [`BRANCH_FORCE_DELETE_RULE`].
+    Destructive,
+    /// A literal deletion with no force was proven (`-d`, `--delete`): Git
+    /// refuses it for an unmerged branch. Attributed to
+    /// [`BRANCH_DELETE_RULE`] (#509).
+    MergeCheckedDelete,
+    /// The destructive verdict rests on an unresolvable dynamic word that
+    /// *may* expand or field-split into a deletion / force flag (#274).
+    /// Attributed to [`BRANCH_DYNAMIC_RULE`] so the denial explains the actual
+    /// hazard and its safe remediations (quote the name, or add `--`).
+    DestructiveDynamic,
+    Unparsed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchLongOptionArity {
+    None,
+    Required,
+    OptionalAttached,
+    LastArgDefault,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BranchLongOptionSpec {
+    name: &'static str,
+    arity: BranchLongOptionArity,
+    negatable: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResolvedBranchLongOption {
+    name: &'static str,
+    arity: BranchLongOptionArity,
+    negated: bool,
+    inline_value: bool,
+}
+
+const BRANCH_LONG_OPTIONS: &[BranchLongOptionSpec] = &[
+    BranchLongOptionSpec {
+        name: "abbrev",
+        arity: BranchLongOptionArity::OptionalAttached,
+        negatable: true,
+    },
+    BranchLongOptionSpec {
+        name: "all",
+        arity: BranchLongOptionArity::None,
+        negatable: false,
+    },
+    BranchLongOptionSpec {
+        name: "color",
+        arity: BranchLongOptionArity::OptionalAttached,
+        negatable: true,
+    },
+    BranchLongOptionSpec {
+        name: "column",
+        arity: BranchLongOptionArity::OptionalAttached,
+        negatable: true,
+    },
+    BranchLongOptionSpec {
+        name: "contains",
+        arity: BranchLongOptionArity::LastArgDefault,
+        negatable: false,
+    },
+    BranchLongOptionSpec {
+        name: "no-contains",
+        arity: BranchLongOptionArity::LastArgDefault,
+        negatable: false,
+    },
+    BranchLongOptionSpec {
+        name: "with",
+        arity: BranchLongOptionArity::LastArgDefault,
+        negatable: false,
+    },
+    BranchLongOptionSpec {
+        name: "without",
+        arity: BranchLongOptionArity::LastArgDefault,
+        negatable: false,
+    },
+    BranchLongOptionSpec {
+        name: "copy",
+        arity: BranchLongOptionArity::None,
+        negatable: true,
+    },
+    BranchLongOptionSpec {
+        name: "create-reflog",
+        arity: BranchLongOptionArity::None,
+        negatable: true,
+    },
+    BranchLongOptionSpec {
+        name: "delete",
+        arity: BranchLongOptionArity::None,
+        negatable: true,
+    },
+    BranchLongOptionSpec {
+        name: "edit-description",
+        arity: BranchLongOptionArity::None,
+        negatable: true,
+    },
+    BranchLongOptionSpec {
+        name: "force",
+        arity: BranchLongOptionArity::None,
+        negatable: true,
+    },
+    BranchLongOptionSpec {
+        name: "format",
+        arity: BranchLongOptionArity::Required,
+        negatable: true,
+    },
+    BranchLongOptionSpec {
+        name: "ignore-case",
+        arity: BranchLongOptionArity::None,
+        negatable: true,
+    },
+    BranchLongOptionSpec {
+        name: "list",
+        arity: BranchLongOptionArity::None,
+        negatable: true,
+    },
+    BranchLongOptionSpec {
+        name: "merged",
+        arity: BranchLongOptionArity::LastArgDefault,
+        negatable: false,
+    },
+    BranchLongOptionSpec {
+        name: "no-merged",
+        arity: BranchLongOptionArity::LastArgDefault,
+        negatable: false,
+    },
+    BranchLongOptionSpec {
+        name: "move",
+        arity: BranchLongOptionArity::None,
+        negatable: true,
+    },
+    BranchLongOptionSpec {
+        name: "omit-empty",
+        arity: BranchLongOptionArity::None,
+        negatable: true,
+    },
+    BranchLongOptionSpec {
+        name: "points-at",
+        arity: BranchLongOptionArity::Required,
+        negatable: true,
+    },
+    BranchLongOptionSpec {
+        name: "quiet",
+        arity: BranchLongOptionArity::None,
+        negatable: true,
+    },
+    BranchLongOptionSpec {
+        name: "recurse-submodules",
+        arity: BranchLongOptionArity::None,
+        negatable: true,
+    },
+    BranchLongOptionSpec {
+        name: "remotes",
+        arity: BranchLongOptionArity::None,
+        negatable: false,
+    },
+    BranchLongOptionSpec {
+        name: "set-upstream",
+        arity: BranchLongOptionArity::None,
+        negatable: true,
+    },
+    BranchLongOptionSpec {
+        name: "set-upstream-to",
+        arity: BranchLongOptionArity::Required,
+        negatable: true,
+    },
+    BranchLongOptionSpec {
+        name: "show-current",
+        arity: BranchLongOptionArity::None,
+        negatable: true,
+    },
+    BranchLongOptionSpec {
+        name: "sort",
+        arity: BranchLongOptionArity::Required,
+        negatable: true,
+    },
+    BranchLongOptionSpec {
+        name: "track",
+        arity: BranchLongOptionArity::OptionalAttached,
+        negatable: true,
+    },
+    BranchLongOptionSpec {
+        name: "unset-upstream",
+        arity: BranchLongOptionArity::None,
+        negatable: true,
+    },
+    BranchLongOptionSpec {
+        name: "verbose",
+        arity: BranchLongOptionArity::None,
+        negatable: true,
+    },
+];
+
+fn resolve_branch_long_option(token: &str) -> Option<ResolvedBranchLongOption> {
+    let option = token.strip_prefix("--")?;
+    let (option, inline_value) = option
+        .split_once('=')
+        .map_or((option, false), |(name, _)| (name, true));
+    if option.is_empty() || option.starts_with("no-no-") {
+        return None;
+    }
+
+    let candidate = |spec: &'static BranchLongOptionSpec, negated| ResolvedBranchLongOption {
+        name: spec.name,
+        arity: spec.arity,
+        negated,
+        inline_value,
+    };
+
+    // Git gives exact long names precedence over abbreviations. This matters
+    // for hidden `--set-upstream`, which is also a prefix of
+    // `--set-upstream-to`.
+    if let Some(spec) = BRANCH_LONG_OPTIONS.iter().find(|spec| spec.name == option) {
+        return Some(candidate(spec, false));
+    }
+    if let Some(base) = option.strip_prefix("no-") {
+        if let Some(spec) = BRANCH_LONG_OPTIONS
+            .iter()
+            .find(|spec| spec.negatable && spec.name == base)
+        {
+            return Some(candidate(spec, true));
+        }
+    }
+
+    let mut matches = BRANCH_LONG_OPTIONS.iter().filter_map(|spec| {
+        if spec.name.starts_with(option) {
+            return Some(candidate(spec, false));
+        }
+        option.strip_prefix("no-").and_then(|base| {
+            (spec.negatable && spec.name.starts_with(base)).then(|| candidate(spec, true))
+        })
+    });
+    let resolved = matches.next()?;
+    matches.next().is_none().then_some(resolved)
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct BranchMutationState {
+    delete_bits: u8,
+    force: bool,
+    forced_move_or_copy: bool,
+}
+
+impl BranchMutationState {
+    /// `-d`/`--delete` sets bit 1, `-D` sets bit 2. `-D` is Git's shorthand
+    /// for `--delete --force`, so only bit 1 without any force is the
+    /// merge-checked deletion.
+    const fn decision(self) -> BranchCommandDecision {
+        if self.delete_bits & 2 != 0 || self.force || self.forced_move_or_copy {
+            BranchCommandDecision::Destructive
+        } else if self.delete_bits != 0 {
+            BranchCommandDecision::MergeCheckedDelete
+        } else {
+            BranchCommandDecision::NonDestructive
+        }
+    }
+
+    /// Whether the scan proved any ref mutation, forced or merge-checked.
+    const fn mutates(self) -> bool {
+        self.decision().is_destructive()
+    }
+}
+
+impl BranchCommandDecision {
+    /// Whether this decision blocks the command.
+    #[must_use]
+    pub(crate) const fn is_destructive(self) -> bool {
+        matches!(
+            self,
+            Self::Destructive | Self::MergeCheckedDelete | Self::DestructiveDynamic
+        )
+    }
+
+    /// The `core.git` rule a blocking decision is attributed to. Every caller
+    /// that turns a branch decision into a finding goes through this, so the
+    /// pack check and the evaluator cannot attribute the same command
+    /// differently.
+    #[must_use]
+    pub(crate) const fn rule_name(self) -> Option<&'static str> {
+        match self {
+            Self::Destructive => Some(BRANCH_FORCE_DELETE_RULE),
+            Self::MergeCheckedDelete => Some(BRANCH_DELETE_RULE),
+            Self::DestructiveDynamic => Some(BRANCH_DYNAMIC_RULE),
+            Self::NotBranch | Self::NonDestructive | Self::Unparsed => None,
+        }
+    }
+}
+
+/// The rule for a `branch-force-delete` *regex* match (#509).
+///
+/// The regex is the fallback for a branch command the semantic parser could
+/// not read (an unmodeled control-flow keyword in front, an unusual launcher),
+/// and it matches every delete form, `-d` included. `text` starts at the
+/// match; this reads the flags after the first `branch` word up to the end of
+/// that command and reports [`BRANCH_DELETE_RULE`] only when every option is
+/// one it understands and the result is a deletion without force. Anything it
+/// cannot read keeps [`BRANCH_FORCE_DELETE_RULE`], the stricter id, so a
+/// policy that relaxes `branch-delete` can never relax a forced form here.
+pub(crate) fn branch_regex_fallback_rule(text: &str) -> &'static str {
+    const SEPARATORS: &[char] = &[';', '&', '|', '(', ')', '<', '>'];
+    let unquote = |token: &str| token.trim_matches(|c| c == '\'' || c == '"').to_string();
+    // A newline ends the command unless it is escaped, and a continued line
+    // is not read here.
+    let line = text.split('\n').next().unwrap_or(text);
+    if line.trim_end().ends_with('\\') {
+        return BRANCH_FORCE_DELETE_RULE;
+    }
+    let mut tokens = line.split_ascii_whitespace();
+    let found_branch = tokens.by_ref().any(|raw| {
+        let token = unquote(raw);
+        let base = token.rsplit(['/', '\\']).next().unwrap_or(&token);
+        token.eq_ignore_ascii_case("branch")
+            || base.eq_ignore_ascii_case("git-branch")
+            || base.eq_ignore_ascii_case("git-branch.exe")
+    });
+    if !found_branch {
+        return BRANCH_FORCE_DELETE_RULE;
+    }
+    let argv: Vec<&str> = tokens.collect();
+    // With a quote among the arguments a separator may be quoted data, and
+    // the words after it may still be options of this command.
+    if argv.iter().any(|raw| raw.contains(SEPARATORS))
+        && argv.iter().any(|raw| raw.contains(['\'', '"']))
+    {
+        return BRANCH_FORCE_DELETE_RULE;
+    }
+    let mut mutation = BranchMutationState::default();
+    for raw in argv {
+        // The command ends at the first separator; whatever precedes it in
+        // this token still belongs to it.
+        let (raw, ends_command) = raw
+            .find(SEPARATORS)
+            .map_or((raw, false), |at| (&raw[..at], true));
+        let token = unquote(raw);
+        if let Some(flags) = token.strip_prefix('-') {
+            if token.contains(|c: char| {
+                matches!(c, '`' | '^' | '$' | '\\' | '{' | '}' | '*' | '?' | '[')
+            }) {
+                return BRANCH_FORCE_DELETE_RULE;
+            }
+            if matches!(token.as_str(), "--" | "--end-of-options") {
+                break;
+            }
+            if flags.starts_with('-') {
+                let Some(resolved) = resolve_branch_long_option(&token) else {
+                    return BRANCH_FORCE_DELETE_RULE;
+                };
+                match resolved.name {
+                    "delete" if resolved.negated => mutation.delete_bits &= !1,
+                    "delete" => mutation.delete_bits |= 1,
+                    "force" => mutation.force = !resolved.negated,
+                    // An option that may take the next word as its value
+                    // changes how the rest reads; do not guess.
+                    _ if !resolved.negated
+                        && !resolved.inline_value
+                        && !matches!(resolved.arity, BranchLongOptionArity::None) =>
+                    {
+                        return BRANCH_FORCE_DELETE_RULE;
+                    }
+                    _ => {}
+                }
+            } else {
+                for flag in flags.chars() {
+                    match flag {
+                        'd' => mutation.delete_bits |= 1,
+                        'v' | 'q' | 'r' | 'a' | 'l' | 'i' => {}
+                        _ => return BRANCH_FORCE_DELETE_RULE,
+                    }
+                }
+            }
+        }
+        if ends_command {
+            break;
+        }
+    }
+    if mutation.decision() == BranchCommandDecision::MergeCheckedDelete {
+        BRANCH_DELETE_RULE
+    } else {
+        BRANCH_FORCE_DELETE_RULE
+    }
+}
+
+#[inline]
+pub(crate) fn contains_git_ascii_case_insensitive(command: &str) -> bool {
+    command
+        .as_bytes()
+        .windows(3)
+        .any(|window| window.eq_ignore_ascii_case(b"git"))
+}
+
+/// Return whether caller-proven shell syntax can hide a Git executable,
+/// subcommand, or option from the raw keyword index.
+///
+/// This is a candidate-selection predicate only. It intentionally admits
+/// dynamic expansions outside Git invocations; the role-aware semantic parser
+/// remains authoritative about whether the command can execute Git and
+/// whether a dynamic word occupies a destructive syntax role.
+pub(crate) fn git_semantic_scan_required(command: &str, dialect: ShellDialect) -> bool {
+    if dialect == ShellDialect::Unknown {
+        return [
+            ShellDialect::Posix,
+            ShellDialect::PowerShell,
+            ShellDialect::Cmd,
+        ]
+        .iter()
+        .any(|dialect| git_semantic_scan_required(command, *dialect));
+    }
+
+    let dialect_obfuscation = match dialect {
+        ShellDialect::Posix => command.contains("$'") || command.contains("$\""),
+        ShellDialect::PowerShell => {
+            command.contains('`') || powershell_dynamic_call_operator(command)
+        }
+        ShellDialect::Cmd => command.contains('^'),
+        // The early branch currently expands Unknown across every supported
+        // dialect. Keep this arm conservative as defense in depth so a future
+        // control-flow refactor cannot turn untrusted input into a panic.
+        ShellDialect::Unknown => true,
+    };
+    dialect_obfuscation
+        || tokenize_for_shell_dialect(command, dialect)
+            .iter()
+            .filter(|token| token.kind == NormalizeTokenKind::Word)
+            .filter_map(|token| token.text(command))
+            .any(|raw| git_token_has_active_expansion(raw, dialect))
+}
+
+fn branch_tokens(command: &str, dialect: ShellDialect) -> Result<Vec<String>, ()> {
+    if dialect == ShellDialect::Unknown {
+        let normalized = crate::normalize::normalize_command(command);
+        return shell_words::split(normalized.as_ref()).map_err(|_| ());
+    }
+
+    let stripped =
+        (dialect == ShellDialect::Posix).then(|| crate::normalize::strip_wrapper_prefixes(command));
+    let command = stripped
+        .as_ref()
+        .map_or(command, |result| result.normalized.as_ref());
+    let raw_tokens = tokenize_for_shell_dialect(command, dialect);
+    if raw_tokens
+        .iter()
+        .any(|token| token.kind == NormalizeTokenKind::Separator)
+    {
+        return Err(());
+    }
+
+    raw_tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .map(|token| token.text(command).map(str::to_string).ok_or(()))
+        .collect()
+}
+
+fn decode_branch_syntax(decoder: &mut ShellTokenDecoder, token: &str) -> Option<String> {
+    decoder
+        .decode(token, ShellTokenRole::Syntax)
+        .map(std::borrow::Cow::into_owned)
+}
+
+const MAX_STATIC_SUBSTITUTION_BYTES: usize = 16 * 1024;
+pub(crate) const POSIX_DYNAMIC_QUOTED: &str = "__DCG_POSIX_SUB_Q_7B8CFAE1__";
+pub(crate) const POSIX_DYNAMIC_UNQUOTED: &str = "__DCG_POSIX_SUB_U_7B8CFAE1__";
+
+/// Bounded matching-only view of POSIX command substitutions.
+///
+/// The evaluator consumes this read-only view only while resolving an
+/// executable launcher command word; the original command remains
+/// authoritative for decisions, logging, allowlists, and source spans.
+pub(crate) struct PosixSubstitutionView {
+    pub(crate) command: String,
+    pub(crate) has_dynamic: bool,
+}
+
+/// Resolve the deliberately small, non-executing subset of POSIX command
+/// substitution that can otherwise splice Git syntax across token boundaries.
+///
+/// Only deliberately narrow literal `printf` and `echo` invocations are
+/// modeled. Shell operators, nested expansion, redirection, globbing,
+/// non-literal arguments, and output that would be reinterpreted as shell
+/// syntax are rejected. This is a matching view only: the original command
+/// remains authoritative for logging, allowlists, and source spans.
+fn resolve_literal_printf_substitutions(command: &str) -> Result<Option<String>, ()> {
+    let view = posix_substitution_view(command)?;
+    if view.has_dynamic {
+        return Err(());
+    }
+    Ok((view.command != command).then_some(view.command))
+}
+
+pub(crate) fn posix_substitution_view(command: &str) -> Result<PosixSubstitutionView, ()> {
+    if command.contains(POSIX_DYNAMIC_QUOTED) || command.contains(POSIX_DYNAMIC_UNQUOTED) {
+        return Err(());
+    }
+    let bytes = command.as_bytes();
+    let mut output = String::with_capacity(command.len());
+    let mut index = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut changed = false;
+    let mut has_dynamic = false;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if !in_single => {
+                let next = index.saturating_add(2).min(bytes.len());
+                output.push_str(command.get(index..next).ok_or(())?);
+                index = next;
+            }
+            b'\'' if !in_double => {
+                in_single = !in_single;
+                output.push('\'');
+                index += 1;
+            }
+            b'"' if !in_single => {
+                in_double = !in_double;
+                output.push('"');
+                index += 1;
+            }
+            b'$' if !in_single && bytes.get(index + 1) == Some(&b'(') => {
+                let close = find_posix_substitution_close(command, index + 2, b')')?;
+                match render_static_producer_body(
+                    command.get(index + 2..close).ok_or(())?,
+                    in_double,
+                ) {
+                    Ok(rendered) => output.push_str(&rendered),
+                    Err(()) => {
+                        output.push_str(if in_double {
+                            POSIX_DYNAMIC_QUOTED
+                        } else {
+                            POSIX_DYNAMIC_UNQUOTED
+                        });
+                        has_dynamic = true;
+                    }
+                }
+                index = close + 1;
+                changed = true;
+            }
+            b'`' if !in_single => {
+                let close = find_posix_substitution_close(command, index + 1, b'`')?;
+                match render_static_producer_body(
+                    command.get(index + 1..close).ok_or(())?,
+                    in_double,
+                ) {
+                    Ok(rendered) => output.push_str(&rendered),
+                    Err(()) => {
+                        output.push_str(if in_double {
+                            POSIX_DYNAMIC_QUOTED
+                        } else {
+                            POSIX_DYNAMIC_UNQUOTED
+                        });
+                        has_dynamic = true;
+                    }
+                }
+                index = close + 1;
+                changed = true;
+            }
+            _ => {
+                let ch = command
+                    .get(index..)
+                    .and_then(|tail| tail.chars().next())
+                    .ok_or(())?;
+                output.push(ch);
+                index += ch.len_utf8();
+            }
+        }
+        if output.len() > MAX_STATIC_SUBSTITUTION_BYTES {
+            return Err(());
+        }
+    }
+
+    Ok(PosixSubstitutionView {
+        command: if changed { output } else { command.to_string() },
+        has_dynamic,
+    })
+}
+
+fn find_posix_substitution_close(command: &str, start: usize, delimiter: u8) -> Result<usize, ()> {
+    let bytes = command.as_bytes();
+    let mut index = start;
+    let mut depth = usize::from(delimiter == b')');
+    let mut in_single = false;
+    let mut in_double = false;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' if !in_single => index = index.saturating_add(2),
+            b'\'' if !in_double => {
+                in_single = !in_single;
+                index += 1;
+            }
+            b'"' if !in_single => {
+                in_double = !in_double;
+                index += 1;
+            }
+            b'`' if delimiter == b'`' && !in_single => return Ok(index),
+            b'(' if delimiter == b')' && !in_single && !in_double => {
+                depth = depth.saturating_add(1);
+                index += 1;
+            }
+            b')' if delimiter == b')' && !in_single && !in_double => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Ok(index);
+                }
+                index += 1;
+            }
+            _ => {
+                index += command
+                    .get(index..)
+                    .and_then(|tail| tail.chars().next())
+                    .map_or(1, char::len_utf8);
+            }
+        }
+    }
+    Err(())
+}
+
+fn render_static_producer_body(body: &str, _in_double_quotes: bool) -> Result<String, ()> {
+    if body.len() > MAX_STATIC_SUBSTITUTION_BYTES
+        || body.bytes().any(|byte| {
+            matches!(
+                byte,
+                b'$' | b'`'
+                    | b';'
+                    | b'|'
+                    | b'&'
+                    | b'<'
+                    | b'>'
+                    | b'('
+                    | b')'
+                    | b'*'
+                    | b'?'
+                    | b'['
+                    | b']'
+                    | b'{'
+                    | b'}'
+                    | b'~'
+                    | b'\n'
+                    | b'\r'
+                    | 0
+            )
+        })
+    {
+        return Err(());
+    }
+
+    let mut words = shell_words::split(body).map_err(|_| ())?;
+    if words.is_empty() {
+        return Err(());
+    }
+    let producer = words.remove(0);
+    let rendered = match producer.as_str() {
+        "printf" => {
+            if words.first().is_some_and(|word| word == "--") {
+                words.remove(0);
+            }
+            crate::evaluator::render_literal_printf(&words).ok_or(())?
+        }
+        // `echo` varies across shells once options or backslash escapes enter
+        // the picture. Model only the portable literal subset. Command
+        // substitution removes trailing newlines, so joining the literal
+        // operands exactly reproduces the value that can become an executable
+        // word without relying on implementation-specific echo behavior.
+        "echo"
+            if words.first().is_none_or(|word| !word.starts_with('-'))
+                && words.iter().all(|word| !word.contains('\\')) =>
+        {
+            words.join(" ")
+        }
+        _ => return Err(()),
+    };
+    let rendered = rendered.trim_end_matches('\n');
+    if rendered.len() > MAX_STATIC_SUBSTITUTION_BYTES
+        || !rendered.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || byte.is_ascii_whitespace()
+                || matches!(
+                    byte,
+                    b'_' | b'.' | b'/' | b':' | b'+' | b',' | b'=' | b'@' | b'%' | b'-'
+                )
+        })
+    {
+        return Err(());
+    }
+
+    // The accepted output alphabet contains no characters that are active
+    // inside POSIX double quotes, so it can be inserted verbatim there. In an
+    // unquoted word, literal whitespace intentionally reproduces field
+    // splitting while the restricted alphabet prevents shell re-parsing.
+    Ok(rendered.to_string())
+}
+
+#[derive(Clone)]
+struct SymbolicPosixWord {
+    text: String,
+    unquoted_dynamic: bool,
+}
+
+impl SymbolicPosixWord {
+    fn exact(&self) -> Option<&str> {
+        (!self.is_dynamic()).then_some(self.text.as_str())
+    }
+
+    fn is_dynamic(&self) -> bool {
+        self.text.contains(POSIX_DYNAMIC_QUOTED) || self.text.contains(POSIX_DYNAMIC_UNQUOTED)
+    }
+
+    /// Whether the word carries any literal bytes at all. A word made up
+    /// entirely of substitution sentinels could expand to anything, so it
+    /// provides no evidence that this command involves Git (#281).
+    fn has_literal_fragment(&self) -> bool {
+        self.text
+            .replace(POSIX_DYNAMIC_QUOTED, POSIX_DYNAMIC_UNQUOTED)
+            .split(POSIX_DYNAMIC_UNQUOTED)
+            .any(|fragment| !fragment.is_empty())
+    }
+
+    fn may_equal(&self, candidate: &str) -> bool {
+        if !self.is_dynamic() {
+            return self.text == candidate;
+        }
+        let normalized = self
+            .text
+            .replace(POSIX_DYNAMIC_QUOTED, POSIX_DYNAMIC_UNQUOTED);
+        let fragments: Vec<_> = normalized.split(POSIX_DYNAMIC_UNQUOTED).collect();
+        let Some(first) = fragments.first() else {
+            return false;
+        };
+        let Some(last) = fragments.last() else {
+            return false;
+        };
+        if !candidate.starts_with(first) || !candidate.ends_with(last) {
+            return false;
+        }
+        let mut offset = first.len();
+        for fragment in fragments
+            .iter()
+            .take(fragments.len().saturating_sub(1))
+            .skip(1)
+        {
+            let Some(relative) = candidate.get(offset..).and_then(|tail| tail.find(fragment))
+            else {
+                return false;
+            };
+            offset += relative + fragment.len();
+        }
+        offset <= candidate.len().saturating_sub(last.len())
+    }
+}
+
+fn symbolic_posix_words(view: &PosixSubstitutionView) -> Result<Vec<SymbolicPosixWord>, ()> {
+    shell_words::split(&view.command)
+        .map_err(|_| ())
+        .map(|words| {
+            words
+                .into_iter()
+                .map(|text| SymbolicPosixWord {
+                    unquoted_dynamic: text.contains(POSIX_DYNAMIC_UNQUOTED),
+                    text,
+                })
+                .collect()
+        })
+}
+
+fn symbolic_data_word_is_safe(word: &SymbolicPosixWord) -> bool {
+    !word.unquoted_dynamic
+}
+
+fn symbolic_branch_option_may_mutate(word: &SymbolicPosixWord) -> bool {
+    ["-d", "-D", "-f", "-M", "-C", "--delete", "--force"]
+        .iter()
+        .any(|candidate| word.may_equal(candidate))
+}
+
+/// Whether the literal words of a symbolic argv tail prove a branch
+/// delete/force mutation. Used when unknown expansions occupy the executable
+/// and subcommand slots (#281): the unknowns supply no Git evidence, but a
+/// literal `-D` / `--delete` / `--force` after them still names a destructive
+/// branch operation in plain sight, so it must not be discarded (#283-review).
+fn literal_argv_proves_branch_mutation(words: &[SymbolicPosixWord]) -> bool {
+    literal_branch_tokens_prove_mutation(words.iter().map(SymbolicPosixWord::exact))
+}
+
+/// Whether `token` is a single-dash CamelCase *long* parameter name
+/// (`-Directory`, `-Recurse`, `-Confirm`) rather than a POSIX cluster of
+/// one-letter flags. Requires at least three characters after the dash, an
+/// initial ASCII uppercase letter, and a following lowercase letter, so
+/// `-D`, `-Df`, `-DF` and every lowercase cluster stay short flags.
+fn camel_case_long_parameter_name(token: &str) -> bool {
+    let Some(name) = token.strip_prefix('-') else {
+        return false;
+    };
+    if name.starts_with('-') {
+        return false;
+    }
+    name.len() >= 3
+        && name.starts_with(|c: char| c.is_ascii_uppercase())
+        && name[1..].contains(|c: char| c.is_ascii_lowercase())
+        && name.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Shared literal-evidence scan behind [`literal_argv_proves_branch_mutation`]
+/// and its `GitSemanticWord` counterpart. `None` marks a dynamic word, which
+/// contributes no evidence but does not stop the scan.
+fn literal_branch_tokens_prove_mutation<'a>(tokens: impl Iterator<Item = Option<&'a str>>) -> bool {
+    let mut mutation = BranchMutationState::default();
+    for token in tokens {
+        let Some(token) = token else {
+            continue;
+        };
+        if matches!(token, "--" | "--end-of-options") {
+            break;
+        }
+        if token.starts_with("--") {
+            let Some(resolved) = resolve_branch_long_option(token) else {
+                continue;
+            };
+            if resolved.inline_value && matches!(resolved.arity, BranchLongOptionArity::None) {
+                continue;
+            }
+            match resolved.name {
+                "delete" if resolved.negated => mutation.delete_bits &= !1,
+                "delete" => mutation.delete_bits |= 1,
+                "force" => mutation.force = !resolved.negated,
+                _ => {}
+            }
+            continue;
+        }
+        if camel_case_long_parameter_name(token) {
+            // PowerShell spells every parameter `-CamelCase` with a single
+            // dash, so a POSIX short-flag reading turns `-Directory` into
+            // `-D` (branch delete) and `-Confirm` into `-C` (forced copy).
+            // This scan only ever runs when the executable slot is a bare
+            // expansion, which is exactly the shape a PowerShell assignment
+            // (`$items = Get-ChildItem -Directory`) presents to a POSIX
+            // tokenizer — issue #401. Git's own short options are never
+            // capitalised multi-letter words, and `git branch -Dxx` is a
+            // usage error rather than a deletion, so nothing real is lost.
+            continue;
+        }
+        if let Some(flags) = token.strip_prefix('-').filter(|flags| !flags.is_empty()) {
+            for flag in flags.chars() {
+                match flag {
+                    'd' => mutation.delete_bits |= 1,
+                    'D' => mutation.delete_bits |= 2,
+                    'f' => mutation.force = true,
+                    'M' | 'C' => mutation.forced_move_or_copy = true,
+                    // `-u<upstream>` and `-t<start>` consume their attached
+                    // remainder as data, not as further short flags.
+                    'u' | 't' => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+    mutation.mutates()
+}
+
+fn sole_posix_branch_name_query(command: &str) -> bool {
+    let command = command.trim();
+    let body = if let Some(body) = command
+        .strip_prefix('`')
+        .and_then(|body| body.strip_suffix('`'))
+    {
+        body
+    } else if let Some(body) = command
+        .strip_prefix("$(")
+        .and_then(|body| body.strip_suffix(')'))
+    {
+        body
+    } else {
+        return false;
+    };
+    let Ok(words) = shell_words::split(body) else {
+        return false;
+    };
+    matches!(
+        words.as_slice(),
+        [git, branch, show_current]
+            if git.eq_ignore_ascii_case("git")
+                && branch == "branch"
+                && show_current == "--show-current"
+    )
+}
+
+fn decoded_words_execute_git(words: &[String]) -> bool {
+    for word in words {
+        if crate::normalize::is_env_assignment(word)
+            || matches!(word.as_str(), "exec" | "time" | "nohup" | "!")
+        {
+            continue;
+        }
+        let Some(mut executable) = word.rsplit(['/', '\\']).next() else {
+            return false;
+        };
+        if executable
+            .get(executable.len().saturating_sub(4)..)
+            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".exe"))
+        {
+            executable = executable
+                .get(..executable.len().saturating_sub(4))
+                .unwrap_or(executable);
+        }
+        return executable.eq_ignore_ascii_case("git")
+            || CORE_GIT_DASHED_BUILTINS
+                .iter()
+                .any(|(bare, _, _)| executable.eq_ignore_ascii_case(bare));
+    }
+    false
+}
+
+fn next_posix_prefix_token(
+    segment: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+    mut index: usize,
+) -> Option<usize> {
+    while let Some(token) = tokens.get(index) {
+        let raw = token.text(segment)?;
+        if token.kind == NormalizeTokenKind::Word && matches!(raw, "\\\n" | "\\\r\n") {
+            index += 1;
+            continue;
+        }
+        return Some(index);
+    }
+    None
+}
+
+fn posix_compound_command_opener(
+    segment: &str,
+    tokens: &[crate::normalize::NormalizeToken],
+    index: usize,
+) -> bool {
+    let Some(token) = tokens.get(index) else {
+        return false;
+    };
+    let Some(raw) = token.text(segment) else {
+        return false;
+    };
+    match token.kind {
+        NormalizeTokenKind::Separator => raw == "(",
+        NormalizeTokenKind::Word => matches!(
+            raw,
+            "{" | "if" | "while" | "until" | "for" | "select" | "case"
+        ),
+    }
+}
+
+fn posix_command_after_compound_opener<'a>(
+    segment: &'a str,
+    tokens: &[crate::normalize::NormalizeToken],
+    opener_index: usize,
+) -> Option<(&'a str, usize)> {
+    let opener = tokens.get(opener_index)?;
+    let raw = opener.text(segment)?;
+    if matches!(raw, "{" | "(") {
+        let body_index = next_posix_prefix_token(segment, tokens, opener_index + 1)?;
+        let start = tokens.get(body_index)?.byte_range.start;
+        return Some((&segment[start..], start));
+    }
+    let start = opener.byte_range.start;
+    Some((&segment[start..], start))
+}
+
+fn first_literal_posix_git_token_offset(segment: &str) -> Option<usize> {
+    let tokens = tokenize_for_shell_dialect(segment, ShellDialect::Posix);
+    let mut decoder = ShellTokenDecoder::new(ShellDialect::Posix);
+    tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .find_map(|token| {
+            let raw = token.text(segment)?;
+            let decoded = decoder.decode(raw, ShellTokenRole::Syntax)?;
+            let executable = decoded.rsplit(['/', '\\']).next()?;
+            let stripped = executable
+                .strip_suffix(".exe")
+                .or_else(|| executable.strip_suffix(".EXE"))
+                .unwrap_or(executable);
+            (stripped.eq_ignore_ascii_case("git")
+                || CORE_GIT_DASHED_BUILTINS
+                    .iter()
+                    .any(|(bare, _, _)| stripped.eq_ignore_ascii_case(bare)))
+            .then_some(token.byte_range.start)
+        })
+}
+
+fn command_after_posix_function_prefix<'a>(
+    segment: &'a str,
+    tokens: &[crate::normalize::NormalizeToken],
+    function_index: usize,
+) -> Option<(&'a str, usize)> {
+    let name_index = next_posix_prefix_token(segment, tokens, function_index + 1)?;
+    if tokens.get(name_index)?.kind != NormalizeTokenKind::Word {
+        return None;
+    }
+
+    let mut opener_index = next_posix_prefix_token(segment, tokens, name_index + 1)?;
+    if tokens.get(opener_index)?.text(segment) == Some("(") {
+        let following_index = next_posix_prefix_token(segment, tokens, opener_index + 1)?;
+        if tokens.get(following_index)?.text(segment) == Some(")") {
+            opener_index = next_posix_prefix_token(segment, tokens, following_index + 1)?;
+        }
+    }
+    if !posix_compound_command_opener(segment, tokens, opener_index) {
+        return None;
+    }
+    posix_command_after_compound_opener(segment, tokens, opener_index)
+}
+
+fn command_after_posix_coproc_prefix<'a>(
+    segment: &'a str,
+    tokens: &[crate::normalize::NormalizeToken],
+    coproc_index: usize,
+) -> Option<(&'a str, usize)> {
+    let candidate_index = next_posix_prefix_token(segment, tokens, coproc_index + 1)?;
+    if posix_compound_command_opener(segment, tokens, candidate_index) {
+        return posix_command_after_compound_opener(segment, tokens, candidate_index);
+    }
+    if tokens.get(candidate_index)?.kind != NormalizeTokenKind::Word {
+        return None;
+    }
+
+    // Bash accepts a coprocess name only when a compound command follows it:
+    // `coproc JOB { command; }` and `coproc JOB if ...; then ...; fi`.
+    // Without that opener, the candidate itself is the executable, as in
+    // `coproc git reset --hard`.
+    if let Some(opener_index) = next_posix_prefix_token(segment, tokens, candidate_index + 1)
+        && posix_compound_command_opener(segment, tokens, opener_index)
+    {
+        return posix_command_after_compound_opener(segment, tokens, opener_index);
+    }
+
+    let start = tokens.get(candidate_index)?.byte_range.start;
+    Some((&segment[start..], start))
+}
+
+/// Return the executable portion of one separator-delimited POSIX segment.
+///
+/// Shell control-flow reserved words can share a segment with the command they
+/// introduce (`then git ...`, `do git ...`, `{ git ...`, or `coproc git ...`).
+/// Bash function declarations and named compound coprocesses also place
+/// syntax before their executable body. Exact raw-token matching deliberately
+/// leaves quoted words, paths, and spellings selected through
+/// `command`/`env`/`sudo` untouched.
+///
+/// The offset is relative to `segment` and lets evaluator diagnostics map a
+/// match in the returned slice back to the original command.
+pub(crate) fn command_after_posix_control_prefixes(
+    segment: &str,
+    dialect: ShellDialect,
+) -> (&str, usize) {
+    command_after_posix_control_prefixes_bounded(segment, dialect, 0)
+}
+
+fn command_after_posix_control_prefixes_bounded(
+    segment: &str,
+    dialect: ShellDialect,
+    nesting_depth: usize,
+) -> (&str, usize) {
+    if dialect != ShellDialect::Posix {
+        return (segment, 0);
+    }
+    const MAX_STRUCTURAL_PREFIX_NESTING: usize = 64;
+    if nesting_depth >= MAX_STRUCTURAL_PREFIX_NESTING {
+        // Fail closed for the only command family this parser owns. Returning
+        // another declaration prefix here would make the later executable
+        // parser classify `function` rather than a deeply nested Git body.
+        // The conservative textual fallback is reached only after 64 valid
+        // structural layers, where avoiding an unbounded recursion is more
+        // important than preserving data-only Git text.
+        if let Some(git_offset) = first_literal_posix_git_token_offset(segment) {
+            return (&segment[git_offset..], git_offset);
+        }
+        return (segment, 0);
+    }
+
+    // Direct Git invocations dominate this hot path. Avoid a second shell
+    // tokenization unless the first raw word can actually be an unquoted
+    // control prefix. Peel only line continuations here; the tokenizer below
+    // remains authoritative for quoting and exact byte offsets.
+    let mut prefix_probe = segment.trim_start();
+    loop {
+        if let Some(rest) = prefix_probe.strip_prefix("\\\r\n") {
+            prefix_probe = rest.trim_start();
+        } else if let Some(rest) = prefix_probe.strip_prefix("\\\n") {
+            prefix_probe = rest.trim_start();
+        } else {
+            break;
+        }
+    }
+    if !prefix_probe.split_whitespace().next().is_some_and(|word| {
+        crate::context::is_shell_command_prefix_reserved_word(word) || word == "function"
+    }) {
+        return (segment, 0);
+    }
+
+    let tokens = tokenize_for_shell_dialect(segment, dialect);
+    let mut stripped_reserved_word = false;
+    let mut token_index = next_posix_prefix_token(segment, &tokens, 0);
+    while let Some(index) = token_index {
+        let Some(token) = tokens.get(index) else {
+            return (segment, 0);
+        };
+        if token.kind != NormalizeTokenKind::Word {
+            return (segment, 0);
+        }
+        let Some(raw) = token.text(segment) else {
+            return (segment, 0);
+        };
+
+        if raw == "function" {
+            let Some((body, offset)) = command_after_posix_function_prefix(segment, &tokens, index)
+            else {
+                return (segment, 0);
+            };
+            if body.is_empty() {
+                return (body, offset);
+            }
+            let (command, nested_offset) = command_after_posix_control_prefixes_bounded(
+                body,
+                ShellDialect::Posix,
+                nesting_depth + 1,
+            );
+            return (command, offset.saturating_add(nested_offset));
+        }
+        if raw == "coproc" {
+            let Some((body, offset)) = command_after_posix_coproc_prefix(segment, &tokens, index)
+            else {
+                return (segment, 0);
+            };
+            if body.is_empty() {
+                return (body, offset);
+            }
+            let (command, nested_offset) = command_after_posix_control_prefixes_bounded(
+                body,
+                ShellDialect::Posix,
+                nesting_depth + 1,
+            );
+            return (command, offset.saturating_add(nested_offset));
+        }
+
+        let command_prefix = if stripped_reserved_word {
+            matches!(raw, "if" | "while" | "until" | "{" | "!")
+        } else {
+            crate::context::is_shell_command_prefix_reserved_word(raw)
+        };
+        if command_prefix {
+            stripped_reserved_word = true;
+            token_index = next_posix_prefix_token(segment, &tokens, index + 1);
+            continue;
+        }
+        if stripped_reserved_word && crate::context::is_shell_command_prefix_reserved_word(raw) {
+            // This is not a valid nested command prefix (`then else ...`,
+            // `do then ...`, and similar forms are syntax errors). Return the
+            // original segment so repeated semantic layers cannot peel one
+            // invalid reserved word at a time and expose inert trailing text.
+            return (segment, 0);
+        }
+        if stripped_reserved_word {
+            let start = token.byte_range.start;
+            return (&segment[start..], start);
+        }
+        return (segment, 0);
+    }
+
+    if stripped_reserved_word {
+        (&segment[segment.len()..], segment.len())
+    } else {
+        (segment, 0)
+    }
+}
+
+/// Dashed helper executables Git ships for the subcommands this pack governs
+/// (issue #400).
+///
+/// Git installs each built-in subcommand as its own `git-<sub>` executable under
+/// `git --exec-path`, and running one does exactly what the spaced spelling
+/// does: `git-reset --hard HEAD~1` discards uncommitted work and moves HEAD
+/// just like `git reset --hard HEAD~1`. Only `git-branch` was recognised here,
+/// so every other rule in the pack — `reset-hard`, `clean-force`,
+/// `checkout-discard`, `restore-worktree`, `push-force-*`, `stash-drop`, … —
+/// was one rename away from being bypassed, including through the reachable
+/// path-qualified form `/usr/libexec/git-core/git-reset`. `strict_git` had
+/// already closed the same hole for its own rules (#367).
+///
+/// Only subcommands this pack actually has a rule for are listed. A third-party
+/// `git-*` program (`git-crypt`, `git-flow`, `git-town`) is not a Git built-in
+/// and stays outside the pack entirely. `git-lfs` IS listed because the pack
+/// carries `lfs-migrate-rewrite` / `lfs-prune` / `lfs-uninstall` rules; entering
+/// the pack is harmless for `git-lfs install`, which matches no rule.
+/// Each entry is a triple: the bare name, the `.exe` spelling, and the
+/// subcommand the dashed builtin stands for.
+///
+/// The `.exe` spelling is stored rather than built on demand: this table is
+/// consulted on the hook's hot path for every command that reaches `core.git`
+/// executable resolution, and formatting nine strings per call to append a
+/// constant suffix is pure waste. Storing the subcommand explicitly also keeps
+/// a future entry from silently deriving the wrong one by prefix-stripping.
+const CORE_GIT_DASHED_BUILTINS: &[(&str, &str, &str)] = &[
+    ("git-branch", "git-branch.exe", "branch"),
+    ("git-checkout", "git-checkout.exe", "checkout"),
+    ("git-clean", "git-clean.exe", "clean"),
+    ("git-lfs", "git-lfs.exe", "lfs"),
+    ("git-push", "git-push.exe", "push"),
+    ("git-reset", "git-reset.exe", "reset"),
+    ("git-restore", "git-restore.exe", "restore"),
+    ("git-show", "git-show.exe", "show"),
+    ("git-stash", "git-stash.exe", "stash"),
+];
+
+/// Whether a decoded executable word can resolve to Git, under either the bare
+/// `git` spelling or one of the dashed built-ins in
+/// [`CORE_GIT_DASHED_BUILTINS`]. `.exe` variants are accepted for every name so
+/// a Windows spelling cannot skip the pack.
+fn git_semantic_word_is_git_executable(word: &GitSemanticWord, dialect: ShellDialect) -> bool {
+    git_semantic_executable_may_equal(word, dialect, "git")
+        || git_semantic_executable_may_equal(word, dialect, "git.exe")
+        || is_dashed_git_builtin(word, dialect)
+}
+
+/// Whether this executable word can be one of the dashed built-ins. Short
+/// circuits and allocates nothing, because this runs per word while resolving
+/// the executable index.
+fn is_dashed_git_builtin(word: &GitSemanticWord, dialect: ShellDialect) -> bool {
+    CORE_GIT_DASHED_BUILTINS.iter().any(|(bare, exe, _)| {
+        git_semantic_executable_may_equal(word, dialect, bare)
+            || git_semantic_executable_may_equal(word, dialect, exe)
+    })
+}
+
+/// Every subcommand a dashed Git built-in word can stand for: `git-reset` →
+/// `[reset]`.
+///
+/// Used to spell the subcommand back out when the pattern-matching view is
+/// synthesized, so a dashed spelling reaches the same rule as the spaced one.
+///
+/// **All of them, not the first one (#428).** A literal word equals exactly one
+/// entry, but a *bounded symbolic* word can equal several: `git-c$X` may be
+/// `git-checkout` or `git-clean`, and taking the first table match resolved it
+/// to `checkout`, synthesized `git checkout -fdx`, and matched nothing — while
+/// `git-cl$X -fdx` was unambiguous and denied. Reading an unknown as whichever
+/// candidate the table happens to list first is a fail-open, so the caller is
+/// given every candidate and spells out every reading.
+fn dashed_git_builtin_subcommands(
+    word: &GitSemanticWord,
+    dialect: ShellDialect,
+) -> SmallVec<[&'static str; 4]> {
+    CORE_GIT_DASHED_BUILTINS
+        .iter()
+        .filter_map(|(bare, exe, subcommand)| {
+            let matches_name = git_semantic_executable_may_equal(word, dialect, bare)
+                || git_semantic_executable_may_equal(word, dialect, exe);
+            matches_name.then_some(*subcommand)
+        })
+        .collect()
+}
+
+fn semantic_git_executable_index(
+    words: &[GitSemanticWord],
+    dialect: ShellDialect,
+) -> Option<usize> {
+    let mut index = 0usize;
+    while let Some(word) = words.get(index) {
+        if crate::normalize::is_env_assignment(&word.decoded) {
+            index += 1;
+            continue;
+        }
+        if dialect == ShellDialect::Cmd {
+            let executable = word.decoded.trim_start_matches('@');
+            if !word.dynamic && (executable.is_empty() || executable.eq_ignore_ascii_case("call")) {
+                index += 1;
+                continue;
+            }
+        }
+        if !word.dynamic && matches!(word.decoded.as_str(), "exec" | "time" | "nohup" | "!") {
+            index += 1;
+            continue;
+        }
+        return git_semantic_word_is_git_executable(word, dialect).then_some(index);
+    }
+    None
+}
+
+fn symbolic_posix_may_execute_git(command: &str) -> bool {
+    let stripped = crate::normalize::strip_wrapper_prefixes(command);
+    let command = stripped.normalized.as_ref();
+    let Ok(view) = posix_substitution_view(command) else {
+        return true;
+    };
+    let Ok(words) = symbolic_posix_words(&view) else {
+        return true;
+    };
+    let mut scan_all_remaining = false;
+    for word in words {
+        if !scan_all_remaining {
+            if let Some(exact) = word.exact() {
+                if crate::normalize::is_env_assignment(exact)
+                    || matches!(exact, "exec" | "time" | "nohup" | "!")
+                {
+                    continue;
+                }
+            }
+        }
+        let basename = SymbolicPosixWord {
+            text: word
+                .text
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(&word.text)
+                .to_string(),
+            unquoted_dynamic: word.unquoted_dynamic,
+        };
+        // Every dashed built-in counts, not just `git-branch`. This is the
+        // fallback the pack takes whenever a POSIX command carries an
+        // unresolvable `$(…)` or backtick, and it decides whether `core.git`
+        // evaluates the command AT ALL — a `false` here returns before any rule
+        // runs. While it knew only `git-branch`, `git-reset --hard $(git
+        // rev-parse HEAD~1)` skipped the entire pack, so the #400 widening of
+        // the rules never got the chance to fire.
+        if basename.may_equal("git")
+            || basename.may_equal("git.exe")
+            || CORE_GIT_DASHED_BUILTINS
+                .iter()
+                .any(|(bare, exe, _)| basename.may_equal(bare) || basename.may_equal(exe))
+        {
+            return true;
+        }
+        if scan_all_remaining {
+            continue;
+        }
+        // #260: the wrapper strip already ran above, so a first word that is
+        // still a known execution frontend means the strip BAILED (dynamic
+        // option value, unmodeled flag). The wrapped command still executes
+        // at runtime; keep scanning the remaining words for a possible Git
+        // executable so the ordinary regex rules run (deny-direction only —
+        // genuinely unknown programs keep the documented argv-data default).
+        if word
+            .exact()
+            .map(|exact| exact.rsplit(['/', '\\']).next().unwrap_or(exact))
+            .is_some_and(crate::normalize::is_posix_execution_frontend_basename)
+        {
+            scan_all_remaining = true;
+            continue;
+        }
+        return false;
+    }
+    false
+}
+
+#[derive(Debug, Clone)]
+struct GitSemanticWord {
+    decoded: String,
+    dynamic: bool,
+    may_split: bool,
+}
+
+#[derive(Debug)]
+struct DecodedGitWords {
+    words: Vec<GitSemanticWord>,
+    over_limit: bool,
+}
+
+#[derive(Debug, Clone)]
+struct EnvironmentValue {
+    value: String,
+    dynamic: bool,
+}
+
+#[derive(Debug, Clone)]
+enum VisibleAliasValue {
+    Static(String),
+    Dynamic,
+}
+
+#[derive(Debug, Clone)]
+struct VisibleAliasDefinition {
+    /// `None` means that expansion can choose the alias name.
+    name: Option<String>,
+    value: VisibleAliasValue,
+}
+
+/// Whether the text following a `{` can brace-expand.
+///
+/// POSIX-family shells expand a brace group only when it closes in the same
+/// word and contains a `,` alternative or a `..` sequence — `{}` (xargs's
+/// conventional replacement token) and `{word}` are literal text.
+/// For a `{` whose text starts at `from`: the first `}` after it (or
+/// `usize::MAX`), and the last position before that `}` where a `,` or a
+/// whole `..` starts. A `{` at `index < close` has a `,`/`..` between it and
+/// its `}` (so the brace may expand) exactly when that position is after it,
+/// so every `{` sharing the `}` reuses one scan instead of rescanning the
+/// rest of the word (`{{{…`, 20,000 of them, was quadratic).
+fn posix_brace_region(raw: &str, from: usize) -> (usize, Option<usize>) {
+    let Some(inner_len) = raw.get(from..).and_then(|rest| rest.find('}')) else {
+        return (usize::MAX, None);
+    };
+    let inner = &raw[from..from + inner_len];
+    let last = inner.rfind(',').max(inner.rfind("..")).map(|at| from + at);
+    (from + inner_len, last)
+}
+
+fn git_token_has_active_expansion(raw: &str, dialect: ShellDialect) -> bool {
+    match dialect {
+        ShellDialect::Posix | ShellDialect::Unknown => {
+            let mut chars = raw.char_indices().peekable();
+            let mut single = false;
+            let mut double = false;
+            // The lookahead for a bracket's `]` and a brace's `}` is computed
+            // once, not per `[`/`{`: a word of 20,000 unclosed `[` rescanned
+            // its remainder at each one.
+            let last_bracket_close = raw.rfind(']');
+            let mut brace_region: Option<(usize, Option<usize>)> = None;
+            while let Some((index, ch)) = chars.next() {
+                match ch {
+                    '\\' if !single => {
+                        chars.next();
+                    }
+                    '\'' if !double => single = !single,
+                    '"' if !single => double = !double,
+                    '$' if !single && !matches!(chars.peek(), Some((_, '\'' | '"'))) => {
+                        return true;
+                    }
+                    '`' if !single => return true,
+                    '*' | '?' if !single && !double => return true,
+                    // A bracket or brace expression only expands when its
+                    // closing delimiter appears later in the same word. A lone
+                    // `[` or `[[` is the literal POSIX test builtin, and a
+                    // lone `{` is the compound-command reserved word; neither
+                    // can glob-expand into a different executable. Brace
+                    // groups additionally need a `,`/`..` inside — `{}` and
+                    // `{word}` are literal.
+                    '[' if !single
+                        && !double
+                        && last_bracket_close.is_some_and(|at| at > index) =>
+                    {
+                        return true;
+                    }
+                    '{' if !single && !double => {
+                        let (close, last_expanding) = match brace_region {
+                            Some(region) if index < region.0 => region,
+                            _ => posix_brace_region(raw, index + 1),
+                        };
+                        brace_region = Some((close, last_expanding));
+                        if last_expanding.is_some_and(|at| at > index) {
+                            return true;
+                        }
+                    }
+                    '<' | '>' if !single && matches!(chars.peek(), Some((_, '('))) => return true,
+                    _ => {}
+                }
+            }
+            false
+        }
+        ShellDialect::PowerShell => {
+            let mut chars = raw.chars().peekable();
+            let mut single = false;
+            let mut double = false;
+            while let Some(ch) = chars.next() {
+                match ch {
+                    '`' if !single => {
+                        chars.next();
+                    }
+                    '\'' if !double => single = !single,
+                    '"' if !single => double = !double,
+                    '$' if !single => return true,
+                    '@' if !single && chars.peek() == Some(&'(') => return true,
+                    _ => {}
+                }
+            }
+            false
+        }
+        ShellDialect::Cmd => {
+            let bytes = raw.as_bytes();
+            bytes
+                .iter()
+                .position(|byte| *byte == b'%')
+                .is_some_and(|start| {
+                    bytes.get(start + 1).is_some_and(|next| {
+                        next.is_ascii_digit()
+                            || matches!(*next, b'*' | b'~')
+                            || bytes
+                                .get(start + 2..)
+                                .is_some_and(|tail| tail.contains(&b'%'))
+                    })
+                })
+                || bytes
+                    .iter()
+                    .position(|byte| *byte == b'!')
+                    .is_some_and(|start| {
+                        bytes
+                            .get(start + 1..)
+                            .is_some_and(|tail| tail.contains(&b'!'))
+                    })
+        }
+    }
+}
+
+fn git_token_expansion_may_split(raw: &str, dialect: ShellDialect) -> bool {
+    match dialect {
+        ShellDialect::Posix | ShellDialect::Unknown => {
+            let mut chars = raw.char_indices().peekable();
+            let mut single = false;
+            let mut double = false;
+            // Linear lookahead, as in `git_token_has_active_expansion`.
+            let last_bracket_close = raw.rfind(']');
+            let mut brace_region: Option<(usize, Option<usize>)> = None;
+            while let Some((index, ch)) = chars.next() {
+                match ch {
+                    '\\' if !single => {
+                        chars.next();
+                    }
+                    '\'' if !double => single = !single,
+                    '"' if !single => double = !double,
+                    '$' | '`' | '*' | '?' if !single && !double => return true,
+                    // See `git_token_has_active_expansion`: `[`/`{` without a
+                    // later closing delimiter in the same word are literal,
+                    // and brace groups additionally need a `,`/`..` inside.
+                    '[' if !single
+                        && !double
+                        && last_bracket_close.is_some_and(|at| at > index) =>
+                    {
+                        return true;
+                    }
+                    '{' if !single && !double => {
+                        let (close, last_expanding) = match brace_region {
+                            Some(region) if index < region.0 => region,
+                            _ => posix_brace_region(raw, index + 1),
+                        };
+                        brace_region = Some((close, last_expanding));
+                        if last_expanding.is_some_and(|at| at > index) {
+                            return true;
+                        }
+                    }
+                    '<' | '>' if !single && !double && matches!(chars.peek(), Some((_, '('))) => {
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Native-command expansion can produce more than one argv element in
+        // both PowerShell (arrays) and Cmd (expanded whitespace). Expansion
+        // inside double quotes is one native-command argument, however.
+        ShellDialect::PowerShell | ShellDialect::Cmd => {
+            let mut chars = raw.chars().peekable();
+            let mut single = false;
+            let mut double = false;
+            while let Some(ch) = chars.next() {
+                match (dialect, ch) {
+                    (ShellDialect::PowerShell, '`') if !single => {
+                        chars.next();
+                    }
+                    (_, '\'') if !double => single = !single,
+                    (_, '"') if !single => double = !double,
+                    (ShellDialect::PowerShell, '$') if !single && !double => return true,
+                    (ShellDialect::PowerShell, '@')
+                        if !single && !double && chars.peek() == Some(&'(') =>
+                    {
+                        return true;
+                    }
+                    (ShellDialect::Cmd, '%' | '!') if !double => return true,
+                    _ => {}
+                }
+            }
+        }
+    }
+    false
+}
+
+fn git_dynamic_fragments(decoded: &str, dialect: ShellDialect) -> Vec<String> {
+    let mut fragments = vec![String::new()];
+    let chars: Vec<char> = decoded.chars().collect();
+    let mut index = 0usize;
+    let mut dynamic = false;
+    while index < chars.len() {
+        let starts_dynamic = match dialect {
+            ShellDialect::Posix | ShellDialect::Unknown => match chars[index] {
+                '$' | '`' | '*' | '?' => true,
+                // A `[`/`{` with no later closing delimiter in the word is
+                // literal (the test builtin / brace reserved word) and must
+                // contribute a literal fragment rather than a wildcard. Brace
+                // groups additionally need a `,`/`..` inside to expand.
+                '[' => chars[index + 1..].contains(&']'),
+                '{' => {
+                    let remainder = &chars[index + 1..];
+                    remainder
+                        .iter()
+                        .position(|&c| c == '}')
+                        .is_some_and(|close| {
+                            let inner = &remainder[..close];
+                            inner.contains(&',') || inner.windows(2).any(|pair| pair == ['.', '.'])
+                        })
+                }
+                _ => false,
+            },
+            ShellDialect::PowerShell => {
+                chars[index] == '$' || chars[index] == '@' && chars.get(index + 1) == Some(&'(')
+            }
+            ShellDialect::Cmd => matches!(chars[index], '%' | '!'),
+        };
+        if !starts_dynamic {
+            fragments.last_mut().expect("seeded").push(chars[index]);
+            index += 1;
+            continue;
+        }
+
+        dynamic = true;
+        fragments.push(String::new());
+        match (dialect, chars[index]) {
+            (ShellDialect::Posix | ShellDialect::Unknown, '$')
+            | (ShellDialect::PowerShell, '$') => {
+                index += 1;
+                if matches!(chars.get(index), Some('{' | '(')) {
+                    let open = chars[index];
+                    let close = if open == '{' { '}' } else { ')' };
+                    index += 1;
+                    let mut depth = 1usize;
+                    while index < chars.len() && depth > 0 {
+                        if chars[index] == open {
+                            depth += 1;
+                        } else if chars[index] == close {
+                            depth -= 1;
+                        }
+                        index += 1;
+                    }
+                } else {
+                    while index < chars.len()
+                        && (chars[index].is_ascii_alphanumeric()
+                            || matches!(chars[index], '_' | ':' | '?' | '*' | '#' | '@' | '-'))
+                    {
+                        index += 1;
+                    }
+                }
+            }
+            (ShellDialect::PowerShell, '@') => {
+                index += 2;
+                let mut depth = 1usize;
+                while index < chars.len() && depth > 0 {
+                    if chars[index] == '(' {
+                        depth += 1;
+                    } else if chars[index] == ')' {
+                        depth -= 1;
+                    }
+                    index += 1;
+                }
+            }
+            (ShellDialect::Posix | ShellDialect::Unknown, '`') => {
+                index += 1;
+                while index < chars.len() && chars[index] != '`' {
+                    index += 1;
+                }
+                index += usize::from(index < chars.len());
+            }
+            (ShellDialect::Posix | ShellDialect::Unknown, '[') => {
+                index += 1;
+                while index < chars.len() && chars[index] != ']' {
+                    index += 1;
+                }
+                index += usize::from(index < chars.len());
+            }
+            (ShellDialect::Posix | ShellDialect::Unknown, '{') => {
+                index += 1;
+                while index < chars.len() && chars[index] != '}' {
+                    index += 1;
+                }
+                index += usize::from(index < chars.len());
+            }
+            (ShellDialect::Posix | ShellDialect::Unknown, '*' | '?') => index += 1,
+            (ShellDialect::Cmd, delimiter @ ('%' | '!')) => {
+                index += 1;
+                if delimiter == '%' && chars.get(index).is_some_and(char::is_ascii_digit) {
+                    index += 1;
+                } else {
+                    while index < chars.len() && chars[index] != delimiter {
+                        index += 1;
+                    }
+                    index += usize::from(index < chars.len());
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    if dynamic {
+        fragments
+    } else {
+        vec![decoded.to_string()]
+    }
+}
+
+fn git_symbolic_word_may_equal(
+    word: &GitSemanticWord,
+    dialect: ShellDialect,
+    candidate: &str,
+    ascii_case_insensitive: bool,
+) -> bool {
+    if !word.dynamic {
+        return if ascii_case_insensitive {
+            word.decoded.eq_ignore_ascii_case(candidate)
+        } else {
+            word.decoded == candidate
+        };
+    }
+    let decoded = if ascii_case_insensitive {
+        word.decoded.to_ascii_lowercase()
+    } else {
+        word.decoded.clone()
+    };
+    let candidate = if ascii_case_insensitive {
+        candidate.to_ascii_lowercase()
+    } else {
+        candidate.to_string()
+    };
+    let fragments = git_dynamic_fragments(&decoded, dialect);
+    let Some(first) = fragments.first() else {
+        return true;
+    };
+    let Some(last) = fragments.last() else {
+        return true;
+    };
+    if !candidate.starts_with(first) || !candidate.ends_with(last) {
+        return false;
+    }
+    let mut offset = first.len();
+    for fragment in fragments
+        .iter()
+        .take(fragments.len().saturating_sub(1))
+        .skip(1)
+    {
+        let Some(relative) = candidate.get(offset..).and_then(|tail| tail.find(fragment)) else {
+            return false;
+        };
+        offset += relative + fragment.len();
+    }
+    offset <= candidate.len().saturating_sub(last.len())
+}
+
+/// Whether a dynamic word consists solely of expansions with no literal bytes.
+/// Such a word could expand to anything, so it supplies no evidence that the
+/// command involves Git; per the #273 precedent (`"$X" "$Y"` is an unknown
+/// program), an unquoted `$X $Y` must not be attributed to a `core.git` rule
+/// on its own (#281).
+fn git_semantic_word_is_unbounded(word: &GitSemanticWord, dialect: ShellDialect) -> bool {
+    word.dynamic
+        && git_dynamic_fragments(&word.decoded, dialect)
+            .iter()
+            .all(String::is_empty)
+}
+
+/// Reduce an executable word to the view that actually names the program: the
+/// basename after the final path separator, with `dynamic` re-derived from the
+/// basename's own fragments rather than inherited from the full word.
+///
+/// The program name is the basename, so every question a `core.git` gate asks
+/// about the executable ("could this be `git`?", "does this carry any literal
+/// evidence?") must be answered against the basename alone. Carrying the whole
+/// word's `dynamic` flag over gets both directions wrong (#360, #361):
+/// a glob in a *directory* component (`/usr/*/git`) left a fully literal `git`
+/// basename flagged dynamic, and a glob *basename* (`/*`) borrowed the literal
+/// `/` separator as the evidence a pure expansion is defined not to have.
+fn git_semantic_executable_basename(
+    word: &GitSemanticWord,
+    dialect: ShellDialect,
+) -> GitSemanticWord {
+    let decoded = if dialect == ShellDialect::Cmd {
+        word.decoded.trim_start_matches('@')
+    } else {
+        &word.decoded
+    };
+    let basename = decoded.rsplit(['/', '\\']).next().unwrap_or(decoded);
+    // A basename that splits into a single fragment is wholly literal text;
+    // only an expansion *inside the basename itself* keeps the word dynamic.
+    let basename_dynamic = word.dynamic && git_dynamic_fragments(basename, dialect).len() > 1;
+    GitSemanticWord {
+        decoded: basename.to_string(),
+        dynamic: basename_dynamic,
+        may_split: word.may_split,
+    }
+}
+
+fn git_semantic_executable_may_equal(
+    word: &GitSemanticWord,
+    dialect: ShellDialect,
+    candidate: &str,
+) -> bool {
+    let word = git_semantic_executable_basename(word, dialect);
+    git_symbolic_word_may_equal(&word, dialect, candidate, true)
+}
+
+/// [`git_semantic_word_is_unbounded`], judged on the executable-name view. The
+/// path separator says nothing about which program the basename resolves to,
+/// so `/*` supplies exactly as little Git evidence as a bare `*` (#360).
+fn git_semantic_executable_is_unbounded(word: &GitSemanticWord, dialect: ShellDialect) -> bool {
+    git_semantic_word_is_unbounded(&git_semantic_executable_basename(word, dialect), dialect)
+}
+
+fn decode_git_semantic_words(command: &str, dialect: ShellDialect) -> Option<DecodedGitWords> {
+    let tokens = tokenize_for_shell_dialect(command, dialect);
+    if tokens
+        .iter()
+        .any(|token| token.kind == NormalizeTokenKind::Separator)
+    {
+        return None;
+    }
+    let over_limit = tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .count()
+        > MAX_GIT_SEMANTIC_TOKENS;
+    let mut decoder = ShellTokenDecoder::new(dialect);
+    let mut powershell_literal = false;
+    let words = tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .take(MAX_GIT_SEMANTIC_TOKENS)
+        .map(|token| {
+            let raw = token.text(command)?;
+            let decoded = decoder.decode(raw, ShellTokenRole::Syntax);
+            let Some(decoded) = decoded else {
+                powershell_literal = true;
+                return Some(None);
+            };
+            let dynamic = !powershell_literal && git_token_has_active_expansion(raw, dialect);
+            let may_split = dynamic && git_token_expansion_may_split(raw, dialect);
+            Some(Some(GitSemanticWord {
+                decoded: decoded.into_owned(),
+                dynamic,
+                may_split,
+            }))
+        })
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect();
+    Some(DecodedGitWords { words, over_limit })
+}
+
+fn git_semantic_command(command: &str, dialect: ShellDialect) -> std::borrow::Cow<'_, str> {
+    let command = command.trim();
+    let (command, _) = command_after_posix_control_prefixes(command, dialect);
+    let command = if dialect == ShellDialect::PowerShell {
+        let command = crate::normalize::powershell_assignment_rhs(command).unwrap_or(command);
+        command
+            .strip_prefix('&')
+            .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))
+            .map(str::trim_start)
+            .unwrap_or(command)
+    } else {
+        command
+    };
+    if dialect == ShellDialect::Posix {
+        crate::normalize::strip_wrapper_prefixes(command).normalized
+    } else {
+        std::borrow::Cow::Borrowed(command)
+    }
+}
+
+fn powershell_call_expression(command: &str) -> bool {
+    command
+        .trim_start()
+        .strip_prefix('&')
+        .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))
+        .map(str::trim_start)
+        .is_some_and(|rest| {
+            rest.starts_with('(') || rest.starts_with("$(") || rest.starts_with("@(")
+        })
+}
+
+/// Return whether a caller-proven PowerShell statement is an expression
+/// statement that cannot invoke its first token as a command.
+///
+/// PowerShell only invokes a statement whose first token is a bare word or a
+/// path. When the first token is a quoted string, a variable, or an array /
+/// hashtable expression (`"…"`, `'…'`, `$…`, `@…`), the statement parses as an
+/// expression and a trailing bare argument is a parse error — `"$tool" build`
+/// cannot execute `$tool`. Invoking a dynamic name requires the call or
+/// dot-source operator (`& $tool …` / `. $tool …`), which callers detect
+/// before this check. Statements containing a subexpression (`$(…)` / `@(…)`)
+/// are excluded: those evaluate their embedded pipeline even inside an
+/// expression statement, so they must keep the conservative treatment.
+fn powershell_expression_statement_without_subexpression(statement: &str) -> bool {
+    let trimmed = statement.trim_start();
+    matches!(trimmed.as_bytes().first(), Some(b'"' | b'\'' | b'$' | b'@'))
+        && !trimmed.contains("$(")
+        && !trimmed.contains("@(")
+}
+
+fn powershell_dynamic_call_operator(command: &str) -> bool {
+    command
+        .trim_start()
+        .strip_prefix('&')
+        .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))
+        .map(str::trim_start)
+        .is_some_and(|rest| {
+            rest.starts_with('$') || rest.starts_with("@(") || rest.starts_with('(')
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PowerShellCallTarget {
+    Git,
+    GitBranch,
+    NonGit,
+    Dynamic,
+}
+
+struct PowerShellStaticExecutableParser<'a> {
+    expression: &'a str,
+    index: usize,
+    terms: usize,
+}
+
+impl<'a> PowerShellStaticExecutableParser<'a> {
+    fn new(expression: &'a str) -> Self {
+        Self {
+            expression,
+            index: 0,
+            terms: 0,
+        }
+    }
+
+    fn skip_whitespace(&mut self) {
+        while let Some(character) = self.expression[self.index..].chars().next() {
+            if !character.is_whitespace() {
+                break;
+            }
+            self.index += character.len_utf8();
+        }
+    }
+
+    fn parse(mut self) -> Result<String, ()> {
+        if self.expression.len() > MAX_GIT_SEMANTIC_BYTES {
+            return Err(());
+        }
+        self.skip_whitespace();
+        let value = self.parse_concatenation(0)?;
+        self.skip_whitespace();
+        (self.index == self.expression.len())
+            .then_some(value)
+            .ok_or(())
+    }
+
+    fn parse_concatenation(&mut self, depth: usize) -> Result<String, ()> {
+        if depth > MAX_GIT_ALIAS_DEPTH {
+            return Err(());
+        }
+        let mut value = self.parse_primary(depth)?;
+        loop {
+            self.skip_whitespace();
+            if self.expression.as_bytes().get(self.index) != Some(&b'+') {
+                return Ok(value);
+            }
+            self.index += 1;
+            self.skip_whitespace();
+            let suffix = self.parse_primary(depth)?;
+            if value.len().saturating_add(suffix.len()) > MAX_GIT_SEMANTIC_BYTES {
+                return Err(());
+            }
+            value.push_str(&suffix);
+        }
+    }
+
+    fn parse_primary(&mut self, depth: usize) -> Result<String, ()> {
+        self.skip_whitespace();
+        self.terms = self.terms.saturating_add(1);
+        if self.terms > MAX_GIT_SEMANTIC_TOKENS {
+            return Err(());
+        }
+        match self.expression.as_bytes().get(self.index).copied() {
+            Some(b'\'') => self.parse_single_quoted(),
+            Some(b'"') => self.parse_double_quoted(),
+            Some(b'(') => {
+                self.index += 1;
+                let value = self.parse_concatenation(depth + 1)?;
+                self.skip_whitespace();
+                if self.expression.as_bytes().get(self.index) != Some(&b')') {
+                    return Err(());
+                }
+                self.index += 1;
+                Ok(value)
+            }
+            _ => Err(()),
+        }
+    }
+
+    fn parse_single_quoted(&mut self) -> Result<String, ()> {
+        self.index += 1;
+        let mut value = String::new();
+        while self.index < self.expression.len() {
+            let character = self.expression[self.index..].chars().next().ok_or(())?;
+            if character == '\'' {
+                if self.expression.as_bytes().get(self.index + 1) == Some(&b'\'') {
+                    value.push('\'');
+                    self.index += 2;
+                    continue;
+                }
+                self.index += 1;
+                return Ok(value);
+            }
+            value.push(character);
+            self.index += character.len_utf8();
+        }
+        Err(())
+    }
+
+    fn parse_double_quoted(&mut self) -> Result<String, ()> {
+        self.index += 1;
+        let mut value = String::new();
+        while self.index < self.expression.len() {
+            let character = self.expression[self.index..].chars().next().ok_or(())?;
+            match character {
+                '"' => {
+                    self.index += 1;
+                    return Ok(value);
+                }
+                '$' => return Err(()),
+                '`' => {
+                    self.index += 1;
+                    let escaped = self.expression[self.index..].chars().next().ok_or(())?;
+                    self.index += escaped.len_utf8();
+                    match escaped {
+                        '0' => value.push('\0'),
+                        'a' => value.push('\u{0007}'),
+                        'b' => value.push('\u{0008}'),
+                        'e' => value.push('\u{001b}'),
+                        'f' => value.push('\u{000c}'),
+                        'n' => value.push('\n'),
+                        'r' => value.push('\r'),
+                        't' => value.push('\t'),
+                        'v' => value.push('\u{000b}'),
+                        '\n' => {}
+                        '\r' if self.expression.as_bytes().get(self.index) == Some(&b'\n') => {
+                            self.index += 1;
+                        }
+                        other => value.push(other),
+                    }
+                }
+                other => {
+                    value.push(other);
+                    self.index += other.len_utf8();
+                }
+            }
+        }
+        Err(())
+    }
+}
+
+fn powershell_call_expression_parts(command: &str) -> Option<(&str, &str)> {
+    let rest = command
+        .trim_start()
+        .strip_prefix('&')
+        .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))?
+        .trim_start();
+    let open = if rest.starts_with("$(") || rest.starts_with("@(") {
+        1
+    } else if rest.starts_with('(') {
+        0
+    } else {
+        return None;
+    };
+    let mut depth = 0usize;
+    let mut single = false;
+    let mut double = false;
+    let mut escaped = false;
+    for (index, character) in rest.char_indices().skip(open) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '`' && !single {
+            escaped = true;
+            continue;
+        }
+        if character == '\'' && !double {
+            single = !single;
+            continue;
+        }
+        if character == '"' && !single {
+            double = !double;
+            continue;
+        }
+        if single || double {
+            continue;
+        }
+        match character {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    let expression_end = index + character.len_utf8();
+                    let tail = powershell_postfix_expression_tail(
+                        rest.get(expression_end..)?.trim_start(),
+                    )?;
+                    return Some((rest.get(..expression_end)?, tail));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn powershell_call_target(command: &str) -> PowerShellCallTarget {
+    let Some((executable, _)) = powershell_static_call_executable(command) else {
+        return PowerShellCallTarget::Dynamic;
+    };
+    let Some(executable) = executable else {
+        return PowerShellCallTarget::Dynamic;
+    };
+    let basename = executable
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&executable)
+        .to_ascii_lowercase();
+    match basename.as_str() {
+        "git" | "git.exe" => PowerShellCallTarget::Git,
+        "git-branch" | "git-branch.exe" => PowerShellCallTarget::GitBranch,
+        _ => PowerShellCallTarget::NonGit,
+    }
+}
+
+/// Decode a statement-leading PowerShell call-operator expression when its
+/// executable is assembled entirely from bounded string literals.
+///
+/// `None` means the command is not a structurally complete expression-form
+/// call. `Some((None, tail))` means it is a call but the target depends on
+/// runtime state. The generic result is shared with other semantic packs so a
+/// statically known non-target command is not mistaken for a protected tool
+/// merely because its data arguments contain protected text.
+pub(crate) fn powershell_static_call_executable(command: &str) -> Option<(Option<String>, &str)> {
+    let (expression, tail) = powershell_call_expression_parts(command)?;
+    let expression = expression
+        .strip_prefix('$')
+        .or_else(|| expression.strip_prefix('@'))
+        .unwrap_or(expression);
+    let executable = PowerShellStaticExecutableParser::new(expression)
+        .parse()
+        .ok();
+    Some((executable, tail))
+}
+
+fn powershell_call_expression_tail(command: &str) -> Option<&str> {
+    powershell_call_expression_parts(command).map(|(_, tail)| tail)
+}
+
+fn powershell_postfix_expression_tail(mut tail: &str) -> Option<&str> {
+    while tail.starts_with('[') {
+        let mut depth = 0usize;
+        let mut single = false;
+        let mut double = false;
+        let mut escaped = false;
+        let mut end = None;
+        for (index, ch) in tail.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '`' && !single {
+                escaped = true;
+                continue;
+            }
+            if ch == '\'' && !double {
+                single = !single;
+                continue;
+            }
+            if ch == '"' && !single {
+                double = !double;
+                continue;
+            }
+            if single || double {
+                continue;
+            }
+            match ch {
+                '[' => depth += 1,
+                ']' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        end = Some(index + ch.len_utf8());
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        tail = tail.get(end?..)?.trim_start();
+    }
+    Some(tail)
+}
+
+fn alias_name_from_key(key: &str) -> Option<&str> {
+    let prefix = key.get(..6)?;
+    prefix.eq_ignore_ascii_case("alias.").then_some(&key[6..])
+}
+
+fn push_visible_alias_definition(
+    definitions: &mut Vec<VisibleAliasDefinition>,
+    config: &str,
+    dynamic: bool,
+    dialect: ShellDialect,
+) {
+    let Some((key, value)) = config.split_once('=') else {
+        if dynamic {
+            definitions.push(VisibleAliasDefinition {
+                name: None,
+                value: VisibleAliasValue::Dynamic,
+            });
+        }
+        return;
+    };
+    let Some(name) = alias_name_from_key(key) else {
+        if dynamic {
+            definitions.push(VisibleAliasDefinition {
+                name: None,
+                value: VisibleAliasValue::Dynamic,
+            });
+        }
+        return;
+    };
+    if name.is_empty() {
+        return;
+    }
+    let key_dynamic = dynamic && git_dynamic_fragments(key, dialect).len() > 1;
+    let value_dynamic = dynamic && git_dynamic_fragments(value, dialect).len() > 1;
+    definitions.push(VisibleAliasDefinition {
+        name: (!key_dynamic).then(|| name.to_string()),
+        value: if value_dynamic {
+            VisibleAliasValue::Dynamic
+        } else {
+            VisibleAliasValue::Static(value.to_string())
+        },
+    });
+}
+
+fn environment_get<'a>(
+    environment: &'a HashMap<String, EnvironmentValue>,
+    name: &str,
+    dialect: ShellDialect,
+) -> Option<&'a EnvironmentValue> {
+    environment.get(name).or_else(|| {
+        matches!(dialect, ShellDialect::PowerShell | ShellDialect::Cmd)
+            .then(|| {
+                environment
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                    .map(|(_, value)| value)
+            })
+            .flatten()
+    })
+}
+
+fn visible_environment_alias_definitions(
+    environment: &HashMap<String, EnvironmentValue>,
+    dialect: ShellDialect,
+) -> Vec<VisibleAliasDefinition> {
+    let Some(count) = environment_get(environment, "GIT_CONFIG_COUNT", dialect) else {
+        return Vec::new();
+    };
+    if count.dynamic {
+        return vec![VisibleAliasDefinition {
+            name: None,
+            value: VisibleAliasValue::Dynamic,
+        }];
+    }
+    let Ok(count) = count.value.parse::<usize>() else {
+        // Git rejects a malformed count before invoking an alias.
+        return Vec::new();
+    };
+
+    let mut indexed = Vec::new();
+    for (variable, key) in environment {
+        let Some(index) = variable
+            .strip_prefix("GIT_CONFIG_KEY_")
+            .and_then(|suffix| suffix.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        if index >= count {
+            continue;
+        }
+        let value_name = format!("GIT_CONFIG_VALUE_{index}");
+        let Some(value) = environment_get(environment, &value_name, dialect) else {
+            continue;
+        };
+        indexed.push((index, key, value));
+    }
+    indexed.sort_unstable_by_key(|(index, _, _)| *index);
+
+    let mut definitions = Vec::new();
+    for (_, key, value) in indexed {
+        let dynamic = key.dynamic || value.dynamic;
+        push_visible_alias_definition(
+            &mut definitions,
+            &format!("{}={}", key.value, value.value),
+            dynamic,
+            dialect,
+        );
+    }
+    definitions
+}
+
+fn push_config_env_alias_definition(
+    definitions: &mut Vec<VisibleAliasDefinition>,
+    environment: &HashMap<String, EnvironmentValue>,
+    config_env: &GitSemanticWord,
+    dialect: ShellDialect,
+) -> bool {
+    let Some((key, variable)) = config_env.decoded.split_once('=') else {
+        if config_env.dynamic {
+            definitions.push(VisibleAliasDefinition {
+                name: None,
+                value: VisibleAliasValue::Dynamic,
+            });
+            return true;
+        }
+        return false;
+    };
+    let Some(value) = environment_get(environment, variable, dialect) else {
+        // Git exits before dispatch when --config-env names a missing value.
+        return false;
+    };
+    push_visible_alias_definition(
+        definitions,
+        &format!("{key}={}", value.value),
+        config_env.dynamic || value.dynamic,
+        dialect,
+    );
+    true
+}
+
+fn lookup_visible_alias<'a>(
+    definitions: &'a [VisibleAliasDefinition],
+    name: &str,
+) -> Option<&'a VisibleAliasValue> {
+    definitions.iter().rev().find_map(|definition| {
+        definition
+            .name
+            .as_deref()
+            .is_none_or(|candidate| candidate.eq_ignore_ascii_case(name))
+            .then_some(&definition.value)
+    })
+}
+
+/// Return whether a shell-alias body combines a POSIX function definition
+/// with positional-parameter expansion.
+///
+/// Git appends alias arguments to a shell alias's final command.  The nested
+/// evaluator can reason about direct uses such as `!git branch "$@"`, but it
+/// deliberately does not execute shell function definitions.  Consequently,
+/// a wrapper such as `!f() { git branch "$@"; }; f` crosses that evaluator's
+/// data-flow boundary: the arguments appended to `f` are invisible while its
+/// body is inspected.  Treat that uncommon, fully general shell construct as
+/// unverified rather than silently dropping the argument flow.
+fn shell_alias_args_cross_function_scope(shell_body: &str) -> bool {
+    let bytes = shell_body.as_bytes();
+    let mut index = 0usize;
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut escaped = false;
+    let mut has_positional_expansion = false;
+    let mut has_function_definition = false;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if byte == b'\\' && !single_quoted {
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if byte == b'\'' && !double_quoted {
+            single_quoted = !single_quoted;
+            index += 1;
+            continue;
+        }
+        if byte == b'"' && !single_quoted {
+            double_quoted = !double_quoted;
+            index += 1;
+            continue;
+        }
+        if single_quoted {
+            index += 1;
+            continue;
+        }
+
+        if byte == b'$' {
+            let tail = &bytes[index + 1..];
+            has_positional_expansion |= matches!(tail.first(), Some(b'@' | b'*' | b'0'..=b'9'))
+                || tail.first() == Some(&b'{')
+                    && matches!(tail.get(1), Some(b'@' | b'*' | b'0'..=b'9'));
+        }
+
+        if !double_quoted && byte == b'(' && bytes.get(index + 1) == Some(&b')') {
+            let mut name_end = index;
+            while name_end > 0 && bytes[name_end - 1].is_ascii_whitespace() {
+                name_end -= 1;
+            }
+            let mut name_start = name_end;
+            while name_start > 0
+                && (bytes[name_start - 1].is_ascii_alphanumeric() || bytes[name_start - 1] == b'_')
+            {
+                name_start -= 1;
+            }
+            let mut body_start = index + 2;
+            while bytes.get(body_start).is_some_and(u8::is_ascii_whitespace) {
+                body_start += 1;
+            }
+            has_function_definition |=
+                name_start < name_end && bytes.get(body_start) == Some(&b'{');
+        }
+
+        index += 1;
+    }
+
+    has_positional_expansion && has_function_definition
+}
+
+fn resolve_visible_alias_invocation(
+    definitions: &[VisibleAliasDefinition],
+    mut command: String,
+    mut arguments: Vec<String>,
+) -> InvokedGitAliasDecision {
+    let mut visited = HashSet::new();
+    for _ in 0..MAX_GIT_ALIAS_DEPTH {
+        if is_known_git_command(&command) {
+            return InvokedGitAliasDecision::Expanded(ExpandedGitAlias {
+                subcommand: command,
+                arguments,
+            });
+        }
+        if !visited.insert(command.clone()) {
+            return InvokedGitAliasDecision::Unverified;
+        }
+        let Some(alias) = lookup_visible_alias(definitions, &command) else {
+            // Git next consults repository/global aliases and external
+            // `git-<command>` helpers. A pure parser cannot prove either
+            // runtime namespace safe, so unknown *name-shaped* subcommands
+            // are the explicit zero-false-negative boundary. A token Git's
+            // dispatch could never accept (shell punctuation glued on by a
+            // cross-dialect tokenizer view, e.g. the Cmd reading of POSIX
+            // `git pull; done`) is a Git usage error, not a possible alias
+            // (issue #250).
+            if !git_subcommand_token_is_dispatchable(&command) {
+                return InvokedGitAliasDecision::NoMatch;
+            }
+            return InvokedGitAliasDecision::Unverified;
+        };
+        let VisibleAliasValue::Static(alias) = alias else {
+            return InvokedGitAliasDecision::Unverified;
+        };
+        if let Some(shell_body) = alias.strip_prefix('!') {
+            if !arguments.is_empty() && shell_alias_args_cross_function_scope(shell_body) {
+                return InvokedGitAliasDecision::Unverified;
+            }
+            return InvokedGitAliasDecision::Shell(InvokedGitShellAlias {
+                shell_body: shell_body.to_string(),
+                invoked_args: arguments,
+            });
+        }
+        let Ok(mut replacement) = shell_words::split(alias) else {
+            // Malformed non-shell aliases are rejected by Git itself.
+            return InvokedGitAliasDecision::NoMatch;
+        };
+        if replacement.is_empty() {
+            return InvokedGitAliasDecision::NoMatch;
+        }
+        command = replacement.remove(0);
+        replacement.extend(arguments);
+        arguments = replacement;
+    }
+    InvokedGitAliasDecision::Unverified
+}
+
+/// Whether a token could ever reach Git's subcommand dispatch (a builtin, an
+/// `alias.<name>` config key, or an external `git-<name>` helper).
+///
+/// Git config key names only allow ASCII alphanumerics and `-`, and helper
+/// names are ordinary executable filenames; a token carrying shell
+/// punctuation such as `;`, quotes, or redirection glyphs is a cross-dialect
+/// tokenizer artifact (e.g. the Cmd view of POSIX `git pull; done`, where
+/// `;` is not a separator), not a candidate alias — Git itself would reject
+/// it as a usage error. Treating such tokens as "possibly aliased" turned
+/// every `git <sub>; …` compound into a false `git-alias-semantic-unverified`
+/// deny under `ShellDialect::Unknown` (issue #250).
+fn git_subcommand_token_is_dispatchable(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-'))
+}
+
+/// Whether a token is a Git global option that carries a *path* value glued to
+/// the option name (`-C<path>`, `--git-dir=<path>`, …).
+///
+/// The option name is literal text, so a runtime expansion inside such a token
+/// can only make the path unresolvable — never the subcommand, and never an
+/// `alias.*` definition. `--exec-path=` is deliberately absent: it redirects
+/// where Git looks for `git-<name>` helpers, so a dynamic value there really
+/// can change what dispatch runs.
+fn git_attached_path_option_prefix(token: &str) -> bool {
+    (token.starts_with("-C") && token.len() > 2)
+        || [
+            "--git-dir=",
+            "--work-tree=",
+            "--namespace=",
+            "--super-prefix=",
+            "--attr-source=",
+            "--shallow-file=",
+        ]
+        .iter()
+        .any(|prefix| token.starts_with(prefix))
+}
+
+fn is_known_git_command(command: &str) -> bool {
+    matches!(
+        command,
+        "add"
+            | "am"
+            | "annotate"
+            | "apply"
+            | "archive"
+            | "archimport"
+            | "backfill"
+            | "bisect"
+            | "blame"
+            | "branch"
+            | "bugreport"
+            | "bundle"
+            | "cat-file"
+            | "check-attr"
+            | "check-ignore"
+            | "check-mailmap"
+            | "check-ref-format"
+            | "checkout"
+            | "checkout-index"
+            | "cherry"
+            | "cherry-pick"
+            | "citool"
+            | "clean"
+            | "clone"
+            | "column"
+            | "commit"
+            | "commit-graph"
+            | "commit-tree"
+            | "config"
+            | "count-objects"
+            | "credential"
+            | "credential-cache"
+            | "credential-store"
+            | "cvsimport"
+            | "cvsexportcommit"
+            | "cvsserver"
+            | "daemon"
+            | "describe"
+            | "diagnose"
+            | "diff"
+            | "diff-files"
+            | "diff-index"
+            | "diff-pairs"
+            | "diff-tree"
+            | "difftool"
+            | "fast-export"
+            | "fast-import"
+            | "fetch"
+            | "fetch-pack"
+            | "filter-branch"
+            | "fmt-merge-msg"
+            | "for-each-ref"
+            | "for-each-repo"
+            | "format-patch"
+            | "fsck"
+            | "gc"
+            | "get-tar-commit-id"
+            | "gitk"
+            | "gitweb"
+            | "grep"
+            | "gui"
+            | "hash-object"
+            | "help"
+            | "history"
+            | "hook"
+            | "http-backend"
+            | "imap-send"
+            | "index-pack"
+            | "init"
+            | "instaweb"
+            | "interpret-trailers"
+            | "last-modified"
+            // `git lfs` is not a builtin but is the canonical spelling of the
+            // Git LFS helper (`git-lfs` on PATH), so Git dispatches it without
+            // consulting `alias.lfs`. Treating it as an unverifiable alias
+            // denied every read-only `git lfs ls-files` / `status` / `fetch`
+            // (Refs PR #383). Its own destructive verbs — `migrate`, `prune`,
+            // `uninstall` — carry dedicated rules below, so recognising the
+            // subcommand here is not a coverage loss.
+            | "lfs"
+            | "log"
+            | "ls-files"
+            | "ls-remote"
+            | "ls-tree"
+            | "mailinfo"
+            | "mailsplit"
+            | "maintenance"
+            | "merge"
+            | "merge-base"
+            | "merge-file"
+            | "merge-index"
+            | "merge-one-file"
+            | "merge-tree"
+            | "mergetool"
+            | "mktag"
+            | "mktree"
+            | "multi-pack-index"
+            | "mv"
+            | "name-rev"
+            | "notes"
+            | "p4"
+            | "pack-objects"
+            | "pack-redundant"
+            | "pack-refs"
+            | "patch-id"
+            | "prune"
+            | "prune-packed"
+            | "pull"
+            | "push"
+            | "quiltimport"
+            | "range-diff"
+            | "read-tree"
+            | "rebase"
+            | "reflog"
+            | "refs"
+            | "remote"
+            | "repack"
+            | "replace"
+            | "replay"
+            | "repo"
+            | "request-pull"
+            | "rerere"
+            | "reset"
+            | "restore"
+            | "rev-list"
+            | "rev-parse"
+            | "revert"
+            | "rm"
+            | "scalar"
+            | "send-email"
+            | "send-pack"
+            | "sh-i18n"
+            | "sh-setup"
+            | "shortlog"
+            | "show"
+            | "show-branch"
+            | "show-index"
+            | "show-ref"
+            | "sparse-checkout"
+            | "stash"
+            | "status"
+            | "stripspace"
+            | "submodule"
+            | "svn"
+            | "switch"
+            | "symbolic-ref"
+            | "tag"
+            | "unpack-file"
+            | "unpack-objects"
+            | "update-index"
+            | "update-ref"
+            | "update-server-info"
+            | "var"
+            | "verify-commit"
+            | "verify-pack"
+            | "verify-tag"
+            | "version"
+            | "whatchanged"
+            | "worktree"
+            | "write-tree"
+    )
+}
+
+fn invoked_git_alias_segment_in_dialect(
+    command: &str,
+    dialect: ShellDialect,
+) -> InvokedGitAliasDecision {
+    let powershell_expression =
+        dialect == ShellDialect::PowerShell && powershell_call_expression(command);
+    if powershell_expression
+        && powershell_call_target(command) != PowerShellCallTarget::NonGit
+        && (command.to_ascii_lowercase().contains("alias.")
+            || command.to_ascii_uppercase().contains("GIT_CONFIG_"))
+    {
+        return InvokedGitAliasDecision::Unverified;
+    }
+    let command = git_semantic_command(command, dialect);
+    let Some(decoded) = decode_git_semantic_words(&command, dialect) else {
+        return InvokedGitAliasDecision::NoMatch;
+    };
+    if decoded.over_limit {
+        return InvokedGitAliasDecision::Unverified;
+    }
+    let words = decoded.words;
+    let mut environment = HashMap::new();
+    let mut index = 0usize;
+    while let Some(word) = words.get(index) {
+        if !word.dynamic && crate::normalize::is_env_assignment(&word.decoded) {
+            if let Some((name, value)) = word.decoded.split_once('=') {
+                environment.insert(
+                    name.to_string(),
+                    EnvironmentValue {
+                        value: value.to_string(),
+                        dynamic: false,
+                    },
+                );
+            }
+            index += 1;
+            continue;
+        }
+        if word.dynamic && word.decoded.contains('=') && !word.decoded.starts_with('=') {
+            if let Some((name, value)) = word.decoded.split_once('=') {
+                environment.insert(
+                    name.to_string(),
+                    EnvironmentValue {
+                        value: value.to_string(),
+                        dynamic: true,
+                    },
+                );
+                index += 1;
+                continue;
+            }
+        }
+        if dialect == ShellDialect::Cmd {
+            let executable = word.decoded.trim_start_matches('@');
+            if executable.eq_ignore_ascii_case("call") {
+                index += 1;
+                continue;
+            }
+        }
+        if !word.dynamic && matches!(word.decoded.as_str(), "exec" | "time" | "nohup" | "!") {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+
+    let Some(executable) = words.get(index) else {
+        return InvokedGitAliasDecision::NoMatch;
+    };
+    if executable.dynamic {
+        let visible_alias_syntax = command.to_ascii_lowercase().contains("alias.")
+            || command.to_ascii_uppercase().contains("GIT_CONFIG_")
+            || command.contains("--config-env");
+        return if visible_alias_syntax
+            && (git_semantic_executable_may_equal(executable, dialect, "git")
+                || git_semantic_executable_may_equal(executable, dialect, "git.exe"))
+        {
+            InvokedGitAliasDecision::Unverified
+        } else {
+            InvokedGitAliasDecision::NoMatch
+        };
+    }
+    if !git_semantic_executable_may_equal(executable, dialect, "git")
+        && !git_semantic_executable_may_equal(executable, dialect, "git.exe")
+    {
+        return InvokedGitAliasDecision::NoMatch;
+    }
+
+    let mut definitions = visible_environment_alias_definitions(&environment, dialect);
+    index += 1;
+    loop {
+        let Some(word) = words.get(index) else {
+            return InvokedGitAliasDecision::NoMatch;
+        };
+        // A dynamic *value* glued to a statically visible path option
+        // (`-C$dir`, `--git-dir=$d/.git`) says nothing about which subcommand
+        // Git will dispatch: the option name is literal, and only the path it
+        // names is unresolvable. Alias resolution depends on the subcommand
+        // word, so it can continue (issue #405). A bare dynamic word here is
+        // still unverifiable — it could expand to `-c alias.st=!rm -rf .`.
+        if word.dynamic && git_attached_path_option_prefix(&word.decoded) {
+            index += 1;
+            continue;
+        }
+        if word.dynamic {
+            return InvokedGitAliasDecision::Unverified;
+        }
+        let token = word.decoded.as_str();
+        if matches!(
+            token,
+            "-v" | "--version"
+                | "-h"
+                | "--help"
+                | "--exec-path"
+                | "--html-path"
+                | "--man-path"
+                | "--info-path"
+                | "help"
+        ) || token.starts_with("--list-cmds=")
+        {
+            return InvokedGitAliasDecision::NoMatch;
+        }
+        if matches!(
+            token,
+            "-p" | "--paginate"
+                | "-P"
+                | "--no-pager"
+                | "--bare"
+                | "--no-replace-objects"
+                | "--literal-pathspecs"
+                | "--no-literal-pathspecs"
+                | "--glob-pathspecs"
+                | "--noglob-pathspecs"
+                | "--icase-pathspecs"
+                | "--no-optional-locks"
+                | "--no-lazy-fetch"
+                | "--no-advice"
+        ) {
+            index += 1;
+            continue;
+        }
+        if token == "-c" {
+            let Some(config) = words.get(index + 1) else {
+                return InvokedGitAliasDecision::NoMatch;
+            };
+            push_visible_alias_definition(
+                &mut definitions,
+                &config.decoded,
+                config.dynamic,
+                dialect,
+            );
+            index += 2;
+            continue;
+        }
+        if token == "--config-env" {
+            let Some(config_env) = words.get(index + 1) else {
+                return InvokedGitAliasDecision::NoMatch;
+            };
+            if !push_config_env_alias_definition(
+                &mut definitions,
+                &environment,
+                config_env,
+                dialect,
+            ) {
+                return InvokedGitAliasDecision::NoMatch;
+            }
+            index += 2;
+            continue;
+        }
+        if matches!(
+            token,
+            "-C" | "--git-dir"
+                | "--work-tree"
+                | "--namespace"
+                | "--super-prefix"
+                | "--shallow-file"
+                | "--attr-source"
+        ) {
+            if words.get(index + 1).is_none() {
+                // The option is the last word, so Git would reject the
+                // invocation before dispatching anything.
+                return InvokedGitAliasDecision::NoMatch;
+            }
+            // A dynamic, field-splitting path (`git -C $d status`) used to end
+            // the walk here, which denied every read-only `git -C $d status` /
+            // `git -C $r log` in a directory loop as an unverifiable alias
+            // (issue #405). The path is not an alias, and the subcommand that
+            // *is* one stays visible: keep walking and let the subcommand
+            // decide. A builtin (`status`, `log`) resolves to `NoMatch`, its
+            // own pack rules still see the command, and a non-builtin word
+            // still falls through to `resolve_visible_alias_invocation`, which
+            // returns `Unverified` for an alias it cannot resolve.
+            index += 2;
+            continue;
+        }
+        if let Some(config) = token.strip_prefix("-c").filter(|value| !value.is_empty()) {
+            push_visible_alias_definition(&mut definitions, config, false, dialect);
+            index += 1;
+            continue;
+        }
+        if let Some(config_env) = token.strip_prefix("--config-env=") {
+            if !push_config_env_alias_definition(
+                &mut definitions,
+                &environment,
+                &GitSemanticWord {
+                    decoded: config_env.to_string(),
+                    dynamic: false,
+                    may_split: false,
+                },
+                dialect,
+            ) {
+                return InvokedGitAliasDecision::NoMatch;
+            }
+            index += 1;
+            continue;
+        }
+        if token.starts_with("-C")
+            || [
+                "--exec-path=",
+                "--git-dir=",
+                "--work-tree=",
+                "--namespace=",
+                "--super-prefix=",
+                "--attr-source=",
+            ]
+            .iter()
+            .any(|prefix| token.starts_with(prefix))
+        {
+            index += 1;
+            continue;
+        }
+        if token == "--" {
+            index += 1;
+            break;
+        }
+        if token.starts_with('-') {
+            // Git rejects unknown global options before alias dispatch.
+            return InvokedGitAliasDecision::NoMatch;
+        }
+        break;
+    }
+
+    let Some(invoked) = words.get(index) else {
+        return InvokedGitAliasDecision::NoMatch;
+    };
+    if invoked.dynamic {
+        return InvokedGitAliasDecision::Unverified;
+    }
+    if is_known_git_command(&invoked.decoded) {
+        return InvokedGitAliasDecision::NoMatch;
+    }
+    let command = invoked.decoded.clone();
+    let mut arguments = Vec::new();
+    for argument in words.iter().skip(index + 1) {
+        if argument.dynamic {
+            return InvokedGitAliasDecision::Unverified;
+        }
+        arguments.push(argument.decoded.clone());
+    }
+    resolve_visible_alias_invocation(&definitions, command, arguments)
+}
+
+fn static_git_executable_index(words: &[GitSemanticWord], dialect: ShellDialect) -> Option<usize> {
+    let mut index = 0usize;
+    while let Some(word) = words.get(index) {
+        if word.dynamic {
+            return None;
+        }
+        if crate::normalize::is_env_assignment(&word.decoded)
+            || matches!(word.decoded.as_str(), "exec" | "time" | "nohup" | "!")
+        {
+            index += 1;
+            continue;
+        }
+        if dialect == ShellDialect::Cmd
+            && (word.decoded.trim_start_matches('@').is_empty()
+                || word
+                    .decoded
+                    .trim_start_matches('@')
+                    .eq_ignore_ascii_case("call"))
+        {
+            index += 1;
+            continue;
+        }
+        return (git_semantic_executable_may_equal(word, dialect, "git")
+            || git_semantic_executable_may_equal(word, dialect, "git.exe"))
+        .then_some(index);
+    }
+    None
+}
+
+fn static_git_subcommand_index(words: &[GitSemanticWord], mut index: usize) -> Option<usize> {
+    while let Some(word) = words.get(index) {
+        if word.dynamic {
+            return None;
+        }
+        let token = word.decoded.as_str();
+        if matches!(
+            token,
+            "-v" | "--version"
+                | "-h"
+                | "--help"
+                | "--exec-path"
+                | "--html-path"
+                | "--man-path"
+                | "--info-path"
+                | "help"
+        ) || token.starts_with("--list-cmds=")
+        {
+            return None;
+        }
+        if matches!(
+            token,
+            "-p" | "--paginate"
+                | "-P"
+                | "--no-pager"
+                | "--bare"
+                | "--no-replace-objects"
+                | "--literal-pathspecs"
+                | "--no-literal-pathspecs"
+                | "--glob-pathspecs"
+                | "--noglob-pathspecs"
+                | "--icase-pathspecs"
+                | "--no-optional-locks"
+                | "--no-lazy-fetch"
+                | "--no-advice"
+        ) {
+            index += 1;
+            continue;
+        }
+        if matches!(
+            token,
+            "-c" | "--config-env"
+                | "-C"
+                | "--git-dir"
+                | "--work-tree"
+                | "--namespace"
+                | "--super-prefix"
+                | "--shallow-file"
+                | "--attr-source"
+        ) {
+            if words.get(index + 1).is_none_or(|value| value.dynamic) {
+                return None;
+            }
+            index += 2;
+            continue;
+        }
+        if token.starts_with("-c")
+            || token.starts_with("-C")
+            || [
+                "--exec-path=",
+                "--git-dir=",
+                "--work-tree=",
+                "--namespace=",
+                "--super-prefix=",
+                "--config-env=",
+                "--attr-source=",
+            ]
+            .iter()
+            .any(|prefix| token.starts_with(prefix))
+        {
+            index += 1;
+            continue;
+        }
+        if token == "--" {
+            index += 1;
+            continue;
+        }
+        return (!token.starts_with('-')).then_some(index);
+    }
+    None
+}
+
+fn record_cross_segment_environment(
+    words: &[GitSemanticWord],
+    dialect: ShellDialect,
+    environment: &mut HashMap<String, EnvironmentValue>,
+    exported: &mut HashSet<String>,
+    unverified: &mut bool,
+) -> bool {
+    let powershell_environment_assignment = words
+        .first()
+        .and_then(|word| word.decoded.get(..5))
+        .is_some_and(|prefix| {
+            dialect == ShellDialect::PowerShell && prefix.eq_ignore_ascii_case("$env:")
+        });
+    if powershell_environment_assignment {
+        let assignment = words[0].decoded.get(5..).unwrap_or_default();
+        let (name, value, dynamic) = if let Some((name, value)) = assignment.split_once('=') {
+            (
+                name,
+                value.to_string(),
+                git_dynamic_fragments(value, dialect).len() > 1,
+            )
+        } else if words.get(1).map(|word| word.decoded.as_str()) == Some("=") {
+            let Some(value) = words.get(2) else {
+                if assignment.to_ascii_uppercase().starts_with("GIT_CONFIG_") {
+                    *unverified = true;
+                }
+                return true;
+            };
+            (
+                assignment,
+                value.decoded.clone(),
+                value.dynamic || words.len() > 3,
+            )
+        } else {
+            if assignment.to_ascii_uppercase().starts_with("GIT_CONFIG_") {
+                *unverified = true;
+            }
+            return true;
+        };
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            if name.to_ascii_uppercase().starts_with("GIT_CONFIG_") {
+                *unverified = true;
+            }
+            return true;
+        }
+        environment.insert(name.to_string(), EnvironmentValue { value, dynamic });
+        return true;
+    }
+
+    // POSIX preserves the export attribute across later assignments.
+    if dialect == ShellDialect::Posix
+        && !words.is_empty()
+        && words
+            .iter()
+            .all(|word| !word.dynamic && crate::normalize::is_env_assignment(&word.decoded))
+    {
+        for assignment in words {
+            let Some((name, value)) = assignment.decoded.split_once('=') else {
+                continue;
+            };
+            if exported.contains(name) {
+                environment.insert(
+                    name.to_string(),
+                    EnvironmentValue {
+                        value: value.to_string(),
+                        dynamic: false,
+                    },
+                );
+            }
+        }
+        return true;
+    }
+
+    let assignments: &[GitSemanticWord] = match dialect {
+        ShellDialect::Posix
+            if words.first().is_some_and(|word| {
+                !word.dynamic && word.decoded.eq_ignore_ascii_case("export")
+            }) =>
+        {
+            &words[1..]
+        }
+        ShellDialect::Cmd
+            if words.first().is_some_and(|word| {
+                !word.dynamic
+                    && word
+                        .decoded
+                        .trim_start_matches('@')
+                        .eq_ignore_ascii_case("set")
+            }) =>
+        {
+            &words[1..]
+        }
+        _ => return false,
+    };
+    if assignments.is_empty() {
+        return true;
+    }
+    for assignment in assignments {
+        let decoded = assignment.decoded.trim_matches('"');
+        let Some((name, value)) = decoded.split_once('=') else {
+            if dialect == ShellDialect::Posix
+                && !decoded.is_empty()
+                && decoded
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            {
+                exported.insert(decoded.to_string());
+                if decoded.to_ascii_uppercase().starts_with("GIT_CONFIG_")
+                    && !environment.contains_key(decoded)
+                {
+                    environment.insert(
+                        decoded.to_string(),
+                        EnvironmentValue {
+                            value: String::new(),
+                            dynamic: true,
+                        },
+                    );
+                }
+            } else if decoded.to_ascii_uppercase().contains("GIT_CONFIG_") {
+                *unverified = true;
+            }
+            continue;
+        };
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        {
+            if name.to_ascii_uppercase().starts_with("GIT_CONFIG_") {
+                *unverified = true;
+            }
+            continue;
+        }
+        let dynamic = assignment.dynamic;
+        if dialect == ShellDialect::Posix {
+            exported.insert(name.to_string());
+        }
+        environment.insert(
+            name.to_string(),
+            EnvironmentValue {
+                value: value.to_string(),
+                dynamic,
+            },
+        );
+    }
+    true
+}
+
+fn update_persistent_alias_definitions(
+    words: &[GitSemanticWord],
+    subcommand_index: usize,
+    definitions: &mut Vec<VisibleAliasDefinition>,
+    dialect: ShellDialect,
+) -> bool {
+    if words
+        .get(subcommand_index)
+        .map(|word| word.decoded.as_str())
+        != Some("config")
+    {
+        return false;
+    }
+    let mut index = subcommand_index + 1;
+    let mut unset = false;
+    if let Some(operation) = words.get(index).filter(|word| !word.dynamic) {
+        match operation.decoded.as_str() {
+            "set" => index += 1,
+            "unset" | "remove-section" => {
+                unset = true;
+                index += 1;
+            }
+            "get" | "get-all" | "get-regexp" | "list" | "show-origin" | "show-scope" => {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    while let Some(option) = words.get(index) {
+        if option.dynamic {
+            definitions.push(VisibleAliasDefinition {
+                name: None,
+                value: VisibleAliasValue::Dynamic,
+            });
+            return true;
+        }
+        if matches!(
+            option.decoded.as_str(),
+            "--global"
+                | "--system"
+                | "--local"
+                | "--worktree"
+                | "--replace-all"
+                | "--add"
+                | "--fixed-value"
+                | "--includes"
+                | "--no-includes"
+        ) {
+            index += 1;
+            continue;
+        }
+        if matches!(option.decoded.as_str(), "--unset" | "--unset-all") {
+            unset = true;
+            index += 1;
+            continue;
+        }
+        if matches!(
+            option.decoded.as_str(),
+            "--file" | "-f" | "--blob" | "--type" | "--default"
+        ) {
+            index += 2;
+            continue;
+        }
+        if option.decoded.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    let Some(key) = words.get(index) else {
+        return true;
+    };
+    let Some(name) = alias_name_from_key(&key.decoded) else {
+        return true;
+    };
+    if unset {
+        definitions.retain(|definition| {
+            definition
+                .name
+                .as_deref()
+                .is_none_or(|candidate| !candidate.eq_ignore_ascii_case(name))
+        });
+        return true;
+    }
+    let Some(value) = words.get(index + 1) else {
+        // `git config alias.x` is a read-only query.
+        return true;
+    };
+    push_visible_alias_definition(
+        definitions,
+        &format!("{}={}", key.decoded, value.decoded),
+        key.dynamic || value.dynamic,
+        dialect,
+    );
+    true
+}
+
+fn token_has_nested_shell_context(raw: &str, dialect: ShellDialect) -> bool {
+    match dialect {
+        ShellDialect::Posix | ShellDialect::Unknown => {
+            let mut chars = raw.chars().peekable();
+            let mut single = false;
+            let mut double = false;
+            while let Some(ch) = chars.next() {
+                match ch {
+                    '\\' if !single => {
+                        chars.next();
+                    }
+                    '\'' if !double => single = !single,
+                    '"' if !single => double = !double,
+                    '`' if !single => return true,
+                    '$' if !single && chars.peek() == Some(&'(') => return true,
+                    _ => {}
+                }
+            }
+            false
+        }
+        ShellDialect::PowerShell => {
+            let mut chars = raw.chars().peekable();
+            let mut single = false;
+            let mut double = false;
+            while let Some(ch) = chars.next() {
+                match ch {
+                    '`' if !single => {
+                        chars.next();
+                    }
+                    '\'' if !double => single = !single,
+                    '"' if !single => double = !double,
+                    '$' | '@' if !single && chars.peek() == Some(&'(') => return true,
+                    _ => {}
+                }
+            }
+            false
+        }
+        ShellDialect::Cmd => false,
+    }
+}
+
+fn shell_control_keyword(raw: &str, dialect: ShellDialect) -> bool {
+    match dialect {
+        ShellDialect::Posix => matches!(
+            raw,
+            "if" | "then"
+                | "elif"
+                | "else"
+                | "fi"
+                | "for"
+                | "while"
+                | "until"
+                | "do"
+                | "done"
+                | "case"
+                | "esac"
+                | "select"
+                | "coproc"
+                | "function"
+                | "{"
+                | "}"
+        ),
+        ShellDialect::PowerShell => matches!(
+            raw.to_ascii_lowercase().as_str(),
+            "if" | "elseif"
+                | "else"
+                | "switch"
+                | "foreach"
+                | "for"
+                | "while"
+                | "do"
+                | "until"
+                | "try"
+                | "catch"
+                | "finally"
+                | "trap"
+                | "function"
+                | "filter"
+                | "begin"
+                | "process"
+                | "end"
+                | "{"
+                | "}"
+        ),
+        ShellDialect::Cmd => matches!(raw.to_ascii_lowercase().as_str(), "if" | "else" | "for"),
+        ShellDialect::Unknown => {
+            shell_control_keyword(raw, ShellDialect::Posix)
+                || shell_control_keyword(raw, ShellDialect::PowerShell)
+                || shell_control_keyword(raw, ShellDialect::Cmd)
+        }
+    }
+}
+
+/// The cross-segment alias-state interpreter is deliberately straight-line.
+/// Any relevant mutation in a conditional, loop, function, subshell,
+/// pipeline, background job, or command substitution must therefore make a
+/// later unresolved Git invocation unverified rather than flattening a path
+/// that the executing shell may skip or isolate.
+fn command_has_conditional_control_flow(command: &str, dialect: ShellDialect) -> bool {
+    let tokens = tokenize_for_shell_dialect(command, dialect);
+    let mut command_word = true;
+    for token in &tokens {
+        let Some(raw) = token.text(command) else {
+            continue;
+        };
+        match token.kind {
+            NormalizeTokenKind::Separator => {
+                let straight_line_separator = matches!(raw, ";" | "\n" | "\r" | "\r\n")
+                    || dialect == ShellDialect::Cmd && raw == "&";
+                if !straight_line_separator {
+                    return true;
+                }
+                command_word = true;
+            }
+            NormalizeTokenKind::Word => {
+                if token_has_nested_shell_context(raw, dialect)
+                    || (command_word && shell_control_keyword(raw, dialect))
+                {
+                    return true;
+                }
+                command_word = false;
+            }
+        }
+    }
+    false
+}
+
+fn git_config_segment_mutates_alias(words: &[GitSemanticWord], subcommand_index: usize) -> bool {
+    if words
+        .get(subcommand_index)
+        .map(|word| word.decoded.as_str())
+        != Some("config")
+    {
+        return false;
+    }
+    let alias_index = words
+        .iter()
+        .enumerate()
+        .skip(subcommand_index + 1)
+        .find_map(|(index, word)| alias_name_from_key(&word.decoded).map(|_| index));
+    let Some(alias_index) = alias_index else {
+        return false;
+    };
+    words.get(alias_index + 1).is_some()
+        || words.iter().skip(subcommand_index + 1).any(|word| {
+            matches!(
+                word.decoded.as_str(),
+                "set" | "unset" | "--unset" | "--unset-all" | "--add" | "--replace-all"
+            )
+        })
+}
+
+fn cross_segment_git_alias_decision(
+    command: &str,
+    dialect: ShellDialect,
+) -> InvokedGitAliasDecision {
+    let segments = crate::packs::split_command_segments_in_dialect(command, dialect);
+    if segments.len() < 2 {
+        return InvokedGitAliasDecision::NoMatch;
+    }
+    let mut environment = HashMap::new();
+    let mut exported = HashSet::new();
+    let mut environment_unverified = false;
+    let mut persistent = Vec::new();
+    let conditional_control_flow = command_has_conditional_control_flow(command, dialect);
+    let mut conditional_alias_state = false;
+    for segment in segments {
+        // Preserve PowerShell environment assignments long enough for
+        // `record_cross_segment_environment` to consume them. Other variable
+        // assignments use their executable RHS so `$result = git ...` is
+        // analyzed as a Git invocation rather than as a dynamic lvalue.
+        let segment = if dialect == ShellDialect::PowerShell
+            && segment
+                .trim_start()
+                .get(..5)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("$env:"))
+        {
+            std::borrow::Cow::Borrowed(segment.trim())
+        } else {
+            git_semantic_command(segment, dialect)
+        };
+        let Some(decoded) = decode_git_semantic_words(&segment, dialect) else {
+            continue;
+        };
+        if decoded.over_limit {
+            return InvokedGitAliasDecision::Unverified;
+        }
+        let words = decoded.words;
+        if record_cross_segment_environment(
+            &words,
+            dialect,
+            &mut environment,
+            &mut exported,
+            &mut environment_unverified,
+        ) {
+            if conditional_control_flow
+                && words
+                    .iter()
+                    .any(|word| word.decoded.to_ascii_uppercase().contains("GIT_CONFIG_"))
+            {
+                conditional_alias_state = true;
+            }
+            continue;
+        }
+        let Some(executable_index) = static_git_executable_index(&words, dialect) else {
+            continue;
+        };
+        let Some(subcommand_index) = static_git_subcommand_index(&words, executable_index + 1)
+        else {
+            continue;
+        };
+        let mutates_alias = git_config_segment_mutates_alias(&words, subcommand_index);
+        if update_persistent_alias_definitions(&words, subcommand_index, &mut persistent, dialect) {
+            if conditional_control_flow && mutates_alias {
+                conditional_alias_state = true;
+            }
+            continue;
+        }
+
+        if conditional_alias_state
+            && !is_known_git_command(&words[subcommand_index].decoded)
+            && git_subcommand_token_is_dispatchable(&words[subcommand_index].decoded)
+        {
+            return InvokedGitAliasDecision::Unverified;
+        }
+
+        let mut definitions = persistent.clone();
+        definitions.extend(visible_environment_alias_definitions(&environment, dialect));
+        if definitions.is_empty() && !environment_unverified {
+            continue;
+        }
+        if environment_unverified
+            || words
+                .iter()
+                .skip(executable_index + 1)
+                .any(|word| word.dynamic)
+            || definitions.iter().any(|definition| {
+                definition.name.is_none() || matches!(definition.value, VisibleAliasValue::Dynamic)
+            })
+        {
+            if !is_known_git_command(&words[subcommand_index].decoded)
+                && git_subcommand_token_is_dispatchable(&words[subcommand_index].decoded)
+            {
+                return InvokedGitAliasDecision::Unverified;
+            }
+            continue;
+        }
+
+        let mut synthetic = String::new();
+        for (name, value) in &environment {
+            if value.dynamic
+                || name.is_empty()
+                || !name
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            {
+                continue;
+            }
+            synthetic.push_str(name);
+            synthetic.push('=');
+            synthetic.push_str(&shell_words::quote(&value.value));
+            synthetic.push(' ');
+        }
+        synthetic.push_str("git");
+        for definition in definitions {
+            let (Some(name), VisibleAliasValue::Static(value)) =
+                (definition.name, definition.value)
+            else {
+                continue;
+            };
+            synthetic.push_str(" -c ");
+            synthetic.push_str(&shell_words::quote(&format!("alias.{name}={value}")));
+        }
+        for word in words.iter().skip(executable_index + 1) {
+            synthetic.push(' ');
+            synthetic.push_str(&shell_words::quote(&word.decoded));
+        }
+        match invoked_git_alias_segment_in_dialect(&synthetic, ShellDialect::Posix) {
+            InvokedGitAliasDecision::NoMatch => {}
+            decision => return decision,
+        }
+    }
+    InvokedGitAliasDecision::NoMatch
+}
+
+/// Resolve aliases visible in this command: invocation-local `-c` /
+/// `--config-env` / `GIT_CONFIG_*` definitions plus earlier `git config` and
+/// exported environment mutations in the same compound shell command.
+/// Pre-existing repository/user aliases remain outside this pure parser and
+/// are covered by the unresolved-subcommand mutation guard.
+#[must_use]
+pub(crate) fn invoked_visible_git_alias_in_dialect(
+    command: &str,
+    dialect: ShellDialect,
+) -> InvokedGitAliasDecision {
+    if dialect == ShellDialect::Unknown {
+        let decisions = [
+            invoked_visible_git_alias_in_dialect(command, ShellDialect::Posix),
+            invoked_visible_git_alias_in_dialect(command, ShellDialect::PowerShell),
+            invoked_visible_git_alias_in_dialect(command, ShellDialect::Cmd),
+        ];
+        if decisions
+            .iter()
+            .any(|decision| matches!(decision, InvokedGitAliasDecision::Unverified))
+        {
+            return InvokedGitAliasDecision::Unverified;
+        }
+        let mut actionable = decisions.iter().filter(|decision| {
+            matches!(
+                decision,
+                InvokedGitAliasDecision::Shell(_) | InvokedGitAliasDecision::Expanded(_)
+            )
+        });
+        if let Some(first) = actionable.next() {
+            if actionable.all(|decision| decision == first) {
+                return first.clone();
+            }
+            return InvokedGitAliasDecision::Unverified;
+        }
+        return InvokedGitAliasDecision::NoMatch;
+    }
+    if dialect == ShellDialect::PowerShell
+        && powershell_call_expression(command)
+        && powershell_call_target(command) != PowerShellCallTarget::NonGit
+        && (command.to_ascii_lowercase().contains("alias.")
+            || command.to_ascii_uppercase().contains("GIT_CONFIG_")
+            || command.contains("--config-env"))
+    {
+        return InvokedGitAliasDecision::Unverified;
+    }
+    if command.len() > MAX_GIT_SEMANTIC_BYTES {
+        return if contains_git_ascii_case_insensitive(command)
+            || command.to_ascii_lowercase().contains("alias.")
+        {
+            InvokedGitAliasDecision::Unverified
+        } else {
+            InvokedGitAliasDecision::NoMatch
+        };
+    }
+    match cross_segment_git_alias_decision(command, dialect) {
+        InvokedGitAliasDecision::NoMatch => {}
+        decision => return decision,
+    }
+    let segments = crate::packs::split_command_segments_in_dialect(command, dialect);
+    let mut actionable = None;
+    for segment in segments {
+        match invoked_git_alias_segment_in_dialect(segment, dialect) {
+            InvokedGitAliasDecision::Unverified => return InvokedGitAliasDecision::Unverified,
+            found @ (InvokedGitAliasDecision::Shell(_) | InvokedGitAliasDecision::Expanded(_)) => {
+                if actionable.replace(found).is_some() {
+                    // Multiple visible aliases require recursive segment
+                    // evaluation rather than collapsing them into one argv.
+                    return InvokedGitAliasDecision::Unverified;
+                }
+            }
+            InvokedGitAliasDecision::NoMatch => {}
+        }
+    }
+    actionable.unwrap_or(InvokedGitAliasDecision::NoMatch)
+}
+
+fn branch_dynamic_word_may_mutate(word: &GitSemanticWord, dialect: ShellDialect) -> bool {
+    word.may_split
+        || [
+            "-d", "-D", "-f", "-M", "-C", "--d", "--de", "--del", "--dele", "--delet", "--delete",
+            "--forc", "--force",
+        ]
+        .iter()
+        .any(|candidate| git_symbolic_word_may_equal(word, dialect, candidate, false))
+}
+
+fn semantic_branch_argv_may_mutate(words: &[GitSemanticWord], dialect: ShellDialect) -> bool {
+    let mut mutation = BranchMutationState::default();
+    let mut index = 0usize;
+    while let Some(word) = words.get(index) {
+        if !word.dynamic && matches!(word.decoded.as_str(), "--" | "--end-of-options") {
+            return mutation.mutates();
+        }
+        if word.dynamic {
+            if branch_dynamic_word_may_mutate(word, dialect) {
+                return true;
+            }
+            index += 1;
+            continue;
+        }
+        let token = word.decoded.as_str();
+        if token.starts_with("--") {
+            if matches!(token, "--help" | "--help-all") {
+                return false;
+            }
+            let Some(resolved) = resolve_branch_long_option(token) else {
+                return false;
+            };
+            if resolved.inline_value && matches!(resolved.arity, BranchLongOptionArity::None) {
+                return false;
+            }
+            match resolved.name {
+                "delete" if resolved.negated => mutation.delete_bits &= !1,
+                "delete" => mutation.delete_bits |= 1,
+                "force" => mutation.force = !resolved.negated,
+                _ => {}
+            }
+            let arity = if resolved.negated {
+                BranchLongOptionArity::None
+            } else {
+                resolved.arity
+            };
+            match arity {
+                BranchLongOptionArity::None | BranchLongOptionArity::OptionalAttached => index += 1,
+                BranchLongOptionArity::Required if resolved.inline_value => index += 1,
+                BranchLongOptionArity::Required => {
+                    let Some(value) = words.get(index + 1) else {
+                        return false;
+                    };
+                    if value.dynamic && value.may_split {
+                        return true;
+                    }
+                    index += 2;
+                }
+                BranchLongOptionArity::LastArgDefault if resolved.inline_value => index += 1,
+                BranchLongOptionArity::LastArgDefault => {
+                    let Some(value) = words.get(index + 1) else {
+                        index += 1;
+                        continue;
+                    };
+                    if value.dynamic && value.may_split {
+                        return true;
+                    }
+                    index += 2;
+                }
+            }
+            continue;
+        }
+        if let Some(flags) = token.strip_prefix('-') {
+            if flags.is_empty() {
+                index += 1;
+                continue;
+            }
+            let mut chars = flags.chars();
+            while let Some(flag) = chars.next() {
+                if flag == 'h' {
+                    return false;
+                }
+                match flag {
+                    'd' => mutation.delete_bits |= 1,
+                    'D' => mutation.delete_bits |= 2,
+                    'f' => mutation.force = true,
+                    'M' | 'C' => mutation.forced_move_or_copy = true,
+                    'v' | 'q' | 'r' | 'a' | 'm' | 'c' | 'l' | 'i' | 'u' | 't' => {}
+                    _ => return false,
+                }
+                if flag == 'u' {
+                    if chars.as_str().is_empty() {
+                        let Some(value) = words.get(index + 1) else {
+                            return false;
+                        };
+                        if value.dynamic && value.may_split {
+                            return true;
+                        }
+                        index += 1;
+                    }
+                    break;
+                }
+                if flag == 't' && !chars.as_str().is_empty() {
+                    break;
+                }
+            }
+        }
+        index += 1;
+    }
+    mutation.mutates()
+}
+
+/// Fail closed only when active shell expansion can occupy Git's executable,
+/// subcommand, or a branch-mutation option role. Expansion consumed as quoted
+/// option data or after `--` remains data and is not reinterpreted.
+fn dynamic_git_branch_may_mutate(command: &str, dialect: ShellDialect) -> bool {
+    if dialect == ShellDialect::Unknown {
+        return [
+            ShellDialect::Posix,
+            ShellDialect::PowerShell,
+            ShellDialect::Cmd,
+        ]
+        .iter()
+        .any(|dialect| dynamic_git_branch_may_mutate(command, *dialect));
+    }
+
+    // Never flatten several shell statements into one synthetic argv. A
+    // dynamic word at the start of one PowerShell assignment must not combine
+    // with an option-looking token from a later statement and become a
+    // fictional `git branch -D` invocation. Each executable segment is already
+    // checked independently by the evaluator, so leave the original compound
+    // form to `branch_command_decision_in_dialect`, which returns `Unparsed`.
+    let powershell_expression =
+        dialect == ShellDialect::PowerShell && powershell_call_expression(command);
+    if !powershell_expression {
+        let trimmed = command.trim();
+        let segments = crate::packs::split_command_segments_in_dialect(trimmed, dialect);
+        if segments.last().is_some_and(|segment| *segment != trimmed) {
+            return false;
+        }
+    }
+
+    let command = if powershell_expression {
+        let Some(tail) = powershell_call_expression_tail(command) else {
+            return true;
+        };
+        match powershell_call_target(command) {
+            PowerShellCallTarget::NonGit => return false,
+            PowerShellCallTarget::GitBranch => {
+                std::borrow::Cow::Owned(format!("git branch {tail}"))
+            }
+            PowerShellCallTarget::Git | PowerShellCallTarget::Dynamic => {
+                std::borrow::Cow::Owned(format!("git {tail}"))
+            }
+        }
+    } else {
+        if dialect == ShellDialect::PowerShell {
+            let statement = command.trim();
+            let (statement, _) = command_after_posix_control_prefixes(statement, dialect);
+            let statement =
+                crate::normalize::powershell_assignment_rhs(statement).unwrap_or(statement);
+            if powershell_expression_statement_without_subexpression(statement) {
+                // An expression statement never invokes its first token, so a
+                // dynamic word there cannot become `git branch` (#273). The
+                // call-operator forms keep their existing handling above.
+                return false;
+            }
+        }
+        git_semantic_command(command, dialect)
+    };
+    let Some(decoded) = decode_git_semantic_words(&command, dialect) else {
+        return false;
+    };
+    if decoded.over_limit {
+        return contains_git_ascii_case_insensitive(&command);
+    }
+    let words = decoded.words;
+    if !powershell_expression && !words.iter().any(|word| word.dynamic) {
+        return false;
+    }
+
+    let mut index = 0usize;
+    while let Some(word) = words.get(index) {
+        if !word.dynamic && crate::normalize::is_env_assignment(&word.decoded) {
+            index += 1;
+            continue;
+        }
+        if dialect == ShellDialect::Cmd {
+            let executable = word.decoded.trim_start_matches('@');
+            if executable.eq_ignore_ascii_case("call") {
+                index += 1;
+                continue;
+            }
+        }
+        if !word.dynamic && matches!(word.decoded.as_str(), "exec" | "time" | "nohup" | "!") {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    let Some(executable) = words.get(index) else {
+        return false;
+    };
+    // #281: an executable word with no literal bytes (`$cmd`) supplies no
+    // evidence of Git. It must not become `git-branch` on its own, and later
+    // dynamic words must not stand in for the literal `branch` subcommand —
+    // two unknowns are not evidence. Literal branch syntax after it (e.g.
+    // `$(producer) branch -d feature`) still fails closed below.
+    let executable_unbounded =
+        !powershell_expression && git_semantic_executable_is_unbounded(executable, dialect);
+    let dashed_branch = !powershell_expression
+        && !executable_unbounded
+        && (git_semantic_executable_may_equal(executable, dialect, "git-branch")
+            || git_semantic_executable_may_equal(executable, dialect, "git-branch.exe"));
+    let may_execute_git = powershell_expression
+        || executable_unbounded
+        || git_semantic_executable_may_equal(executable, dialect, "git")
+        || git_semantic_executable_may_equal(executable, dialect, "git.exe")
+        || dashed_branch;
+    if !may_execute_git {
+        return false;
+    }
+    index += 1;
+    if dashed_branch {
+        return semantic_branch_argv_may_mutate(&words[index..], dialect);
+    }
+
+    // When the executable name proved nothing (#360, #361: a pure-wildcard
+    // basename, or a bare expansion), no later word may stand in for the
+    // literal `branch` subcommand — but literal deletion/force flags anywhere
+    // in the remaining argv are still evidence in plain sight. Scanning the
+    // whole tail here (not just the words after a dynamic token) keeps
+    // `/* -D main` denied even though its flag sits in the very first argv
+    // slot, where no dynamic word precedes it.
+    if executable_unbounded
+        && literal_branch_tokens_prove_mutation(
+            words[index..]
+                .iter()
+                .map(|word| (!word.dynamic).then_some(word.decoded.as_str())),
+        )
+    {
+        return true;
+    }
+
+    loop {
+        let Some(word) = words.get(index) else {
+            return false;
+        };
+        if word.dynamic {
+            if !executable_unbounded
+                && git_symbolic_word_may_equal(word, dialect, "branch", false)
+                && semantic_branch_argv_may_mutate(&words[index + 1..], dialect)
+            {
+                return true;
+            }
+            if executable_unbounded
+                && literal_branch_tokens_prove_mutation(
+                    words[index + 1..]
+                        .iter()
+                        .map(|word| (!word.dynamic).then_some(word.decoded.as_str())),
+                )
+            {
+                // #281 keeps two unknowns from standing in for `git branch`,
+                // but literal argv after them is still evidence: `$g $sub -D
+                // main` shows a proven branch deletion in plain sight, and the
+                // short-flag spelling must not fare better than `--delete`.
+                return true;
+            }
+            // A dynamic global prefix can disappear or expand to a valid Git
+            // option. Continue looking for a literal branch subcommand.
+            index += 1;
+            continue;
+        }
+        let token = word.decoded.as_str();
+        if token == "branch" {
+            return semantic_branch_argv_may_mutate(&words[index + 1..], dialect);
+        }
+        if is_known_git_command(token) {
+            return false;
+        }
+        if matches!(
+            token,
+            "-v" | "--version"
+                | "-h"
+                | "--help"
+                | "--exec-path"
+                | "--html-path"
+                | "--man-path"
+                | "--info-path"
+                | "help"
+        ) || token.starts_with("--list-cmds=")
+        {
+            return false;
+        }
+        if matches!(
+            token,
+            "-p" | "--paginate"
+                | "-P"
+                | "--no-pager"
+                | "--bare"
+                | "--no-replace-objects"
+                | "--literal-pathspecs"
+                | "--no-literal-pathspecs"
+                | "--glob-pathspecs"
+                | "--noglob-pathspecs"
+                | "--icase-pathspecs"
+                | "--no-optional-locks"
+                | "--no-lazy-fetch"
+                | "--no-advice"
+        ) {
+            index += 1;
+            continue;
+        }
+        if matches!(
+            token,
+            "-c" | "--config-env"
+                | "-C"
+                | "--git-dir"
+                | "--work-tree"
+                | "--namespace"
+                | "--super-prefix"
+                | "--shallow-file"
+                | "--attr-source"
+        ) {
+            let Some(value) = words.get(index + 1) else {
+                return false;
+            };
+            // A field-splitting value could supply the subcommand itself
+            // (`$r` = `dir branch`), so the words after it may be branch
+            // argv. When a literal Git subcommand follows the value, that
+            // reading needs a second unknown to reach a deletion flag
+            // (`git -C $r log main $b`), and two unknowns are not evidence
+            // (#281): let the visible subcommand decide, as #405 does for
+            // aliases (#597).
+            let visible_subcommand = words
+                .get(index + 2)
+                .is_some_and(|next| !next.dynamic && is_known_git_command(&next.decoded));
+            if value.dynamic && value.may_split && !visible_subcommand {
+                return semantic_branch_argv_may_mutate(&words[index + 2..], dialect);
+            }
+            index += 2;
+            continue;
+        }
+        if token.starts_with("-c")
+            || token.starts_with("-C")
+            || [
+                "--exec-path=",
+                "--git-dir=",
+                "--work-tree=",
+                "--namespace=",
+                "--super-prefix=",
+                "--config-env=",
+                "--attr-source=",
+            ]
+            .iter()
+            .any(|prefix| token.starts_with(prefix))
+        {
+            index += 1;
+            continue;
+        }
+        if token == "--" {
+            index += 1;
+            continue;
+        }
+        // An unresolved command may be a persistent alias for `branch` — but
+        // only when the executable itself gave some evidence of being Git.
+        // With an unbounded executable this token is a second unknown, and
+        // two unknowns are not evidence (#360, per the #281 precedent). Any
+        // literal deletion flag in the tail was already caught by the
+        // whole-argv scan above, so returning false here hides nothing.
+        if executable_unbounded {
+            return false;
+        }
+        return semantic_branch_argv_may_mutate(&words[index + 1..], dialect);
+    }
+}
+
+const MAX_VISIBLE_GIT_ALIASES: usize = 64;
+
+fn insert_visible_alias(aliases: &mut HashMap<String, String>, config: &str) {
+    let Some((key, value)) = config.split_once('=') else {
+        return;
+    };
+    let Some(prefix) = key.get(..6) else {
+        return;
+    };
+    if !prefix.eq_ignore_ascii_case("alias.") {
+        return;
+    }
+    let name = &key[6..];
+    if name.is_empty() || (aliases.len() >= MAX_VISIBLE_GIT_ALIASES && !aliases.contains_key(name))
+    {
+        return;
+    }
+    aliases.insert(name.to_string(), value.to_string());
+}
+
+fn insert_visible_config_env_alias(
+    aliases: &mut HashMap<String, String>,
+    environment: &HashMap<String, String>,
+    config_env: &str,
+) {
+    let Some((key, variable)) = config_env.split_once('=') else {
+        return;
+    };
+    let Some(value) = environment.get(variable) else {
+        return;
+    };
+    insert_visible_alias(aliases, &format!("{key}={value}"));
+}
+
+fn visible_environment_aliases(environment: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut aliases = HashMap::new();
+    let count = environment
+        .get("GIT_CONFIG_COUNT")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(MAX_VISIBLE_GIT_ALIASES);
+    for index in 0..count {
+        let Some(key) = environment.get(&format!("GIT_CONFIG_KEY_{index}")) else {
+            continue;
+        };
+        let Some(value) = environment.get(&format!("GIT_CONFIG_VALUE_{index}")) else {
+            continue;
+        };
+        insert_visible_alias(&mut aliases, &format!("{key}={value}"));
+    }
+    aliases
+}
+
+fn resolve_visible_branch_alias(
+    invoked: &str,
+    aliases: &HashMap<String, String>,
+) -> Option<Vec<String>> {
+    let mut words = vec![invoked.to_string()];
+    let mut visited = HashSet::new();
+
+    for _ in 0..MAX_VISIBLE_GIT_ALIASES {
+        let command = words.first()?.clone();
+        if command == "branch" {
+            return Some(words);
+        }
+        if command.eq_ignore_ascii_case("git-branch") {
+            words[0] = "branch".to_string();
+            return Some(words);
+        }
+        if !visited.insert(command.clone()) {
+            return None;
+        }
+        let alias = aliases.get(&command)?;
+        let mut replacement = if let Some(shell_alias) = alias.strip_prefix('!') {
+            if shell_alias.contains([';', '|', '&', '(', ')', '\n', '\r']) {
+                return None;
+            }
+            let mut shell_words = shell_words::split(shell_alias).ok()?;
+            let executable = shell_words
+                .first()?
+                .rsplit(['/', '\\'])
+                .next()?
+                .trim_end_matches(".exe");
+            if !executable.eq_ignore_ascii_case("git") {
+                return None;
+            }
+            shell_words.remove(0);
+            shell_words
+        } else {
+            shell_words::split(alias).ok()?
+        };
+        if replacement.is_empty() {
+            return None;
+        }
+        replacement.extend(words.into_iter().skip(1));
+        words = replacement;
+    }
+    None
+}
+
+/// Conservatively execute the branch grammar over unresolved POSIX command
+/// substitutions. Quoted dynamic data consumed by a known option stays data;
+/// an unquoted substitution may field-split into additional options and is
+/// therefore unsafe whenever it occupies a Git syntax position.
+fn symbolic_posix_branch_decision(command: &str) -> Option<BranchCommandDecision> {
+    // The splitter evaluates this inner Git query independently. Its outer
+    // substitution yields at most one branch-name argv word, so it cannot
+    // synthesize a `git branch -d/-f/-M/-C` invocation by field splitting.
+    if sole_posix_branch_name_query(command) {
+        return Some(BranchCommandDecision::NotBranch);
+    }
+    let stripped = crate::normalize::strip_wrapper_prefixes(command);
+    let command = stripped.normalized.as_ref();
+    let view = posix_substitution_view(command).ok()?;
+    if !view.has_dynamic {
+        return None;
+    }
+    let mut words = symbolic_posix_words(&view).ok()?;
+    let mut environment = HashMap::new();
+    let mut executable_index = 0usize;
+    let mut executable_unbounded = false;
+    let dashed_branch;
+
+    loop {
+        let word = words.get(executable_index)?;
+        if let Some(exact) = word.exact() {
+            if crate::normalize::is_env_assignment(exact) {
+                if let Some((name, value)) = exact.split_once('=') {
+                    environment.insert(name.to_string(), value.to_string());
+                }
+                executable_index += 1;
+                continue;
+            }
+            if matches!(exact, "exec" | "time" | "nohup" | "!") {
+                executable_index += 1;
+                continue;
+            }
+        }
+        let basename = SymbolicPosixWord {
+            text: word
+                .text
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(&word.text)
+                .to_string(),
+            unquoted_dynamic: word.unquoted_dynamic,
+        };
+        if basename.may_equal("git") || basename.may_equal("git.exe") {
+            if basename.unquoted_dynamic {
+                // #281: a substitution with no literal bytes could expand to
+                // anything and supplies no Git evidence; keep parsing so only
+                // literal branch syntax after it (e.g. `$(producer) branch -d
+                // feature`) can fail closed. A partially literal word such as
+                // `gi$(x)` retains the conservative treatment.
+                if basename.has_literal_fragment() {
+                    return Some(BranchCommandDecision::DestructiveDynamic);
+                }
+                executable_unbounded = true;
+            }
+            dashed_branch = false;
+            break;
+        }
+        if basename.may_equal("git-branch") || basename.may_equal("git-branch.exe") {
+            if basename.unquoted_dynamic {
+                return Some(BranchCommandDecision::DestructiveDynamic);
+            }
+            dashed_branch = true;
+            break;
+        }
+        return Some(BranchCommandDecision::NotBranch);
+    }
+
+    let mut aliases = visible_environment_aliases(&environment);
+    let mut index = executable_index + 1;
+    let found_branch = dashed_branch;
+    if !found_branch {
+        loop {
+            let Some(word) = words.get(index) else {
+                return Some(BranchCommandDecision::NotBranch);
+            };
+            if word.is_dynamic() {
+                if executable_unbounded {
+                    // #281: two unknowns are not evidence — a dynamic word
+                    // cannot stand in for `branch` when the executable is
+                    // itself an unbounded expansion. Literal argv after the
+                    // unknowns is evidence, though: `$g $sub -D main` still
+                    // carries a proven branch deletion in plain sight, so the
+                    // scan continues past the dynamic word rather than
+                    // discarding what follows it.
+                    return Some(
+                        if literal_argv_proves_branch_mutation(&words[index + 1..]) {
+                            BranchCommandDecision::DestructiveDynamic
+                        } else {
+                            BranchCommandDecision::NotBranch
+                        },
+                    );
+                }
+                if word.may_equal("branch") {
+                    if word.unquoted_dynamic {
+                        return Some(BranchCommandDecision::DestructiveDynamic);
+                    }
+                    index += 1;
+                    break;
+                }
+                return Some(BranchCommandDecision::NotBranch);
+            }
+            let token = word.exact()?;
+            if token == "branch" {
+                index += 1;
+                break;
+            }
+            if matches!(
+                token,
+                "-v" | "--version"
+                    | "-h"
+                    | "--help"
+                    | "--exec-path"
+                    | "--html-path"
+                    | "--man-path"
+                    | "--info-path"
+                    | "help"
+            ) || token.starts_with("--list-cmds=")
+            {
+                return Some(BranchCommandDecision::NonDestructive);
+            }
+            if matches!(
+                token,
+                "-p" | "--paginate"
+                    | "-P"
+                    | "--no-pager"
+                    | "--bare"
+                    | "--no-replace-objects"
+                    | "--literal-pathspecs"
+                    | "--no-literal-pathspecs"
+                    | "--glob-pathspecs"
+                    | "--noglob-pathspecs"
+                    | "--icase-pathspecs"
+                    | "--no-optional-locks"
+                    | "--no-lazy-fetch"
+                    | "--no-advice"
+            ) {
+                index += 1;
+                continue;
+            }
+            if token == "-c" || token == "--config-env" {
+                let Some(data) = words.get(index + 1) else {
+                    return Some(BranchCommandDecision::Unparsed);
+                };
+                if !symbolic_data_word_is_safe(data) {
+                    return Some(BranchCommandDecision::DestructiveDynamic);
+                }
+                if let Some(exact) = data.exact() {
+                    if token == "-c" {
+                        insert_visible_alias(&mut aliases, exact);
+                    } else {
+                        insert_visible_config_env_alias(&mut aliases, &environment, exact);
+                    }
+                }
+                index += 2;
+                continue;
+            }
+            if matches!(
+                token,
+                "-C" | "--git-dir"
+                    | "--work-tree"
+                    | "--namespace"
+                    | "--super-prefix"
+                    | "--shallow-file"
+                    | "--attr-source"
+            ) {
+                let Some(data) = words.get(index + 1) else {
+                    return Some(BranchCommandDecision::Unparsed);
+                };
+                if !symbolic_data_word_is_safe(data) {
+                    return Some(BranchCommandDecision::DestructiveDynamic);
+                }
+                index += 2;
+                continue;
+            }
+            if let Some(config) = token.strip_prefix("-c").filter(|value| !value.is_empty()) {
+                insert_visible_alias(&mut aliases, config);
+                index += 1;
+                continue;
+            }
+            if let Some(config_env) = token.strip_prefix("--config-env=") {
+                insert_visible_config_env_alias(&mut aliases, &environment, config_env);
+                index += 1;
+                continue;
+            }
+            if token.starts_with("-C")
+                || [
+                    "--exec-path=",
+                    "--git-dir=",
+                    "--work-tree=",
+                    "--namespace=",
+                    "--super-prefix=",
+                    "--config-env=",
+                    "--attr-source=",
+                ]
+                .iter()
+                .any(|prefix| token.starts_with(prefix))
+            {
+                index += 1;
+                continue;
+            }
+            if !token.starts_with('-') {
+                let Some(expansion) = resolve_visible_branch_alias(token, &aliases) else {
+                    return Some(BranchCommandDecision::NotBranch);
+                };
+                let mut expanded: Vec<_> = expansion
+                    .into_iter()
+                    .map(|text| SymbolicPosixWord {
+                        text,
+                        unquoted_dynamic: false,
+                    })
+                    .collect();
+                expanded.extend(words.into_iter().skip(index + 1));
+                words = expanded;
+                index = 1;
+                break;
+            }
+            return Some(BranchCommandDecision::Unparsed);
+        }
+    }
+
+    let mut mutation = BranchMutationState::default();
+    while let Some(word) = words.get(index) {
+        if word.is_dynamic() {
+            if word.unquoted_dynamic || symbolic_branch_option_may_mutate(word) {
+                return Some(BranchCommandDecision::DestructiveDynamic);
+            }
+            index += 1;
+            continue;
+        }
+        let token = word.exact()?;
+        if matches!(token, "--" | "--end-of-options") {
+            return Some(symbolic_scan_decision(mutation, executable_unbounded));
+        }
+        if token.starts_with("--") {
+            if matches!(token, "--help" | "--help-all") {
+                return Some(BranchCommandDecision::NonDestructive);
+            }
+            let Some(resolved) = resolve_branch_long_option(token) else {
+                return Some(BranchCommandDecision::NonDestructive);
+            };
+            if resolved.inline_value && matches!(resolved.arity, BranchLongOptionArity::None) {
+                return Some(BranchCommandDecision::NonDestructive);
+            }
+            match resolved.name {
+                "delete" if resolved.negated => mutation.delete_bits &= !1,
+                "delete" => mutation.delete_bits |= 1,
+                "force" => mutation.force = !resolved.negated,
+                _ => {}
+            }
+            let arity = if resolved.negated {
+                BranchLongOptionArity::None
+            } else {
+                resolved.arity
+            };
+            match arity {
+                BranchLongOptionArity::None | BranchLongOptionArity::OptionalAttached => index += 1,
+                BranchLongOptionArity::Required if resolved.inline_value => index += 1,
+                BranchLongOptionArity::Required => {
+                    let Some(data) = words.get(index + 1) else {
+                        return Some(BranchCommandDecision::NonDestructive);
+                    };
+                    if !symbolic_data_word_is_safe(data) {
+                        return Some(BranchCommandDecision::DestructiveDynamic);
+                    }
+                    index += 2;
+                }
+                BranchLongOptionArity::LastArgDefault if resolved.inline_value => index += 1,
+                BranchLongOptionArity::LastArgDefault => {
+                    if let Some(data) = words.get(index + 1) {
+                        if !symbolic_data_word_is_safe(data) {
+                            return Some(BranchCommandDecision::DestructiveDynamic);
+                        }
+                        index += 2;
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            continue;
+        }
+        if let Some(flags) = token.strip_prefix('-') {
+            let mut chars = flags.chars();
+            while let Some(flag) = chars.next() {
+                if flag == 'h' {
+                    return Some(BranchCommandDecision::NonDestructive);
+                }
+                match flag {
+                    'd' => mutation.delete_bits |= 1,
+                    'D' => mutation.delete_bits |= 2,
+                    'f' => mutation.force = true,
+                    'M' | 'C' => mutation.forced_move_or_copy = true,
+                    'v' | 'q' | 'r' | 'a' | 'm' | 'c' | 'l' | 'i' | 'u' | 't' => {}
+                    _ => return Some(BranchCommandDecision::NonDestructive),
+                }
+                if flag == 'u' {
+                    if chars.as_str().is_empty() {
+                        let Some(data) = words.get(index + 1) else {
+                            return Some(BranchCommandDecision::NonDestructive);
+                        };
+                        if !symbolic_data_word_is_safe(data) {
+                            return Some(BranchCommandDecision::DestructiveDynamic);
+                        }
+                        index += 1;
+                    }
+                    // `-u<upstream>` consumes the entire attached remainder as
+                    // data; letters such as d/f/M/C are not more short flags.
+                    break;
+                }
+                if flag == 't' && !chars.as_str().is_empty() {
+                    break;
+                }
+            }
+        }
+        index += 1;
+    }
+
+    Some(symbolic_scan_decision(mutation, executable_unbounded))
+}
+
+/// Map a completed symbolic branch-argv scan to a decision. When the
+/// executable word was an unbounded expansion (#281), a proven mutation is
+/// attributed to the dynamic-token rule (the unresolved word is part of the
+/// proof) and anything weaker stays unattributed to Git entirely.
+const fn symbolic_scan_decision(
+    mutation: BranchMutationState,
+    executable_unbounded: bool,
+) -> BranchCommandDecision {
+    let decision = mutation.decision();
+    if !executable_unbounded {
+        return decision;
+    }
+    match decision {
+        BranchCommandDecision::Destructive | BranchCommandDecision::MergeCheckedDelete => {
+            BranchCommandDecision::DestructiveDynamic
+        }
+        _ => BranchCommandDecision::NotBranch,
+    }
+}
+
+/// Return whether this command segment invokes Git as its executable in a
+/// caller-proven shell dialect. This prevents quoted documentation or command
+/// substitution output from being reinterpreted as executable shell source by
+/// regex-backed rules. Unknown callers retain the historical conservative
+/// behavior.
+pub(crate) fn command_executes_git_in_dialect(command: &str, dialect: ShellDialect) -> bool {
+    command_executes_git_in_dialect_at(command, dialect, 0)
+}
+
+/// How many `watch`/`xargs`/`parallel`/`find -exec` layers are looked
+/// through before the answer is "may execute git" (the conservative one).
+const MAX_EXEC_WRAPPER_DEPTH: usize = 8;
+
+fn command_executes_git_in_dialect_at(command: &str, dialect: ShellDialect, depth: usize) -> bool {
+    if dialect == ShellDialect::Unknown {
+        return true;
+    }
+
+    let resolved;
+    let command = if dialect == ShellDialect::Posix {
+        match resolve_literal_printf_substitutions(command) {
+            Ok(Some(view)) => {
+                resolved = view;
+                resolved.as_str()
+            }
+            Ok(None) => command,
+            Err(()) => return symbolic_posix_may_execute_git(command),
+        }
+    } else {
+        command
+    };
+    let command = command.trim();
+    let (command, _) = command_after_posix_control_prefixes(command, dialect);
+    let command = if dialect == ShellDialect::PowerShell {
+        crate::normalize::powershell_assignment_rhs(command).unwrap_or(command)
+    } else {
+        command
+    };
+    if dialect == ShellDialect::PowerShell
+        && powershell_expression_statement_without_subexpression(command)
+    {
+        // `"$X" …` / `$X …` is an expression statement; PowerShell refuses to
+        // invoke it without the call operator, so it cannot execute Git (#273).
+        return false;
+    }
+    let command = command
+        .strip_prefix('&')
+        .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))
+        .map(str::trim_start)
+        .unwrap_or(command);
+    let stripped =
+        (dialect == ShellDialect::Posix).then(|| crate::normalize::strip_wrapper_prefixes(command));
+    let command = stripped
+        .as_ref()
+        .map_or(command, |result| result.normalized.as_ref());
+    let tokens = tokenize_for_shell_dialect(command, dialect);
+    if tokens
+        .iter()
+        .any(|token| token.kind == NormalizeTokenKind::Separator)
+    {
+        return true;
+    }
+    if dialect == ShellDialect::Posix {
+        let payloads = exec_wrapper_payloads(command, &tokens);
+        if !payloads.is_empty() && depth >= MAX_EXEC_WRAPPER_DEPTH {
+            return true;
+        }
+        if payloads
+            .iter()
+            .any(|payload| command_executes_git_in_dialect_at(payload, dialect, depth + 1))
+        {
+            return true;
+        }
+    }
+    let Some(decoded) = decode_git_semantic_words(command, dialect) else {
+        return false;
+    };
+    if decoded.over_limit {
+        return contains_git_ascii_case_insensitive(command)
+            || git_semantic_scan_required(command, dialect);
+    }
+    if semantic_git_executable_index(&decoded.words, dialect).is_some() {
+        return true;
+    }
+    dialect == ShellDialect::Posix && frontend_bail_may_execute_git(&decoded.words, dialect)
+}
+
+/// The commands a POSIX `watch`, `xargs`, `parallel` or `find -exec` runs.
+///
+/// Each runs its operand words as a command of its own, as `nice` or
+/// `timeout` does, but none is a wrapper
+/// [`crate::normalize::strip_wrapper_prefixes`] strips, so `git` there was
+/// never in executable position: `watch git reset --hard`,
+/// `echo a | xargs git reset --hard` and `find . -exec git reset --hard \;`
+/// were allowed while `rm -rf` behind the same wrappers denied (the
+/// filesystem rules are not position-gated). Returns each command the
+/// wrapper can run; the caller recurses, which handles `xargs sudo git …` and
+/// nested wrappers.
+///
+/// An option this does not know may take a value, so the word after that
+/// value is tried as the command too: `parallel --retries 3 git …` was read as
+/// running `3`. (A command these run from one quoted string, `watch 'git …'`
+/// or `parallel ::: 'git …'`, is extracted and re-evaluated whole by
+/// `heredoc::extract_command_string_runner_scripts`.)
+fn exec_wrapper_payloads<'a>(
+    command: &'a str,
+    tokens: &[crate::normalize::NormalizeToken],
+) -> Vec<&'a str> {
+    let words: Vec<(&str, usize)> = tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+        .filter_map(|token| Some((token.text(command)?, token.byte_range.start)))
+        .collect();
+    let Some(&(first, _)) = words.first() else {
+        return Vec::new();
+    };
+    let name = first.rsplit('/').next().unwrap_or(first);
+    let from = |index: usize| {
+        words
+            .get(index)
+            .and_then(|(_, start)| command.get(*start..))
+    };
+    // (options whose value is the next word, options known to take none)
+    let (value_options, flag_options): (&[&str], &[&str]) = match name {
+        "find" | "gfind" => {
+            return words
+                .iter()
+                .enumerate()
+                .filter(|(_, (word, _))| matches!(*word, "-exec" | "-execdir" | "-ok" | "-okdir"))
+                .filter_map(|(index, _)| from(index + 1))
+                .collect();
+        }
+        "xargs" | "gxargs" => (
+            &[
+                "-a",
+                "-d",
+                "-E",
+                "-I",
+                "-J",
+                "-L",
+                "-n",
+                "-P",
+                "-R",
+                "-s",
+                "-S",
+                "--arg-file",
+                "--delimiter",
+                "--max-args",
+                "--max-procs",
+                "--max-chars",
+                "--max-lines",
+                "--process-slot-var",
+            ],
+            &[
+                "-0",
+                "-e",
+                "-i",
+                "-l",
+                "-o",
+                "-p",
+                "-r",
+                "-t",
+                "-x",
+                "--null",
+                "--eof",
+                "--replace",
+                "--open-tty",
+                "--interactive",
+                "--no-run-if-empty",
+                "--show-limits",
+                "--verbose",
+                "--exit",
+            ],
+        ),
+        "watch" => (
+            &["-n", "--interval", "-q", "--equexit"],
+            &[
+                "-b",
+                "-c",
+                "-C",
+                "-d",
+                "-e",
+                "-g",
+                "-p",
+                "-r",
+                "-t",
+                "-w",
+                "-x",
+                "--beep",
+                "--color",
+                "--no-color",
+                "--differences",
+                "--errexit",
+                "--chgexit",
+                "--precise",
+                "--no-rerun",
+                "--no-title",
+                "--no-wrap",
+                "--exec",
+            ],
+        ),
+        "parallel" => (
+            &[
+                "-a",
+                "-C",
+                "-I",
+                "-j",
+                "-L",
+                "-N",
+                "-P",
+                "-S",
+                "--arg-file",
+                "--colsep",
+                "--delay",
+                "--jobs",
+                "--joblog",
+                "--max-args",
+                "--results",
+                "--sshlogin",
+                "--timeout",
+            ],
+            &[
+                "-0",
+                "-k",
+                "-q",
+                "-r",
+                "-u",
+                "-v",
+                "-X",
+                "-m",
+                "--bar",
+                "--dry-run",
+                "--eta",
+                "--group",
+                "--keep-order",
+                "--line-buffer",
+                "--null",
+                "--pipe",
+                "--progress",
+                "--quote",
+                "--tag",
+                "--ungroup",
+                "--verbose",
+                "--xargs",
+            ],
+        ),
+        _ => return Vec::new(),
+    };
+    let mut payloads: Vec<&'a str> = Vec::new();
+    let mut index = 1usize;
+    while let Some(&(word, _)) = words.get(index) {
+        if word == "--" {
+            payloads.extend(from(index + 1));
+            return payloads;
+        }
+        if word.len() > 1 && word.starts_with('-') {
+            if value_options.contains(&word) {
+                index += 2;
+                continue;
+            }
+            let known_flag = flag_options.contains(&word)
+                || word.contains('=')
+                || value_options
+                    .iter()
+                    .chain(flag_options)
+                    .any(|option| option.len() == 2 && word.len() > 2 && word.starts_with(option));
+            if !known_flag {
+                payloads.extend(from(index + 2));
+            }
+            index += 1;
+            continue;
+        }
+        payloads.extend(from(index));
+        return payloads;
+    }
+    payloads
+}
+
+/// Programs that run the rest of their words as a command but whose options
+/// this does not model: when one of those words may be git, git may run.
+/// Pure wrappers take any later word; subcommand runners only behind their
+/// run subcommand.
+pub(crate) fn unmodeled_exec_wrapper(basename: &str, next: Option<&str>) -> bool {
+    matches!(
+        basename,
+        "sudo"
+            | "doas"
+            | "chronic"
+            | "unbuffer"
+            | "caffeinate"
+            | "flock"
+            | "taskset"
+            | "numactl"
+            | "cpulimit"
+            | "prlimit"
+            | "strace"
+            | "ltrace"
+            | "valgrind"
+            | "systemd-run"
+            | "runuser"
+            | "unshare"
+            | "nsenter"
+            | "chroot"
+            | "firejail"
+            | "bwrap"
+            | "xvfb-run"
+            | "dbus-run-session"
+            | "entr"
+            | "watchexec"
+            | "sem"
+            | "tsp"
+            | "retry"
+            | "catchsegv"
+            | "faketime"
+            | "proxychains"
+            | "proxychains4"
+            | "torsocks"
+            | "tini"
+            | "dumb-init"
+            | "gosu"
+            | "su-exec"
+            | "setpriv"
+            | "systemd-inhibit"
+            | "script"
+            | "gdb"
+            | "eatmydata"
+            | "fakeroot"
+            | "cgexec"
+            | "flatpak-spawn"
+            | "pkexec"
+            | "run0"
+            // The remote command `ssh` runs is judged like a local one
+            // (#326); unquoted it was never extracted, and git there was
+            // never in executable position.
+            | "ssh"
+    ) || matches!(
+        (basename, next),
+        (
+            "direnv" | "bundle" | "docker" | "podman" | "kubectl" | "oc",
+            Some("exec")
+        ) | ("nix", Some("develop" | "shell" | "run"))
+            | (
+                "uv" | "poetry" | "pipenv" | "pdm" | "rye" | "hatch" | "pixi",
+                Some("run")
+            )
+    )
+}
+
+/// #260 deny-direction backstop: a command whose executable is a *known*
+/// execution frontend, but whose wrapper strip bailed (dynamic option value,
+/// unmodeled flag), still executes its wrapped command at runtime. Report
+/// scan-required when any later word may resolve to a Git executable so the
+/// ordinary regex rules evaluate the command text. Genuinely unknown
+/// programs (`foo exec git …`) keep the documented argv-data default.
+fn frontend_bail_may_execute_git(words: &[GitSemanticWord], dialect: ShellDialect) -> bool {
+    let mut index = 0usize;
+    while let Some(word) = words.get(index) {
+        if !word.dynamic
+            && (crate::normalize::is_env_assignment(&word.decoded)
+                || matches!(word.decoded.as_str(), "exec" | "time" | "nohup" | "!"))
+        {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    let Some(first) = words.get(index) else {
+        return false;
+    };
+    if first.dynamic {
+        return false;
+    }
+    let basename = first
+        .decoded
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&first.decoded);
+    let next = words.get(index + 1).map(|word| word.decoded.as_str());
+    if !crate::normalize::is_posix_execution_frontend_basename(basename)
+        && !unmodeled_exec_wrapper(basename, next)
+    {
+        return false;
+    }
+    words[index + 1..].iter().any(|word| {
+        git_semantic_executable_may_equal(word, dialect, "git")
+            || git_semantic_executable_may_equal(word, dialect, "git.exe")
+            // Same stale-list hazard as `symbolic_posix_may_execute_git`: a
+            // wrapper whose strip bailed must still be able to name any dashed
+            // built-in, not only `git-branch` (#400).
+            || CORE_GIT_DASHED_BUILTINS.iter().any(|(bare, exe, _)| {
+                git_semantic_executable_may_equal(word, dialect, bare)
+                    || git_semantic_executable_may_equal(word, dialect, exe)
+            })
+    })
+}
+
+/// Build a matching-only view of a Git invocation in a caller-proven shell.
+///
+/// Raw command bytes remain authoritative for history, allowlists, and output.
+/// This view exists only so Windows escape syntax and Bash ANSI-C/locale
+/// quoting cannot hide existing regex-backed `core.git` rules. Callers must not
+/// synthesize source spans from the decoded string.
+pub(crate) fn syntax_view_in_dialect(command: &str, dialect: ShellDialect) -> Option<String> {
+    let resolved_substitutions = matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown)
+        .then(|| resolve_literal_printf_substitutions(command))
+        .transpose()
+        .ok()
+        .flatten()
+        .flatten();
+    let command = resolved_substitutions.as_deref().unwrap_or(command);
+    let dialect = if resolved_substitutions.is_some() && dialect == ShellDialect::Unknown {
+        ShellDialect::Posix
+    } else {
+        dialect
+    };
+
+    if dialect == ShellDialect::Unknown {
+        return Some(command.to_string());
+    }
+
+    let command = command.trim();
+    let (command, _) = command_after_posix_control_prefixes(command, dialect);
+    if dialect == ShellDialect::PowerShell && powershell_call_expression(command) {
+        let tail = powershell_call_expression_tail(command)?;
+        let synthetic = match powershell_call_target(command) {
+            PowerShellCallTarget::NonGit => "__dcg_non_git_command__".to_string(),
+            PowerShellCallTarget::GitBranch => format!("git branch {tail}"),
+            PowerShellCallTarget::Git | PowerShellCallTarget::Dynamic => format!("git {tail}"),
+        };
+        return Some(crate::normalize::normalize_command(&synthetic).into_owned());
+    }
+    let command = command
+        .strip_prefix('&')
+        .map(str::trim_start)
+        .filter(|remainder| !remainder.is_empty())
+        .unwrap_or(command);
+    let stripped =
+        (dialect == ShellDialect::Posix).then(|| crate::normalize::strip_wrapper_prefixes(command));
+    let command = stripped
+        .as_ref()
+        .map_or(command, |result| result.normalized.as_ref());
+    let tokens = tokenize_for_shell_dialect(command, dialect);
+    if tokens
+        .iter()
+        .any(|token| token.kind == NormalizeTokenKind::Separator)
+    {
+        return None;
+    }
+
+    let mut decoder = ShellTokenDecoder::new(dialect);
+    let mut words = Vec::with_capacity(tokens.len());
+    for token in tokens
+        .iter()
+        .filter(|token| token.kind == NormalizeTokenKind::Word)
+    {
+        let raw = token.text(command)?;
+        if let Some(decoded) = decoder.decode(raw, ShellTokenRole::Syntax) {
+            words.push(decoded.into_owned());
+        }
+    }
+    if words.is_empty() {
+        return None;
+    }
+    if resolved_substitutions.is_some() && !decoded_words_execute_git(&words) {
+        // Command-substitution output is argv data; it is not parsed again as
+        // shell source. Do not let an `echo "$(printf 'git reset --hard')"`
+        // data argument become a synthetic Git invocation in the regex view.
+        return Some("__dcg_non_git_command__".to_string());
+    }
+
+    if let Some(semantic) = decode_git_semantic_words(command, dialect)
+        && !semantic.over_limit
+        && let Some(executable_index) = semantic_git_executable_index(&semantic.words, dialect)
+        && semantic.words[executable_index].dynamic
+    {
+        let mut words: Vec<_> = semantic
+            .words
+            .iter()
+            .map(|word| word.decoded.clone())
+            .collect();
+        words[executable_index] = "git".to_string();
+        return Some(crate::normalize::normalize_command(&words.join(" ")).into_owned());
+    }
+
+    let decoded = words.join(" ");
+    Some(crate::normalize::normalize_command(&decoded).into_owned())
+}
+
+/// Build the decoded Git regex view without reintroducing inert argv data.
+///
+/// `command` is the exact caller-proven shell source used by the semantic
+/// executable parser. `sanitized_command` is the length-preserving view whose
+/// known data-only arguments have already been masked. Most invocations can be
+/// decoded directly from the sanitized view. If masking obscured an obfuscated
+/// executable expression, reconstruct a canonical POSIX argv from the raw
+/// semantic words, quote each word to preserve its boundary, and sanitize that
+/// reconstruction before regex matching.
+pub(crate) fn syntax_view_for_pattern_matching(
+    command: &str,
+    sanitized_command: &str,
+    dialect: ShellDialect,
+) -> Option<String> {
+    let sanitized_view = syntax_view_in_dialect(sanitized_command, dialect);
+    if dialect == ShellDialect::Unknown {
+        return sanitized_view;
+    }
+
+    if dialect == ShellDialect::PowerShell && powershell_call_expression(command) {
+        let tail = powershell_call_expression_tail(command)?;
+        let synthetic = match powershell_call_target(command) {
+            PowerShellCallTarget::NonGit => return sanitized_view,
+            PowerShellCallTarget::GitBranch => format!("git branch {tail}"),
+            PowerShellCallTarget::Git | PowerShellCallTarget::Dynamic => format!("git {tail}"),
+        };
+        let sanitized = crate::context::sanitize_for_pattern_matching(&synthetic);
+        return syntax_view_in_dialect(sanitized.as_ref(), ShellDialect::PowerShell);
+    }
+
+    let semantic_command = git_semantic_command(command, dialect);
+    let Some(decoded) = decode_git_semantic_words(semantic_command.as_ref(), dialect) else {
+        return sanitized_view;
+    };
+    if decoded.over_limit {
+        return sanitized_view;
+    }
+    let Some(executable_index) = semantic_git_executable_index(&decoded.words, dialect) else {
+        return sanitized_view;
+    };
+
+    // A dynamic argv word may become a destructive option at execution time.
+    // Keep the established conservative sanitized view in that case. Only the
+    // executable itself may be symbolic here because the semantic parser has
+    // already proven that it can resolve to Git.
+    if decoded
+        .words
+        .iter()
+        .skip(executable_index + 1)
+        .any(|word| word.dynamic)
+    {
+        return sanitized_view;
+    }
+
+    let executable = &decoded.words[executable_index];
+    // A bare expansion (`$items`, `$g`) *may* equal any name, so asking
+    // `may_equal("git-branch")` about one always says yes — and the synthesized
+    // view then reads `git branch <rest of the command line>`, which hands the
+    // `branch-force-delete` regex a `-D`-looking token from argv that has
+    // nothing to do with Git. That is how `$items = Get-ChildItem C:\temp
+    // -Recurse -Directory` came to be denied as a forced branch deletion: the
+    // unresolvable executable was upgraded into the most dangerous reading, and
+    // `-Directory` supplied the `D` (issue #401 class).
+    //
+    // Two unknowns are not evidence (#281). An unbounded executable synthesizes
+    // plain `git`, exactly as it does elsewhere; a *proven* `git-branch` still
+    // gets the subcommand spelled out. Nothing is lost: literal branch evidence
+    // after an unbounded executable is still caught by
+    // `dynamic_git_branch_may_mutate`, which attributes it to
+    // `branch-dynamic-token` — the rule that describes what was actually seen.
+    //
+    // A proven dashed built-in spells its subcommand out, so `git-reset --hard`
+    // synthesizes `git reset --hard` and reaches the same rule the spaced
+    // spelling does (issue #400). Only `git-branch` used to be spelled out;
+    // every other dashed built-in synthesized a bare `git` and *dropped its
+    // subcommand*, which is why `git-reset --hard` was read as `git --hard` and
+    // matched nothing at all.
+    // A bounded symbolic word can stand for several built-ins, and picking the
+    // first table entry is a guess that lands on the benign reading (#428):
+    // `git-c$X` resolved to `checkout`, synthesized `git checkout -fdx`, and
+    // matched nothing, while the unambiguous `git-cl$X -fdx` denied.
+    //
+    // The view has to stay a single command — `syntax_view_in_dialect` drops
+    // any view carrying a separator, so the candidate readings cannot simply be
+    // joined — so the ambiguity is resolved by the pack's own verdict rather
+    // than by table order: the reading presented is one this pack would deny,
+    // if any candidate reading is. `check` is safe-patterns-first, so
+    // `git-c$X -n` still presents a benign reading (`git clean -n` is exempt,
+    // and `checkout -n` is nothing), while `git-c$X -fdx` presents
+    // `git clean -fdx`. Every argv word here is literal — a dynamic one
+    // returned the sanitized view above — so each reading is a faithful
+    // spelling of what that candidate would run.
+    let executable_unbounded = git_semantic_executable_is_unbounded(executable, dialect);
+    let mut args = String::new();
+    for word in decoded.words.iter().skip(executable_index + 1) {
+        args.push(' ');
+        args.push_str(&shell_words::quote(&word.decoded));
+    }
+    let subcommands = if executable_unbounded {
+        SmallVec::<[&'static str; 4]>::new()
+    } else {
+        dashed_git_builtin_subcommands(executable, dialect)
+    };
+    let synthetic = match subcommands.as_slice() {
+        [] => format!("git{args}"),
+        [only] => format!("git {only}{args}"),
+        candidates => {
+            let readings = candidates
+                .iter()
+                .map(|subcommand| format!("git {subcommand}{args}"));
+            let mut fallback = None;
+            let mut destructive = None;
+            for reading in readings {
+                if AMBIGUITY_ARBITER.check(&reading).is_some() {
+                    destructive = Some(reading);
+                    break;
+                }
+                if fallback.is_none() {
+                    fallback = Some(reading);
+                }
+            }
+            destructive
+                .or(fallback)
+                .unwrap_or_else(|| format!("git{args}"))
+        }
+    };
+    let sanitized = crate::context::sanitize_for_pattern_matching(&synthetic);
+    syntax_view_in_dialect(sanitized.as_ref(), ShellDialect::Posix)
+}
+
+/// Parse a direct `git branch` invocation with option arity awareness.
+///
+/// Regex alone cannot distinguish `git branch --format -d` (where `-d` is a
+/// format string) from `git branch -d name` (where it deletes a ref). This
+/// parser is deliberately narrow: it handles wrappers through the shared
+/// command normalizer, recognizes Git's global options, honors `--`, and
+/// consumes branch options whose following token is data. Unknown syntax
+/// returns [`BranchCommandDecision::Unparsed`] so the existing regex remains a
+/// conservative fallback.
+pub(crate) fn branch_command_decision(command: &str) -> BranchCommandDecision {
+    branch_command_decision_in_dialect(command, ShellDialect::Unknown)
+}
+
+pub(crate) fn branch_command_decision_in_dialect(
+    command: &str,
+    dialect: ShellDialect,
+) -> BranchCommandDecision {
+    if matches!(dialect, ShellDialect::Posix | ShellDialect::Unknown) {
+        match resolve_literal_printf_substitutions(command) {
+            Ok(Some(resolved)) => {
+                return branch_command_decision_in_dialect(&resolved, ShellDialect::Posix);
+            }
+            Err(()) => {
+                if let Some(decision) = symbolic_posix_branch_decision(command) {
+                    return decision;
+                }
+            }
+            Ok(None) => {}
+        }
+    }
+
+    if dialect == ShellDialect::Unknown {
+        let trimmed = command.trim_start();
+        if trimmed
+            .strip_prefix('&')
+            .as_ref()
+            .is_some_and(|remainder| remainder.chars().next().is_some_and(char::is_whitespace))
+        {
+            // A leading call operator is unambiguously PowerShell syntax; in
+            // POSIX shells `&` terminates the preceding command instead of
+            // introducing an executable. Preserve quoted Windows paths and
+            // their embedded spaces by parsing this direct Pack API call with
+            // the same dialect used by hook-mode PowerShell invocations.
+            return branch_command_decision_in_dialect(trimmed, ShellDialect::PowerShell);
+        }
+    }
+
+    // `Pack::check` evaluates split segments first and then the original whole
+    // command. Refuse the whole compound form here so an option-looking token
+    // in a later command cannot be attributed to the earlier `git branch`.
+    let command = command.trim();
+    let (command, _) = command_after_posix_control_prefixes(command, dialect);
+    let command = if dialect == ShellDialect::PowerShell {
+        crate::normalize::powershell_assignment_rhs(command).unwrap_or(command)
+    } else {
+        command
+    };
+    let semantic_command = command;
+    let command = command
+        .strip_prefix('&')
+        .map(str::trim_start)
+        .filter(|remainder| !remainder.is_empty())
+        .unwrap_or(command);
+    if dialect == ShellDialect::PowerShell
+        && powershell_call_expression(semantic_command)
+        && dynamic_git_branch_may_mutate(semantic_command, dialect)
+    {
+        return BranchCommandDecision::Destructive;
+    }
+    let segments = crate::packs::split_command_segments_in_dialect(command, dialect);
+    if segments.last().is_some_and(|segment| *segment != command) {
+        return BranchCommandDecision::Unparsed;
+    }
+    if dynamic_git_branch_may_mutate(semantic_command, dialect) {
+        // This path fires only when a dynamic word can occupy a mutating
+        // syntax role (the all-literal case returns false), so attribute it
+        // to the dynamic-token rule rather than a proven deletion (#274).
+        return BranchCommandDecision::DestructiveDynamic;
+    }
+    let Ok(mut tokens) = branch_tokens(command, dialect) else {
+        return BranchCommandDecision::Unparsed;
+    };
+    let mut decoder = ShellTokenDecoder::new(dialect);
+    let mut environment = HashMap::new();
+    let mut executable_index = 0usize;
+    let executable = loop {
+        let Some(raw_token) = tokens.get(executable_index) else {
+            return BranchCommandDecision::NotBranch;
+        };
+        let Some(token) = decode_branch_syntax(&mut decoder, raw_token) else {
+            executable_index += 1;
+            continue;
+        };
+        let token = if dialect == ShellDialect::Cmd {
+            token.trim_start_matches('@')
+        } else {
+            token.as_str()
+        };
+        if crate::normalize::is_env_assignment(token) {
+            if let Some((name, value)) = token.split_once('=') {
+                environment.insert(name.to_string(), value.to_string());
+            }
+            executable_index += 1;
+            continue;
+        }
+        if dialect == ShellDialect::Cmd && token.eq_ignore_ascii_case("call") {
+            executable_index += 1;
+            continue;
+        }
+        if matches!(token, "exec" | "time" | "nohup" | "!") {
+            executable_index += 1;
+            continue;
+        }
+        let Some(executable) = token.rsplit(['/', '\\']).next() else {
+            return BranchCommandDecision::NotBranch;
+        };
+        break executable.to_string();
+    };
+    let executable = executable.as_str();
+    let executable = executable
+        .len()
+        .checked_sub(4)
+        .and_then(|suffix_start| {
+            executable
+                .get(suffix_start..)
+                .filter(|suffix| suffix.eq_ignore_ascii_case(".exe"))
+                .and_then(|_| executable.get(..suffix_start))
+        })
+        .unwrap_or(executable);
+    let dashed_branch = executable.eq_ignore_ascii_case("git-branch");
+    if !executable.eq_ignore_ascii_case("git") && !dashed_branch {
+        return BranchCommandDecision::NotBranch;
+    }
+
+    let mut aliases = visible_environment_aliases(&environment);
+    let mut index = executable_index + 1;
+    let mut found_branch = dashed_branch;
+    while !found_branch {
+        let Some(raw_token) = tokens.get(index) else {
+            break;
+        };
+        let Some(token) = decode_branch_syntax(&mut decoder, raw_token) else {
+            index += 1;
+            continue;
+        };
+        let token = token.as_str();
+        if token == "branch" {
+            index += 1;
+            found_branch = true;
+            break;
+        }
+        if matches!(
+            token,
+            "-v" | "--version"
+                | "-h"
+                | "--help"
+                | "--exec-path"
+                | "--html-path"
+                | "--man-path"
+                | "--info-path"
+        ) || token.starts_with("--list-cmds=")
+        {
+            return BranchCommandDecision::NonDestructive;
+        }
+        if token == "help" {
+            return BranchCommandDecision::NonDestructive;
+        }
+        if matches!(
+            token,
+            "-p" | "--paginate"
+                | "-P"
+                | "--no-pager"
+                | "--bare"
+                | "--no-replace-objects"
+                | "--literal-pathspecs"
+                | "--no-literal-pathspecs"
+                | "--glob-pathspecs"
+                | "--noglob-pathspecs"
+                | "--icase-pathspecs"
+                | "--no-optional-locks"
+                | "--no-lazy-fetch"
+                | "--no-advice"
+        ) {
+            index += 1;
+            continue;
+        }
+        if token == "-c" {
+            let Some(raw_config) = tokens.get(index + 1) else {
+                return BranchCommandDecision::Unparsed;
+            };
+            let Some(config) = decode_branch_syntax(&mut decoder, raw_config) else {
+                return BranchCommandDecision::Unparsed;
+            };
+            insert_visible_alias(&mut aliases, &config);
+            index += 2;
+            continue;
+        }
+        if token == "--config-env" {
+            let Some(raw_config_env) = tokens.get(index + 1) else {
+                return BranchCommandDecision::Unparsed;
+            };
+            let Some(config_env) = decode_branch_syntax(&mut decoder, raw_config_env) else {
+                return BranchCommandDecision::Unparsed;
+            };
+            insert_visible_config_env_alias(&mut aliases, &environment, &config_env);
+            index += 2;
+            continue;
+        }
+        if matches!(
+            token,
+            "-C" | "--git-dir"
+                | "--work-tree"
+                | "--namespace"
+                | "--super-prefix"
+                | "--shallow-file"
+                | "--attr-source"
+        ) {
+            if tokens.get(index + 1).is_none() {
+                return BranchCommandDecision::Unparsed;
+            }
+            index += 2;
+            continue;
+        }
+        if let Some(config) = token.strip_prefix("-c").filter(|config| !config.is_empty()) {
+            insert_visible_alias(&mut aliases, config);
+            index += 1;
+            continue;
+        }
+        if let Some(config_env) = token.strip_prefix("--config-env=") {
+            insert_visible_config_env_alias(&mut aliases, &environment, config_env);
+            index += 1;
+            continue;
+        }
+        if token.starts_with("-C")
+            || [
+                "--exec-path=",
+                "--git-dir=",
+                "--work-tree=",
+                "--namespace=",
+                "--super-prefix=",
+                "--config-env=",
+                "--attr-source=",
+            ]
+            .iter()
+            .any(|prefix| token.starts_with(prefix))
+        {
+            index += 1;
+            continue;
+        }
+        if !token.starts_with('-') {
+            let Some(mut expansion) = resolve_visible_branch_alias(token, &aliases) else {
+                if !aliases.contains_key(token) && !is_known_git_command(token) {
+                    let remaining: Vec<_> = tokens
+                        .iter()
+                        .skip(index + 1)
+                        .filter_map(|raw| decode_branch_syntax(&mut decoder, raw))
+                        .map(|decoded| GitSemanticWord {
+                            decoded,
+                            dynamic: false,
+                            may_split: false,
+                        })
+                        .collect();
+                    if semantic_branch_argv_may_mutate(&remaining, dialect) {
+                        return BranchCommandDecision::Destructive;
+                    }
+                }
+                return BranchCommandDecision::NotBranch;
+            };
+            for raw_argument in tokens.iter().skip(index + 1) {
+                if let Some(argument) = decode_branch_syntax(&mut decoder, raw_argument) {
+                    expansion.push(argument);
+                }
+            }
+            tokens = expansion;
+            decoder = ShellTokenDecoder::new(ShellDialect::Unknown);
+            index = 1;
+            found_branch = true;
+            break;
+        }
+        return if token.starts_with('-') {
+            BranchCommandDecision::Unparsed
+        } else {
+            BranchCommandDecision::NotBranch
+        };
+    }
+
+    if !found_branch {
+        return BranchCommandDecision::NotBranch;
+    }
+
+    let mut mutation = BranchMutationState::default();
+    while let Some(raw_token) = tokens.get(index) {
+        let Some(token) = decode_branch_syntax(&mut decoder, raw_token) else {
+            index += 1;
+            continue;
+        };
+        let token = token.as_str();
+        if matches!(token, "--" | "--end-of-options") {
+            return mutation.decision();
+        }
+        if token.starts_with("--") {
+            if matches!(token, "--help" | "--help-all") {
+                return BranchCommandDecision::NonDestructive;
+            }
+            let Some(resolved) = resolve_branch_long_option(token) else {
+                // A confirmed direct `git branch` invocation with an unknown
+                // or ambiguous option exits during parse-options and cannot
+                // mutate refs.
+                return BranchCommandDecision::NonDestructive;
+            };
+            if resolved.inline_value && matches!(resolved.arity, BranchLongOptionArity::None) {
+                return BranchCommandDecision::NonDestructive;
+            }
+            match resolved.name {
+                "delete" => {
+                    if resolved.negated {
+                        mutation.delete_bits &= !1;
+                    } else {
+                        mutation.delete_bits |= 1;
+                    }
+                }
+                "force" => mutation.force = !resolved.negated,
+                _ => {}
+            }
+            let effective_arity = if resolved.negated {
+                BranchLongOptionArity::None
+            } else {
+                resolved.arity
+            };
+            match effective_arity {
+                BranchLongOptionArity::None | BranchLongOptionArity::OptionalAttached => {
+                    index += 1;
+                }
+                BranchLongOptionArity::Required if resolved.inline_value => index += 1,
+                BranchLongOptionArity::Required => {
+                    if tokens.get(index + 1).is_none() {
+                        return BranchCommandDecision::NonDestructive;
+                    }
+                    index += 2;
+                }
+                BranchLongOptionArity::LastArgDefault if resolved.inline_value => index += 1,
+                BranchLongOptionArity::LastArgDefault => {
+                    index += 1 + usize::from(tokens.get(index + 1).is_some());
+                }
+            }
+            continue;
+        }
+        if let Some(flags) = token.strip_prefix('-') {
+            if flags.is_empty() {
+                index += 1;
+                continue;
+            }
+            let mut chars = flags.chars();
+            while let Some(flag) = chars.next() {
+                if flag == 'h' {
+                    return BranchCommandDecision::NonDestructive;
+                }
+                match flag {
+                    'd' => mutation.delete_bits |= 1,
+                    'D' => mutation.delete_bits |= 2,
+                    'f' => mutation.force = true,
+                    'M' | 'C' => mutation.forced_move_or_copy = true,
+                    'v' | 'q' | 'r' | 'a' | 'm' | 'c' | 'l' | 'i' => {}
+                    'u' | 't' => {}
+                    _ => return BranchCommandDecision::NonDestructive,
+                }
+                // `-u <upstream>` consumes the following token; in a combined
+                // form such as `-vuorigin/main`, the remainder is its value.
+                if flag == 'u' {
+                    if chars.as_str().is_empty() {
+                        if tokens.get(index + 1).is_none() {
+                            return BranchCommandDecision::NonDestructive;
+                        }
+                        index += 1;
+                    }
+                    break;
+                }
+                // `-t`/`--track` has an optional argument that Git accepts
+                // only when attached (`-tdirect`, `-tinherit`). The remainder
+                // is data, so letters such as the `d` in `direct` are not
+                // additional short flags. A bare `-t` does not consume the
+                // following token, which may therefore still be `-d`.
+                if flag == 't' && !chars.as_str().is_empty() {
+                    break;
+                }
+            }
+        }
+        index += 1;
+    }
+
+    mutation.decision()
+}
 
 /// Create the core git pack.
 #[must_use]
@@ -25,16 +5581,104 @@ pub fn create_pack() -> Pack {
     }
 }
 
+/// Most rules in this pack spell their executable as two alternatives (#400):
+///
+/// ```text
+/// (?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*      the spaced spelling
+/// (?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-   the dashed builtin
+/// ```
+///
+/// Git ships its subcommands as dashed helper executables under
+/// `git --exec-path`, so `git-reset --hard`, `git-clean -fdx`, and
+/// `git-checkout HEAD -- src/foo.py` do exactly what the spaced spellings do.
+/// The whitespace-only prefix missed all of them, including the reachable
+/// path-qualified form (`/usr/libexec/git-core/git-reset --hard`), so the
+/// pack's own rules were a rename away from bypass. `strict_git` had already
+/// been through this (#367); `core.git` had no equivalent.
+///
+/// **The two branches carry different leading guards, and that asymmetry is the
+/// point.** The spaced branch may begin after anything that is not a word
+/// character, because what follows is `git` plus a *separate* subcommand token.
+/// The dashed branch may only begin where a command can actually start — string
+/// start, or after `;`, `&`, `|`, `(`, or a newline, optionally through one
+/// path component. Sharing the loose guard let the dashed branch re-anchor on
+/// any argv token that merely *contained* `git-<sub>`, which broke both ways:
+/// `git log --grep="git-reset --hard"` and `git status bin/git-restore .`
+/// became denials, and a safe pattern could re-anchor *past* the flag that was
+/// supposed to disqualify it, so `git clean -fdx -- . git-clean -n` matched
+/// `clean-dry-run-short` and the genuinely destructive `git clean -fdx -- .`
+/// rode through on the exemption.
+///
+/// **The spaced branch's `(?:\S+\s+)*` accepts any token. That is a hole in the
+/// SAFE direction only, and the two directions are now spelled differently.**
+/// See #429: the wildcard swallows the real subcommand, so a safe pattern can
+/// match a flag that belongs to a later pathspec — `git clean -fdx -- . clean
+/// -n` matched `clean-dry-run-short` and the destructive `git clean -fdx -- .`
+/// rode through on the exemption, while real git accepted the trailing tokens
+/// as pathspecs and deleted the tree.
+///
+/// Narrowing the prefix for *every* rule was tried in a887a5f and reverted in
+/// 58daf61, and the measurement is worth keeping: with a grammar-accurate
+/// prefix, `evaluator::tests::explicit_shell_dialects_close_core_git_escape_bypasses`
+/// stops denying `PART=i; g${PART}t reset --hard` under Posix, re-opening a
+/// proven escape-sequence bypass. Reverting *only* the `reset-hard` prefix makes
+/// it pass again, so the prefix is the cause; admitting assignment-shaped tokens
+/// (`\S+=\S*`) as well does not fix it, because the leftover is a bare word.
+/// These patterns do not run against a command line — they run against a
+/// synthesized view, and for a variable-spliced executable that view carries a
+/// bare fragment where a subcommand would be.
+///
+/// **The asymmetry is what makes the narrow prefix safe on the allow side.** A
+/// destructive pattern that stops matching is a missed denial, so its prefix
+/// stays permissive and keeps the bypass guard above. A safe pattern that stops
+/// matching only withdraws an exemption: the command then faces the pack's
+/// destructive rules, which is the conservative direction. So `create_safe_patterns`
+/// spells Git's real grammar — `git [global-options] <subcommand>`, where an
+/// intermediate word is an option or the value of one of the global options that
+/// take a separate value (the same set `resolve_visible_alias_invocation` walks)
+/// — and `create_destructive_patterns` keeps `(?:\S+\s+)*`. Do not unify them.
+///
+/// The safe patterns whose evidence is a *flag* carry a second constraint for
+/// the same reason. Git's `parse_options` permutes, so `git clean . -n` really
+/// is a dry run and the flag cannot be required to sit immediately after the
+/// subcommand; but a bare `--` ends option parsing, so everything after it is a
+/// pathspec and `git clean -fdx -- . clean -n` deletes. The walk from the
+/// subcommand to the flag therefore accepts any token except a bare `--`, and
+/// stops at a quote as well: a quoted `'--'` is still the separator to git,
+/// and the walk runs on a view that may have lost the quotes.
+///
+/// The dashed branch takes no intermediate words on purpose: a dashed builtin
+/// carries its options *after* the subcommand, so `git-<sub>` must be followed
+/// immediately by that rule's own argument shape. That, plus the
+/// `command_executes_git_in_dialect` executable gate, is what keeps
+/// `git-lfs install`, `git-crypt unlock`, and any other `git-*` third-party
+/// executable unmatched. `mygit-reset` and `--no-git-reset` stay unmatched too.
+///
+/// Two rules spell their executable differently and are deliberately not part
+/// of this shape: `branch-force-delete` carries its own
+/// `(?i:…|git-branch(?:\.exe)?)` alternation, and the `push-force-*` rules use
+/// `[^\s&;|`()<>]+` rather than `\S+`.
+///
+/// Safe patterns keep a dashed branch too, so the dry-run spellings
+/// (`git-clean -n`, `git-lfs prune --dry-run`) keep their exemption rather than
+/// falling through to the destructive rule — but it anchors at the start of the
+/// text only, where the destructive branch also accepts `;`, `&`, `|`, `(` and a
+/// newline. #431: safe matching runs on a view with the quotes removed, so a
+/// *quoted* separator arrives as a bare one and satisfies a guard that means "a
+/// command really starts here"; `git clean -fdx -- . '(' git-clean -n` was
+/// allowed, and git treats the extra tokens as pathspecs. Quote removal cannot
+/// manufacture a string start, and safe matching is per segment, so a dashed
+/// builtin in real command position is the segment's first word.
 fn create_safe_patterns() -> Vec<SafePattern> {
     vec![
         // Branch creation is safe
         safe_pattern!(
             "checkout-new-branch",
-            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*checkout\s+-b\s+"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[cC]|--git-dir|--work-tree|--namespace|--super-prefix|--shallow-file|--attr-source|--exec-path|--config-env)\s+[^\s;&|<>()]+\s+|-[^\s;&|<>()]*\s+)*|^\s*(?:[^\s;&|<>()]*/)?git-)checkout\s+-b\s+"
         ),
         safe_pattern!(
             "checkout-orphan",
-            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*checkout\s+--orphan\s+"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[cC]|--git-dir|--work-tree|--namespace|--super-prefix|--shallow-file|--attr-source|--exec-path|--config-env)\s+[^\s;&|<>()]+\s+|-[^\s;&|<>()]*\s+)*|^\s*(?:[^\s;&|<>()]*/)?git-)checkout\s+--orphan\s+"
         ),
         // restore --staged only affects the index, not the working tree, so it
         // is safe. `--staged`/`-S` is a flag that may appear in ANY position
@@ -44,24 +5688,41 @@ fn create_safe_patterns() -> Vec<SafePattern> {
         // the restore touch the working tree (handled by `restore-worktree-explicit`).
         safe_pattern!(
             "restore-staged-long",
-            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*restore\b(?=\s)(?=.*\s--staged\b)(?!.*\s(?:--worktree|-W)\b)"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[cC]|--git-dir|--work-tree|--namespace|--super-prefix|--shallow-file|--attr-source|--exec-path|--config-env)\s+[^\s;&|<>()]+\s+|-[^\s;&|<>()]*\s+)*|^\s*(?:[^\s;&|<>()]*/)?git-)restore\b(?=\s)(?=(?:\s+(?!--(?:\s|$))[^\s;&|<>()\x22']+)*\s+--staged\b)(?!.*\s(?:--worktree|-W)\b)"
         ),
         safe_pattern!(
             "restore-staged-short",
-            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*restore\b(?=\s)(?=.*\s-S\b)(?!.*\s(?:--worktree|-W)\b)"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[cC]|--git-dir|--work-tree|--namespace|--super-prefix|--shallow-file|--attr-source|--exec-path|--config-env)\s+[^\s;&|<>()]+\s+|-[^\s;&|<>()]*\s+)*|^\s*(?:[^\s;&|<>()]*/)?git-)restore\b(?=\s)(?=(?:\s+(?!--(?:\s|$))[^\s;&|<>()\x22']+)*\s+-S\b)(?!.*\s(?:--worktree|-W)\b)"
         ),
         // clean dry-run just previews, doesn't delete
         safe_pattern!(
             "clean-dry-run-short",
-            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*clean\s+-[a-z]*n[a-z]*"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[cC]|--git-dir|--work-tree|--namespace|--super-prefix|--shallow-file|--attr-source|--exec-path|--config-env)\s+[^\s;&|<>()]+\s+|-[^\s;&|<>()]*\s+)*|^\s*(?:[^\s;&|<>()]*/)?git-)clean(?:\s+(?!--(?:\s|$))[^\s;&|<>()\x22']+)*\s+-[a-z]*n[a-z]*"
         ),
         safe_pattern!(
             "clean-dry-run-long",
-            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*clean\s+--dry-run"
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[cC]|--git-dir|--work-tree|--namespace|--super-prefix|--shallow-file|--attr-source|--exec-path|--config-env)\s+[^\s;&|<>()]+\s+|-[^\s;&|<>()]*\s+)*|^\s*(?:[^\s;&|<>()]*/)?git-)clean(?:\s+(?!--(?:\s|$))[^\s;&|<>()\x22']+)*\s+--dry-run"
+        ),
+        // `git lfs prune --dry-run` reports what it would delete and deletes
+        // nothing (Refs PR #383). The flag must be a whole token — `--dry-runx`
+        // is not it — and quoted argument text cannot supply it, because the
+        // walk stops at a quote or a redirection glyph.
+        safe_pattern!(
+            "lfs-prune-dry-run",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:(?:-[cC]|--git-dir|--work-tree|--namespace|--super-prefix|--shallow-file|--attr-source|--exec-path|--config-env)\s+[^\s;&|<>()]+\s+|-[^\s;&|<>()]*\s+)*|^\s*(?:[^\s;&|<>()]*/)?git-)lfs\s+prune(?:\s+(?!--(?:\s|$))[^\s;&|<>()\x22']+)*\s+--dry-run(?:\s|$)"
         ),
     ]
 }
 
+/// The destructive patterns for `core.git`.
+///
+/// Like `core.filesystem`, this pack is argv-inert: the evaluator discards any
+/// match here whose first alphanumeric byte lands in an operand span, quoted or
+/// not, which is what keeps `git commit -m "rm -rf /"` from being read as the
+/// command it quotes. Rules must therefore key on the command word or an
+/// option, never on a path sitting in argv. The full statement of the
+/// constraint, and where a path-keyed rule belongs instead, is on
+/// `core::filesystem::create_destructive_patterns` (#460).
 #[allow(clippy::too_many_lines)]
 fn create_destructive_patterns() -> Vec<DestructivePattern> {
     // Severity levels:
@@ -71,10 +5732,65 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
     // - Low: Log only
 
     vec![
+        // Evaluated explicitly by the bounded visible-alias semantic pass.
+        // The regex is intentionally unsatisfiable so ordinary text matching
+        // cannot manufacture an unverified finding.
+        DestructivePattern {
+            regex: crate::packs::regex_engine::LazyCompiledRegex::new(r"(?!)"),
+            reason: GIT_ALIAS_UNVERIFIED_REASON,
+            name: Some(GIT_ALIAS_UNVERIFIED_RULE),
+            severity: crate::packs::Severity::High,
+            explanation: Some(
+                "Review the fully expanded Git executable, alias chain, shell-alias body, and appended arguments before allowing execution. Dynamic shell values, cycles, and commands beyond the semantic parser's bounds can hide destructive operations.",
+            ),
+            suggestions: &[],
+            executables: None,
+        },
+        // Evaluated explicitly by the branch semantic parser when a dynamic
+        // word may expand or field-split into a deletion / force flag (#274).
+        // The regex is intentionally unsatisfiable so ordinary text matching
+        // cannot manufacture this finding.
+        DestructivePattern {
+            regex: crate::packs::regex_engine::LazyCompiledRegex::new(r"(?!)"),
+            reason: BRANCH_DYNAMIC_REASON,
+            name: Some(BRANCH_DYNAMIC_RULE),
+            severity: crate::packs::Severity::High,
+            explanation: Some(
+                "An unquoted command substitution or variable in a git branch invocation is \
+                 expanded and field-split by the shell before git parses it, so its output can \
+                 inject `-D`, `-f`, `-M`, or `-C` and turn a branch creation into a deletion or \
+                 forced ref update. dcg cannot statically bound the expansion's output.\n\n\
+                 The reliable fix is to resolve the dynamic value first and rerun the command \
+                 with the literal branch name.\n\n\
+                 For a branch *creation*, these spellings are safe without any exception:\n\
+                 - Quote the name so it stays one word: git branch \"backup-$(date +%s)\"\n\
+                 - End option parsing first: git branch -- backup-$(date +%s)\n\n\
+                 Both guarantee the expansion cannot become a flag. They do not unlock a command \
+                 that already carries a literal deletion/force flag (`-D`, `-d`, `-f`, `-M`, \
+                 `-C`) — branch deletion stays gated on its own merits.",
+            ),
+            suggestions: &const {
+                [
+                    PatternSuggestion::new(
+                        "Resolve the dynamic value first, then rerun with the literal branch name",
+                        "The expansion is the problem; a literal name is evaluated on its own merits",
+                    ),
+                    PatternSuggestion::new(
+                        "git branch \"{name}\"",
+                        "For a creation: quote the branch name so the expansion stays a single non-flag word",
+                    ),
+                    PatternSuggestion::new(
+                        "git branch -- {name}",
+                        "For a creation: `--` ends option parsing, so expanded output cannot become a flag",
+                    ),
+                ]
+            },
+            executables: None,
+        },
         // checkout -- discards uncommitted changes
         destructive_pattern!(
             "checkout-discard",
-            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*checkout\s+--\s+",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)checkout\s+--\s+",
             "git checkout -- discards uncommitted changes permanently. Use 'git stash' first.",
             High,
             "git checkout -- <path> discards all uncommitted changes to the specified files \
@@ -85,8 +5801,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - git diff <path>: Review what would be lost before discarding\n\n\
              Preview changes first:\n  git diff -- <path>\n\n\
              Recovering from a failed `git pull --rebase`?\n\
-             Run `dcg rebase-recover` in this repo, then retry the command. This issues a \
-             short-lived, single-shot permit that unblocks this rule only. A rebase already \
+             Run `dcg rebase-recover` in this repo, then retry the command on its own line \
+             (a leading `cd <repo> &&` is fine; nothing else may share the line). This \
+             issues a short-lived, single-shot permit that unblocks this rule only. A rebase already \
              in progress (`.git/rebase-merge/` or `.git/rebase-apply/` present) auto-allows \
              the same rule without a permit.",
             &const {
@@ -104,7 +5821,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "checkout-ref-discard",
-            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*checkout\s+(?!-b\b)(?!--orphan\b)[^\s]+\s+--\s+",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)checkout\s+(?!-b\b)(?!--orphan\b)[^\s]+\s+--\s+",
             "git checkout <ref> -- <path> overwrites working tree. Use 'git stash' first.",
             High,
             "git checkout <ref> -- <path> replaces your working tree files with versions from \
@@ -112,7 +5829,10 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              lost - they cannot be recovered.\n\n\
              Safer alternatives:\n\
              - git stash: Save changes first, then checkout, then restore with 'git stash pop'\n\
-             - git show <ref>:<path>: View the file content without overwriting\n\n\
+             - git show <ref>:<path>: View the file content without overwriting. View only — \
+             redirecting the output back onto <path> (`git show <ref>:<path> > <path>`) reaches \
+             the exact overwrite this rule denies. To capture the content, redirect to a NEW \
+             file: `git show <ref>:<path> > <path>.from-ref`\n\n\
              Preview what would change:\n  git diff HEAD <ref> -- <path>",
             &const {
                 [
@@ -122,7 +5842,200 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                     ),
                     PatternSuggestion::new(
                         "git show {ref}:{path}",
-                        "View the file content without overwriting",
+                        "View the file content without overwriting (view only — do not redirect back onto the same path)",
+                    ),
+                    PatternSuggestion::new(
+                        "git diff HEAD {ref} -- {path}",
+                        "Preview what would change before overwriting",
+                    ),
+                ]
+            }
+        ),
+        // `git checkout .` / `git checkout <ref> .` (no `--`) discards every
+        // uncommitted change under the pathspec, exactly like the blocked
+        // `git checkout -- .` and `git restore .`. The `--`-only rules above
+        // deliberately leave the general `git checkout <pathspec>` alone
+        // because a bare word is ambiguous with a branch name — but `.` (and
+        // `./…`) is NEVER a valid ref, so it is an unambiguous working-tree
+        // discard that was slipping through.
+        destructive_pattern!(
+            "checkout-discard-cwd",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)checkout\s+(?!-b\b)(?!--orphan\b)(?:[^\s;&|<>()]+\s+)*\.(?:/[^\s;&|<>()]*)?(?:\s|$|[;&|<>)])",
+            "git checkout . discards all uncommitted changes in the path. Use 'git stash' first.",
+            High,
+            "git checkout . (or git checkout <ref> .) overwrites the working tree from the \
+             index or a commit, discarding every uncommitted change under the current \
+             directory. The changes were never committed, so they cannot be recovered.\n\n\
+             Safer alternatives:\n\
+             - git stash: save the changes first, restore later with 'git stash pop'\n\
+             - git diff: review exactly what would be discarded\n\
+             - git checkout <ref> -- <specific-file>: limit the overwrite to reviewed files"
+        ),
+        // `git filter-branch` rewrites every commit in the history it touches
+        // and can silently drop commits; `git-filter-repo` (its recommended
+        // replacement) is already treated as unverifiable. Rewritten history
+        // must be reviewed before it is force-pushed over a shared branch.
+        destructive_pattern!(
+            "filter-branch",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)filter-branch\b",
+            "git filter-branch rewrites repository history and can permanently drop commits. Back up the refs first.",
+            High,
+            "git filter-branch rewrites every commit in the selected range, changing their \
+             hashes and, with the wrong filter, silently dropping commits or files. The \
+             original commits survive only in the reflog until it expires or is pruned.\n\n\
+             Safer alternatives:\n\
+             - Back up first: git branch backup-before-rewrite\n\
+             - Prefer git-filter-repo (faster, safer) and review the result\n\
+             - Force-push a rewritten branch only with --force-with-lease"
+        ),
+        // `git reflog expire --expire=now` (and `--expire-unreachable=now`)
+        // destroys the reflog entries that are the last recovery path for
+        // reset/rebase/branch-deletion mistakes; paired with `gc --prune=now`
+        // the lost commits become truly unrecoverable.
+        destructive_pattern!(
+            "reflog-expire-now",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)reflog\s+expire\b[^|;&\r\n]*--expire(?:-(?:u(?:n(?:r(?:e(?:a(?:c(?:h(?:a(?:b(?:le?)?)?)?)?)?)?)?)?)?)?)?=(?:now|all|0)\b",
+            "git reflog expire --expire=now destroys the reflog, removing the ability to recover lost commits.",
+            High,
+            "The reflog records where HEAD and each branch pointed, and is what lets you \
+             recover from a bad reset, rebase, or branch deletion. Expiring it with \
+             --expire=now deletes those entries immediately; after a subsequent \
+             gc --prune=now the orphaned commits cannot be recovered at all.\n\n\
+             Safer alternatives:\n\
+             - Let the reflog expire on its default schedule (90 days)\n\
+             - Recover what you need first: git reflog, then git branch <name> <sha>"
+        ),
+        // `git checkout -f <branch>` / `--force`: switching with force throws
+        // away every uncommitted change to tracked files — the effect of the
+        // Critical `reset --hard`, and the reflex an agent reaches for when a
+        // plain checkout refuses ("your local changes would be overwritten").
+        // fe556e9 deferred it as a posture call; the posture this project
+        // states is that an extra prompt beats lost work. `-f` inside a short
+        // cluster counts (`-qf`); `--ours`/`--theirs`/`--conflict=` do not.
+        destructive_pattern!(
+            "checkout-force",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)checkout\b[^;&|\n<>()]*?\s(?:--f(?:o(?:r(?:ce?)?)?)?|-[A-Za-z]*f[A-Za-z]*)(?:\s|$|[;&|)])",
+            "git checkout -f/--force discards all uncommitted changes to tracked files. Use 'git stash' first.",
+            High,
+            "git checkout --force switches branches (or rewrites paths) even when that \
+             overwrites local modifications, and those modifications are discarded. They \
+             were never committed, so they cannot be recovered — the same outcome as \
+             git reset --hard.\n\n\
+             Safer alternatives:\n\
+             - git stash: save the changes, switch, then 'git stash pop'\n\
+             - git worktree add ../other <branch>: check the branch out alongside\n\
+             - git status / git diff: see exactly what the force would discard"
+        ),
+        // `git switch -f` / `--force` / `--discard-changes`: the modern
+        // spelling of the same force-switch discard.
+        destructive_pattern!(
+            "switch-discard",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)switch\b[^;&|\n<>()]*?\s(?:--force|--di(?:s(?:c(?:a(?:r(?:d(?:-(?:c(?:h(?:a(?:n(?:g(?:es?)?)?)?)?)?)?)?)?)?)?)?)?|-[A-Za-z]*f[A-Za-z]*)(?:\s|$|[;&|)])",
+            "git switch --discard-changes/-f discards all uncommitted changes to tracked files. Use 'git stash' first.",
+            High,
+            "git switch --discard-changes (alias -f/--force) switches branches and throws \
+             away local modifications that would otherwise block the switch. They were never \
+             committed, so they cannot be recovered.\n\n\
+             Safer alternatives:\n\
+             - git stash: save the changes, switch, then 'git stash pop'\n\
+             - git switch -c <new-branch>: carry the changes to a new branch instead\n\
+             - git worktree add ../other <branch>: check the branch out alongside"
+        ),
+        // `git rm -f` deletes the files from the working tree even when they
+        // carry uncommitted modifications — the up-to-date check `-f` exists
+        // to override. `git rm -rf .` was only denied by accident, by the
+        // filesystem `rm -rf` text rule, and `git rm -f <file>` was allowed.
+        // `--cached` (index only, worktree kept) and dry runs stay allowed.
+        destructive_pattern!(
+            "rm-force",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)rm\b(?![^;&|\n]*\s(?:--cached|--dry-run|-[A-Za-z]*n[A-Za-z]*)(?:\s|$))[^;&|\n<>()]*?\s(?:--f(?:o(?:r(?:ce?)?)?)?|-[A-Za-z]*f[A-Za-z]*)(?:\s|$|[;&|)])",
+            "git rm -f deletes files even when they have uncommitted modifications. Commit or stash them first.",
+            High,
+            "git rm --force removes the named files from the index AND the working tree, \
+             bypassing the check that would otherwise refuse when they differ from HEAD. \
+             Committed content can be restored from history, but any uncommitted edits to \
+             those files are gone.\n\n\
+             Safer alternatives:\n\
+             - git rm --cached <path>: stop tracking but keep the file on disk\n\
+             - git rm -n <path>: preview which files would be removed\n\
+             - git stash or git commit first, then git rm without -f"
+        ),
+        // `git update-ref -d <ref>` deletes a branch or any other ref outright
+        // — the plumbing spelling of `git branch -D`, which already requires
+        // approval (README FAQ: every branch deletion is an approval boundary).
+        destructive_pattern!(
+            "update-ref-delete",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)update-ref\b[^;&|\n<>()]*?\s(?:-d|--delete)(?:\s|$)",
+            "git update-ref -d deletes a ref (e.g. a branch) outright, like git branch -D.",
+            High,
+            "git update-ref -d is the plumbing form of deleting a ref. Pointed at \
+             refs/heads/<branch> it is git branch -D without the safety messages; commits \
+             reachable only from that ref survive only in the reflog.\n\n\
+             Safer alternatives:\n\
+             - git branch -vv: review the ref first\n\
+             - git branch backup/<name> <ref>: keep a pointer before deleting\n\
+             - git branch -d <branch>: the porcelain delete, which refuses unmerged branches"
+        ),
+        // `git read-tree --reset -u <tree>` is the plumbing under `git reset
+        // --hard`: `--reset` loads the tree into the index discarding every
+        // staged and unmerged entry, and `-u` then rewrites the working tree
+        // to match, overwriting uncommitted modifications. It was allowed
+        // while its porcelain was Critical. `--reset` needs `-u` to touch the
+        // worktree, so both must be present (either order, `-u` alone or in a
+        // short cluster such as `-vu`; git accepts `--res`/`--rese` too).
+        // `-m -u` is not matched: a merge refuses to overwrite local changes.
+        destructive_pattern!(
+            "read-tree-reset",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)read-tree\b(?=[^;&|\n<>()]*\s--res(?:e(?:t)?)?(?:\s|$|[;&|)]))(?=[^;&|\n<>()]*\s-[A-Za-z]*u[A-Za-z]*(?:\s|$|[;&|)]))",
+            "git read-tree --reset -u overwrites the working tree like git reset --hard, destroying uncommitted changes.",
+            Critical,
+            "git read-tree --reset -u is the plumbing form of git reset --hard. It replaces \
+             the index with the given tree, discarding staged and unmerged entries, and -u \
+             then rewrites the working tree to match, overwriting every uncommitted \
+             modification to tracked files. Those changes were never committed, so they \
+             cannot be recovered.\n\n\
+             Safer alternatives:\n\
+             - git stash: save the changes first, restore later with 'git stash pop'\n\
+             - git read-tree -m -u <tree>: a merge that refuses to overwrite local changes\n\
+             - git status / git diff: see exactly what would be discarded"
+        ),
+        // `git show <ref>:<path>` is safe on its own (stdout only), and the
+        // checkout-ref-discard remediation above recommends it. But redirected
+        // back onto the SAME path it reaches the identical end state that rule
+        // denies: the working-tree file is overwritten with another commit's
+        // content and uncommitted changes to it are lost (#373). Deny only the
+        // same-path shape (a backreference pins redirect target == shown
+        // path), so `git show HEAD:f > f.from-ref` and every other capture to
+        // a new file stays allowed. Covers `>`, `>>`, and `>|`; the piped
+        // `| tee <path>` spelling cannot be a core.git pattern (this pack is
+        // matched per pipeline segment by design), so the prose warns about
+        // it instead.
+        destructive_pattern!(
+            "show-redirect-overwrite-source",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)show\s+[^\s:]+:(\S+)\s*(?:>>|>\|?)\s*(?:\./)?\1(?:[\s;&|)]|$)",
+            "git show <ref>:<path> redirected onto the same <path> overwrites the working tree file, exactly like the denied 'git checkout <ref> -- <path>'.",
+            High,
+            "Redirecting `git show <ref>:<path>` back onto `<path>` replaces the working-tree \
+             file with the version from another commit or branch. Any uncommitted changes to \
+             that file are permanently lost — the same hazard `checkout-ref-discard` exists to \
+             prevent, reached through a redirect instead of a checkout.\n\n\
+             The piped spelling `git show <ref>:<path> | tee <path>` reaches the same \
+             overwrite and is just as unsafe.\n\n\
+             Safer alternatives:\n\
+             - Redirect to a NEW file, then inspect: `git show <ref>:<path> > <path>.from-ref`\n\
+             - git stash: Save changes first, then take the other version, then \
+             'git stash pop'\n\
+             - Bare `git show <ref>:<path>` (no redirect) only prints and is always allowed.\n\n\
+             Preview what would change:\n  git diff HEAD <ref> -- <path>",
+            &const {
+                [
+                    PatternSuggestion::new(
+                        "git show {ref}:{path} > {path}.from-ref",
+                        "Capture the other version into a NEW file instead of overwriting the working copy",
+                    ),
+                    PatternSuggestion::new(
+                        "git stash",
+                        "Save changes first, then take the other version, then 'git stash pop'",
                     ),
                     PatternSuggestion::new(
                         "git diff HEAD {ref} -- {path}",
@@ -138,7 +6051,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // `restore-worktree-explicit` below regardless of `--staged`.
         destructive_pattern!(
             "restore-worktree",
-            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*restore\b(?=\s)(?!.*\s(?:--staged|-S)\b)",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)restore\b(?=\s)(?!.*\s(?:--staged|-S)\b)",
             "git restore discards uncommitted changes. Use 'git stash' or 'git diff' first.",
             High,
             "git restore <path> discards uncommitted changes in your working directory, \
@@ -150,8 +6063,9 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - git diff <path>: Review what would be lost\n\n\
              Preview changes first:\n  git diff <path>\n\n\
              Recovering from a failed `git pull --rebase`?\n\
-             Run `dcg rebase-recover` in this repo, then retry the command. This issues a \
-             short-lived, single-shot permit that unblocks this rule only. A rebase already \
+             Run `dcg rebase-recover` in this repo, then retry the command on its own line \
+             (a leading `cd <repo> &&` is fine; nothing else may share the line). This \
+             issues a short-lived, single-shot permit that unblocks this rule only. A rebase already \
              in progress (`.git/rebase-merge/` or `.git/rebase-apply/` present) auto-allows \
              the same rule without a permit.",
             &const {
@@ -173,7 +6087,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         ),
         destructive_pattern!(
             "restore-worktree-explicit",
-            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*restore\s+.*(?:--worktree|-W\b)",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)restore\s+.*(?:--worktree|-W\b)",
             "git restore --worktree/-W discards uncommitted changes permanently.",
             High,
             "git restore --worktree (or -W) explicitly targets your working directory, \
@@ -201,9 +6115,14 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             }
         ),
         // reset --hard destroys uncommitted work (CRITICAL - extremely common mistake)
+        //
+        // `--hard` may follow other arguments (`git reset HEAD~1 --hard`,
+        // `git reset -q --hard`), and git accepts any unambiguous prefix of a
+        // long option, down to `--h` here. Both were allowed while only
+        // `reset --hard` in first position denied.
         destructive_pattern!(
             "reset-hard",
-            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*reset\s+--hard",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)reset\b[^;&|\n<>()]*?\s--h(?:a(?:rd?)?)?\b",
             "git reset --hard destroys uncommitted changes. Use 'git stash' first.",
             Critical,
             "git reset --hard discards ALL uncommitted changes in your working directory \
@@ -232,16 +6151,18 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                         "git reset --mixed HEAD~1",
                         "Undo commit, unstage changes, but keep working directory",
                     ),
-                    PatternSuggestion::new(
+                    PatternSuggestion::gated(
                         "git checkout -- {file}",
-                        "Reset a specific file only, preserving other changes",
+                        "Discards changes in one file only — still destructive, so dcg gates it too",
                     ),
                 ]
             }
         ),
         destructive_pattern!(
             "reset-merge",
-            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*reset\s+--merge",
+            // Anywhere in the reset, and down to `--me` (`--m` is ambiguous
+            // with `--mixed`), for the same reasons as `reset-hard`.
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)reset\b[^;&|\n<>()]*?\s--me(?:r(?:ge?)?)?\b",
             "git reset --merge can lose uncommitted changes.",
             High,
             "git reset --merge resets the index and updates files in the working tree that \
@@ -269,7 +6190,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // clean -f deletes untracked files (CRITICAL - permanently removes files)
         destructive_pattern!(
             "clean-force",
-            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*clean\s+(?:-[a-z]*f|--force\b)",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)clean(?:\s+(?!--(?:\s|$))[^\s;&|<>()]+)*\s+(?:-[a-z]*f|--f(?:o(?:r(?:ce?)?)?)?\b)",
             "git clean -f/--force removes untracked files permanently. Review with 'git clean -n' first.",
             Critical,
             "git clean -f permanently deletes untracked files from your working directory. \
@@ -314,14 +6235,11 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             // chars forces the walker to stay within a single command segment.
             // Matches the fix already applied to `branch-force-delete` (#121).
             //
-            // KNOWN LIMITATION (#124): the regex still false-positives when
-            // `git push --force` appears verbatim inside a quoted argument
-            // body (e.g. `git commit -m "...mentions git push --force"`) —
-            // the inner sequence is itself a complete command shape preceded
-            // by whitespace, which no walker-tightening can distinguish from
-            // a real command. A complete fix needs shell tokenization in
-            // `pack.check` before regex matching.
-            r"(?:^|[^[:alnum:]_-])git\s+(?:[^\s&;|`()<>]+\s+)*push\s+(?:[^\s&;|`()<>]+\s+)*--force(?![-a-z])",
+            // The evaluator applies this regex only to its role-aware,
+            // string-data-sanitized command view. That boundary is essential:
+            // the regex alone cannot distinguish a real force push from the
+            // same words inside `git commit -m "..."`.
+            r"(?:^|[^[:alnum:]_-])git(?:\s+(?:[^\s&;|`()<>]+\s+)*|-)push\s+(?:[^\s&;|`()<>]+\s+)*--force(?![-a-z])",
             "Force push can destroy remote history. Use --force-with-lease if necessary.",
             Critical,
             "git push --force overwrites remote history with your local history. This can \
@@ -362,8 +6280,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         destructive_pattern!(
             "push-force-short",
             // Bounded walker — see `push-force-long` for rationale and the
-            // known shell-tokenization limitation. (#124)
-            r"(?:^|[^[:alnum:]_-])git\s+(?:[^\s&;|`()<>]+\s+)*push\s+(?:[^\s&;|`()<>]+\s+)*-[a-zA-Z]*f[a-zA-Z]*\b",
+            // evaluator-owned role-aware data masking. (#124)
+            r"(?:^|[^[:alnum:]_-])git(?:\s+(?:[^\s&;|`()<>]+\s+)*|-)push\s+(?:[^\s&;|`()<>]+\s+)*-[a-zA-Z]*f[a-zA-Z]*\b",
             "Force push (-f) can destroy remote history. Use --force-with-lease if necessary.",
             Critical,
             "git push -f (short for --force) overwrites remote history with your local history. \
@@ -393,7 +6311,90 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                 ]
             }
         ),
-        // branch -D/-f force deletes or overwrites without checks (Medium: recoverable via reflog).
+        // `git push origin +main` / `+HEAD:main` / `+refs/heads/*:refs/heads/*`:
+        // a leading `+` on a refspec is git's per-ref force flag — the same
+        // overwrite as `--force` for that ref, with no flag for the two rules
+        // above to see. Same bounded walker, so it stays inside one command.
+        destructive_pattern!(
+            "push-force-refspec",
+            r#"(?:^|[^[:alnum:]_-])git(?:\s+(?:[^\s&;|`()<>]+\s+)*|-)push\s+(?:[^\s&;|`()<>]+\s+)*['"]?\+[^\s&;|`()<>]+"#,
+            "A '+' refspec force-pushes that ref and can destroy remote history. Use --force-with-lease if necessary.",
+            Critical,
+            "In `git push <remote> +<ref>`, the leading `+` forces that one update exactly as \
+             --force would, overwriting remote history with your local history. Commits \
+             others already pushed to that ref are discarded from the remote.\n\n\
+             Safer alternative:\n\
+             - git push --force-with-lease <remote> <ref>: only forces if the remote still \
+             matches what you last fetched\n\n\
+             Check remote state first:\n  git fetch && git log origin/<branch>..HEAD",
+            &const {
+                [
+                    PatternSuggestion::new(
+                        "git push --force-with-lease origin {branch}",
+                        "Fails if remote has new commits you haven't fetched",
+                    ),
+                    PatternSuggestion::new(
+                        "git fetch && git log origin/{branch}..HEAD",
+                        "Preview what you're about to overwrite on the remote",
+                    ),
+                ]
+            }
+        ),
+        // Merge-checked branch deletion (`-d` / `--delete`, no force). Git
+        // refuses to delete a branch it does not consider merged, but the
+        // command still removes the branch name, its tracking configuration
+        // and the convenient reflog anchor, so it is denied by default like
+        // the forced forms (#209). It has its own id so `[policy.rules]` and
+        // allowlists can relax it without relaxing `-D` (#509); an entry for
+        // `branch-force-delete` still covers it (see
+        // `crate::packs::legacy_rule_names`).
+        //
+        // Evaluated only by the branch semantic parser, which is what can tell
+        // `-d` from `-D`, `--delete --force` and `-df`. The regex is
+        // intentionally unsatisfiable; a branch command the parser cannot read
+        // falls back to the `branch-force-delete` regex below, which matches
+        // every delete form.
+        DestructivePattern {
+            regex: crate::packs::regex_engine::LazyCompiledRegex::new(r"(?!)"),
+            reason: "git branch deletion requires explicit user approval.",
+            name: Some(BRANCH_DELETE_RULE),
+            severity: crate::packs::Severity::High,
+            explanation: Some(
+                "git branch -d (or --delete) removes a branch reference. Git refuses when it \
+                 does not consider the branch merged into its upstream or HEAD, but a merged \
+                 deletion still discards the branch name, its tracking configuration, and the \
+                 convenient reflog reference. The user may intentionally need any of those, so \
+                 agents must not delete a branch without explicit approval.\n\n\
+                 This rule covers only the merge-checked form. -D, --delete --force, -f, -M and \
+                 -C are reported as branch-force-delete. To let agents delete merged branches \
+                 after review while still refusing the forced forms, set\n\
+                 [policy.rules] \"core.git:branch-delete\" = \"ask\".\n\n\
+                 Review without changing refs:\n\
+                 - git branch -vv: Show branch tips and upstream tracking state\n\
+                 - git branch --merged / --no-merged: Review Git's merge classification\n\n\
+                 Recovery if deletion already happened:\n\
+                   git reflog  # Find the commit hash while it is still retained\n\
+                   git branch <branch> <commit-hash>",
+            ),
+            suggestions: &const {
+                [
+                    PatternSuggestion::new(
+                        "git branch -vv",
+                        "Review branch tips and upstream tracking state without changing refs",
+                    ),
+                    PatternSuggestion::new(
+                        "git branch --merged && git branch --no-merged",
+                        "Review Git's merged and unmerged classifications before asking approval",
+                    ),
+                ]
+            },
+            executables: None,
+        },
+        // Forced branch deletion and forced ref updates cross a user-intent
+        // boundary. The semantic parser attributes only the forced forms here;
+        // this regex still matches every delete form, including `-d`, because
+        // it is the fallback for a branch command the parser cannot read, and
+        // there the stricter attribution is the safe one.
         //
         // Intermediate tokens between `git` and `branch`, and between
         // `branch` and the force-flag, are constrained to NOT contain
@@ -407,34 +6408,46 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // `\b` treats hyphens as word boundaries, so `--force\b` falsely
         // matched the `--force` prefix of `--force-with-lease` and
         // `--force-if-includes` (#121).
+        //
+        // Token separators use `[ \t]+` rather than `\s+` so the walkers
+        // cannot bridge a newline — a POSIX command separator — from a benign
+        // `git branch --list` line into an unrelated later line whose first
+        // token starts with `-` (for example a `[ -d "$p/.git" ]` test) (#246).
         destructive_pattern!(
             "branch-force-delete",
-            r"(?:^|[^[:alnum:]_-])git\s+(?:[^\s&;|`()<>]+\s+)*branch\s+(?:[^\s&;|`()<>]+\s+)*(?:-[a-zA-Z]*[Df][a-zA-Z]*(?:\s|$)|--force(?:\s|$))",
-            "git branch -D/--force deletes branches without checks. Recoverable via 'git reflog'.",
-            Medium,
-            "git branch -D force-deletes a branch without checking if it has been merged. \
-             If the branch contains unmerged commits, you may lose access to that work. \
-             However, the commits still exist in git's object database and can be recovered \
-             using reflog (for a limited time, typically 90 days).\n\n\
-             Safer alternatives:\n\
-             - git branch -d <branch>: Safe delete, fails if branch is not fully merged\n\
-             - Merge the branch first, then delete with -d\n\n\
-             Recovery if needed:\n\
-               git reflog  # Find the commit hash\n\
-               git checkout -b <branch> <commit-hash>",
+            r"(?:^|[^[:alnum:]_-])(?i:(?:git(?:\.exe)?[ \t]+(?:[^\s&;|`()<>]+[ \t]+)*branch|git-branch(?:\.exe)?))[ \t]+(?:[^\s&;|`()<>]+[ \t]+)*(?:-[a-zA-Z]*[dDfMC][a-zA-Z]*(?:\s|$)|--(?:d(?:e(?:l(?:e(?:t(?:e)?)?)?)?)?|forc(?:e)?)(?:\s|$))",
+            "git branch deletion or forced ref updates require explicit user approval.",
+            High,
+            "git branch -D (--delete --force) removes a branch reference without Git's \
+             merge check, so commits reachable only from that branch are left to the reflog \
+             and garbage collection. The -f/--force forms can also move an existing branch \
+             reference away from commits, and the -M and -C shorthands force-overwrite an \
+             existing rename/copy target. Agents must not cross these user-intent boundaries \
+             without explicit approval.\n\n\
+             The merge-checked deletion (-d / --delete without force) is reported as \
+             core.git:branch-delete when dcg can parse the command; a command it cannot \
+             parse is reported here. A [policy.rules] or allowlist entry for this rule also \
+             covers core.git:branch-delete unless that rule has its own entry.\n\n\
+             Review without changing refs:\n\
+             - git branch -vv: Show branch tips and upstream tracking state\n\
+             - git branch --merged / --no-merged: Review Git's merge classification\n\
+             - git log --oneline --decorate <branch>: Inspect the branch history\n\n\
+             Recovery if deletion already happened:\n\
+               git reflog  # Find the commit hash while it is still retained\n\
+               git branch <branch> <commit-hash>",
             &const {
                 [
                     PatternSuggestion::new(
-                        "git branch -d {branch}",
-                        "Safe delete: only works if branch is fully merged",
+                        "git branch -vv",
+                        "Review branch tips and upstream tracking state without changing refs",
                     ),
                     PatternSuggestion::new(
-                        "git branch -v {branch}",
-                        "Show branch info (last commit) before deleting",
+                        "git branch --merged && git branch --no-merged",
+                        "Review Git's merged and unmerged classifications before asking approval",
                     ),
                     PatternSuggestion::new(
                         "git log {branch} --oneline -10",
-                        "Review branch commits before deleting",
+                        "Review branch commits without deleting or moving the ref",
                     ),
                 ]
             }
@@ -442,7 +6455,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // stash destruction (Medium: single stash, recoverable via fsck/unreachable objects)
         destructive_pattern!(
             "stash-drop",
-            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*stash\s+drop",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)stash\s+drop",
             "git stash drop deletes a single stash. Recoverable via `git fsck` (unreachable objects).",
             Medium,
             "git stash drop removes a specific stash entry from your stash list. The stashed \
@@ -479,7 +6492,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // stash clear destroys ALL stashes (CRITICAL)
         destructive_pattern!(
             "stash-clear",
-            r"(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*stash\s+clear",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)stash\s+clear",
             "git stash clear permanently deletes ALL stashed changes.",
             Critical,
             "git stash clear removes ALL stash entries at once. Unlike git stash drop, \
@@ -496,14 +6509,106 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
                git fsck --unreachable | grep commit",
             &const {
                 [
-                    PatternSuggestion::new(
+                    PatternSuggestion::gated(
                         "git stash drop stash@{n}",
-                        "Remove one specific stash at a time",
+                        "Drops one stash at a time instead of all — still deletes stashed work, so dcg gates it too",
                     ),
                     PatternSuggestion::new("git stash list", "Review all stashes before clearing"),
                     PatternSuggestion::new(
                         "git stash show stash@{n}",
                         "Inspect each stash before deciding to delete",
+                    ),
+                ]
+            }
+        ),
+        // ---- Git LFS (Refs PR #383) -----------------------------------------
+        //
+        // `git lfs` is dispatched to the `git-lfs` helper, so it is a known
+        // subcommand rather than an unverifiable alias. Its read-only verbs
+        // (`ls-files`, `status`, `env`, `fetch`, `pull`, `track`, `locks`,
+        // `migrate info`) carry no rule; the three verbs that destroy data or
+        // rewrite history do.
+        destructive_pattern!(
+            "lfs-migrate-rewrite",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)lfs\s+migrate\s+(?:import|export)(?![\w-])",
+            "git lfs migrate import/export rewrites history — every commit in the range gets a new SHA.",
+            High,
+            "git lfs migrate import/export rewrites the commits it touches:\n\n\
+             - Every rewritten commit gets a NEW SHA, so the branch diverges from\n  \
+             every clone and a force-push is required to publish it\n\
+             - Collaborators' branches, open PRs and CI pins all break\n\
+             - `--everything` rewrites every local ref, not just the current branch\n\
+             - The original objects survive only until the next `git gc` prunes\n  \
+             the unreachable ones\n\n\
+             Preview without rewriting anything:\n\
+             - git lfs migrate info: report what WOULD be converted\n\
+             - git lfs migrate info --everything --above=1MB\n\n\
+             Back the refs up first: git branch backup/pre-lfs-migrate",
+            &const {
+                [
+                    PatternSuggestion::new(
+                        "git lfs migrate info",
+                        "Reports what would be converted without rewriting any commit",
+                    ),
+                    PatternSuggestion::new(
+                        "git branch backup/pre-lfs-migrate",
+                        "Keep a ref to the pre-rewrite history before migrating",
+                    ),
+                ]
+            }
+        ),
+        destructive_pattern!(
+            "lfs-prune",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)lfs\s+prune(?![\w-])",
+            "git lfs prune deletes local LFS objects; with --force it deletes objects the remote does not have.",
+            Medium,
+            "git lfs prune deletes local Git LFS objects from .git/lfs/objects:\n\n\
+             - Objects older than the fetch/push retention window are removed\n\
+             - Anything the remote also has is re-downloadable, so the usual\n  \
+             case is recoverable — at the cost of a re-fetch\n\
+             - `--force` / `-f` prunes objects even when the remote is NOT known\n  \
+             to have them, which can destroy the only copy of unpushed content\n\
+             - `--recent` widens what is kept; it does not make the delete safer\n\n\
+             Check what would go first:\n\
+             - git lfs prune --dry-run --verbose\n\
+             - git lfs prune --verify-remote: only prune what the remote confirms",
+            &const {
+                [
+                    PatternSuggestion::new(
+                        "git lfs prune --dry-run --verbose",
+                        "Lists the objects that would be deleted without deleting them",
+                    ),
+                    PatternSuggestion::gated(
+                        "git lfs prune --verify-remote",
+                        "Only prunes objects the remote confirms it has — still a delete, so dcg gates it too",
+                    ),
+                ]
+            }
+        ),
+        destructive_pattern!(
+            "lfs-uninstall",
+            r"(?:(?:^|[^[:alnum:]_-])git\s+(?:\S+\s+)*|(?:^|[;&|(\n]\s*)(?:[^\s;&|<>()]*/)?git-)lfs\s+uninstall(?![\w-])",
+            "git lfs uninstall removes the LFS filters and hooks, so LFS files check out as pointer text.",
+            Medium,
+            "git lfs uninstall removes Git LFS from the git configuration:\n\n\
+             - The clean/smudge filters go, so tracked binaries check out as\n  \
+             one-line pointer files — and a later `git add`/commit can write\n  \
+             those pointers back over real content\n\
+             - The pre-push hook goes, so LFS objects stop being uploaded and a\n  \
+             push can publish pointers with no objects behind them\n\
+             - `--system` and `--global` affect EVERY repository on the machine,\n  \
+             not just this one\n\n\
+             Check the current configuration first: git lfs env\n\
+             Re-enable with: git lfs install",
+            &const {
+                [
+                    PatternSuggestion::new(
+                        "git lfs env",
+                        "Shows the filters and hooks that would be removed",
+                    ),
+                    PatternSuggestion::new(
+                        "git lfs install",
+                        "Restores the LFS filters and hooks if they were removed",
                     ),
                 ]
             }
@@ -521,6 +6626,739 @@ mod tests {
     use super::*;
     use crate::packs::Severity;
     use crate::packs::test_helpers::*;
+    use std::fmt::Write as _;
+
+    // =========================================================================
+    // Git LFS (Refs PR #383): `git lfs` is a known subcommand, and its three
+    // destructive verbs carry their own rules.
+    // =========================================================================
+
+    // =========================================================================
+    // Issue #405: a read-only `git` subcommand must resolve independently of a
+    // path argument dcg cannot resolve.
+    // =========================================================================
+
+    #[test]
+    fn dynamic_path_options_do_not_make_the_subcommand_unverifiable() {
+        // `-C $d` / `--git-dir=$d/.git` name a *path*, never an alias, and the
+        // subcommand stays in plain sight. Every one of these used to deny as
+        // `git-alias-semantic-unverified`, which made a read-only status/log
+        // sweep over a directory list unusable.
+        for command in [
+            "git -C $d status --short",
+            "git -C $d log -1",
+            "git -C$d status",
+            "git --git-dir=$d/.git status",
+            "git --work-tree=$w --git-dir=$d/.git diff",
+            "git -C \"$r\" log --oneline -5",
+            "git -C $d rev-parse --abbrev-ref HEAD",
+        ] {
+            assert_eq!(
+                invoked_visible_git_alias_in_dialect(command, ShellDialect::Posix),
+                InvokedGitAliasDecision::NoMatch,
+                "{command} must resolve its subcommand"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_path_options_do_not_weaken_alias_or_dispatch_checks() {
+        // What the rule is actually for stays denied: a dynamic *subcommand*,
+        // a dynamic `-c alias.…` definition, an unresolvable alias name, and a
+        // dynamic `--exec-path` (which really can redirect dispatch to another
+        // `git-<name>` helper).
+        for command in [
+            "git $sub status",
+            "git -C $d st",
+            "git -c alias.st=$x st",
+            "git --exec-path=$evil status",
+            "git $flag status",
+        ] {
+            assert_eq!(
+                invoked_visible_git_alias_in_dialect(command, ShellDialect::Posix),
+                InvokedGitAliasDecision::Unverified,
+                "{command} must stay unverifiable"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_path_value_before_a_visible_subcommand_is_not_branch_argv() {
+        // #597: with an unquoted `-C $r`, a bare dynamic operand after a
+        // read-only subcommand was judged as `git branch` argv.
+        for command in [
+            "git -C $r log main $b",
+            "git -C $r log $b",
+            "git -C $r log main \"$b\"",
+            "git -C $r diff main $b",
+            "git -C $r rev-list main $b",
+            "git -C $r merge-base main $b",
+            "git -C $r cherry main $b",
+            "git --work-tree $w --git-dir $d diff $b",
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let decision = branch_command_decision_in_dialect(command, dialect);
+                assert!(
+                    !decision.is_destructive(),
+                    "{command} ({dialect:?}) -> {decision:?}"
+                );
+            }
+        }
+        // Branch argv after the dynamic path, and a dynamic path with no
+        // visible subcommand after it, still fail closed.
+        for command in [
+            "git -C $r branch $b",
+            "git -C $r branch -D $b",
+            "git -C $r -D main",
+            "git -C $r $sub main $b",
+            "git -C $r -f main $b",
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let decision = branch_command_decision_in_dialect(command, dialect);
+                assert!(
+                    decision.is_destructive(),
+                    "{command} ({dialect:?}) -> {decision:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn camel_case_parameters_are_not_git_short_flag_clusters() {
+        // #401: PowerShell writes `-Directory`, `-Confirm`, `-Recurse`; a POSIX
+        // short-flag reading turns those into `-D` (branch delete) and `-C`
+        // (forced copy). Only the literal-evidence scan behind an unbounded
+        // executable consults this, which is exactly where a PowerShell
+        // assignment lands, so `$items = Get-ChildItem -Directory` used to be
+        // a `branch-dynamic-token` deny.
+        assert!(camel_case_long_parameter_name("-Directory"));
+        assert!(camel_case_long_parameter_name("-Confirm"));
+        assert!(camel_case_long_parameter_name("-Recurse"));
+        assert!(camel_case_long_parameter_name("-Descending"));
+        // Real short-flag clusters and their capitalised forms stay flags.
+        assert!(!camel_case_long_parameter_name("-D"));
+        assert!(!camel_case_long_parameter_name("-Df"));
+        assert!(!camel_case_long_parameter_name("-DF"));
+        assert!(!camel_case_long_parameter_name("-fd"));
+        assert!(!camel_case_long_parameter_name("--delete"));
+        assert!(!camel_case_long_parameter_name("main"));
+
+        assert!(!dynamic_git_branch_may_mutate(
+            "$items = Get-ChildItem C:\\temp -Recurse -Directory",
+            ShellDialect::Unknown
+        ));
+        // Literal branch evidence after an unknown executable still denies.
+        assert!(dynamic_git_branch_may_mutate(
+            "$g $sub -D main",
+            ShellDialect::Posix
+        ));
+    }
+
+    #[test]
+    fn an_unbounded_executable_is_not_synthesized_into_git_branch() {
+        // `$items` may equal any name, so `may_equal("git-branch")` says yes
+        // about every bare expansion. Synthesizing `git branch <argv>` from
+        // that handed the `branch-force-delete` regex an unrelated argument to
+        // read as `-D`: `$items = Get-ChildItem C:\temp -Recurse -Directory`
+        // was denied as a forced branch deletion.
+        for command in [
+            "$items = Get-ChildItem C:\\temp -Recurse -Directory",
+            "$count += Get-ChildItem -Directory",
+            "$tool -Confirm build",
+        ] {
+            let sanitized = crate::context::sanitize_for_pattern_matching(command);
+            let view =
+                syntax_view_for_pattern_matching(command, sanitized.as_ref(), ShellDialect::Posix);
+            assert!(
+                !view
+                    .as_deref()
+                    .is_some_and(|view| view.contains("git branch")),
+                "{command} must not synthesize a branch subcommand: {view:?}"
+            );
+        }
+
+        // A statically proven `git-branch` still spells its subcommand out.
+        let sanitized = crate::context::sanitize_for_pattern_matching("git-branch -D main");
+        let view = syntax_view_for_pattern_matching(
+            "git-branch -D main",
+            sanitized.as_ref(),
+            ShellDialect::Posix,
+        );
+        assert!(
+            view.as_deref()
+                .is_some_and(|view| view.contains("git branch")),
+            "proven git-branch keeps its synthesis: {view:?}"
+        );
+    }
+
+    /// #428: a bounded symbolic executable can stand for several dashed
+    /// built-ins, and the first table match is a guess. `git-c$X` resolved to
+    /// `checkout`, synthesized `git checkout -fdx`, and matched nothing —
+    /// while the unambiguous `git-cl$X -fdx` denied. Every candidate reading
+    /// is now spelled out, so the destructive one is still seen.
+    #[test]
+    fn an_ambiguous_dashed_builtin_spells_out_every_candidate() {
+        let command = "git-c$X -fdx";
+        let sanitized = crate::context::sanitize_for_pattern_matching(command);
+        let view =
+            syntax_view_for_pattern_matching(command, sanitized.as_ref(), ShellDialect::Posix)
+                .expect("a bounded symbolic git executable synthesizes a view");
+        // Since `checkout-force`, `git checkout -fdx` is itself destructive
+        // (a force-checkout discards uncommitted changes), so either reading
+        // satisfies #428; what must never be presented is only a benign one.
+        assert!(
+            view.contains("git clean -fdx") || view.contains("git checkout -fdx"),
+            "a destructive reading must be the one presented: {view:?}"
+        );
+        assert!(
+            create_pack().check(&view).is_some(),
+            "the presented reading must deny: {view:?}"
+        );
+
+        // The benign candidate is still presented when no reading is
+        // destructive, so this is not "always pick the scariest subcommand":
+        // `git clean -n` is exempt and `git checkout -n` is nothing.
+        let benign = "git-c$X -n";
+        let sanitized_benign = crate::context::sanitize_for_pattern_matching(benign);
+        let benign_view = syntax_view_for_pattern_matching(
+            benign,
+            sanitized_benign.as_ref(),
+            ShellDialect::Posix,
+        )
+        .expect("a bounded symbolic git executable synthesizes a view");
+        assert!(
+            AMBIGUITY_ARBITER.check(&benign_view).is_none(),
+            "a dry-run reading must not be presented as destructive: {benign_view:?}"
+        );
+
+        // An unambiguous word still resolves to exactly one subcommand, and a
+        // proven literal is unaffected.
+        for (command, expected, unexpected) in [
+            ("git-cl$X -fdx", "git clean -fdx", "git checkout"),
+            ("git-clean -fdx", "git clean -fdx", "git checkout"),
+            (
+                "git-checkout -- src/f",
+                "git checkout -- src/f",
+                "git clean",
+            ),
+        ] {
+            let sanitized = crate::context::sanitize_for_pattern_matching(command);
+            let view =
+                syntax_view_for_pattern_matching(command, sanitized.as_ref(), ShellDialect::Posix)
+                    .unwrap_or_else(|| panic!("{command} synthesizes a view"));
+            assert!(
+                view.contains(expected),
+                "{command} must read as {expected:?}: {view:?}"
+            );
+            assert!(
+                !view.contains(unexpected),
+                "{command} must not also read as {unexpected:?}: {view:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_lfs_destructive_verbs_are_covered() {
+        let pack = create_pack();
+
+        for (command, pattern, severity) in [
+            (
+                "git lfs migrate import --everything --above=1MB",
+                "lfs-migrate-rewrite",
+                Severity::High,
+            ),
+            (
+                "git lfs migrate export --include='*.psd'",
+                "lfs-migrate-rewrite",
+                Severity::High,
+            ),
+            ("git lfs prune", "lfs-prune", Severity::Medium),
+            ("git lfs prune --force", "lfs-prune", Severity::Medium),
+            ("git lfs uninstall", "lfs-uninstall", Severity::Medium),
+            (
+                "git lfs uninstall --system",
+                "lfs-uninstall",
+                Severity::Medium,
+            ),
+            // Global git flags between `git` and `lfs`.
+            (
+                "git -C /srv/repo lfs prune --force",
+                "lfs-prune",
+                Severity::Medium,
+            ),
+        ] {
+            assert_no_safe_match(&pack, command);
+            assert_blocks_with_pattern(&pack, command, pattern);
+            assert_blocks_with_severity(&pack, command, severity);
+        }
+
+        // Read-only and routine LFS verbs stay allowed — `migrate info` in
+        // particular is the recommended preview for `migrate import`.
+        for command in [
+            "git lfs ls-files",
+            "git lfs ls-files --long",
+            "git lfs status",
+            "git lfs env",
+            "git lfs version",
+            "git lfs fetch origin main",
+            "git lfs pull",
+            "git lfs checkout",
+            "git lfs track '*.psd'",
+            "git lfs install",
+            "git lfs locks",
+            "git lfs migrate info --everything --above=1MB",
+            "git lfs prune --dry-run --verbose",
+        ] {
+            assert_allows(&pack, command);
+        }
+    }
+
+    // =========================================================================
+    // PowerShell expression statements are not command invocations (#273)
+    // =========================================================================
+
+    /// A PS statement whose first token is a quoted string or variable is an
+    /// expression statement; PowerShell refuses to invoke it without `&`, so
+    /// the git semantic layer must not treat it as a possible Git executable.
+    #[test]
+    fn powershell_expression_statement_is_not_a_git_invocation() {
+        for command in [
+            "\"$X\" \"$Y\"",
+            "\"$BIN\" run \"$ARG\"",
+            "\"$X\" y",
+            "$X $Y",
+            "\"$X\" -D",
+            "\"$env:TOOL\" \"$env:ARG\"",
+            "$x = \"$Y\" \"$Z\"",
+        ] {
+            assert!(
+                !command_executes_git_in_dialect(command, ShellDialect::PowerShell),
+                "expression statement must not execute git: {command}"
+            );
+            assert!(
+                !dynamic_git_branch_may_mutate(command, ShellDialect::PowerShell),
+                "expression statement must not reach branch mutation: {command}"
+            );
+            assert_ne!(
+                branch_command_decision_in_dialect(command, ShellDialect::PowerShell),
+                BranchCommandDecision::Destructive,
+                "expression statement must not be a destructive branch command: {command}"
+            );
+        }
+    }
+
+    /// Real invocation shapes must keep their conservative treatment: an
+    /// assignment executes its right-hand side, and `$(…)` / `@(…)`
+    /// subexpressions evaluate their embedded pipeline even inside an
+    /// expression statement.
+    #[test]
+    fn powershell_expression_shortcut_excludes_invoking_shapes() {
+        assert_eq!(
+            branch_command_decision_in_dialect("$x = git branch -D main", ShellDialect::PowerShell),
+            BranchCommandDecision::Destructive,
+            "assignment RHS is a real invocation and must stay destructive"
+        );
+        for command in [
+            "$(git branch -D main)",
+            "\"$(git branch -D main)\"",
+            "@(git branch -D main)",
+        ] {
+            assert!(
+                command_executes_git_in_dialect(command, ShellDialect::PowerShell),
+                "subexpression statements keep the conservative treatment: {command}"
+            );
+        }
+    }
+
+    /// The reported #273 shapes must not be denied on the all-dialect route
+    /// either: the quoted dynamic executable is an unknown program in every
+    /// dialect. Since #281, the unquoted `$X $Y` form agrees with the quoted
+    /// one — an executable with no literal bytes supplies no Git evidence, so
+    /// quoted and unquoted spellings must not disagree.
+    #[test]
+    fn quoted_dynamic_executable_with_dynamic_argument_is_unknown_program() {
+        for command in ["\"$X\" \"$Y\"", "\"$BIN\" run \"$ARG\"", "$X $Y"] {
+            for dialect in [
+                ShellDialect::Posix,
+                ShellDialect::PowerShell,
+                ShellDialect::Cmd,
+                ShellDialect::Unknown,
+            ] {
+                let decision = branch_command_decision_in_dialect(command, dialect);
+                assert!(
+                    !decision.is_destructive(),
+                    "dynamic executable without git evidence must not be branch-destructive: {command} ({dialect:?}) -> {decision:?}"
+                );
+            }
+        }
+    }
+
+    // =========================================================================
+    // Unbounded dynamic executables carry no git evidence (#281)
+    // =========================================================================
+
+    /// A command whose executable resolves to an unbounded expansion — a
+    /// backtick pair surfaced by Unknown-dialect quote stripping, or a bare
+    /// `$cmd` — must not be attributed to `core.git:branch-dynamic-token`
+    /// when nothing literal ties the command to Git (#281).
+    #[test]
+    fn unbounded_dynamic_executable_without_git_evidence_is_not_branch() {
+        for command in [
+            // Reported shape 1: backticks inside a single-quoted string in an
+            // assignment value; Unknown-dialect normalization strips the
+            // quotes and the substitution lands in the executable slot.
+            "s=s.replace('a `x` b', 'c')",
+            // The exact normalized slice the evaluator scans for it.
+            "s=s.replace(a `x` b, c)",
+            // Reported shape 2: dynamic executable plus dynamic argument.
+            "$cmd $arg",
+            // Reporter-verified boundary facts that already allow.
+            "s=s.replace('a $(x) b', 'c')",
+            "s=`echo hi`",
+            "print('a `x` b', 'c')",
+        ] {
+            for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
+                let decision = branch_command_decision_in_dialect(command, dialect);
+                assert!(
+                    !decision.is_destructive(),
+                    "no git evidence, must not deny as git branch: {command} ({dialect:?}) -> {decision:?}"
+                );
+            }
+        }
+    }
+
+    /// Planted negatives for #281: literal branch evidence keeps every one of
+    /// these fail-closed under the dynamic-token attribution.
+    #[test]
+    fn literal_branch_evidence_stays_fail_closed_281() {
+        for command in [
+            "git branch $(cat f)",
+            "git branch -D $BR",
+            // An unbounded executable followed by literal branch syntax keeps
+            // the conservative treatment: the literal words are the evidence.
+            "$(producer) branch -d feature",
+        ] {
+            for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
+                assert_eq!(
+                    branch_command_decision_in_dialect(command, dialect),
+                    BranchCommandDecision::DestructiveDynamic,
+                    "literal branch evidence must stay denied: {command} ({dialect:?})"
+                );
+            }
+        }
+    }
+
+    /// #281 must not discard literal argv that follows the unknowns. A short
+    /// delete/force flag proves the mutation exactly like the long spelling
+    /// that already fails closed, so both must deny.
+    #[test]
+    fn literal_short_flags_after_unbounded_dynamics_stay_fail_closed_281() {
+        for command in [
+            "$g $sub -D main",
+            "$g $sub -d feature",
+            "$g ${sub} -D main",
+            "$g $sub -M old new",
+            "$g $sub -f main origin/main",
+            "$g $sub --delete --force main",
+        ] {
+            for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
+                assert_eq!(
+                    branch_command_decision_in_dialect(command, dialect),
+                    BranchCommandDecision::DestructiveDynamic,
+                    "literal mutation evidence must stay denied: {command} ({dialect:?})"
+                );
+            }
+        }
+
+        // Literal evidence that is not a branch mutation keeps the #281 allow.
+        for command in [
+            "$cmd $arg",
+            "\"$cmd\" \"$arg\"",
+            "$cmd literal",
+            "$g $sub main",
+            "$g $sub -v",
+            "$g $sub --list",
+            "ls $arg",
+        ] {
+            for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
+                let decision = branch_command_decision_in_dialect(command, dialect);
+                assert!(
+                    !decision.is_destructive(),
+                    "no branch mutation evidence, must not deny: {command} ({dialect:?}) -> {decision:?}"
+                );
+            }
+        }
+    }
+
+    // =========================================================================
+    // Executable evidence is judged on the basename (#360, #361)
+    // =========================================================================
+
+    /// A word whose basename is nothing but glob metacharacters names no
+    /// program at all — the leading `/` is a directory separator, not literal
+    /// Git evidence — so it must supply exactly as little evidence as the bare
+    /// `*`/`$cmd` that #281 already discounts. The reported symptom: a C/JSDoc
+    /// block comment (`/* ... */`) reaching a shell was denied as a
+    /// destructive dynamic git-branch invocation (#360).
+    #[test]
+    fn wildcard_basename_executable_supplies_no_git_evidence_360() {
+        for command in [
+            // Minimal reproducer and the block-comment pair.
+            "/* *",
+            "/* */",
+            "/** Default language for new articles */",
+            // Other pure-metacharacter basenames.
+            "/? *",
+            "./* *",
+            "lib/* *",
+            "/[ab]* *",
+            // A second wildcard cannot stand in for the `branch` subcommand.
+            "/* b*",
+            // An expansion basename behind a literal directory is just as
+            // unbounded as the bare expansion.
+            "dir/$X $sub",
+        ] {
+            for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
+                let decision = branch_command_decision_in_dialect(command, dialect);
+                assert!(
+                    !decision.is_destructive(),
+                    "wildcard basename is no git evidence: {command} ({dialect:?}) -> {decision:?}"
+                );
+            }
+        }
+    }
+
+    /// The full reported command: a `python3` heredoc rewriting source files
+    /// whose body contains a JSDoc comment. Neither `git` nor `branch` appears
+    /// anywhere; the `/**` line manufactured the old match (#360).
+    #[test]
+    fn python_heredoc_with_jsdoc_body_is_not_a_branch_command_360() {
+        let command = concat!(
+            "cd /tmp/proj && python3 - <<'PY'\n",
+            "pairs = [\n",
+            "    ('src/settings.ts', '/** Default language for new articles */', '/** Default locale */'),\n",
+            "]\n",
+            "for path, old, new in pairs:\n",
+            "    text = open(path).read()\n",
+            "    open(path, 'w').write(text.replace(old, new))\n",
+            "PY",
+        );
+        for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
+            let decision = branch_command_decision_in_dialect(command, dialect);
+            assert!(
+                !decision.is_destructive(),
+                "python heredoc body is not a git branch command: ({dialect:?}) -> {decision:?}"
+            );
+        }
+    }
+
+    /// The mirror defect (#361): a glob in a *directory* component leaves a
+    /// fully literal `git` basename, which names Git unambiguously. Treating
+    /// the whole word's dynamism as the basename's let
+    /// `/usr/*/git branch -D main` slip past the entire `core.git` pack while
+    /// the literal-path spelling was denied.
+    #[test]
+    fn glob_directory_with_literal_git_basename_stays_denied_361() {
+        for command in [
+            "/usr/*/git branch -D main",
+            "/usr/*/git branch $name",
+            "/*/bin/git branch -D main",
+            "/opt/?/git branch $name",
+            "$PREFIX/*/git branch -D main",
+        ] {
+            for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
+                let decision = branch_command_decision_in_dialect(command, dialect);
+                assert!(
+                    decision.is_destructive(),
+                    "literal git basename must stay fail-closed: {command} ({dialect:?}) -> {decision:?}"
+                );
+            }
+        }
+    }
+
+    /// The #360 allow must not open a bypass: literal branch-mutation flags
+    /// anywhere in the argv after an unbounded executable are evidence in
+    /// plain sight, wherever they sit — including the first argv slot, which
+    /// no dynamic word precedes.
+    #[test]
+    fn literal_mutation_flags_after_wildcard_executable_stay_denied_360() {
+        for command in [
+            "/* -D main",
+            "/* -d feature",
+            "/* --delete feature",
+            "/* --force --delete feature",
+            "/* -M old new",
+            "lib/* -D main",
+            "/* $sub -D main",
+            "$cmd $sub -D main",
+        ] {
+            for dialect in [ShellDialect::Unknown, ShellDialect::Posix] {
+                assert_eq!(
+                    branch_command_decision_in_dialect(command, dialect),
+                    BranchCommandDecision::DestructiveDynamic,
+                    "literal mutation flags stay denied: {command} ({dialect:?})"
+                );
+            }
+        }
+    }
+
+    // =========================================================================
+    // Execution-frontend strip failures stay scan-required (#260)
+    // =========================================================================
+
+    /// When a known execution frontend's wrapper strip bails (dynamic option
+    /// value, unmodeled flag), the wrapped `git` word must stay scan-required
+    /// under the Posix dialect so the regex rules run — the live hook path
+    /// must not be weaker than `dcg test`.
+    #[test]
+    fn frontend_strip_failure_keeps_git_scan_required() {
+        for command in [
+            "nice -n $(x) git reset --hard",
+            "timeout $(x) git reset --hard",
+            "mise exec --cd $(pwd) git reset --hard",
+            "mise exec --no-such-flag git reset --hard",
+            "sudo nice -n $(x) git reset --hard",
+            "nice -n $(x) git branch -D main",
+        ] {
+            assert!(
+                command_executes_git_in_dialect(command, ShellDialect::Posix),
+                "frontend bail must keep the wrapped git command scan-required: {command}"
+            );
+        }
+        // Genuinely unknown programs keep the documented argv-data default,
+        // and a frontend with no possible git word downstream stays skipped.
+        for command in ["foo exec git reset --hard", "timeout 5 sleep 1"] {
+            assert!(
+                !command_executes_git_in_dialect(command, ShellDialect::Posix),
+                "unknown program argv keeps the documented default: {command}"
+            );
+        }
+    }
+
+    /// `watch`, `xargs`, `parallel` and `find -exec` run their operand words
+    /// as a command, so a git invocation there executes. All of these were
+    /// allowed through the Posix hook while `rm -rf` behind the same wrappers
+    /// denied (found reviewing #498).
+    #[test]
+    fn exec_wrappers_put_git_in_executable_position() {
+        let deep = "xargs ".repeat(5000);
+        for command in [
+            "watch git reset --hard",
+            "watch -n 1 git reset --hard",
+            "watch -n1 -d git clean -fdx",
+            "xargs git reset --hard",
+            "xargs -I {} git reset --hard {}",
+            "xargs -0 -n 1 git branch -D",
+            "xargs sudo git reset --hard",
+            "xargs -- git reset --hard",
+            "parallel git reset --hard ::: a",
+            "parallel -j 4 git reset --hard ::: a",
+            "find . -exec git reset --hard \\;",
+            "find . -name x -execdir git clean -fdx \\;",
+            "find . -ok git reset --hard \\;",
+            "find . -exec true \\; -exec git reset --hard \\;",
+            "/usr/bin/find . -exec /usr/bin/git reset --hard {} +",
+            "watch xargs git reset --hard",
+            // An option the table does not know may take a value.
+            "parallel --retries 3 git reset --hard ::: a",
+            "xargs --foo 1 git reset --hard",
+            // Wrappers whose options are not modeled.
+            "doas -u root git reset --hard",
+            "sudo --user=bob git reset --hard",
+            "strace -f -o /tmp/t git reset --hard",
+            "uv run git reset --hard",
+            "docker exec app git reset --hard",
+            // Past the depth cap the answer is the conservative one, not a
+            // stack overflow.
+            deep.as_str(),
+        ] {
+            assert!(
+                command_executes_git_in_dialect(command, ShellDialect::Posix),
+                "{command}"
+            );
+        }
+        for command in [
+            "watch ls",
+            "xargs echo git reset --hard",
+            "find . -name git",
+            "find . -exec grep git {} \\;",
+            "parallel echo ::: git",
+            "uv pip install git",
+            "docker run git",
+        ] {
+            assert!(
+                !command_executes_git_in_dialect(command, ShellDialect::Posix),
+                "{command}"
+            );
+        }
+    }
+
+    // =========================================================================
+    // Branch creation with dynamic tokens (#274)
+    // =========================================================================
+
+    /// An unquoted, unresolvable expansion in `git branch` argv stays
+    /// fail-closed — its output can field-split into `-D main` — but the
+    /// verdict is attributed to the dynamic-token rule so the denial explains
+    /// the real hazard and its safe spellings, not a fictional deletion.
+    #[test]
+    fn branch_creation_with_unresolvable_expansion_uses_dynamic_rule() {
+        for command in [
+            "git branch backup-$(date +%s)",
+            "git branch backup/pre-$(git rev-parse --short HEAD)",
+            "git branch $FLAGS",
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                assert_eq!(
+                    branch_command_decision_in_dialect(command, dialect),
+                    BranchCommandDecision::DestructiveDynamic,
+                    "unquoted dynamic branch argv fails closed under the dynamic rule: {command} ({dialect:?})"
+                );
+            }
+        }
+    }
+
+    /// The safe spellings need no allowlist entry: quoting pins the expansion
+    /// to a single non-flag word, `--` ends option parsing, and a
+    /// statically-resolvable substitution folds to a literal name.
+    #[test]
+    fn branch_creation_safe_spellings_stay_allowed() {
+        for command in [
+            "git branch mybackup",
+            "git branch foo-$(echo x)",
+            "git branch \"backup-$(date +%s)\"",
+            "git branch \"backup/pre-$(git rev-parse --short HEAD)\"",
+            "git branch -- backup-$(date +%s)",
+        ] {
+            for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+                let decision = branch_command_decision_in_dialect(command, dialect);
+                assert!(
+                    !decision.is_destructive(),
+                    "safe branch creation spelling must not fail closed: {command} ({dialect:?}) -> {decision:?}"
+                );
+            }
+        }
+        // Literal deletion / force flags keep their literal attribution:
+        // forced forms on branch-force-delete, the merge-checked `-d` on
+        // branch-delete (#509).
+        for (command, expected) in [
+            ("git branch -D main", BranchCommandDecision::Destructive),
+            (
+                "git branch -d merged",
+                BranchCommandDecision::MergeCheckedDelete,
+            ),
+            (
+                "git branch -f main HEAD~1",
+                BranchCommandDecision::Destructive,
+            ),
+        ] {
+            assert_eq!(
+                branch_command_decision_in_dialect(command, ShellDialect::Posix),
+                expected,
+                "literal mutation flags keep a literal rule: {command}"
+            );
+        }
+    }
 
     // =========================================================================
     // Pack Creation Tests
@@ -541,9 +7379,566 @@ mod tests {
         assert_unique_pattern_names(&pack);
     }
 
+    fn assert_shell_alias(
+        command: &str,
+        dialect: ShellDialect,
+        expected_body: &str,
+        expected_args: &[&str],
+    ) {
+        let InvokedGitAliasDecision::Shell(alias) =
+            invoked_visible_git_alias_in_dialect(command, dialect)
+        else {
+            panic!("expected visible shell alias: {command}");
+        };
+        assert_eq!(alias.shell_body, expected_body, "command: {command}");
+        assert_eq!(
+            alias.invoked_args, expected_args,
+            "appended arguments for: {command}"
+        );
+    }
+
+    fn assert_expanded_alias(
+        command: &str,
+        dialect: ShellDialect,
+        expected_subcommand: &str,
+        expected_args: &[&str],
+    ) {
+        let InvokedGitAliasDecision::Expanded(alias) =
+            invoked_visible_git_alias_in_dialect(command, dialect)
+        else {
+            panic!("expected expanded Git alias: {command}");
+        };
+        assert_eq!(alias.subcommand, expected_subcommand, "command: {command}");
+        assert_eq!(alias.arguments, expected_args, "arguments for: {command}");
+    }
+
+    #[test]
+    fn visible_git_shell_aliases_preserve_body_and_arguments() {
+        for command in [
+            "git -c 'alias.x=!rm -r ./tree' x",
+            "git -calias.x='!rm -r ./tree' x",
+            "ALIAS_BODY='!rm -r ./tree' git --config-env=alias.x=ALIAS_BODY x",
+            "ALIAS_BODY='!rm -r ./tree' git --config-env alias.x=ALIAS_BODY x",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0='!rm -r ./tree' git x",
+        ] {
+            assert_shell_alias(command, ShellDialect::Posix, "rm -r ./tree", &[]);
+        }
+        assert_shell_alias(
+            "git -c 'alias.x=!rm -r' x ./tree",
+            ShellDialect::Posix,
+            "rm -r",
+            &["./tree"],
+        );
+        assert_shell_alias(
+            "git -c 'alias.x=!rm' x -r ./tree",
+            ShellDialect::Posix,
+            "rm",
+            &["-r", "./tree"],
+        );
+        assert_shell_alias(
+            "git -c alias.x=y -c 'alias.y=!rm -r ./tree' x",
+            ShellDialect::Posix,
+            "rm -r ./tree",
+            &[],
+        );
+        assert_shell_alias(
+            "git -c 'alias.x=!f(){ rm -r ./tree; }; f' x",
+            ShellDialect::Posix,
+            "f(){ rm -r ./tree; }; f",
+            &[],
+        );
+        assert_shell_alias(
+            "git -c \"alias.x=!sh -c 'rm -r ./tree | tee /tmp/log'\" x",
+            ShellDialect::Posix,
+            "sh -c 'rm -r ./tree | tee /tmp/log'",
+            &[],
+        );
+    }
+
+    #[test]
+    fn visible_git_alias_resolution_is_bounded_and_last_definition_wins() {
+        for command in [
+            "git -c alias.x=x x",
+            "git -c alias.x=y -c alias.y=x x",
+            "git -c 'alias.x=!rm -r ./tree' $alias",
+            "git -c \"alias.$name=!rm -r ./tree\" x",
+            "git -c \"alias.x=!rm $target\" x",
+            "git -c 'alias.x=!f() { git branch \"$@\"; }; f' x -d victim",
+            "git -c 'alias.x=!f () { git branch \"${1}\" \"${2}\"; }; f' x -d victim",
+        ] {
+            assert_eq!(
+                invoked_visible_git_alias_in_dialect(command, ShellDialect::Posix),
+                InvokedGitAliasDecision::Unverified,
+                "must fail closed: {command}"
+            );
+        }
+        for command in [
+            "git -c alias.x=status -c 'alias.x=!rm -r ./tree' status",
+            "git -c 'alias.x=!rm -r ./tree' status",
+            "MISSING= git --config-env=alias.x=ABSENT x",
+        ] {
+            assert_eq!(
+                invoked_visible_git_alias_in_dialect(command, ShellDialect::Posix),
+                InvokedGitAliasDecision::NoMatch,
+                "configured-but-inert alias must not match: {command}"
+            );
+        }
+        assert_expanded_alias(
+            "git -c 'alias.x=!rm -r ./tree' -c alias.x=status x",
+            ShellDialect::Posix,
+            "status",
+            &[],
+        );
+        assert_shell_alias(
+            "git -c alias.x=status -c 'alias.x=!rm -r ./tree' x",
+            ShellDialect::Posix,
+            "rm -r ./tree",
+            &[],
+        );
+
+        let mut command = String::from("git");
+        for index in 0..65 {
+            let _ = write!(command, " -c alias.dummy{index}=status");
+        }
+        command.push_str(" -c 'alias.x=!rm -r ./tree' x");
+        assert_shell_alias(&command, ShellDialect::Posix, "rm -r ./tree", &[]);
+    }
+
+    #[test]
+    fn shell_alias_function_scope_detection_is_quote_aware() {
+        assert!(shell_alias_args_cross_function_scope(
+            "f() { git branch \"$@\"; }; f"
+        ));
+        assert!(shell_alias_args_cross_function_scope(
+            "f () { git branch \"${1}\"; }; f"
+        ));
+        assert!(!shell_alias_args_cross_function_scope(
+            "f() { printf '%s' '$@'; }; f"
+        ));
+        assert!(!shell_alias_args_cross_function_scope("git branch \"$@\""));
+    }
+
+    #[test]
+    fn non_shell_aliases_expose_exact_expanded_git_argv() {
+        for (command, subcommand, arguments) in [
+            (
+                "git -c 'alias.x=branch -d' x victim",
+                "branch",
+                &["-d", "victim"][..],
+            ),
+            ("git -c 'alias.x=reset --hard' x", "reset", &["--hard"][..]),
+            ("git -c 'alias.x=clean -fd' x", "clean", &["-fd"][..]),
+            (
+                "git -c alias.x=y -c 'alias.y=branch -d' x victim",
+                "branch",
+                &["-d", "victim"][..],
+            ),
+            (
+                "git config alias.x 'branch -d'; git x victim",
+                "branch",
+                &["-d", "victim"][..],
+            ),
+            (
+                "git config alias.x 'reset --hard'; git x",
+                "reset",
+                &["--hard"][..],
+            ),
+            (
+                "git config alias.x 'clean -fd'; git x",
+                "clean",
+                &["-fd"][..],
+            ),
+        ] {
+            assert_expanded_alias(command, ShellDialect::Posix, subcommand, arguments);
+        }
+        for command in ["git nuke", "git custom-helper", "git -C /tmp/repo nuke"] {
+            assert_eq!(
+                invoked_visible_git_alias_in_dialect(command, ShellDialect::Posix),
+                InvokedGitAliasDecision::Unverified,
+                "runtime aliases/helpers make unknown Git commands unverified: {command}"
+            );
+        }
+        for command in ["git status", "git log", "git branch"] {
+            assert_eq!(
+                invoked_visible_git_alias_in_dialect(command, ShellDialect::Posix),
+                InvokedGitAliasDecision::NoMatch,
+                "known Git builtins remain directly inspectable: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_expansion_is_role_aware_for_git_branch_mutation() {
+        for (command, dialect) in [
+            ("then git branch -d victim", ShellDialect::Posix),
+            ("do ! git branch --delete victim", ShellDialect::Posix),
+            ("else { sudo git branch -D victim", ShellDialect::Posix),
+            ("g${part}t branch -d victim", ShellDialect::Posix),
+            ("git br${part}anch -d victim", ShellDialect::Posix),
+            ("git branch -${flag} victim", ShellDialect::Posix),
+            ("$cmd branch -d victim", ShellDialect::Posix),
+            ("$result = git branch -d victim", ShellDialect::PowerShell),
+            ("git br${part}anch -d victim", ShellDialect::PowerShell),
+            ("git branch -${flag} victim", ShellDialect::PowerShell),
+            ("%G% branch -d victim", ShellDialect::Cmd),
+            ("!G! branch --delete victim", ShellDialect::Cmd),
+            ("git br%PART%anch -d victim", ShellDialect::Cmd),
+            ("git branch -%FLAG% victim", ShellDialect::Cmd),
+            ("call g^it branch -^d victim", ShellDialect::Cmd),
+            ("@g^it branch -^d victim", ShellDialect::Cmd),
+            ("& ('g'+'it') branch -d victim", ShellDialect::PowerShell),
+            ("& $('git') branch -d victim", ShellDialect::PowerShell),
+        ] {
+            let decision = branch_command_decision_in_dialect(command, dialect);
+            assert!(
+                decision.is_destructive(),
+                "active syntax can select destructive Git branch semantics: {command} -> {decision:?}"
+            );
+        }
+
+        for (command, dialect) in [
+            ("command then git branch -d victim", ShellDialect::Posix),
+            ("'then' git branch -d victim", ShellDialect::Posix),
+            ("then else git branch -d victim", ShellDialect::Posix),
+            ("echo g${part}t branch -d victim", ShellDialect::Posix),
+            ("git status -${flag}", ShellDialect::Posix),
+            ("git branch --format \"$value\"", ShellDialect::Posix),
+            ("git branch -- \"$value\"", ShellDialect::Posix),
+            ("git branch --format \"$value\"", ShellDialect::PowerShell),
+            ("git branch -- \"$value\"", ShellDialect::PowerShell),
+            // A variable at PowerShell statement position is an expression
+            // statement; `$cmd branch -d victim` is a parse error in real
+            // PowerShell and cannot invoke `$cmd` (#273). The POSIX dialect
+            // keeps the equivalent unquoted form fail-closed above, so the
+            // all-dialect route still denies it.
+            ("$cmd branch -d victim", ShellDialect::PowerShell),
+            ("git branch --format \"%VALUE%\"", ShellDialect::Cmd),
+            ("git branch -- \"%VALUE%\"", ShellDialect::Cmd),
+            ("call g^it branch --format -^d", ShellDialect::Cmd),
+            ("@g^it branch --format -^d", ShellDialect::Cmd),
+            ("call echo git branch -d victim", ShellDialect::Cmd),
+            (
+                "$outlook = New-Object -ComObject Outlook.Application\n\
+                 $mail = $outlook.CreateItem(0)\n\
+                 $mail.Subject = 'Daily dossier'\n\
+                 $mail.HTMLBody = Get-Content .\\dossier.html -Raw\n\
+                 $mail.Send()",
+                ShellDialect::PowerShell,
+            ),
+        ] {
+            assert_ne!(
+                branch_command_decision_in_dialect(command, dialect),
+                BranchCommandDecision::Destructive,
+                "active data must not be reinterpreted as Git syntax: {command}"
+            );
+        }
+
+        for command in [
+            "git x -d victim",
+            "git x --delete victim",
+            "git x -M old new",
+        ] {
+            assert_eq!(
+                branch_command_decision_in_dialect(command, ShellDialect::Posix),
+                BranchCommandDecision::Destructive,
+                "an unresolved command can be a persistent branch alias: {command}"
+            );
+        }
+        for command in ["git status -d", "git x -- -d", "git x"] {
+            assert_ne!(
+                branch_command_decision_in_dialect(command, ShellDialect::Posix),
+                BranchCommandDecision::Destructive,
+                "known builtins and post-terminator data remain safe: {command}"
+            );
+        }
+
+        let outlook_assignment = "$outlook = New-Object -ComObject Outlook.Application";
+        assert!(
+            !command_executes_git_in_dialect(outlook_assignment, ShellDialect::PowerShell),
+            "a PowerShell assignment must analyze its executable RHS, not its dynamic lvalue"
+        );
+
+        for command in [
+            "& ('g'+'it') -c 'alias.x=!rm -r ./tree' x",
+            "& $('git') -c 'alias.x=!rm -r ./tree' x",
+        ] {
+            assert_eq!(
+                invoked_visible_git_alias_in_dialect(command, ShellDialect::PowerShell),
+                InvokedGitAliasDecision::Unverified,
+                "PowerShell call-operator expressions must fail closed: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn posix_control_prefixes_expose_only_the_introduced_command() {
+        for command in [
+            "if git reset --hard",
+            "then git reset --hard",
+            "elif env FOO=1 git reset --hard",
+            "else sudo git reset --hard",
+            "while ! git reset --hard",
+            "until { git reset --hard",
+            "do git reset --hard",
+            "{ git reset --hard",
+            "! git reset --hard",
+            "then { sudo git reset --hard",
+            "\\\n then git reset --hard",
+            "coproc git reset --hard",
+            "then coproc git reset --hard",
+            "coproc JOB { git reset --hard",
+            "coproc JOB ( git reset --hard )",
+            "coproc JOB if git reset --hard",
+            "function f { git reset --hard",
+            "function f() { git reset --hard",
+            "function f if git reset --hard",
+            "then function f { git reset --hard",
+        ] {
+            assert!(
+                command_executes_git_in_dialect(command, ShellDialect::Posix),
+                "reserved control prefix must expose Git: {command}"
+            );
+        }
+
+        for command in [
+            "command then git reset --hard",
+            "env then git reset --hard",
+            "sudo then git reset --hard",
+            "/usr/bin/then git reset --hard",
+            "'then' git reset --hard",
+            "ifconfig git reset --hard",
+            "then else git reset --hard",
+            "do then git reset --hard",
+            "coproc echo git reset --hard",
+            "coproc JOB { echo git reset --hard",
+            "function f { echo git reset --hard",
+            "command coproc git reset --hard",
+            "env coproc git reset --hard",
+            "sudo coproc git reset --hard",
+            "/usr/bin/coproc git reset --hard",
+            "'coproc' git reset --hard",
+        ] {
+            assert!(
+                !command_executes_git_in_dialect(command, ShellDialect::Posix),
+                "argv data or invalid reserved-word order must not expose Git: {command}"
+            );
+        }
+
+        let mut deeply_nested = String::new();
+        for index in 0..80 {
+            let _ = write!(deeply_nested, "function f{index} {{ ");
+        }
+        deeply_nested.push_str("git reset --hard");
+        for index in (0..80).rev() {
+            let _ = write!(deeply_nested, "; }}; f{index}");
+        }
+        let (deeply_nested_body, _) =
+            command_after_posix_control_prefixes(&deeply_nested, ShellDialect::Posix);
+        assert!(
+            command_executes_git_in_dialect(&deeply_nested, ShellDialect::Posix),
+            "valid structural nesting beyond the parser budget must fail closed; parser body: \
+             {deeply_nested_body:?}"
+        );
+    }
+
+    #[test]
+    fn visible_git_alias_state_flows_across_shell_segments() {
+        assert_shell_alias(
+            "git config alias.x '!rm -r ./tree'; git x",
+            ShellDialect::Posix,
+            "rm -r ./tree",
+            &[],
+        );
+        for command in [
+            "git config alias.x 'reset --hard'; if true; then git x; fi",
+            "git config alias.x '!rm -r ./tree'; while true; do git x; done",
+        ] {
+            assert_eq!(
+                invoked_visible_git_alias_in_dialect(command, ShellDialect::Posix),
+                InvokedGitAliasDecision::Unverified,
+                "control-flow alias invocation must fail closed: {command}"
+            );
+        }
+        assert_shell_alias(
+            "export GIT_CONFIG_COUNT=1; export GIT_CONFIG_KEY_0=alias.x; export GIT_CONFIG_VALUE_0='!rm -r ./tree'; git x",
+            ShellDialect::Posix,
+            "rm -r ./tree",
+            &[],
+        );
+        assert_shell_alias(
+            "set GIT_CONFIG_COUNT=1 & set GIT_CONFIG_KEY_0=alias.x & set \"GIT_CONFIG_VALUE_0=!rm -r ./tree\" & git x",
+            ShellDialect::Cmd,
+            "rm -r ./tree",
+            &[],
+        );
+        assert_shell_alias(
+            "$env:GIT_CONFIG_COUNT='1'; $env:GIT_CONFIG_KEY_0='alias.x'; $env:GIT_CONFIG_VALUE_0='!rm -r ./tree'; git x",
+            ShellDialect::PowerShell,
+            "rm -r ./tree",
+            &[],
+        );
+        assert_shell_alias(
+            "$Env:GIT_CONFIG_COUNT = '1'; $ENV:GIT_CONFIG_KEY_0 = 'alias.x'; $env:GIT_CONFIG_VALUE_0 = '!rm -r ./tree'; git x",
+            ShellDialect::PowerShell,
+            "rm -r ./tree",
+            &[],
+        );
+        assert_shell_alias(
+            "export GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; GIT_CONFIG_COUNT=1; GIT_CONFIG_KEY_0=alias.x; GIT_CONFIG_VALUE_0='!rm -r ./tree'; git x",
+            ShellDialect::Posix,
+            "rm -r ./tree",
+            &[],
+        );
+        assert_expanded_alias(
+            "git config alias.x status; git x",
+            ShellDialect::Posix,
+            "status",
+            &[],
+        );
+        let removed = "git config alias.x '!rm -r ./tree' && git config --unset alias.x && git x";
+        assert_eq!(
+            invoked_visible_git_alias_in_dialect(removed, ShellDialect::Posix),
+            InvokedGitAliasDecision::Unverified,
+            "unknown helper namespace remains unverified after alias removal: {removed}"
+        );
+        for command in [
+            "git config alias.x '!rm -r ./tree'; false && git config alias.x status; git x",
+            "export GIT_CONFIG_COUNT=1; export GIT_CONFIG_KEY_0=alias.x; export GIT_CONFIG_VALUE_0='!rm -r ./tree'; false && GIT_CONFIG_VALUE_0=status; git x",
+            "export GIT_CONFIG_COUNT=1; export GIT_CONFIG_KEY_0=alias.x; export GIT_CONFIG_VALUE_0='!rm -r ./tree'; (GIT_CONFIG_VALUE_0=status); git x",
+            "export GIT_CONFIG_COUNT=1; export GIT_CONFIG_KEY_0=alias.x; export GIT_CONFIG_VALUE_0='!rm -r ./tree'; GIT_CONFIG_VALUE_0=status | cat; git x",
+            "export GIT_CONFIG_COUNT=1; export GIT_CONFIG_KEY_0=alias.x; export GIT_CONFIG_VALUE_0='!rm -r ./tree'; f() { GIT_CONFIG_VALUE_0=status; }; git x",
+            "export GIT_CONFIG_COUNT=1; export GIT_CONFIG_KEY_0=alias.x; export GIT_CONFIG_VALUE_0='!rm -r ./tree'; while false; do GIT_CONFIG_VALUE_0=status; done; git x",
+            "export GIT_CONFIG_COUNT=1; export GIT_CONFIG_KEY_0=alias.x; export GIT_CONFIG_VALUE_0='!rm -r ./tree'; case no in yes) GIT_CONFIG_VALUE_0=status ;; esac; git x",
+        ] {
+            assert_eq!(
+                invoked_visible_git_alias_in_dialect(command, ShellDialect::Posix),
+                InvokedGitAliasDecision::Unverified,
+                "conditional alias-state mutation must not be flattened: {command}"
+            );
+        }
+        let skipped_multiline_override = "export GIT_CONFIG_COUNT=1
+export GIT_CONFIG_KEY_0=alias.x
+export GIT_CONFIG_VALUE_0='!printf EXECUTED'
+if false
+then
+GIT_CONFIG_VALUE_0=status
+fi
+git x";
+        assert_eq!(
+            invoked_visible_git_alias_in_dialect(skipped_multiline_override, ShellDialect::Posix),
+            InvokedGitAliasDecision::Unverified,
+            "a skipped multiline override must not hide the dangerous alias"
+        );
+        assert_expanded_alias(
+            "export GIT_CONFIG_COUNT=1
+export GIT_CONFIG_KEY_0=alias.x
+export GIT_CONFIG_VALUE_0='!printf EXECUTED'
+GIT_CONFIG_VALUE_0=status
+git x",
+            ShellDialect::Posix,
+            "status",
+            &[],
+        );
+        assert_expanded_alias(
+            "git config alias.x '!rm -r ./tree'; git config alias.x status; git x",
+            ShellDialect::Posix,
+            "status",
+            &[],
+        );
+    }
+
+    #[test]
+    fn dynamic_shell_executables_receive_a_conservative_git_view() {
+        for (command, dialect) in [
+            (
+                "& @('noop', ('g'+'it'))[1] reset --hard",
+                ShellDialect::PowerShell,
+            ),
+            ("& $G reset --hard", ShellDialect::PowerShell),
+            ("%G% reset --hard", ShellDialect::Cmd),
+            ("g${PART}t reset --hard", ShellDialect::Posix),
+        ] {
+            assert!(
+                git_semantic_scan_required(command, dialect),
+                "dynamic executable must force core.git candidate selection: {command}"
+            );
+            assert!(
+                command_executes_git_in_dialect(command, dialect),
+                "dynamic executable must conservatively remain Git-capable: {command}"
+            );
+            let view = syntax_view_in_dialect(command, dialect)
+                .unwrap_or_else(|| panic!("dynamic executable needs a syntax view: {command}"));
+            assert_eq!(view, "git reset --hard", "unexpected view for {command}");
+            assert_eq!(
+                create_pack()
+                    .matches_destructive(&view)
+                    .and_then(|matched| matched.name),
+                Some("reset-hard"),
+                "semantic view must reach the destructive reset rule: {command}"
+            );
+        }
+
+        for (command, dialect) in [
+            ("echo '$G reset --hard'", ShellDialect::Posix),
+            ("echo '$G reset --hard'", ShellDialect::PowerShell),
+        ] {
+            assert!(
+                !git_semantic_scan_required(command, dialect),
+                "single-quoted data must not force a semantic scan: {command}"
+            );
+        }
+    }
+
     // =========================================================================
     // Critical Severity Pattern Tests
     // =========================================================================
+
+    /// An option may follow other arguments, and git accepts any unambiguous
+    /// prefix of a long option. Every row below was allowed while the full,
+    /// first-position spelling denied. The prefix floors are the shortest
+    /// forms git 2.50 accepts: `--m`, `--d` and switch's `--f`..`--forc` are
+    /// ambiguous (`--mixed`, `--detach`, `--force-create`) and git rejects them.
+    #[test]
+    fn abbreviated_and_trailing_long_options_still_deny() {
+        let pack = create_pack();
+        for (command, rule) in [
+            ("git reset HEAD~1 --hard", "reset-hard"),
+            ("git reset -q --hard", "reset-hard"),
+            ("git reset origin/main --hard", "reset-hard"),
+            ("git reset --har", "reset-hard"),
+            ("git reset --ha HEAD~1", "reset-hard"),
+            ("git reset --h", "reset-hard"),
+            ("git reset HEAD --merge", "reset-merge"),
+            ("git reset --me", "reset-merge"),
+            ("git clean --forc -d", "clean-force"),
+            ("git clean --f", "clean-force"),
+            ("git checkout --forc", "checkout-force"),
+            ("git checkout --f main", "checkout-force"),
+            ("git switch --discard main", "switch-discard"),
+            ("git switch --di main", "switch-discard"),
+            ("git rm --forc file.txt", "rm-force"),
+            ("git rm --f file.txt", "rm-force"),
+            (
+                "git reflog expire --expire-unr=now --all",
+                "reflog-expire-now",
+            ),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
+        for command in [
+            "git reset --soft HEAD~1",
+            "git reset --mixed HEAD~1",
+            "git reset HEAD file.txt",
+            "git reset --keep HEAD~1",
+            "git clean -n",
+            "git clean --dry-run",
+            "git checkout main",
+            "git switch --detach main",
+            "git switch -c feature",
+        ] {
+            assert_allows(&pack, command);
+        }
+    }
 
     #[test]
     fn test_reset_hard_critical() {
@@ -560,6 +7955,81 @@ mod tests {
         );
     }
 
+    /// #429 and #431: a safe pattern shadows every destructive pattern in the
+    /// pack, so anything that lets one match past the flag that should have
+    /// disqualified it is an under-block. Both doors are pinned here, including
+    /// the de-quoted spelling the evaluator hands the pack for #431 — quote
+    /// removal is what turned `'('` into a command boundary.
+    #[test]
+    fn a_safe_pattern_cannot_be_reached_past_a_pathspec_separator() {
+        let pack = create_pack();
+
+        for command in [
+            "git clean -fdx -- . clean -n",
+            "git clean -xfd -- . clean --dry-run",
+            "git clean -fdx -- . lfs prune --dry-run",
+            "git clean -fdx -- . restore --staged x",
+            "git clean -fdx -- . checkout -b x",
+            "git clean -fdx --quiet -- . clean -n",
+            // #431, as the pack receives it: the quotes are already gone.
+            "git clean -fdx -- . ( git-clean -n",
+            "git clean -fdx -- . & git-clean -n",
+            "git clean -fdx -- . | git-clean -n",
+            "git clean -fdx -- . ; git-clean -n",
+            // A quoted bare `--` is still the separator to git, and the walk to
+            // the flag stops at a quote rather than reading through it.
+            "git clean -fdx '--' . -n",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "clean-force");
+        }
+    }
+
+    /// The exemptions the fix above must leave intact. `parse_options` permutes,
+    /// so a dry-run flag after a pathspec is still a dry run; and a global
+    /// option — including the ones that take a separate value — does not change
+    /// which subcommand runs.
+    #[test]
+    fn a_permuted_dry_run_flag_still_earns_its_exemption() {
+        let pack = create_pack();
+
+        for command in [
+            "git clean -n",
+            "git clean --dry-run",
+            "git clean -fdxn",
+            "git clean -fdx -n",
+            "git clean . -n",
+            "git clean -fdx src -n",
+            "git clean -fdx src --dry-run",
+            "git -C /tmp/repo clean -n",
+            "git -c core.pager=cat clean --dry-run",
+            "git --no-pager clean -n",
+            "git --git-dir=/tmp/repo/.git clean -n",
+            "git --git-dir /tmp/repo/.git clean -n",
+            "git --work-tree /tmp/repo clean -n",
+            "git restore --staged file.txt",
+            "git restore . --staged",
+            "git checkout -b feature/x",
+            "git checkout --orphan gh-pages",
+            "git lfs prune --dry-run",
+            "git-clean -n",
+            "/usr/libexec/git-core/git-clean -n",
+        ] {
+            assert_allows(&pack, command);
+        }
+
+        // For these the exemption is load-bearing: `clean-force` matches the
+        // same text, so `assert_allows` alone would also pass if the safe
+        // pattern had stopped matching and the destructive one had too.
+        for command in [
+            "git clean -fdx -n",
+            "git clean -fdx src -n",
+            "git clean -fdx src --dry-run",
+            "git -C /tmp/repo clean -fdx -n",
+        ] {
+            assert_safe_pattern_matches(&pack, command);
+        }
+    }
+
     #[test]
     fn test_clean_force_critical() {
         let pack = create_pack();
@@ -568,6 +8038,26 @@ mod tests {
         assert_blocks_with_pattern(&pack, "git clean -f", "clean-force");
         assert_blocks(&pack, "git clean -fd", "removes untracked files");
         assert_blocks(&pack, "git clean -xf", "removes untracked files");
+
+        // #434: git's `parse_options` permutes, so a force flag after a
+        // pathspec is still a force flag and the tree is still deleted. Proven
+        // against git 2.55.0 with an invalid switch, which git reports as an
+        // unknown switch only if it parsed the token as an option at all:
+        // `git clean . -Z -n` -> "error: unknown switch `Z'".
+        assert_blocks_with_pattern(&pack, "git clean . -f", "clean-force");
+        assert_blocks_with_pattern(&pack, "git clean src -fdx", "clean-force");
+        assert_blocks_with_pattern(&pack, "git clean . --force", "clean-force");
+
+        // A bare `--` ends option parsing, so what follows cannot be a force
+        // flag; git refuses the command instead of deleting. It is still
+        // reported, because the flag before the `--` is genuine.
+        assert_blocks_with_pattern(&pack, "git clean -fdx -- . -f", "clean-force");
+
+        // The dry-run exemption is evaluated first, so the shapes where git
+        // itself would not delete stay allowed even though a force flag is
+        // present.
+        assert_allows(&pack, "git clean -n . -f");
+        assert_allows(&pack, "git clean --dry-run . --force");
     }
 
     #[test]
@@ -669,9 +8159,106 @@ mod tests {
         assert_blocks_with_pattern(&pack, "git stash clear", "stash-clear");
     }
 
+    /// `git read-tree --reset -u` is the plumbing under `reset --hard` and was
+    /// allowed. It needs both flags, in either order; a merge (`-m -u`) and
+    /// an index-only reset keep the working tree and stay allowed.
+    #[test]
+    fn read_tree_reset_update_is_denied_like_reset_hard() {
+        let pack = create_pack();
+        for command in [
+            "git read-tree --reset -u HEAD",
+            "git read-tree -u --reset HEAD~3",
+            "git read-tree --reset -vu HEAD",
+            "git read-tree --res -u origin/main",
+            "git -C sub read-tree --reset -u HEAD",
+            "git read-tree --reset -u HEAD && git status",
+            "/usr/lib/git-core/git-read-tree --reset -u HEAD",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "read-tree-reset");
+            assert_blocks_with_severity(&pack, command, Severity::Critical);
+        }
+        for command in [
+            "git read-tree HEAD",
+            "git read-tree --reset HEAD",
+            "git read-tree -m -u HEAD origin/main",
+            "git read-tree -u -m HEAD",
+            "git read-tree --prefix=sub/ -u HEAD",
+            "git read-tree --reset HEAD; git checkout-index --all",
+            "git read-tree --reset HEAD && echo -u",
+        ] {
+            assert!(
+                pack.check(command)
+                    .is_none_or(|m| m.name != Some("read-tree-reset")),
+                "{command} must not match read-tree-reset"
+            );
+        }
+    }
+
     // =========================================================================
     // High Severity Pattern Tests
     // =========================================================================
+
+    /// Force-switches, forced `git rm` and ref deletion discard work the same
+    /// way the blocked `reset --hard`, `checkout -- .` and `branch -D` do, and
+    /// were all allowed. Their read-only and non-forcing neighbours are not.
+    #[test]
+    fn force_switch_forced_rm_and_ref_delete_are_denied() {
+        let pack = create_pack();
+        for (command, rule) in [
+            ("git checkout -f", "checkout-force"),
+            ("git checkout --force main", "checkout-force"),
+            ("git checkout -qf main", "checkout-force"),
+            ("git -C sub checkout -f main", "checkout-force"),
+            ("git switch -f main", "switch-discard"),
+            ("git switch --force main", "switch-discard"),
+            ("git switch --discard-changes main", "switch-discard"),
+            ("git rm -f src/main.rs", "rm-force"),
+            ("git rm -r --force src", "rm-force"),
+            ("git rm -rf .", "rm-force"),
+            ("git update-ref -d refs/heads/main", "update-ref-delete"),
+            ("git push origin +main", "push-force-refspec"),
+            ("git push origin +HEAD:main", "push-force-refspec"),
+            (
+                "git push origin '+refs/heads/*:refs/heads/*'",
+                "push-force-refspec",
+            ),
+            (
+                "git update-ref --delete refs/heads/main",
+                "update-ref-delete",
+            ),
+            (
+                "git update-ref -m why -d refs/heads/main",
+                "update-ref-delete",
+            ),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
+        for command in [
+            "git checkout main",
+            "git checkout -b feature",
+            "git checkout --ours file.txt",
+            "git checkout --theirs file.txt",
+            "git checkout --conflict=diff3 file.txt",
+            "git switch main",
+            "git switch -c feature",
+            "git switch -C feature",
+            "git rm src/main.rs",
+            "git rm -r --cached src",
+            "git rm -rf --cached .",
+            "git rm -n -rf .",
+            "git rm --dry-run -f src",
+            "git update-ref refs/heads/main HEAD",
+            "git push origin main",
+            "git push origin main+fix",
+            "git push --force-with-lease origin main",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command} must stay allowed, matched {:?}",
+                pack.check(command).and_then(|m| m.name)
+            );
+        }
+    }
 
     #[test]
     fn test_checkout_discard_high() {
@@ -680,6 +8267,46 @@ mod tests {
         assert_blocks_with_severity(&pack, "git checkout -- file.txt", Severity::High);
         assert_blocks_with_pattern(&pack, "git checkout -- file.txt", "checkout-discard");
         assert_blocks(&pack, "git checkout -- .", "discards uncommitted changes");
+    }
+
+    /// #373: the checkout-ref-discard remediation recommends
+    /// `git show <ref>:<path>`, which is safe bare but reaches the identical
+    /// overwrite when redirected back onto the same path. The sibling rule
+    /// denies exactly the same-path redirected shape; every capture to a new
+    /// file and the bare view stay allowed.
+    #[test]
+    fn show_redirect_onto_same_path_is_denied_373() {
+        let pack = create_pack();
+
+        for cmd in [
+            // The reported shape.
+            "git show origin/main:Directory.Packages.props > Directory.Packages.props",
+            "git show HEAD~1:src/config.rs > src/config.rs",
+            "git show origin/main:README.md >> README.md",
+            "git show origin/main:README.md >| README.md",
+            "git show HEAD:a.txt > ./a.txt",
+            "git show HEAD:a.txt > a.txt && cargo build",
+        ] {
+            assert_blocks_with_pattern(&pack, cmd, "show-redirect-overwrite-source");
+            assert_blocks_with_severity(&pack, cmd, Severity::High);
+        }
+
+        // Bare view and captures to a new file are the recommended safe forms.
+        for cmd in [
+            "git show origin/main:Directory.Packages.props",
+            "git show HEAD~1:src/config.rs",
+            "git show origin/main:README.md > README.md.from-ref",
+            "git show origin/main:README.md > /tmp/README.md",
+            "git show HEAD:a.txt > b.txt",
+            "git show HEAD:a.txt | less",
+            "git show HEAD:a.txt | grep TODO",
+        ] {
+            assert!(
+                pack.check(cmd)
+                    .is_none_or(|hit| hit.name != Some("show-redirect-overwrite-source")),
+                "safe form must not match show-redirect-overwrite-source: {cmd:?}"
+            );
+        }
     }
 
     #[test]
@@ -706,43 +8333,222 @@ mod tests {
     }
 
     #[test]
-    fn test_branch_force_medium() {
-        // Branch force delete is Medium severity (recoverable via reflog)
+    fn posix_test_brackets_are_not_branch_mutations() {
+        // Regression for #246: a lone `[` (or `[[`) is the literal POSIX test
+        // builtin — an unclosed bracket cannot glob-expand into `git` or
+        // `git-branch`, so `-d`/`-f`/`-M`/`-C` test operators must not be read
+        // as branch mutation flags.
+        let pack = create_pack();
+        for cmd in [
+            "[ -f x ]",
+            "[ -d x ]",
+            "[ -d /some/dir/.git ]",
+            "[ -d \"$p/.git\" ]",
+            "[[ -f x ]]",
+            "[[ -d \"$repo/.git\" ]]",
+            "[ -f .git/config ]",
+            "test -d \"$p/.git\"",
+        ] {
+            assert!(
+                pack.check(cmd).is_none(),
+                "POSIX test must not be blocked: {cmd}"
+            );
+            assert!(
+                matches!(
+                    branch_command_decision(cmd),
+                    BranchCommandDecision::NotBranch
+                ),
+                "POSIX test must not parse as a branch command: {cmd}"
+            );
+        }
+
+        // A bracket expression that closes in the same word can still
+        // glob-expand into `git`, so the semantic layer must keep treating it
+        // as a possible branch mutation. (`gi[t]` contains no literal `git`
+        // substring, so the pack-level keyword quick-reject never reaches the
+        // regex — the semantic decision is the meaningful guard here.)
+        assert!(
+            branch_command_decision("gi[t] branch -D feature").is_destructive(),
+            "closed bracket expression in executable position must stay fail-closed"
+        );
+    }
+
+    #[test]
+    fn branch_regex_walkers_do_not_bridge_newlines() {
+        // Regression for the newline-bridge variant of #246: a benign
+        // read-only `git branch` line must not lend its `git … branch` prefix
+        // to a `-d`-looking token on a later line of the same submission.
+        let pack = create_pack();
+        for cmd in [
+            "git branch --list\n[ -d \"$p/.git\" ] && echo x",
+            "git branch --show-current\ntest -d \"$p/.git\"",
+            "git branch\ncat -d file",
+        ] {
+            assert!(
+                pack.check(cmd).is_none(),
+                "newline-separated benign lines must not combine into a branch deletion: {cmd}"
+            );
+        }
+    }
+
+    /// #509: the regex fallback reports `branch-delete` only for a readable
+    /// merge-checked deletion; every forced or unreadable form keeps the
+    /// stricter `branch-force-delete`.
+    #[test]
+    fn branch_regex_fallback_attribution_is_conservative_509() {
+        for text in [
+            "git branch -d feature",
+            "git branch --delete feature",
+            "git branch --del feature",
+            "git branch -vd a b c",
+            "elif git branch --delete stale; then true; fi",
+            "git.exe' branch --delete feature",
+            "git branch -d x; git branch -D y",
+            "git branch -d x && git push -f",
+            "git branch --force --no-force -d feature",
+            "git branch --no-format -d feature",
+            "git branch -d feature\ngit branch -D other",
+        ] {
+            assert_eq!(
+                branch_regex_fallback_rule(text),
+                BRANCH_DELETE_RULE,
+                "{text:?}"
+            );
+        }
+        for text in [
+            "git branch -D feature",
+            "git branch -d -f feature",
+            "git branch -d feature -f",
+            "git branch -df feature",
+            "git branch --delete --force feature",
+            "git branch -d feature --force",
+            "git branch -f feature",
+            "git branch -M a b",
+            "git branch -C a b",
+            "git branch -d 'x;y' -f",
+            "git branch -d \"a ; b\" -D",
+            "git branch -d x \\\n -f",
+            "git branch -`d feature",
+            "git branch -^d feature",
+            "git branch -$flag feature",
+            "git branch --format -d feature",
+            "git branch -u up -d feature",
+            "git branch --unknown-option -d feature",
+            "git status -d",
+            "",
+        ] {
+            assert_eq!(
+                branch_regex_fallback_rule(text),
+                BRANCH_FORCE_DELETE_RULE,
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_branch_delete_and_force_update_high() {
+        // Every branch deletion form and forced ref update is a default-deny
+        // user-intent boundary, even when Git considers the branch merged.
+        // The merge-checked deletion is reported as `branch-delete`, every
+        // forced form as `branch-force-delete` (#509).
         let pack = create_pack();
 
-        assert_blocks_with_severity(&pack, "git branch -D feature", Severity::Medium);
+        assert_blocks_with_severity(&pack, "git branch -d feature", Severity::High);
+        assert_blocks_with_severity(&pack, "git branch -D feature", Severity::High);
+        assert_blocks_with_pattern(&pack, "git branch -d feature", "branch-delete");
         assert_blocks_with_pattern(&pack, "git branch -D feature", "branch-force-delete");
+        assert_blocks_with_pattern(&pack, "git branch --delete feature", "branch-delete");
         assert_blocks_with_pattern(&pack, "git branch --force feature", "branch-force-delete");
         assert_blocks_with_pattern(&pack, "git branch -f feature", "branch-force-delete");
+        for cmd in [
+            "git branch --d feature",
+            "git branch --del feature",
+            "git branch --dele feature",
+            "git branch --delet feature",
+            "git branch --no-format -d feature",
+            "git branch --no-sort -d feature",
+            "git branch --no-points-at -d feature",
+            "git branch --no-set-upstream-to -d feature",
+            "git branch --set-upstream -d feature",
+            "git branch --merged HEAD -d feature",
+            "git branch --contains HEAD --delete feature",
+            "git branch --no-delete -d feature",
+            "git branch --force --no-force -d feature",
+            "git --no-literal-pathspecs branch --del feature",
+            "git --shallow-file shallow branch -d feature",
+            "git --attr-source HEAD branch --del feature",
+            "FOO=bar git branch --del feature",
+            "exec git branch --del feature",
+            "gIt.ExE branch -d feature",
+            "git-branch -d feature",
+            "/usr/lib/git-core/git-branch --delete feature",
+            "git -c alias.x=branch x -d feature",
+            "git -calias.x=branch x --delete feature",
+            "git -c 'alias.x=!git branch' x -d feature",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0=branch git x -d feature",
+            "ALIAS_COMMAND=branch git --config-env=alias.x=ALIAS_COMMAND x -d feature",
+            r"& 'C:\Program Files\Git\cmd\git.exe' branch -d feature",
+        ] {
+            assert_blocks_with_pattern(&pack, cmd, "branch-delete");
+        }
+        for cmd in [
+            "git branch -M old existing",
+            "git branch -C old existing",
+            "git branch --forc feature",
+            "git branch --no-force -f feature",
+            "git branch -D --no-delete --no-force feature",
+            "git branch -d -f feature",
+            "git branch -df feature",
+            "git branch --delete --force feature",
+            "git branch --force --delete feature",
+            "git branch -d --force feature",
+            "git -c alias.x=y -c alias.y=branch x -D feature",
+        ] {
+            assert_blocks_with_pattern(&pack, cmd, "branch-force-delete");
+        }
 
-        // Combined short-flag forms (previously missed) — all map to
-        // force-delete semantics:
+        // Combined short-flag forms (previously missed):
         //   -Dr   (force-delete a remote-tracking branch)
         //   -vD   (verbose + force-delete)
         //   -fv   (force + verbose)
         //   -vdf  (verbose + delete + force)
+        //   -vd   (verbose + merge-checked delete)
         assert_blocks_with_pattern(
             &pack,
             "git branch -Dr origin/feature",
             "branch-force-delete",
         );
         assert_blocks_with_pattern(&pack, "git branch -vD feature", "branch-force-delete");
+        assert_blocks_with_pattern(&pack, "git branch -vd feature", "branch-delete");
         assert_blocks_with_pattern(&pack, "git branch -fv feature", "branch-force-delete");
         assert_blocks_with_pattern(&pack, "git branch -vdf feature", "branch-force-delete");
-
-        // Safe cases: lowercase `-d` alone deletes only if merged. Listing
-        // flags without D/f must NOT trigger the rule.
-        assert!(
-            pack.check("git branch -d merged-feature").is_none(),
-            "non-forcing `-d` should not be blocked"
+        assert_blocks_with_pattern(
+            &pack,
+            "sudo git -C /tmp/repo branch -d feature",
+            "branch-delete",
         );
-        assert!(
-            pack.check("git branch -vd merged-feature").is_none(),
-            "non-forcing `-vd` should not be blocked"
+        assert_blocks_with_pattern(
+            &pack,
+            "git --no-pager branch --delete feature",
+            "branch-delete",
         );
+        assert_blocks_with_pattern(
+            &pack,
+            "git branch --format -d --delete feature",
+            "branch-delete",
+        );
+        // Read-only and branch-creation forms remain safe.
         assert!(
             pack.check("git branch -a").is_none(),
             "listing all branches must not be blocked"
+        );
+        assert!(
+            pack.check("git branch --merged").is_none(),
+            "merged-branch listing must not be blocked"
+        );
+        assert!(
+            pack.check("git branch feature").is_none(),
+            "ordinary branch creation must not be blocked"
         );
 
         // Regression for #121: `--force-with-lease` and `--force-if-includes`
@@ -773,10 +8579,158 @@ mod tests {
             "git branch --show-current || git push --force-with-lease origin main",
             "git branch --show-current | tee /tmp/branch && git push --force-with-lease",
             "`git branch --show-current` && git push --force-with-lease",
+            "git branch --show-current && ls -d",
+            "git branch --show-current; printf '%s' --delete",
+            "git branch --show-current || echo --force",
         ] {
             assert!(
                 pack.check(cmd).is_none(),
                 "branch-force-delete must not span shell boundaries; cmd={cmd}"
+            );
+        }
+
+        // Option-like text inside a quoted format string is data, not a
+        // branch deletion option.
+        for cmd in [
+            "git branch --format='%(refname:short) -d'",
+            "git branch --format='--delete %(refname:short)'",
+            "git branch --format -d",
+            "git branch --sort -d",
+            "git branch --points-at -d",
+            "git branch --set-upstream-to -d",
+            "git branch --form -d",
+            "git branch --so -d",
+            "git branch --poi -d",
+            "git branch --merged -d feature",
+            "git branch --contains -d feature",
+            "git branch --with -d feature",
+            "git branch --without --delete feature",
+            "git branch -u -d feature",
+            "git branch -tdirect",
+            "git branch -tinherit",
+            "git branch -- -d",
+            "git branch --end-of-options -d",
+            "git branch --delete --no-delete feature",
+            "git branch -d --no-delete feature",
+            "git branch --force --no-force feature",
+            "git branch --delete=feature",
+            "git branch --force=feature",
+            "git branch --help -d feature",
+            "git branch -dh feature",
+            "git branch -hd feature",
+            "git help branch -d feature",
+            "git --version branch -d feature",
+            "git --exec-path branch -d feature",
+            "FOO=bar git branch --format -d",
+            "time git branch --format -d",
+            "git-branch --format -d",
+            "/usr/lib/git-core/git-branch --merged -d feature",
+            "git -c 'alias.x=branch --format' x -d",
+            "git -c alias.x=status x -d feature",
+            "git -c alias.x=y -c alias.y=status x -d feature",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.x GIT_CONFIG_VALUE_0='branch --format' git x -d",
+            "ALIAS_COMMAND='branch --format' git --config-env alias.x=ALIAS_COMMAND x -d",
+            r"& 'C:\Program Files\Git\cmd\git.exe' branch --format -d",
+            r#"git branch --format -d "$(printf feature)""#,
+        ] {
+            assert!(
+                pack.check(cmd).is_none(),
+                "quoted format data must not trigger branch deletion; cmd={cmd}"
+            );
+        }
+        assert_blocks_with_pattern(&pack, "git branch -tdirect -d feature", "branch-delete");
+    }
+
+    #[test]
+    fn posix_literal_printf_substitutions_cannot_hide_branch_deletion() {
+        let destructive = [
+            "g$(printf it) br$(printf anch) -$(printf d) feature",
+            "g`printf it` br`printf anch` -`printf d` feature",
+            "g$(printf it) branch -d feature",
+            "git br$(printf anch) -d feature",
+            "git branch -$(printf d) feature",
+            "$(printf git) branch -d feature",
+            "git $(printf branch) -d feature",
+            "git branch --$(printf delete) feature",
+            "g$(printf '')it branch -d feature",
+        ];
+        for command in destructive {
+            assert_eq!(
+                branch_command_decision_in_dialect(command, ShellDialect::Posix),
+                BranchCommandDecision::MergeCheckedDelete,
+                "literal command substitution must not hide deletion: {command}"
+            );
+            assert_eq!(
+                branch_command_decision(command),
+                BranchCommandDecision::MergeCheckedDelete,
+                "unknown callers must conservatively recognize POSIX substitution: {command}"
+            );
+        }
+        assert_eq!(
+            branch_command_decision_in_dialect(
+                "git branch -$(printf D) feature",
+                ShellDialect::Posix
+            ),
+            BranchCommandDecision::Destructive,
+            "a substituted -D stays a forced deletion"
+        );
+
+        for command in [
+            "git branch --format $(printf %s -d)",
+            "git branch --format \"$(printf %s -d)\"",
+        ] {
+            assert_eq!(
+                branch_command_decision_in_dialect(command, ShellDialect::Posix),
+                BranchCommandDecision::NonDestructive,
+                "option data must stay non-destructive: {command}"
+            );
+        }
+
+        let reset_view = syntax_view_in_dialect(
+            "g$(printf it) re$(printf set) --ha$(printf rd)",
+            ShellDialect::Posix,
+        )
+        .expect("static printf substitution should produce a syntax view");
+        assert_eq!(reset_view, "git reset --hard");
+
+        let inert_view =
+            syntax_view_in_dialect("echo \"$(printf 'git reset --hard')\"", ShellDialect::Posix)
+                .expect("literal substitution data should produce a non-matching view");
+        assert_eq!(inert_view, "__dcg_non_git_command__");
+    }
+
+    #[test]
+    fn unresolved_posix_substitutions_are_role_aware() {
+        for command in [
+            "g$(producer) branch -d feature",
+            "git br$(producer) -d feature",
+            "git branch -$(producer) feature",
+            "$(producer) branch -d feature",
+            "git $(producer) -d feature",
+            "git branch $(producer)",
+            "git branch --format $(producer)",
+            "/usr/bin/git branch $(producer)",
+            "sudo git branch $(producer)",
+        ] {
+            assert_eq!(
+                branch_command_decision_in_dialect(command, ShellDialect::Posix),
+                BranchCommandDecision::DestructiveDynamic,
+                "dynamic shell output can occupy a destructive syntax role: {command}"
+            );
+        }
+
+        for command in [
+            "echo $(producer)",
+            "git branch --format \"$(producer)\"",
+            "git branch '$(producer)'",
+            r"git branch \$(producer)",
+            "git branch -- \"$(producer)\"",
+            "git branch -udanger --format \"$(producer)\"",
+        ] {
+            assert_ne!(
+                branch_command_decision_in_dialect(command, ShellDialect::Posix),
+                BranchCommandDecision::Destructive,
+                "inert or quoted option data must remain safe: {command}"
             );
         }
     }
@@ -859,7 +8813,7 @@ mod tests {
                 "git push", // Without --force
                 "git add .",
                 "git commit -m 'message'",
-                "git branch -d feature", // Safe delete with -d
+                "git branch --merged",
             ],
         );
     }
@@ -905,5 +8859,266 @@ mod tests {
 
         let many_spaces = format!("git{}status", " ".repeat(100));
         assert_matches_within_budget(&pack, &many_spaces);
+    }
+
+    // =========================================================================
+    // Issue #250: cross-dialect tokenizer artifacts are not alias candidates
+    // =========================================================================
+
+    #[test]
+    fn dispatchable_git_subcommand_tokens_are_name_shaped() {
+        // Builtins, unknown alias names, and external `git-<name>` helper
+        // names all stay candidates for Git's subcommand dispatch.
+        for token in ["pull", "lg", "foo-bar", "st.sub", "a_b", "x+y", "v2"] {
+            assert!(
+                git_subcommand_token_is_dispatchable(token),
+                "expected {token:?} to be dispatchable"
+            );
+        }
+    }
+
+    #[test]
+    fn tokenizer_artifacts_are_not_dispatchable_git_subcommands() {
+        // Shell punctuation can never appear in a config key or helper
+        // filename that Git would dispatch; such tokens are cross-dialect
+        // tokenizer artifacts (e.g. the Cmd view of POSIX `git pull; done`).
+        for token in [
+            "pull;", "pull'", "fetch\"", "", "sub|x", "x&y", "sub>out", "pu ll", "x`y", "$(x)",
+        ] {
+            assert!(
+                !git_subcommand_token_is_dispatchable(token),
+                "expected {token:?} to be rejected as a tokenizer artifact"
+            );
+        }
+    }
+
+    /// Issue #400: Git ships each built-in subcommand as its own `git-<sub>`
+    /// executable, so the dashed spelling runs the identical operation. The
+    /// pack's gate recognised only `git` and `git-branch`, so every other rule
+    /// was one rename away from a bypass.
+    #[test]
+    fn dashed_git_builtins_are_recognised_as_git_executables() {
+        for command in [
+            "git-reset --hard HEAD~1",
+            "git-clean -fdx",
+            "git-checkout HEAD -- src/foo.py",
+            "git-restore src/foo.py",
+            "git-push --force origin main",
+            "git-stash drop",
+            "git-branch -D feature",
+            "/usr/libexec/git-core/git-reset --hard HEAD~1",
+        ] {
+            assert!(
+                command_executes_git_in_dialect(command, ShellDialect::Posix),
+                "{command:?} must be recognised as executing git"
+            );
+        }
+    }
+
+    /// End-to-end parity: each dashed spelling must reach the same rule id the
+    /// spaced spelling does. Before the fix, the synthesized pattern view
+    /// dropped the subcommand entirely (`git-reset --hard` became `git --hard`),
+    /// so every rule but `branch-force-delete` matched nothing.
+    #[test]
+    fn dashed_spellings_reach_the_same_rule_as_spaced_ones() {
+        let pack = create_pack();
+        for (spaced, dashed, rule) in [
+            (
+                "git reset --hard HEAD~1",
+                "git-reset --hard HEAD~1",
+                "reset-hard",
+            ),
+            ("git reset --merge", "git-reset --merge", "reset-merge"),
+            ("git clean -fdx", "git-clean -fdx", "clean-force"),
+            (
+                "git checkout -- src/foo.py",
+                "git-checkout -- src/foo.py",
+                "checkout-discard",
+            ),
+            (
+                "git checkout HEAD -- src/foo.py",
+                "git-checkout HEAD -- src/foo.py",
+                "checkout-ref-discard",
+            ),
+            (
+                "git restore src/foo.py",
+                "git-restore src/foo.py",
+                "restore-worktree",
+            ),
+            (
+                "git push --force origin main",
+                "git-push --force origin main",
+                "push-force-long",
+            ),
+            (
+                "git push -f origin main",
+                "git-push -f origin main",
+                "push-force-short",
+            ),
+            ("git stash clear", "git-stash clear", "stash-clear"),
+            (
+                "git branch -D feature",
+                "git-branch -D feature",
+                "branch-force-delete",
+            ),
+        ] {
+            assert_blocks_with_pattern(&pack, spaced, rule);
+            assert_blocks_with_pattern(&pack, dashed, rule);
+        }
+
+        // Git's own exec-path layout is reachable, so the path-qualified dashed
+        // spelling must be covered too.
+        assert_blocks_with_pattern(
+            &pack,
+            "/usr/libexec/git-core/git-reset --hard HEAD~1",
+            "reset-hard",
+        );
+    }
+
+    /// The dashed extension must not cost a safe pattern its exemption: the
+    /// dry-run and branch-creating spellings stay allowed under both forms.
+    #[test]
+    fn dashed_safe_spellings_keep_their_exemption() {
+        let pack = create_pack();
+        for command in [
+            "git-checkout -b feature",
+            "git-checkout --orphan gh-pages",
+            "git-restore --staged src/foo.py",
+            "git-clean -n",
+            "git-clean --dry-run",
+            "git-lfs prune --dry-run",
+            "git-push --force-with-lease origin main",
+            // Third-party `git-*` programs are not built-ins at all.
+            "git-lfs install",
+            "git-crypt unlock",
+            "git-flow init",
+            // Prose and path text that merely contains a builtin name.
+            "cat mygit-reset-notes.txt",
+            "./scripts/no-git-reset.sh",
+        ] {
+            assert_allows(&pack, command);
+        }
+    }
+
+    /// A third-party `git-*` program is not a Git built-in and must stay
+    /// outside the pack, as must a word that merely ends in a builtin name.
+    #[test]
+    fn third_party_git_prefixed_programs_are_not_git_builtins() {
+        for command in [
+            "git-crypt unlock",
+            "git-flow init",
+            "git-town sync",
+            "mygit-reset --hard",
+            "./scripts/no-git-reset.sh",
+        ] {
+            assert!(
+                !command_executes_git_in_dialect(command, ShellDialect::Posix),
+                "{command:?} must not be treated as a git built-in"
+            );
+        }
+    }
+
+    /// Working-tree/history/recovery destroyers that were previously fail-open:
+    /// `git checkout .` (the no-`--` twin of the blocked `git restore .`),
+    /// `git filter-branch`, and `git reflog expire --expire=now`.
+    #[test]
+    fn checkout_cwd_filter_branch_and_reflog_expire_block() {
+        let pack = create_pack();
+        for (command, rule) in [
+            ("git checkout .", "checkout-discard-cwd"),
+            ("git checkout ./src", "checkout-discard-cwd"),
+            ("git checkout HEAD .", "checkout-discard-cwd"),
+            ("git checkout origin/main .", "checkout-discard-cwd"),
+            ("git filter-branch -f HEAD", "filter-branch"),
+            ("git-filter-branch --force", "filter-branch"),
+            ("git reflog expire --expire=now --all", "reflog-expire-now"),
+            (
+                "git reflog expire --expire-unreachable=now main",
+                "reflog-expire-now",
+            ),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
+
+        // Branch switches, dotted branch names, quoted mentions, and the
+        // default-schedule reflog expiry must stay allowed — `.` is the only
+        // unambiguous pathspec, so ambiguous bare words are left alone.
+        // (A `.`/`filter-branch`/`checkout .` mention inside a quoted argument,
+        // e.g. `git commit -m 'git checkout .'`, is allowed in production
+        // because the evaluator masks quoted strings before matching — a
+        // property of the evaluator, not `Pack::check`, so it is not asserted
+        // at this raw-regex layer.)
+        for command in [
+            "git checkout main",
+            "git checkout -b feature",
+            "git checkout --orphan gh-pages",
+            "git checkout feature.branch",
+            "git checkout release/1.2",
+            "git log --grep=filter-branch",
+            "git reflog expire --all",
+            "git reflog",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command} must stay allowed, matched {:?}",
+                pack.check(command).and_then(|matched| matched.name)
+            );
+        }
+    }
+
+    /// Fifth review (#498/#502 follow-up): the bracket and brace lookahead
+    /// rescanned the rest of the word at every `[`/`{`, quadratic in a run of
+    /// unclosed ones; the answers themselves are unchanged.
+    #[test]
+    fn expansion_lookahead_is_linear_and_keeps_its_answers() {
+        for dialect in [ShellDialect::Posix, ShellDialect::Unknown] {
+            for (raw, expands) in [
+                ("git", false),
+                ("[", false),
+                ("[[", false),
+                ("g[i]t", true),
+                ("[a", false),
+                ("[a]", true),
+                ("{", false),
+                ("{}", false),
+                ("{git}", false),
+                ("{a,b}", true),
+                ("{a..c}", true),
+                ("{a.}", false),
+                ("{a}{b,c}", true),
+                ("{{a}", false),
+                ("{,{a}", true),
+                ("{a,{b}", true),
+                ("{.}.", false),
+                ("'{a,b}'", false),
+                ("\"[a]\"", false),
+            ] {
+                assert_eq!(
+                    git_token_has_active_expansion(raw, dialect),
+                    expands,
+                    "{raw:?} {dialect:?}"
+                );
+                assert_eq!(
+                    git_token_expansion_may_split(raw, dialect),
+                    expands,
+                    "{raw:?} {dialect:?}"
+                );
+            }
+        }
+        let started = std::time::Instant::now();
+        for raw in [
+            "[".repeat(200_000),
+            "[:".repeat(100_000),
+            "{".repeat(200_000),
+            format!("{}}}", "{".repeat(200_000)),
+        ] {
+            assert!(!git_token_has_active_expansion(&raw, ShellDialect::Posix));
+            assert!(!git_token_expansion_may_split(&raw, ShellDialect::Posix));
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 }

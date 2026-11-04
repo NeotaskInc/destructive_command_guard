@@ -59,8 +59,37 @@ fn mask_dynamic_fields(mut json: Value) -> Value {
                     Value::String("dcg allow-once <DYNAMIC>".to_string());
             }
         }
+
+        // Mask the dynamic allow-once code inside the reason text (GH#332:
+        // the reason names the scoped remedy, and the minted code changes
+        // per invocation).
+        if let Some(reason) = hook_output
+            .get("permissionDecisionReason")
+            .and_then(Value::as_str)
+        {
+            let masked = mask_allow_once_code_in_text(reason);
+            if masked != reason {
+                hook_output["permissionDecisionReason"] = Value::String(masked);
+            }
+        }
     }
     json
+}
+
+/// Replace a minted `dcg allow-once <code>` occurrence with a stable token.
+fn mask_allow_once_code_in_text(text: &str) -> String {
+    const NEEDLE: &str = "dcg allow-once ";
+    let Some(idx) = text.find(NEEDLE) else {
+        return text.to_string();
+    };
+    let code_start = idx + NEEDLE.len();
+    let code_end = text[code_start..]
+        .find(|c: char| !c.is_ascii_alphanumeric())
+        .map_or(text.len(), |off| code_start + off);
+    if code_end == code_start {
+        return text.to_string();
+    }
+    format!("{}<DYNAMIC>{}", &text[..code_start], &text[code_end..])
 }
 
 /// Compare JSON output against a golden file.
@@ -375,11 +404,50 @@ fn golden_json_severity_values() {
 // Robot Mode Golden Tests
 // ============================================================================
 
+/// Every environment variable dcg's agent detection reads (`src/agent.rs`).
+const AGENT_ENV_MARKERS: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE",
+    "CLAUDE_SESSION_ID",
+    "AUGMENT_AGENT",
+    "AUGMENT_CONVERSATION_ID",
+    "AIDER_SESSION",
+    "CONTINUE_SESSION_ID",
+    "CODEX_CLI",
+    "GEMINI_CLI",
+    "COPILOT_CLI",
+    "COPILOT_AGENT_START_TIME_SEC",
+    "CURSOR_IDE",
+    "HERMES_AGENT",
+    "HERMES_SESSION_ID",
+    "GROK_SESSION_ID",
+    "GROK_HOOK_EVENT",
+    "GROK_WORKSPACE_ROOT",
+    "ANTIGRAVITY_CONVERSATION_ID",
+    "OPENCODE",
+    "CRUSH",
+    "PI_CODING_AGENT",
+    "PA_PROJECT_DIR",
+];
+
 /// Run dcg in robot mode via test subcommand
 fn run_robot_mode(command: &str) -> Option<Value> {
     use std::process::Command;
 
-    let output = Command::new(env!("CARGO_BIN_EXE_dcg"))
+    // The goldens record `agent.detected: "unknown"`, so ambient agent markers
+    // must not leak in: tests run inside Claude Code inherit `CLAUDECODE=1`.
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_dcg"));
+    for marker in AGENT_ENV_MARKERS {
+        cmd.env_remove(marker);
+    }
+    // Likewise the developer's own config must not shape the recorded output.
+    let home = tempfile::tempdir().expect("tempdir");
+    let output = cmd
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("XDG_CONFIG_HOME", home.path().join(".config"))
         .args(["--robot", "test", command])
         .output()
         .expect("Failed to run dcg");

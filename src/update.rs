@@ -106,7 +106,7 @@ pub struct BackupEntry {
 /// Get the path to the backup directory.
 #[must_use]
 pub fn backup_dir() -> Option<PathBuf> {
-    dirs::data_dir().map(|d| d.join("dcg").join("backups"))
+    crate::config::user_data_dir().map(|d| d.join("dcg").join("backups"))
 }
 
 fn is_valid_backup_artifact_name(name: &str) -> bool {
@@ -512,7 +512,7 @@ pub fn format_backup_list(backups: &[BackupEntry], use_color: bool) -> String {
 
 /// Get the path to the version check cache file.
 fn cache_path() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("dcg").join("version_check.json"))
+    crate::config::user_cache_dir().map(|d| d.join("dcg").join("version_check.json"))
 }
 
 /// Read cached version check if it exists and is still valid.
@@ -594,6 +594,103 @@ pub const fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+const fn prefer_dsr_metadata<'a>(dsr: Option<&'a str>, vergen: Option<&'a str>) -> Option<&'a str> {
+    match dsr {
+        Some(value) => Some(value),
+        None => vergen,
+    }
+}
+
+/// `git describe --tags --dirty` captured at compile time by `build.rs`
+/// (#320).
+///
+/// Strict DSR snapshots use their prevalidated release tag because the
+/// tracked-byte build root intentionally has no `.git` directory.
+pub const GIT_DESCRIBE: Option<&str> = prefer_dsr_metadata(
+    option_env!("DCG_DSR_GIT_DESCRIBE"),
+    option_env!("VERGEN_GIT_DESCRIBE"),
+);
+
+/// Full commit SHA captured at compile time by `build.rs`.
+pub const GIT_SHA: Option<&str> = prefer_dsr_metadata(
+    option_env!("DCG_DSR_GIT_SHA"),
+    option_env!("VERGEN_GIT_SHA"),
+);
+
+/// Explicit release-pipeline fallback marker (#320). Strict DSR builds emit
+/// their marker only after the supplied SHA and tag have passed build-script
+/// validation; legacy release builders may still export `DCG_RELEASE_BUILD=1`.
+/// Usable git metadata remains authoritative, so neither marker can bless a
+/// dirty or ahead-of-tag build.
+const RELEASE_BUILD_MARKER: Option<&str> = prefer_dsr_metadata(
+    option_env!("DCG_DSR_RELEASE_BUILD"),
+    option_env!("DCG_RELEASE_BUILD"),
+);
+
+/// Where this binary came from, as far as compile-time metadata can prove
+/// (#320).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildProvenance {
+    /// Built from a clean checkout exactly at this version's release tag, or
+    /// built by a release pipeline when git metadata was unavailable.
+    /// Replacing it with the published release of the same or newer version
+    /// loses nothing.
+    Release,
+    /// Built from a git checkout that is ahead of (or dirty relative to) the
+    /// release tag for this version. Replacing it with the published release
+    /// silently discards the local delta — for a guard, that can mean
+    /// downgrading coverage the operator depends on.
+    LocalAheadOfRelease {
+        /// The compile-time `git describe --tags --dirty` output.
+        describe: String,
+    },
+    /// No usable provenance: no git metadata was available at build time
+    /// (e.g. `cargo install` from a registry tarball).
+    Unknown,
+}
+
+/// Classify this binary's build provenance (#320).
+#[must_use]
+pub fn build_provenance() -> BuildProvenance {
+    classify_provenance(GIT_DESCRIBE, RELEASE_BUILD_MARKER, current_version())
+}
+
+/// Pure classification seam for [`build_provenance`], unit-testable without
+/// rebuilding under different environments.
+fn classify_provenance(
+    describe: Option<&str>,
+    release_marker: Option<&str>,
+    version: &str,
+) -> BuildProvenance {
+    let release_marker_enabled = release_marker.is_some_and(crate::output::env_flag_value_enabled);
+    let Some(describe) = describe else {
+        return if release_marker_enabled {
+            BuildProvenance::Release
+        } else {
+            BuildProvenance::Unknown
+        };
+    };
+    // vergen substitutes a fixed placeholder when git metadata could not be
+    // gathered; treat it (and empty output) as absent metadata, where the
+    // explicit release-pipeline marker may supply the missing provenance.
+    if describe.is_empty() || describe == "VERGEN_IDEMPOTENT_OUTPUT" {
+        return if release_marker_enabled {
+            BuildProvenance::Release
+        } else {
+            BuildProvenance::Unknown
+        };
+    }
+    if describe == format!("v{version}") {
+        return BuildProvenance::Release;
+    }
+    // Anything else — `v0.11.0-7-gabc1234`, a `-dirty` suffix, or a describe
+    // rooted at an older tag — is a local build whose bytes are not those of
+    // this version's release tag.
+    BuildProvenance::LocalAheadOfRelease {
+        describe: describe.to_string(),
+    }
+}
+
 /// Check for updates, using cache if available.
 ///
 /// Returns the version check result, either from cache or from a fresh API call.
@@ -664,7 +761,7 @@ fn fetch_latest_version() -> Result<VersionCheckResult, VersionCheckError> {
         current_version: current.to_string(),
         latest_version,
         update_available,
-        release_url: release_url_for_tag(latest.version()),
+        release_url: release_url_for_version(latest.version()),
         release_notes,
         checked_at,
     };
@@ -731,12 +828,12 @@ fn truncate_release_notes(body: &str, max_chars: usize) -> String {
     format!("{truncated}...")
 }
 
-fn release_url_for_tag(tag: &str) -> String {
-    let trimmed = tag.trim();
-    if trimmed.is_empty() {
+fn release_url_for_version(version: &str) -> String {
+    let bare_version = version.trim().trim_start_matches('v');
+    if bare_version.is_empty() {
         format!("https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/latest")
     } else {
-        format!("https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/tag/{trimmed}")
+        format!("https://github.com/{REPO_OWNER}/{REPO_NAME}/releases/tag/v{bare_version}")
     }
 }
 
@@ -883,6 +980,92 @@ fn disable_env_flag_enabled(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn dsr_release_identity_precedes_git_discovery_fallbacks() {
+        assert_eq!(
+            prefer_dsr_metadata(Some("certified"), Some("discovered")),
+            Some("certified")
+        );
+        assert_eq!(
+            prefer_dsr_metadata(None, Some("discovered")),
+            Some("discovered")
+        );
+        assert_eq!(prefer_dsr_metadata(None, None), None);
+    }
+
+    /// #320/#344: a release marker is fallback evidence for builds where git
+    /// metadata is unavailable, not permission to contradict explicit git
+    /// state.
+    #[test]
+    fn release_marker_only_fills_unusable_git_metadata() {
+        for release_marker in ["1", "true", "YES", "on", " enabled "] {
+            for describe in [None, Some(""), Some("VERGEN_IDEMPOTENT_OUTPUT")] {
+                assert_eq!(
+                    classify_provenance(describe, Some(release_marker), "0.11.0"),
+                    BuildProvenance::Release,
+                    "{release_marker:?}, {describe:?}"
+                );
+            }
+        }
+
+        for describe in ["v0.11.0-7-gabc1234", "v0.11.0-dirty", "v0.10.0"] {
+            assert_eq!(
+                classify_provenance(Some(describe), Some("1"), "0.11.0"),
+                BuildProvenance::LocalAheadOfRelease {
+                    describe: describe.to_string()
+                },
+                "release marker must not bless explicit git state: {describe}"
+            );
+        }
+    }
+
+    /// #320/#344: exact matching tag metadata is independently sufficient,
+    /// while documented falsey marker values cannot manufacture provenance.
+    #[test]
+    fn classify_provenance_covers_release_local_and_unknown() {
+        for release_marker in [None, Some("1"), Some("true"), Some("yes"), Some("on")] {
+            assert_eq!(
+                classify_provenance(Some("v0.11.0"), release_marker, "0.11.0"),
+                BuildProvenance::Release,
+                "{release_marker:?}"
+            );
+        }
+
+        for release_marker in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("NO"),
+            Some("n"),
+            Some("Off"),
+        ] {
+            assert_eq!(
+                classify_provenance(None, release_marker, "0.11.0"),
+                BuildProvenance::Unknown,
+                "{release_marker:?}"
+            );
+        }
+
+        for describe in ["v0.11.0-7-gabc1234", "v0.11.0-dirty", "v0.10.0-40-gdeadbee"] {
+            assert_eq!(
+                classify_provenance(Some(describe), None, "0.11.0"),
+                BuildProvenance::LocalAheadOfRelease {
+                    describe: describe.to_string()
+                },
+                "{describe}"
+            );
+        }
+
+        for describe in [None, Some("VERGEN_IDEMPOTENT_OUTPUT"), Some("")] {
+            assert_eq!(
+                classify_provenance(describe, None, "0.11.0"),
+                BuildProvenance::Unknown,
+                "{describe:?}"
+            );
+        }
+    }
+
     /// win-test-rollback-bom: the Windows rename-then-copy executable swap must
     /// replace the binary on success and restore the original on failure (the
     /// running exe is locked on Windows, so it can never be left missing).
@@ -938,7 +1121,9 @@ mod tests {
         let mut builder = Release::builder();
         builder
             .name(version)
-            .version(version)
+            // self_update 1.0 validates custom Release values as bare SemVer;
+            // forge adapters preserve the raw tag only in the display name.
+            .version(version.trim_start_matches('v'))
             .date("2026-01-01T00:00:00Z");
         builder.build().expect("valid test release")
     }
@@ -968,7 +1153,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_latest_release_with_v_prefix() {
+    fn test_select_latest_release_with_backend_normalized_v_tags() {
         let releases = vec![
             make_release("v1.0.0"),
             make_release("v2.1.0"),
@@ -976,25 +1161,26 @@ mod tests {
         ];
 
         let selected = select_latest_release(&releases).expect("select");
-        assert_eq!(selected.version(), "v2.1.0");
+        assert_eq!(selected.version(), "2.1.0");
+        assert_eq!(selected.name(), "v2.1.0");
     }
 
     #[test]
-    fn test_release_url_for_tag_uses_exact_tag() {
+    fn test_release_url_for_version_uses_canonical_v_tag() {
         assert_eq!(
-            release_url_for_tag("v2.1.0"),
+            release_url_for_version("v2.1.0"),
             "https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v2.1.0"
         );
         assert_eq!(
-            release_url_for_tag("2.1.0"),
-            "https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/2.1.0"
+            release_url_for_version("2.1.0"),
+            "https://github.com/Dicklesworthstone/destructive_command_guard/releases/tag/v2.1.0"
         );
     }
 
     #[test]
-    fn test_release_url_for_tag_empty_uses_latest() {
+    fn test_release_url_for_version_empty_uses_latest() {
         assert_eq!(
-            release_url_for_tag(""),
+            release_url_for_version(""),
             "https://github.com/Dicklesworthstone/destructive_command_guard/releases/latest"
         );
     }

@@ -96,6 +96,24 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - podman container prune: Only remove stopped containers\n\
              - podman image prune: Only remove dangling images"
         ),
+        // system reset - a superset of `system prune -a --volumes`: it removes
+        // every container, pod, image, network and volume, in use or not.
+        destructive_pattern!(
+            "system-reset",
+            r"podman\b.*?\bsystem\s+reset\b",
+            "podman system reset deletes ALL containers, pods, images, networks and volumes.",
+            Critical,
+            "podman system reset returns Podman storage to its initial state. Unlike \
+             system prune it does not stop at unused data:\n\n\
+             - Every container and pod, running or stopped\n\
+             - Every image, including ones in use\n\
+             - Every volume and the data in it\n\
+             - Every network and the build cache\n\n\
+             There is no recovery. Safer alternatives:\n\
+             - podman system df: See what is using space\n\
+             - podman system prune: Remove only unused data\n\
+             - podman volume ls: Check for volumes holding data first"
+        ),
         // volume prune - removes all unused volumes
         destructive_pattern!(
             "volume-prune",
@@ -160,10 +178,14 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - podman rm <container>: Remove specific containers\n\
              - podman start <container>: Restart instead of removing"
         ),
-        // rm -f (force remove containers)
+        // rm -f / `<management command> rm -f` (force removal), scoped to this
+        // podman command's own option words exactly like the docker pack's
+        // rm-force (#548): one shell word per `[ \t]+`-separated token, an
+        // unquoted `;`, `&`, `|` or newline ends the command, and the flag must
+        // start a word.
         destructive_pattern!(
             "rm-force",
-            r"podman\b.*?\brm\s+.*(?:-[a-zA-Z0-9]*f|--force)",
+            r#"\bpodman(?:\.exe)?['"]?(?:(?:[ \t]|\\\n)+--?[A-Za-z][\w.-]*(?:=(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+)|(?:[ \t]|\\\n)+(?!-)(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))?)*(?:(?:[ \t]|\\\n)+[a-z][a-z0-9-]*(?:(?:[ \t]|\\\n)+--?[A-Za-z][\w.-]*(?:=(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+)|(?:[ \t]|\\\n)+(?!-)(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))?)*)?(?:[ \t]|\\\n)+['"]?(?:rm|remove)['"]?(?:(?:[ \t]|\\\n)+(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))*?(?:[ \t]|\\\n)+(?:\$?['"])?(?:-[A-Za-z0-9]*f[A-Za-z0-9]*|--force(?:=(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))?)['"]?(?=[\s;&|)'"]|$)"#,
             "podman rm -f forcibly removes containers, potentially losing data.",
             High,
             "podman rm -f forcibly stops and removes containers. This is dangerous because:\n\n\
@@ -176,10 +198,10 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - podman rm <container>: Then remove\n\
              - podman ps: Check container status first"
         ),
-        // rmi -f (force remove images)
+        // rmi -f (force remove images), scoped like rm-force above (#548).
         destructive_pattern!(
             "rmi-force",
-            r"podman\b.*?\brmi\s+.*(?:-[a-zA-Z0-9]*f|--force)",
+            r#"\bpodman(?:\.exe)?['"]?(?:(?:[ \t]|\\\n)+--?[A-Za-z][\w.-]*(?:=(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+)|(?:[ \t]|\\\n)+(?!-)(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))?)*(?:[ \t]|\\\n)+['"]?rmi['"]?(?:(?:[ \t]|\\\n)+(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))*?(?:[ \t]|\\\n)+(?:\$?['"])?(?:-[A-Za-z0-9]*f[A-Za-z0-9]*|--force(?:=(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))?)['"]?(?=[\s;&|)'"]|$)"#,
             "podman rmi -f forcibly removes images even if in use.",
             High,
             "podman rmi -f forcibly removes images, even if containers reference them. \
@@ -261,10 +283,47 @@ mod tests {
     }
 
     #[test]
+    fn force_flag_must_be_an_option_word_of_the_same_command_548() {
+        let pack = create_pack();
+        for command in [
+            "podman image rm cve-followup/web:1.2",
+            "podman rmi cve-followup/web:1.2",
+            "podman rm probe-xf",
+            "podman rm probe-a; podman ps -a --format '{{.Names}}'",
+            "podman network rm probe-net && grep -f patterns.txt file.txt",
+            "cat podman-compose.yml && rm -f /tmp/a",
+            "flock /tmp/l podman run --rm --platform linux/arm64 alpine true",
+        ] {
+            assert_allows(&pack, command);
+        }
+        for (command, rule) in [
+            ("podman rm -f c1", "rm-force"),
+            ("podman rm c1 -f", "rm-force"),
+            ("podman pod rm -f p1", "rm-force"),
+            ("podman container rm --force c1", "rm-force"),
+            ("flock /tmp/l podman rm -f c1", "rm-force"),
+            ("podman rmi -f img", "rmi-force"),
+            ("podman rm $'-f' c1", "rm-force"),
+            ("podman rmi $\"-f\" img", "rmi-force"),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
+    }
+
+    #[test]
     fn podman_blocks_each_destructive_pattern() {
         let pack = create_pack();
         assert_blocks(&pack, "podman system prune", "prune");
         assert_blocks(&pack, "podman system prune --all", "prune");
+        for command in [
+            "podman system reset",
+            "podman system reset -f",
+            "podman --remote system reset --force",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "system-reset");
+        }
+        assert_allows(&pack, "podman system df");
+        assert_allows(&pack, "podman system info");
         assert_blocks(&pack, "podman volume prune", "prune");
         assert_blocks(&pack, "podman pod prune", "prune");
         assert_blocks(&pack, "podman image prune", "prune");

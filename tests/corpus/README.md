@@ -27,7 +27,58 @@ corpus/
     multi_segment.toml      # pipes, &&, ||, ;, subshells, $()
     unicode.toml            # UTF-8 edge cases
     regex_worst_case.toml   # Potential ReDoS patterns
+  cross_pack_fp/            # Cross-pack replay (separate runner, see below)
+    issue_246_test_builtin.toml
+    issue_277_stdin_sink_prose.toml
+    issue_279_quoted_substitution.toml
+    issue_281_dynamic_executables.toml
+    issue_283_bare_wrapper_words.toml
+    issue_285_windows_user_temp.toml
+    issue_287_permission_chains.toml
+    controls_true_positives.toml
 ```
+
+## Cross-Pack Corpus (`cross_pack_fp/`)
+
+The four categories above evaluate against the **default-enabled,
+platform-dependent** pack set. `cross_pack_fp/` closes the three holes that
+leaves: opt-in packs are never exercised, `windows.*` cases never run on unix
+CI, and per-issue regressions live as inline unit tests next to the one rule
+that was patched — so a shape that false-positived under one rule is never
+re-asked of the others.
+
+`cross_pack_fp/` is loaded by its own runner, `tests/cross_pack_corpus.rs`,
+which force-enables **every** registry pack and replays each case across the
+`posix`, `ps`, `cmd` and `unknown` dialects:
+
+```bash
+cargo test --test cross_pack_corpus
+DCG_CROSS_PACK_DUMP=1 cargo test --test cross_pack_corpus -- --nocapture
+```
+
+It uses a superset of the schema below:
+
+```toml
+[[case]]
+description = "chmod 600 then grep -rn: the -rn belongs to grep"
+command = "chmod 600 /root/.ssh/x && grep -rn foo /etc/ssh/"
+expected = "allow"               # "deny" marks a true-positive control
+issue = 287                      # source issue (0 = no single issue)
+rule_id = "core.git:reset-hard"  # optional; asserted on deny cases
+dialects = ["posix", "unknown"]  # optional; default = all four
+known_failing = true             # optional; reported but tolerated
+known_failing_reason = "..."     # required when known_failing = true
+known_failing_dialects = ["ps"]  # optional; narrows the tolerance
+```
+
+`known_failing` records false positives this suite has **found**: a benign
+shape that still denies under some pack is a bug owned by that pack, not
+something the corpus may weaken away. Marked cases are printed prominently, and
+if one starts passing the suite fails so the marker gets removed.
+
+`load_corpus_dir` only walks the four fixed category directories, so
+`cross_pack_fp/` is invisible to `regression_corpus.rs` — the two suites do not
+interfere.
 
 ## File Format (TOML)
 
@@ -42,8 +93,8 @@ rule_id = "pack.id:pattern-name"  # optional, for validation
 # These are ignored by the current regression_corpus test, but are part
 # of the canonical schema for future harnesses.
 [case.log]
-decision = "deny"          # allow|deny|warn|log
-mode = "deny"              # deny|warn|log
+decision = "deny"          # allow|deny|ask|warn|log
+mode = "deny"              # deny|ask|warn|log
 pack_id = "core.git"
 pattern_name = "reset-hard"
 rule_id = "core.git:reset-hard"
@@ -164,12 +215,15 @@ These invariants must never change without an explicit design review:
 - Allowlist matches are logged with `allowlist_override` field.
 - Allowlist lookup happens **after** pattern matching, not before.
 
-### 4. Fail-Open Semantics
-- On **budget exhaustion**: allow (return early with `skipped_due_to_budget`).
+### 4. Bounded Failure Semantics
+- On **budget exhaustion**: return `Indeterminate` with
+  `skipped_due_to_budget`; hook protocols ask for review or block and never
+  silently allow.
 - On **heredoc parse error**: allow (with warning log).
 - On **heredoc timeout**: allow (with warning log).
 - On **JSON parse error** (hook mode): allow (with warning log).
-- **Never block due to internal errors.**
+- Parse/error policies remain explicit per subsystem; a safety deadline is not
+  proof that a command is safe.
 
 ### 5. Word-Boundary Keyword Gating
 - Keywords are matched at **word boundaries**, not substrings.
@@ -199,17 +253,16 @@ They are commented out in the corpus files with `# NOTE:` markers.
 
 ### Flag Separation
 
-These patterns use separated flags which current patterns don't handle:
-
-- `rm -r -f /path` - Flags separated by space (only `-rf` combined works)
-- `git clean -d -f` - Flags separated (only `-fd` combined works)
+None currently known: separated flags (`rm -r -f /path`, `git clean -d -f`)
+are covered.
 
 ### Missing Patterns
 
-These dangerous operations don't have patterns yet:
-
-- `git checkout -f` / `git checkout --force` - Overwrites local changes
-- `git checkout HEAD -- .` - Can overwrite working tree
+None currently tracked here. `git checkout -f`/`--force`, `git switch
+--discard-changes`, `git rm -f`, `git update-ref -d`, `+refspec` pushes and
+`find … -exec rm {}` were added in 2026-09; `git checkout HEAD -- .` is
+`core.git:checkout-ref-discard`. Remote-branch deletion, `push --mirror` and
+`worktree remove --force` are deliberately in the opt-in `strict_git` pack.
 
 ### Partial Coverage
 

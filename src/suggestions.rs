@@ -129,9 +129,21 @@ pub static SUGGESTION_REGISTRY: LazyLock<HashMap<&'static str, Vec<Suggestion>>>
 ///     }
 /// }
 /// ```
+///
+/// A refined embedded-code rule id (`heredoc.javascript:fs_rmsync.catastrophic`)
+/// falls back to its base rule's suggestions. Every blocking `fs.rmSync`
+/// match carries such a refinement, so the exact-key lookup alone meant the
+/// registered `heredoc.javascript:fs_rmsync` guidance was never shown.
 #[must_use]
 pub fn get_suggestions(rule_id: &str) -> Option<&'static [Suggestion]> {
-    SUGGESTION_REGISTRY.get(rule_id).map(Vec::as_slice)
+    if let Some(found) = SUGGESTION_REGISTRY.get(rule_id) {
+        return Some(found.as_slice());
+    }
+    let (pack, pattern) = rule_id.split_once(':')?;
+    let (base, _refinement) = pattern.split_once('.')?;
+    SUGGESTION_REGISTRY
+        .get(format!("{pack}:{base}").as_str())
+        .map(Vec::as_slice)
 }
 
 /// Get the first suggestion of a specific kind for a rule.
@@ -309,6 +321,10 @@ fn register_core_git_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>)
         ),
     ];
     m.insert("core.git:push-force-long", force_push_suggestions.clone());
+    m.insert(
+        "core.git:push-force-refspec",
+        force_push_suggestions.clone(),
+    );
     m.insert("core.git:push-force-short", force_push_suggestions);
 
     // Checkout patterns that discard changes
@@ -333,18 +349,104 @@ fn register_core_git_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>)
         checkout_discard_suggestions,
     );
 
+    // `git show <ref>:<path>` redirected onto the same <path> (#373): the
+    // remediation is to capture into a NEW file, or stash before taking the
+    // other version.
+    m.insert(
+        "core.git:show-redirect-overwrite-source",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Run `git status` and `git diff` to see uncommitted changes that would be lost",
+            )
+            .with_command("git status && git diff"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Redirect to a NEW file instead of overwriting the working copy",
+            )
+            .with_command("git show <ref>:<path> > <path>.from-ref"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Stash first, then take the other version, then `git stash pop`",
+            )
+            .with_command("git stash"),
+        ],
+    );
+
+    m.insert(
+        "core.git:branch-delete",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Confirm Git considers the branch merged with `git branch --merged`",
+            )
+            .with_command("git branch --merged"),
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Review branch tips and upstream tracking state with `git branch -vv`",
+            )
+            .with_command("git branch -vv"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Ask the user for explicit approval before deleting a branch",
+            ),
+        ],
+    );
+
     m.insert(
         "core.git:branch-force-delete",
         vec![
             Suggestion::new(
                 SuggestionKind::PreviewFirst,
-                "Check if branch has unmerged commits with `git log branch --not main`",
+                "Review branch tips and upstream tracking state with `git branch -vv`",
+            )
+            .with_command("git branch -vv"),
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Compare Git's merged and unmerged branch classifications",
+            )
+            .with_command("git branch --merged && git branch --no-merged"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Ask the user for explicit approval before deleting or force-moving a branch ref",
+            ),
+        ],
+    );
+
+    m.insert(
+        "core.git:branch-dynamic-token",
+        vec![
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Resolve the dynamic value first, then pass the literal branch name — quoting \
+                 keeps a *creation* safe, but a command that keeps a deletion/force flag like \
+                 -D stays gated on its own merits",
             ),
             Suggestion::new(
                 SuggestionKind::SaferAlternative,
-                "Use `git branch -d` (lowercase) to only delete if merged",
+                "For a creation: quote the branch name so the expansion stays a single non-flag word",
             )
-            .with_command("git branch -d branch-name"),
+            .with_command("git branch \"backup-$(date +%s)\""),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "For a creation: add `--` to end option parsing so expanded output cannot become a flag",
+            )
+            .with_command("git branch -- <name>"),
+        ],
+    );
+
+    m.insert(
+        "core.git:git-alias-semantic-unverified",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Inspect the effective alias definition before invoking it",
+            )
+            .with_command("git config --show-origin --get-regexp '^alias\\.'"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Invoke the intended built-in Git subcommand directly after reviewing the alias expansion",
+            ),
         ],
     );
 
@@ -424,10 +526,258 @@ fn register_core_git_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>)
             .with_command("git stash drop stash@{0}"),
         ],
     );
+
+    // ---- Git LFS (Refs PR #383) --------------------------------------------
+    m.insert(
+        "core.git:lfs-migrate-rewrite",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Report what `git lfs migrate` would convert without rewriting any commit",
+            )
+            .with_command("git lfs migrate info --everything"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Keep a ref to the pre-rewrite history so the old SHAs stay reachable",
+            )
+            .with_command("git branch backup/pre-lfs-migrate"),
+        ],
+    );
+
+    m.insert(
+        "core.git:lfs-prune",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "List the LFS objects that would be deleted without deleting them",
+            )
+            .with_command("git lfs prune --dry-run --verbose"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Only prune objects the remote confirms it already has",
+            )
+            .with_command("git lfs prune --verify-remote"),
+        ],
+    );
+
+    m.insert(
+        "core.git:lfs-uninstall",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Show the LFS filters and hooks that would be removed",
+            )
+            .with_command("git lfs env"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Restore the LFS filters and hooks if they were already removed",
+            )
+            .with_command("git lfs install"),
+        ],
+    );
+    m.insert(
+        "core.git:checkout-discard-cwd",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Review exactly what would be discarded with `git diff`",
+            )
+            .with_command("git diff"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Save the changes first, then restore later with `git stash pop`",
+            )
+            .with_command("git stash"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Limit the overwrite to reviewed files: `git checkout <ref> -- <file>`",
+            ),
+        ],
+    );
+    m.insert(
+        "core.git:filter-branch",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Back up the current refs before rewriting: `git branch backup-before-rewrite`",
+            )
+            .with_command("git branch backup-before-rewrite"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Prefer git-filter-repo (faster and safer) and review the result",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Force-push a rewritten branch only with --force-with-lease after review",
+            ),
+        ],
+    );
+    m.insert(
+        "core.git:reflog-expire-now",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Recover what you need first: `git reflog`, then `git branch <name> <sha>`",
+            )
+            .with_command("git reflog"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Let the reflog expire on its default 90-day schedule instead of --expire=now",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Only expire the reflog once you have confirmed nothing else needs recovery",
+            ),
+        ],
+    );
+    let force_switch = || {
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "See exactly what the force would discard: `git status` and `git diff`",
+            )
+            .with_command("git status"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Save the changes first with `git stash`, switch, then `git stash pop`",
+            )
+            .with_command("git stash"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Check the other branch out alongside: `git worktree add ../other <branch>`",
+            ),
+        ]
+    };
+    m.insert("core.git:checkout-force", force_switch());
+    m.insert("core.git:switch-discard", force_switch());
+    m.insert(
+        "core.git:rm-force",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Preview which files would be removed: `git rm -n <path>`",
+            ),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Stop tracking but keep the file on disk: `git rm --cached <path>`",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Commit or stash the modifications, then `git rm` without -f",
+            ),
+        ],
+    );
+    m.insert(
+        "core.git:read-tree-reset",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "See what would be discarded: `git status` and `git diff`",
+            )
+            .with_command("git status"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Save the changes first: `git stash`, then restore with `git stash pop`",
+            ),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Merge instead, which refuses to overwrite local changes: `git read-tree -m -u <tree>`",
+            ),
+        ],
+    );
+    m.insert(
+        "core.git:update-ref-delete",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Review the ref first: `git branch -vv`",
+            )
+            .with_command("git branch -vv"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Use the porcelain delete, which refuses unmerged branches: `git branch -d <branch>`",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Keep a pointer before deleting: `git branch backup/<name> <ref>`",
+            ),
+        ],
+    );
 }
+
+/// Recursive rm rules whose target is a root, home, or sensitive system path.
+/// Their safer alternative must narrow the scope; repeating any recursive rm
+/// here would merely restate the catastrophic operation.
+const ROOT_HOME_RECURSIVE_RM_SUGGESTION_RULES: &[&str] = &[
+    "core.filesystem:rm-rf-root-home",
+    "core.filesystem:rm-r-f-separate-root-home",
+    "core.filesystem:rm-recursive-force-root-home",
+    "core.filesystem:rm-recursive-root-home",
+];
+
+/// Recursive rm rules for non-root targets. Their operand can still be a
+/// regular file, so every command must accept either a file or a directory.
+const GENERAL_RECURSIVE_RM_SUGGESTION_RULES: &[&str] = &[
+    "core.filesystem:rm-rf-general",
+    "core.filesystem:rm-r-f-separate",
+    "core.filesystem:rm-recursive-force-long",
+    "core.filesystem:rm-recursive-general",
+];
+
+/// A terminal `find -delete` preview must preserve the original expression and
+/// its implicit depth-first traversal. Arbitrary boolean expressions have no
+/// guaranteed exact mechanical rewrite.
+const FIND_DELETE_SUGGESTION_RULES: &[&str] = &[
+    "core.filesystem:find-delete-root-home",
+    "core.filesystem:find-delete-general",
+];
+
+/// `tar --remove-files` should remain an archive operation while preserving
+/// its sources, not be translated into a recursive rm workflow.
+const TAR_REMOVE_FILES_SUGGESTION_RULES: &[&str] = &[
+    "core.filesystem:tar-remove-files-root-home",
+    "core.filesystem:tar-remove-files-general",
+];
+
+/// Rules that destroy or overwrite one file. Their preview must accept a file
+/// operand; a directory-only `find path/ ...` command is incorrect here.
+const SINGLE_FILE_SUGGESTION_RULES: &[&str] = &[
+    "core.filesystem:unlink-root-home",
+    "core.filesystem:unlink-general",
+    "core.filesystem:truncate-zero-root-home",
+    "core.filesystem:truncate-zero-general",
+    "core.filesystem:shred-root-home",
+    "core.filesystem:shred-general",
+    "core.filesystem:dd-overwrite-root-home",
+    "core.filesystem:dd-overwrite-general",
+];
+
+/// Move rules can target either a file or a directory, so their preview uses
+/// `ls -ld` on the object itself and never assumes a tree.
+const MOVED_PATH_SUGGESTION_RULES: &[&str] = &[
+    "core.filesystem:mv-sensitive-source-root-home",
+    "core.filesystem:mv-dynamic-path",
+];
 
 /// Register suggestions for core.filesystem pack rules.
 fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Suggestion>>) {
+    m.insert(
+        "core.filesystem:tar-exec-unverified",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "List the archive with `tar -tvf archive.tar` and read the exact helper command tar would run before running it",
+            ),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Drop the helper option (`--checkpoint-action=exec=`, `--to-command`, `-I`, `--info-script`, `--rmt-command`) and run any reviewed command as a separate step",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Use a literal, bounded helper command; archive bytes are not verified shell or database input",
+            ),
+        ],
+    );
     m.insert(
         "core.filesystem:sed-exec-unverified",
         vec![
@@ -446,123 +796,527 @@ fn register_core_filesystem_suggestions(m: &mut HashMap<&'static str, Vec<Sugges
         ],
     );
 
-    // Shared suggestions for all recursive force-delete variants
-    let rm_rf_suggestions = vec![
+    // This registry feeds scan/trace output independently of the authored
+    // PatternSuggestion guidance attached to hook denials. Root/home matches
+    // must narrow the target instead of advertising another recursive delete.
+    let root_home_recursive_rm_suggestions = vec![
         Suggestion::new(
             SuggestionKind::PreviewFirst,
-            "List contents first with `ls -la` to verify target",
+            "Preview the target path with `find path -maxdepth 2 -print` before deleting",
+        )
+        .with_command("find path -maxdepth 2 -print"),
+        Suggestion::new(
+            SuggestionKind::SaferAlternative,
+            "Copy one specific, explicitly reviewed file or directory to a backup; `reviewed-path` must be non-root, non-home, and non-sensitive, never the blocked root, home, or sensitive target, and the original is preserved",
+        )
+        .with_command("cp -a reviewed-path /tmp/reviewed-backup"),
+        Suggestion::new(
+            SuggestionKind::WorkflowFix,
+            "Verify the backup first and require separate approval for any cleanup; never substitute the blocked root, home, or sensitive path itself",
+        ),
+    ];
+    for &rule_id in ROOT_HOME_RECURSIVE_RM_SUGGESTION_RULES {
+        m.insert(rule_id, root_home_recursive_rm_suggestions.clone());
+    }
+
+    let general_recursive_rm_suggestions = vec![
+        Suggestion::new(
+            SuggestionKind::PreviewFirst,
+            "Preview the target path with `find path -maxdepth 2 -print` before deleting",
+        )
+        .with_command("find path -maxdepth 2 -print"),
+        Suggestion::new(
+            SuggestionKind::SaferAlternative,
+            "Use `rm -ri` only from an interactive terminal; with stdin closed (as under an agent hook), it deletes nothing and exits 0",
+        )
+        .with_command("rm -ri path"),
+        Suggestion::new(
+            SuggestionKind::WorkflowFix,
+            "Move to trash with `trash-put path` on Linux (trash-cli), or `mv path ~/.Trash/` on macOS",
+        ),
+    ];
+    for &rule_id in GENERAL_RECURSIVE_RM_SUGGESTION_RULES {
+        m.insert(rule_id, general_recursive_rm_suggestions.clone());
+    }
+
+    // A terminal -delete can be transformed into a depth-first read-only
+    // preview. Inside an arbitrary boolean expression, delete success can
+    // affect evaluation, so there is no universally exact textual rewrite.
+    let find_delete_suggestions = vec![
+        Suggestion::new(
+            SuggestionKind::PreviewFirst,
+            "For a terminal `-delete` action, preserve every original search root, option, and predicate, retain or add `-depth`, then replace that terminal action with `-print`",
         ),
         Suggestion::new(
             SuggestionKind::SaferAlternative,
-            "Use `rm -ri` for interactive confirmation of each file",
-        )
-        .with_command("rm -ri path/"),
+            "When `-delete` is inside an arbitrary boolean expression, there is no guaranteed exact mechanical rewrite; construct and inspect a read-only expression manually",
+        ),
         Suggestion::new(
             SuggestionKind::WorkflowFix,
-            "Move to trash instead: `mv path ~/.local/share/Trash/`",
+            "Constrain both the find roots and predicates to a literal temp subtree before any separately approved deletion",
         ),
     ];
+    for &rule_id in FIND_DELETE_SUGGESTION_RULES {
+        m.insert(rule_id, find_delete_suggestions.clone());
+    }
 
-    // Register for all actual pattern names from filesystem.rs
-    m.insert("core.filesystem:rm-rf-root-home", rm_rf_suggestions.clone());
-    m.insert(
-        "core.filesystem:rm-r-f-separate-root-home",
-        rm_rf_suggestions.clone(),
-    );
-    m.insert(
-        "core.filesystem:rm-recursive-force-root-home",
-        rm_rf_suggestions.clone(),
-    );
-    m.insert("core.filesystem:rm-rf-general", rm_rf_suggestions.clone());
-    m.insert("core.filesystem:rm-r-f-separate", rm_rf_suggestions.clone());
-    m.insert(
-        "core.filesystem:rm-recursive-force-long",
-        rm_rf_suggestions.clone(),
-    );
-    // `find ... -delete` mirrors `rm -rf` (bytewise-equivalent destruction
-    // on the matched tree). Reuse the same suggestion set — the safer
-    // alternatives (preview with -ls, scope to /tmp, use trash-cli) all
-    // apply identically.
-    m.insert(
-        "core.filesystem:find-delete-root-home",
-        rm_rf_suggestions.clone(),
-    );
-    m.insert(
-        "core.filesystem:find-delete-general",
-        rm_rf_suggestions.clone(),
-    );
-    // unlink-root-home / unlink-general: same shape as rm/find-delete.
-    // Reuse the same suggestion set — the safer alternatives (preview
-    // with ls, scope to /tmp, use trash-cli) all apply identically.
-    m.insert(
-        "core.filesystem:unlink-root-home",
-        rm_rf_suggestions.clone(),
-    );
-    m.insert("core.filesystem:unlink-general", rm_rf_suggestions.clone());
-    // truncate-zero-* (zero/shrink in place): same shape as unlink — single-
-    // file content destruction. Reuse the same suggestion set.
-    m.insert(
-        "core.filesystem:truncate-zero-root-home",
-        rm_rf_suggestions.clone(),
-    );
-    m.insert(
-        "core.filesystem:truncate-zero-general",
-        rm_rf_suggestions.clone(),
-    );
-    // shred-* (overwrite + optional unlink): same single-file destruction
-    // shape. Reuse the rm_rf suggestion set.
-    m.insert("core.filesystem:shred-root-home", rm_rf_suggestions.clone());
-    m.insert("core.filesystem:shred-general", rm_rf_suggestions.clone());
-    // tar-remove-files-* (archive-then-delete on sources): recursive-
-    // delete sibling. Reuse rm_rf suggestion set.
-    m.insert(
-        "core.filesystem:tar-remove-files-root-home",
-        rm_rf_suggestions.clone(),
-    );
-    m.insert(
-        "core.filesystem:tar-remove-files-general",
-        rm_rf_suggestions.clone(),
-    );
-    // dd-overwrite-* (file-level dd with of=<sensitive>): file
-    // truncate-equivalent. Reuse the rm_rf suggestion set.
-    m.insert(
-        "core.filesystem:dd-overwrite-root-home",
-        rm_rf_suggestions.clone(),
-    );
-    m.insert(
-        "core.filesystem:dd-overwrite-general",
-        rm_rf_suggestions.clone(),
-    );
-    // mv-sensitive-source-root-home: cross-segment bypass closure.
-    // Reuse rm_rf suggestion set (same broad-destruction shape).
-    m.insert(
-        "core.filesystem:mv-sensitive-source-root-home",
-        rm_rf_suggestions.clone(),
-    );
-    m.insert("core.filesystem:mv-dynamic-path", rm_rf_suggestions.clone());
-    // sensitive-source propagation into temp followed by forced deletion:
-    // same broad data-loss shape as the mv cross-segment bypass.
+    let tar_remove_files_suggestions = vec![
+        Suggestion::new(
+            SuggestionKind::PreviewFirst,
+            "Inspect the exact source operands before archiving or removing anything",
+        )
+        .with_command("ls -la source"),
+        Suggestion::new(
+            SuggestionKind::SaferAlternative,
+            "Create the archive without `--remove-files` so every source is preserved",
+        )
+        .with_command("tar -cf archive.tar source"),
+        Suggestion::new(
+            SuggestionKind::WorkflowFix,
+            "Verify the archive in a separate step before considering any separately approved source cleanup",
+        )
+        .with_command("tar -tf archive.tar"),
+    ];
+    for &rule_id in TAR_REMOVE_FILES_SUGGESTION_RULES {
+        m.insert(rule_id, tar_remove_files_suggestions.clone());
+    }
+
     m.insert(
         "core.filesystem:cp-sensitive-then-delete",
-        rm_rf_suggestions.clone(),
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Inspect the exact sensitive source before copying it",
+            )
+            .with_command("ls -ld source"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Run the archive copy without chaining any deletion, then inspect the backup separately",
+            )
+            .with_command("cp -a source backup"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Verify source and backup in a separate step before considering cleanup",
+            )
+            .with_command("diff -r source backup"),
+        ],
     );
+
     m.insert(
         "core.filesystem:ln-symlink-sensitive-then-delete",
-        rm_rf_suggestions.clone(),
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Inspect where the link points before removing anything",
+            )
+            .with_command("readlink link"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Unlink only the symlink itself; never recursively remove the link target",
+            )
+            .with_command("unlink link"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Create, inspect, and clean up a symlink in separate commands without appending `/.` to it",
+            ),
+        ],
     );
+
     m.insert(
         "core.filesystem:rsync-sensitive-then-delete",
-        rm_rf_suggestions.clone(),
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Preview a transfer to a fresh, non-existing backup destination without changing files or chaining deletion",
+            )
+            .with_command("rsync -a --dry-run --ignore-existing source fresh-backup/"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Copy to a fresh, non-existing backup destination without the later deletion; `--ignore-existing` prevents overwriting if that path unexpectedly exists",
+            )
+            .with_command("rsync -a --ignore-existing source fresh-backup/"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Verify source and the fresh backup in a separate step before considering cleanup",
+            )
+            .with_command("diff -r source fresh-backup"),
+        ],
     );
-    // redirect-truncate-root-home: shell-syntax truncate-equivalent.
-    // Reuse rm_rf suggestion set (single-file destruction shape).
+
+    // A home-directory glob is a shell-selected file set, not necessarily a
+    // directory tree. Preview the expansion itself instead of appending `/`.
+    m.insert(
+        "core.filesystem:rm-glob-home",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Preview the exact glob expansion with `ls -la path-pattern` before deleting",
+            )
+            .with_command("ls -la path-pattern"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Delete explicitly named files so the removal set is reviewable",
+            )
+            .with_command("rm path/file-one path/file-two"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Move reviewed matches with `trash-put` on Linux (trash-cli), or into `~/.Trash/` on macOS",
+            ),
+        ],
+    );
+
+    let single_file_suggestions = vec![
+        Suggestion::new(
+            SuggestionKind::PreviewFirst,
+            "Inspect the file with `ls -la path` before deleting or overwriting it",
+        )
+        .with_command("ls -la path"),
+        Suggestion::new(
+            SuggestionKind::SaferAlternative,
+            "Copy the file to a reviewed backup before unlinking or overwriting it",
+        )
+        .with_command("cp -p path path.bak"),
+        Suggestion::new(
+            SuggestionKind::WorkflowFix,
+            "Move a disposable file with `trash-put path` on Linux (trash-cli), or `mv path ~/.Trash/` on macOS",
+        ),
+    ];
+    for &rule_id in SINGLE_FILE_SUGGESTION_RULES {
+        m.insert(rule_id, single_file_suggestions.clone());
+    }
+
+    let moved_path_suggestions = vec![
+        Suggestion::new(
+            SuggestionKind::PreviewFirst,
+            "Inspect the exact source and destination with `ls -ld path` before moving",
+        )
+        .with_command("ls -ld path"),
+        Suggestion::new(
+            SuggestionKind::SaferAlternative,
+            "Copy to a literal backup path first, then verify the copy before any move",
+        )
+        .with_command("cp -a path path.bak"),
+        Suggestion::new(
+            SuggestionKind::WorkflowFix,
+            "Resolve dynamic paths to literal source and destination values in a separate review step",
+        ),
+    ];
+    for &rule_id in MOVED_PATH_SUGGESTION_RULES {
+        m.insert(rule_id, moved_path_suggestions.clone());
+    }
+
+    // The command word is assembled at runtime. Do not guess a platform or
+    // repeat the unverified delete; make the executable and target reviewable.
+    m.insert(
+        "core.filesystem:rm-recursive-unverified",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Render and inspect the assembled executable, flags, and target as data before running it",
+            ),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Use a literal executable and literal target in a separate command so dcg can evaluate the exact operation",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Avoid a find -exec placeholder or PowerShell splat as the command word for recursive deletion",
+            ),
+        ],
+    );
+
+    // PowerShell guidance stays PowerShell-native and uses the runtime's own
+    // cross-platform temp-directory resolver; never advertise Unix rm/trash.
+    m.insert(
+        "core.filesystem:powershell-remove-item-recursive",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "List the item tree with `Get-ChildItem -Recurse path` before removing it",
+            )
+            .with_command("Get-ChildItem -Recurse path"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Use `Remove-Item -Recurse -WhatIf path` to preview without deleting",
+            )
+            .with_command("Remove-Item -Recurse -WhatIf path"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Move the tree aside with `Move-Item path (Join-Path ([IO.Path]::GetTempPath()) delete-me-reviewed)`",
+            )
+            .with_command(
+                "Move-Item path (Join-Path ([IO.Path]::GetTempPath()) delete-me-reviewed)",
+            ),
+        ],
+    );
+
+    m.insert(
+        "core.filesystem:rm-bare-glob",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "List what the working-directory glob expands to before deleting anything",
+            )
+            .with_command("ls -la"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Delete explicitly named files so the removal set is reviewable",
+            )
+            .with_command("rm ./file-one ./file-two"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Constrain the glob to a reviewed shape such as `*.log` instead of every file",
+            ),
+        ],
+    );
+    m.insert(
+        "core.filesystem:rm-bare-glob-root",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "List the filesystem root before naming any one target",
+            )
+            .with_command("ls -la /"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Name one reviewed root-level file instead of the unbounded /* expansion",
+            )
+            .with_command("rm /specific-file"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Move one reviewed file aside first instead of deleting every root entry",
+            )
+            .with_command("mv /specific-file /tmp/delete-me-reviewed"),
+        ],
+    );
+
+    m.insert(
+        "core.filesystem:rm-protected-file",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Confirm which file the operand actually names before deleting it",
+            )
+            .with_command("ls -la"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Move the file aside instead: reversible, and it proves nothing depended on it",
+            )
+            .with_command("mv /path/to/file /tmp/delete-me-reviewed"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "For an SSH key, remove the authorized entry rather than the key file, so a live session is not the last one you have",
+            ),
+        ],
+    );
+
+    // redirect-truncate-*: shell-syntax truncate-equivalent. These need
+    // redirect-specific guidance; deletion suggestions read as a non sequitur
+    // on a redirect denial (issues #316/#317).
+    let redirect_truncate_suggestions = vec![
+        Suggestion::new(
+            SuggestionKind::PreviewFirst,
+            "Resolve and inspect the redirect target path before truncating it",
+        ),
+        Suggestion::new(
+            SuggestionKind::SaferAlternative,
+            "Use append (`>>`) when preserving existing content is acceptable",
+        ),
+        Suggestion::new(
+            SuggestionKind::SaferAlternative,
+            "Redirect to a literal temp path instead of an expanded one",
+        )
+        .with_command("cmd > /tmp/scratch/out.log 2>&1"),
+        Suggestion::new(
+            SuggestionKind::WorkflowFix,
+            "Back up the target first if its current content matters: `cp target target.bak`",
+        ),
+    ];
+    m.insert(
+        "core.filesystem:credential-file-write",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Read the current content first; reads of credential and login files are never blocked",
+            )
+            .with_command("cat ~/.ssh/config"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Stage the proposed content in a scratch file and let the user apply it",
+            )
+            .with_command("echo data > /tmp/scratch/proposed && cat /tmp/scratch/proposed"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Appending a host key to known_hosts is allowed (what ssh itself does)",
+            )
+            .with_command("ssh-keyscan host >> ~/.ssh/known_hosts"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "For a change the user has approved, grant this one command with `dcg allow-once`, or allowlist `core.filesystem:credential-file-write` in the project config with a reason",
+            ),
+        ],
+    );
+    m.insert(
+        "core.filesystem:git-internals-write",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Read the current content first; reads under `.git/` are never blocked",
+            )
+            .with_command("git config --list --show-origin"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Let git edit its own config; it validates the key and picks the right scope",
+            )
+            .with_command("git config remote.origin.url <url>"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Change a remote through porcelain rather than by rewriting `.git/config`",
+            )
+            .with_command("git remote set-url origin <url>"),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "For a change the user has approved, grant this one command with `dcg allow-once`, or allowlist `core.filesystem:git-internals-write` in the project config with a reason — note this is deliberately separate from `credential-file-write`, so allowing one does not allow the other",
+            ),
+        ],
+    );
+    // The `.git` rules cannot take the generic redirect advice, because its
+    // second entry is "use append instead". For an ordinary file that is the
+    // safer spelling; for a git internal it is the more useful one, since a
+    // section appended to `.git/config` runs on the next git command and
+    // leaves everything already there working (#457). These rules get their
+    // own list, built around the routes git provides.
+    let git_internals_write_suggestions = vec![
+        Suggestion::new(
+            SuggestionKind::PreviewFirst,
+            "Read the current content first; reads under `.git` are never blocked",
+        )
+        .with_command("cat .git/config"),
+        Suggestion::new(
+            SuggestionKind::SaferAlternative,
+            "Change repository configuration through git, which validates the key and writes atomically",
+        )
+        .with_command("git config <key> <value>"),
+        Suggestion::new(
+            SuggestionKind::SaferAlternative,
+            "Move a ref through git rather than by writing `.git/refs` or `.git/HEAD`",
+        )
+        .with_command("git update-ref <ref> <sha>"),
+        Suggestion::new(
+            SuggestionKind::WorkflowFix,
+            "Stage the proposed file outside the repository and copy it in after review",
+        )
+        .with_command("echo data > /tmp/scratch/config && cp /tmp/scratch/config .git/config"),
+    ];
     m.insert(
         "core.filesystem:redirect-truncate-root-home",
-        rm_rf_suggestions.clone(),
+        redirect_truncate_suggestions.clone(),
     );
     m.insert(
         "core.filesystem:redirect-truncate-dynamic-path",
-        rm_rf_suggestions,
+        redirect_truncate_suggestions,
+    );
+    m.insert(
+        "core.filesystem:redirect-truncate-git-internals-relative",
+        git_internals_write_suggestions.clone(),
+    );
+    m.insert(
+        "core.filesystem:redirect-append-git-internals-relative",
+        git_internals_write_suggestions,
+    );
+    m.insert(
+        "core.filesystem:fork-bomb",
+        vec![
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "There is no safe variant of a fork bomb; do not run it",
+            ),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "To test process limits, use `ulimit -u` inside a disposable VM or container",
+            ),
+        ],
+    );
+    // Windows disk-destruction verbs (cross-platform baseline, #451).
+    m.insert(
+        "core.filesystem:format-volume",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Confirm the target volume with `Get-Volume` before reformatting anything",
+            )
+            .with_command("Get-Volume"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Add `-WhatIf` to report what Format-Volume would do without erasing the volume",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Reformatting a volume must be run interactively by a human who has confirmed the target drive",
+            ),
+        ],
+    );
+    m.insert(
+        "core.filesystem:clear-disk",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Inspect the disk with `Get-Disk` before removing its partitions and data",
+            )
+            .with_command("Get-Disk"),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Add `-WhatIf` to preview Clear-Disk without changing the disk",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Wiping a disk must be run interactively by a human who has confirmed the target disk number",
+            ),
+        ],
+    );
+    let shadow_copy_suggestions = vec![
+        Suggestion::new(
+            SuggestionKind::PreviewFirst,
+            "List the shadow copies first with `vssadmin list shadows`",
+        )
+        .with_command("vssadmin list shadows"),
+        Suggestion::new(
+            SuggestionKind::SaferAlternative,
+            "Manage restore points through System Protection instead of deleting shadow copies",
+        ),
+        Suggestion::new(
+            SuggestionKind::WorkflowFix,
+            "Deleting Volume Shadow Copies destroys the local means of recovery; do not run it unattended",
+        ),
+    ];
+    m.insert(
+        "core.filesystem:vssadmin-delete-shadows",
+        shadow_copy_suggestions.clone(),
+    );
+    m.insert(
+        "core.filesystem:wmic-shadowcopy-delete",
+        shadow_copy_suggestions.clone(),
+    );
+    m.insert(
+        "core.filesystem:wmi-shadowcopy-delete",
+        shadow_copy_suggestions,
+    );
+    m.insert(
+        "core.filesystem:rsync-delete-sensitive-dest",
+        vec![
+            Suggestion::new(
+                SuggestionKind::PreviewFirst,
+                "Preview the deletions first with `--dry-run` (or `-n`) and read the list",
+            ),
+            Suggestion::new(
+                SuggestionKind::SaferAlternative,
+                "Drop `--delete` to copy without removing extra files in the destination",
+            ),
+            Suggestion::new(
+                SuggestionKind::WorkflowFix,
+                "Mirror into a dedicated non-system directory you own, and back it up first",
+            ),
+        ],
     );
 }
 
@@ -1523,6 +2277,11 @@ fn register_system_permissions_suggestions(m: &mut HashMap<&'static str, Vec<Sug
 mod tests {
     use super::*;
 
+    fn required_suggestion(rule_id: &str, kind: SuggestionKind) -> &'static Suggestion {
+        get_suggestion_by_kind(rule_id, kind)
+            .unwrap_or_else(|| panic!("missing {kind:?} suggestion for {rule_id}"))
+    }
+
     #[test]
     fn suggestion_kind_labels() {
         assert_eq!(SuggestionKind::PreviewFirst.label(), "Preview first");
@@ -1609,6 +2368,7 @@ mod tests {
             "core.git:push-force-short",
             "core.git:checkout-discard",
             "core.git:checkout-ref-discard",
+            "core.git:branch-delete",
             "core.git:branch-force-delete",
             "core.git:restore-worktree",
             "core.git:restore-worktree-explicit",
@@ -1630,12 +2390,20 @@ mod tests {
         // These must match actual pattern names from src/packs/core/filesystem.rs
         let expected_rules = [
             "core.filesystem:sed-exec-unverified",
+            "core.filesystem:tar-exec-unverified",
             "core.filesystem:rm-rf-root-home",
             "core.filesystem:rm-r-f-separate-root-home",
             "core.filesystem:rm-recursive-force-root-home",
             "core.filesystem:rm-rf-general",
+            "core.filesystem:rm-glob-home",
             "core.filesystem:rm-r-f-separate",
             "core.filesystem:rm-recursive-force-long",
+            "core.filesystem:rm-recursive-root-home",
+            "core.filesystem:rm-recursive-general",
+            "core.filesystem:rm-recursive-unverified",
+            "core.filesystem:powershell-remove-item-recursive",
+            "core.filesystem:rm-bare-glob",
+            "core.filesystem:rm-bare-glob-root",
             "core.filesystem:find-delete-root-home",
             "core.filesystem:find-delete-general",
             "core.filesystem:unlink-root-home",
@@ -1653,8 +2421,10 @@ mod tests {
             "core.filesystem:cp-sensitive-then-delete",
             "core.filesystem:ln-symlink-sensitive-then-delete",
             "core.filesystem:rsync-sensitive-then-delete",
+            "core.filesystem:credential-file-write",
             "core.filesystem:redirect-truncate-root-home",
             "core.filesystem:redirect-truncate-dynamic-path",
+            "core.filesystem:redirect-truncate-git-internals-relative",
         ];
 
         for rule in expected_rules {
@@ -1663,6 +2433,327 @@ mod tests {
                 "Expected suggestions for {rule}"
             );
         }
+    }
+
+    #[test]
+    fn secondary_registry_root_home_recursive_rm_consumers_narrow_the_target() {
+        for &rule_id in ROOT_HOME_RECURSIVE_RM_SUGGESTION_RULES {
+            let preview = required_suggestion(rule_id, SuggestionKind::PreviewFirst);
+            assert_eq!(
+                preview.command.as_deref(),
+                Some("find path -maxdepth 2 -print"),
+                "{rule_id}: find accepts files or trees, uses -maxdepth (one dash), and prints without deleting",
+            );
+            assert!(!preview.text.contains("--maxdepth"), "{rule_id}");
+            assert!(!preview.text.contains("path/"), "{rule_id}");
+
+            let narrowed = required_suggestion(rule_id, SuggestionKind::SaferAlternative);
+            assert_eq!(
+                narrowed.command.as_deref(),
+                Some("cp -a reviewed-path /tmp/reviewed-backup"),
+                "{rule_id}"
+            );
+            assert!(
+                narrowed
+                    .text
+                    .contains("specific, explicitly reviewed file or directory")
+            );
+            assert!(
+                narrowed
+                    .text
+                    .contains("must be non-root, non-home, and non-sensitive")
+            );
+            assert!(narrowed.text.contains("never the blocked root"));
+            assert!(narrowed.text.contains("original is preserved"));
+
+            let commands = get_suggestions(rule_id)
+                .expect("root/home guidance")
+                .iter()
+                .filter_map(|suggestion| suggestion.command.as_deref())
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(!commands.contains("rm -r"), "{rule_id}: {commands}");
+            assert!(
+                !commands.contains("rm --recursive"),
+                "{rule_id}: {commands}"
+            );
+        }
+    }
+
+    #[test]
+    fn secondary_registry_general_recursive_rm_consumers_accept_files_or_trees() {
+        for &rule_id in GENERAL_RECURSIVE_RM_SUGGESTION_RULES {
+            let preview = required_suggestion(rule_id, SuggestionKind::PreviewFirst);
+            assert_eq!(
+                preview.command.as_deref(),
+                Some("find path -maxdepth 2 -print"),
+                "{rule_id}"
+            );
+            assert!(!preview.text.contains("path/"), "{rule_id}");
+
+            let interactive = required_suggestion(rule_id, SuggestionKind::SaferAlternative);
+            assert_eq!(interactive.command.as_deref(), Some("rm -ri path"));
+            assert!(
+                interactive.text.contains("interactive terminal"),
+                "{rule_id}"
+            );
+            assert!(interactive.text.contains("stdin closed"), "{rule_id}");
+            assert!(interactive.text.contains("deletes nothing"), "{rule_id}");
+
+            let trash = required_suggestion(rule_id, SuggestionKind::WorkflowFix);
+            assert!(trash.text.contains("trash-put") && trash.text.contains("Linux"));
+            assert!(trash.text.contains("~/.Trash/") && trash.text.contains("macOS"));
+            assert!(!trash.text.contains("~/.local/share/Trash"), "{rule_id}");
+        }
+    }
+
+    #[test]
+    fn secondary_registry_find_delete_consumers_preserve_the_expression() {
+        for &rule_id in FIND_DELETE_SUGGESTION_RULES {
+            let preview = required_suggestion(rule_id, SuggestionKind::PreviewFirst);
+            assert!(preview.command.is_none(), "{rule_id}");
+            assert!(preview.text.contains("For a terminal `-delete` action"));
+            assert!(
+                preview
+                    .text
+                    .contains("original search root, option, and predicate")
+            );
+            assert!(preview.text.contains("retain or add `-depth`"));
+            assert!(preview.text.contains("terminal action with `-print`"));
+
+            let safer = required_suggestion(rule_id, SuggestionKind::SaferAlternative);
+            assert!(safer.text.contains("read-only"), "{rule_id}");
+            assert!(
+                safer.text.contains("arbitrary boolean expression"),
+                "{rule_id}"
+            );
+            assert!(
+                safer
+                    .text
+                    .contains("no guaranteed exact mechanical rewrite")
+            );
+        }
+    }
+
+    #[test]
+    fn secondary_registry_tar_remove_files_consumers_preserve_sources() {
+        for &rule_id in TAR_REMOVE_FILES_SUGGESTION_RULES {
+            let safer = required_suggestion(rule_id, SuggestionKind::SaferAlternative);
+            assert_eq!(safer.command.as_deref(), Some("tar -cf archive.tar source"));
+            assert!(safer.text.contains("without `--remove-files`"), "{rule_id}");
+
+            for command in get_suggestions(rule_id)
+                .expect("tar guidance")
+                .iter()
+                .filter_map(|suggestion| suggestion.command.as_deref())
+            {
+                assert!(!command.contains("--remove-files"), "{rule_id}: {command}");
+                assert!(!command.contains("rm -r"), "{rule_id}: {command}");
+            }
+        }
+    }
+
+    #[test]
+    fn secondary_registry_sensitive_propagation_guidance_matches_each_operation() {
+        let cp_rule = "core.filesystem:cp-sensitive-then-delete";
+        assert_eq!(
+            required_suggestion(cp_rule, SuggestionKind::SaferAlternative)
+                .command
+                .as_deref(),
+            Some("cp -a source backup"),
+        );
+
+        let link_rule = "core.filesystem:ln-symlink-sensitive-then-delete";
+        let unlink = required_suggestion(link_rule, SuggestionKind::SaferAlternative);
+        assert_eq!(unlink.command.as_deref(), Some("unlink link"));
+        assert!(unlink.text.contains("symlink itself"));
+        assert!(
+            unlink
+                .text
+                .contains("never recursively remove the link target")
+        );
+
+        let rsync_rule = "core.filesystem:rsync-sensitive-then-delete";
+        assert_eq!(
+            required_suggestion(rsync_rule, SuggestionKind::PreviewFirst)
+                .command
+                .as_deref(),
+            Some("rsync -a --dry-run --ignore-existing source fresh-backup/"),
+        );
+        assert_eq!(
+            required_suggestion(rsync_rule, SuggestionKind::SaferAlternative)
+                .command
+                .as_deref(),
+            Some("rsync -a --ignore-existing source fresh-backup/"),
+        );
+        let rsync_safer = required_suggestion(rsync_rule, SuggestionKind::SaferAlternative);
+        assert!(rsync_safer.text.contains("fresh, non-existing"));
+        assert!(rsync_safer.text.contains("prevents overwriting"));
+
+        for rule_id in [cp_rule, link_rule, rsync_rule] {
+            let commands = get_suggestions(rule_id)
+                .expect("propagation guidance")
+                .iter()
+                .filter_map(|suggestion| suggestion.command.as_deref())
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(!commands.contains("rm -r"), "{rule_id}: {commands}");
+        }
+    }
+
+    #[test]
+    fn secondary_registry_single_file_consumers_use_file_guidance() {
+        for &rule_id in SINGLE_FILE_SUGGESTION_RULES {
+            let preview = required_suggestion(rule_id, SuggestionKind::PreviewFirst);
+            assert_eq!(preview.command.as_deref(), Some("ls -la path"), "{rule_id}");
+            assert!(!preview.text.contains("find "), "{rule_id}");
+            assert!(!preview.text.contains("path/"), "{rule_id}");
+
+            let backup = required_suggestion(rule_id, SuggestionKind::SaferAlternative);
+            assert_eq!(backup.command.as_deref(), Some("cp -p path path.bak"));
+            assert!(backup.text.contains("file"), "{rule_id}");
+        }
+    }
+
+    #[test]
+    fn secondary_registry_moved_path_consumers_accept_files_or_directories() {
+        for &rule_id in MOVED_PATH_SUGGESTION_RULES {
+            let preview = required_suggestion(rule_id, SuggestionKind::PreviewFirst);
+            assert_eq!(preview.command.as_deref(), Some("ls -ld path"), "{rule_id}");
+            assert!(!preview.text.contains("path/"), "{rule_id}");
+            assert!(
+                required_suggestion(rule_id, SuggestionKind::SaferAlternative)
+                    .text
+                    .contains("literal backup path"),
+                "{rule_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn secondary_registry_home_glob_previews_the_expansion() {
+        let rule_id = "core.filesystem:rm-glob-home";
+        assert_eq!(
+            required_suggestion(rule_id, SuggestionKind::PreviewFirst)
+                .command
+                .as_deref(),
+            Some("ls -la path-pattern"),
+        );
+        let trash = required_suggestion(rule_id, SuggestionKind::WorkflowFix);
+        assert!(trash.text.contains("trash-put") && trash.text.contains("Linux"));
+        assert!(trash.text.contains("~/.Trash/") && trash.text.contains("macOS"));
+    }
+
+    #[test]
+    fn secondary_registry_covers_every_classifier_only_rule_accurately() {
+        let classifier_only_rules = [
+            "core.filesystem:rm-recursive-root-home",
+            "core.filesystem:rm-recursive-general",
+            "core.filesystem:rm-recursive-unverified",
+            "core.filesystem:powershell-remove-item-recursive",
+            "core.filesystem:rm-bare-glob",
+            "core.filesystem:rm-bare-glob-root",
+        ];
+        for rule_id in classifier_only_rules {
+            let suggestions = get_suggestions(rule_id)
+                .unwrap_or_else(|| panic!("missing secondary suggestions for {rule_id}"));
+            assert!(!suggestions.is_empty(), "{rule_id}");
+            assert!(
+                suggestions
+                    .iter()
+                    .any(|suggestion| suggestion.kind == SuggestionKind::SaferAlternative),
+                "{rule_id} has no safer alternative for scan output"
+            );
+        }
+
+        assert_eq!(
+            required_suggestion(
+                "core.filesystem:rm-recursive-root-home",
+                SuggestionKind::SaferAlternative,
+            )
+            .command
+            .as_deref(),
+            Some("cp -a reviewed-path /tmp/reviewed-backup"),
+        );
+
+        let unverified = get_suggestions("core.filesystem:rm-recursive-unverified")
+            .expect("unverified classifier guidance");
+        let unverified_text = unverified
+            .iter()
+            .map(|suggestion| suggestion.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(unverified_text.contains("assembled executable"));
+        assert!(unverified_text.contains("literal executable"));
+        assert!(unverified_text.contains("PowerShell splat"));
+
+        let powershell = get_suggestions("core.filesystem:powershell-remove-item-recursive")
+            .expect("PowerShell classifier guidance");
+        let powershell_commands: Vec<_> = powershell
+            .iter()
+            .filter_map(|suggestion| suggestion.command.as_deref())
+            .collect();
+        assert_eq!(
+            powershell_commands,
+            [
+                "Get-ChildItem -Recurse path",
+                "Remove-Item -Recurse -WhatIf path",
+                "Move-Item path (Join-Path ([IO.Path]::GetTempPath()) delete-me-reviewed)",
+            ]
+        );
+        let powershell_text = powershell
+            .iter()
+            .flat_map(|suggestion| {
+                [
+                    suggestion.text.as_str(),
+                    suggestion.command.as_deref().unwrap_or(""),
+                ]
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        for unix_advice in ["rm -", "find ", "ls -", "/tmp", "trash-put", "~/.Trash"] {
+            assert!(
+                !powershell_text.contains(unix_advice),
+                "PowerShell guidance contains Unix advice {unix_advice:?}: {powershell_text}"
+            );
+        }
+
+        assert_eq!(
+            required_suggestion("core.filesystem:rm-bare-glob", SuggestionKind::PreviewFirst)
+                .command
+                .as_deref(),
+            Some("ls -la"),
+        );
+        assert_eq!(
+            required_suggestion(
+                "core.filesystem:rm-bare-glob-root",
+                SuggestionKind::PreviewFirst
+            )
+            .command
+            .as_deref(),
+            Some("ls -la /"),
+        );
+    }
+
+    /// The ids a blocking `fs.rmSync` match actually reports are refined; they
+    /// must reach the base rule's guidance.
+    #[test]
+    fn refined_heredoc_rule_ids_fall_back_to_the_base_rule() {
+        let base = get_suggestions("heredoc.javascript:fs_rmsync").expect("base registered");
+        for refined in [
+            "heredoc.javascript:fs_rmsync.catastrophic",
+            "heredoc.javascript:fs_rmsync.non_temp",
+        ] {
+            assert_eq!(
+                get_suggestions(refined).map(<[Suggestion]>::len),
+                Some(base.len()),
+                "{refined}"
+            );
+        }
+        // An unregistered base stays unregistered, and pack-level dots in the
+        // id are never mistaken for a refinement.
+        assert!(get_suggestions("heredoc.javascript:no_such_rule.catastrophic").is_none());
+        assert!(get_suggestions("core.git").is_none());
     }
 
     #[test]
@@ -1719,9 +2810,9 @@ mod tests {
     }
 
     #[test]
-    fn coverage_all_core_pack_patterns_have_suggestions() {
-        // This test dynamically checks all destructive patterns in core.* packs
-        // against the suggestion registry, ensuring complete coverage.
+    fn coverage_all_core_pack_rules_have_suggestions() {
+        // This dynamically checks regex-backed and semantic-classifier rules in
+        // core.* packs against the secondary suggestion registry.
         //
         // This satisfies the acceptance criteria for git_safety_guard-1gt.5.2:
         // "A coverage test that asserts all core destructive patterns have at least 1 suggestion."
@@ -1736,12 +2827,10 @@ mod tests {
                 .get(pack_id)
                 .unwrap_or_else(|| panic!("Pack {pack_id} should exist"));
 
-            for pattern in &pack.destructive_patterns {
-                if let Some(pattern_name) = pattern.name {
-                    let rule_id = format!("{pack_id}:{pattern_name}");
-                    if get_suggestions(&rule_id).is_none() {
-                        missing_suggestions.push(rule_id);
-                    }
+            for rule_name in pack.guidance_rule_names() {
+                let rule_id = format!("{pack_id}:{rule_name}");
+                if get_suggestions(&rule_id).is_none() {
+                    missing_suggestions.push(rule_id);
                 }
             }
         }
@@ -1754,19 +2843,15 @@ mod tests {
     }
 
     #[test]
-    fn coverage_core_patterns_count_matches_registry() {
-        // Verify the number of patterns with suggestions matches actual pack definitions.
-        // This catches drift between packs and suggestion registry.
+    fn coverage_core_rule_count_matches_registry() {
+        // Verify regex-backed plus semantic guidance rule counts match the
+        // secondary registry. This catches drift in either direction.
 
         use crate::packs::REGISTRY;
 
-        // Count patterns in core.git
+        // Count guidance-bearing rules in core.git.
         let git_pack = REGISTRY.get("core.git").unwrap();
-        let git_pattern_count = git_pack
-            .destructive_patterns
-            .iter()
-            .filter(|p| p.name.is_some())
-            .count();
+        let git_rule_count = git_pack.guidance_rule_names().count();
 
         // Count suggestions for core.git
         let git_suggestion_count = SUGGESTION_REGISTRY
@@ -1775,17 +2860,14 @@ mod tests {
             .count();
 
         assert_eq!(
-            git_pattern_count, git_suggestion_count,
-            "core.git pattern count ({git_pattern_count}) != suggestion count ({git_suggestion_count})"
+            git_rule_count, git_suggestion_count,
+            "core.git rule count ({git_rule_count}) != suggestion count ({git_suggestion_count})"
         );
 
-        // Count patterns in core.filesystem
+        // Count guidance-bearing rules in core.filesystem, including semantic
+        // classifier-only names.
         let fs_pack = REGISTRY.get("core.filesystem").unwrap();
-        let fs_pattern_count = fs_pack
-            .destructive_patterns
-            .iter()
-            .filter(|p| p.name.is_some())
-            .count();
+        let fs_rule_count = fs_pack.guidance_rule_names().count();
 
         // Count suggestions for core.filesystem
         let fs_suggestion_count = SUGGESTION_REGISTRY
@@ -1794,8 +2876,8 @@ mod tests {
             .count();
 
         assert_eq!(
-            fs_pattern_count, fs_suggestion_count,
-            "core.filesystem pattern count ({fs_pattern_count}) != suggestion count ({fs_suggestion_count})"
+            fs_rule_count, fs_suggestion_count,
+            "core.filesystem rule count ({fs_rule_count}) != suggestion count ({fs_suggestion_count})"
         );
     }
 
@@ -1903,7 +2985,7 @@ mod tests {
 
     #[test]
     fn coverage_all_suggestion_rules_are_valid() {
-        // Verify every rule_id in SUGGESTION_REGISTRY matches a real pack/pattern.
+        // Verify every rule_id matches a regex-backed or semantic pack rule.
         use crate::packs::REGISTRY;
         let mut invalid = Vec::new();
         for rule_id in SUGGESTION_REGISTRY.keys() {
@@ -1920,12 +3002,8 @@ mod tests {
                 invalid.push(format!("{rule_id} (pack not found)"));
                 continue;
             };
-            if !pack
-                .destructive_patterns
-                .iter()
-                .any(|p| p.name == Some(pattern_name))
-            {
-                invalid.push(format!("{rule_id} (pattern not found)"));
+            if !pack.guidance_rule_names().any(|name| name == pattern_name) {
+                invalid.push(format!("{rule_id} (rule not found)"));
             }
         }
         assert!(

@@ -15,7 +15,7 @@ This document describes packs in the `windows` category.
 
 **Pack ID:** `windows.filesystem`
 
-Protects against recursive/forced filesystem destruction on Windows: cmd `del /s`, `rd /s`, `format <drive>:`, and PowerShell `Remove-Item -Recurse -Force` (and aliases), `Clear-Content`, and `Clear-RecycleBin`.
+Protects against recursive/forced filesystem destruction on Windows: cmd `del /s`, `rd /s`, `format <drive>:`, PowerShell `Remove-Item -Recurse (with or without `-Force`; aliases included), `Clear-Content`, `Clear-RecycleBin`, and the .NET recursive-delete APIs `[System.IO.Directory]::Delete($path, $true)` and `<DirectoryInfo>.Delete($true)`.
 
 ### Keywords
 
@@ -46,6 +46,13 @@ Commands containing these keywords are checked against this pack:
 - `Clear-RecycleBin`
 - `clear-recyclebin`
 - `CLEAR-RECYCLEBIN`
+- `IO.Directory`
+- `io.directory`
+- `Io.Directory`
+- `IO.DIRECTORY`
+- `.Delete(`
+- `.delete(`
+- `.DELETE(`
 
 ### Safe Patterns (Allowed)
 
@@ -53,7 +60,7 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `whatif-preview` | `(?i)^\s*(?:(?:remove-item\|ri\|clear-content\|clc\|clear-recyclebin)\b[^\|&;\r\n]*\s-whatif\b\|rm\b(?=[^\|&;\r\n]*\s-recurse\b)(?=[^\|&;\r\n]*\s-force\b)[^\|&;\r\n]*\s-whatif\b)[^\|&;\r\n]*$` |
+| `whatif-preview` | `(?i)^\s*(?:(?:remove-item\|ri\|clear-content\|clc\|clear-recyclebin)\b(?![^\|&;\r\n]*\s--(?:\s\|$))[^\|&;\r\n]*\s-whatif\b\|rm\b(?=[^\|&;\r\n]*\s-recurse\b)(?![^\|&;\r\n]*\s--(?:\s\|$))[^\|&;\r\n]*\s-whatif\b)[^\|&;\r\n]*$` |
 | `del-help` | `(?i)^\s*(?:del\|rd\|rmdir\|format\|erase)(?:\.exe)?\s+/\?\s*$` |
 
 ### Destructive Patterns (Blocked)
@@ -62,12 +69,17 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
+| `windows-filesystem-semantic-unverified` | The Windows filesystem command contains unresolved shell syntax in an executable or destructive option position. | critical |
 | `del-recursive` | del /s recursively deletes every matching file in a directory tree. | critical |
 | `rd-recursive` | rd /s deletes a directory and its entire contents. | critical |
 | `remove-item-recurse-force` | Remove-Item -Recurse -Force deletes a tree with no Recycle Bin and no prompt. | critical |
+| `remove-item-recurse` | Remove-Item -Recurse permanently deletes a tree with no Recycle Bin. | critical |
 | `format-drive` | format <drive>: erases an entire volume. | critical |
 | `clear-content` | Clear-Content empties a file's contents in place with no undo. | high |
 | `clear-recyclebin` | Clear-RecycleBin permanently purges the Recycle Bin. | medium |
+| `dotnet-directory-delete-recursive` | [System.IO.Directory]::Delete with a true recursive flag deletes an entire directory tree. | critical |
+| `dotnet-directory-delete` | [System.IO.Directory]::Delete removes a directory outside the Recycle Bin. | high |
+| `directoryinfo-delete-recursive` | .Delete($true) on a DirectoryInfo object recursively deletes the directory tree. | critical |
 
 ### Allowlist Guidance
 
@@ -94,7 +106,7 @@ risk_acknowledged = true
 
 **Pack ID:** `windows.system`
 
-Protects against catastrophic Windows disk/system operations: `vssadmin delete shadows` / `wmic shadowcopy delete` (Volume Shadow Copy destruction), `diskpart`, `Format-Volume`, `Clear-Disk`, `Remove-Partition`, `Initialize-Disk`, `Reset-PhysicalDisk`, `cipher /w`, and `bcdedit /delete`.
+Protects against catastrophic Windows disk/system operations: `vssadmin delete shadows` / `wmic shadowcopy delete` / `Win32_ShadowCopy` deletion through WMI or CIM (Volume Shadow Copy destruction), `wbadmin delete` (backup recovery points), `diskpart`, `Format-Volume`, `Clear-Disk`, `Remove-Partition`, `Remove-VirtualDisk`, `Initialize-Disk`, `Reset-PhysicalDisk`, `cipher /w`, `bcdedit /delete`, and destructive `fsutil` file/volume operations.
 
 ### Keywords
 
@@ -107,6 +119,9 @@ Commands containing these keywords are checked against this pack:
 - `shadowcopy`
 - `ShadowCopy`
 - `SHADOWCOPY`
+- `Win32_ShadowCopy`
+- `win32_shadowcopy`
+- `WIN32_SHADOWCOPY`
 - `diskpart`
 - `DISKPART`
 - `Format-Volume`
@@ -118,6 +133,9 @@ Commands containing these keywords are checked against this pack:
 - `Remove-Partition`
 - `remove-partition`
 - `REMOVE-PARTITION`
+- `Remove-VirtualDisk`
+- `remove-virtualdisk`
+- `REMOVE-VIRTUALDISK`
 - `Initialize-Disk`
 - `initialize-disk`
 - `INITIALIZE-DISK`
@@ -128,6 +146,10 @@ Commands containing these keywords are checked against this pack:
 - `CIPHER`
 - `bcdedit`
 - `BCDEDIT`
+- `wbadmin`
+- `WBADMIN`
+- `fsutil`
+- `FSUTIL`
 
 ### Safe Patterns (Allowed)
 
@@ -137,7 +159,7 @@ These patterns match safe commands that are always allowed:
 |--------------|----------|
 | `vssadmin-list` | `(?i)^\s*vssadmin(?:\.exe)?\s+list\b[^\|&;\r\n]*$` |
 | `diskpart-list` | `(?i)^\s*diskpart(?:\.exe)?\s+(?:/s\s+\S+\s+)?list\b[^\|&;\r\n]*$` |
-| `storage-whatif` | `(?i)^\s*(?:format-volume\|clear-disk\|remove-partition\|initialize-disk\|reset-physicaldisk)\b[^\|&;\r\n]*\s-whatif\b[^\|&;\r\n]*$` |
+| `storage-whatif` | `(?i)^\s*(?:format-volume\|clear-disk\|remove-partition\|remove-virtualdisk\|initialize-disk\|reset-physicaldisk)\b[^\|&;\r\n'"`$@(){}]*\s-whatif(?:\s[^\|&;\r\n'"`$@(){}]*)?$` |
 
 ### Destructive Patterns (Blocked)
 
@@ -146,14 +168,19 @@ These patterns match potentially destructive commands:
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
 | `vssadmin-delete-shadows` | vssadmin delete shadows destroys Volume Shadow Copies (System Restore + backups). | critical |
+| `wbadmin-delete` | wbadmin delete destroys Windows backup recovery points or the backup catalog. | critical |
 | `wmic-shadowcopy-delete` | wmic shadowcopy delete destroys Volume Shadow Copies. | critical |
+| `wmi-shadowcopy-delete` | Deleting Win32_ShadowCopy instances destroys Volume Shadow Copies. | critical |
 | `diskpart` | diskpart with clean/delete/format/script reconfigures or wipes disks and partitions. | high |
 | `format-volume` | Format-Volume erases a volume's filesystem and data. | critical |
 | `clear-disk` | Clear-Disk removes all partitions and data from a disk. | critical |
 | `remove-partition` | Remove-Partition deletes a partition and its data. | critical |
+| `remove-virtualdisk` | Remove-VirtualDisk deletes a Storage Spaces virtual disk and all data on it. | critical |
 | `initialize-or-reset-disk` | Initialize-Disk / Reset-PhysicalDisk wipe disk metadata and data. | high |
 | `cipher-wipe` | cipher /w overwrites free space, making deleted files unrecoverable. | high |
 | `bcdedit-delete` | bcdedit /delete removes a boot configuration entry. | high |
+| `fsutil-setzerodata` | fsutil file setzerodata zeroes a byte range of a file in place. | high |
+| `fsutil-volume-dismount` | fsutil volume dismount forcibly dismounts a volume, invalidating open handles. | high |
 
 ### Allowlist Guidance
 

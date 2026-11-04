@@ -14,19 +14,32 @@ This document describes packs in the `system` category.
 
 **Pack ID:** `system.disk`
 
-Protects against destructive disk operations like dd to devices, mkfs, partition table modifications, RAID management, btrfs/LVM/device-mapper operations, and network block devices
+Protects against destructive disk operations like dd to devices, mkfs, partition table modifications, RAID management, btrfs/LVM/device-mapper operations, network block devices, and macOS diskutil erase/partition/APFS deletion
 
 ### Keywords
 
 Commands containing these keywords are checked against this pack:
 
 - `dd`
+- `diskutil`
 - `fdisk`
 - `mkfs`
+- `mke2fs`
+- `mkdosfs`
+- `mkntfs`
+- `mkexfatfs`
+- `newfs`
+- `newfs_apfs`
+- `newfs_hfs`
+- `newfs_msdos`
+- `newfs_exfat`
 - `mkswap`
 - `parted`
 - `mount`
 - `wipefs`
+- `sgdisk`
+- `gdisk`
+- `cgdisk`
 - `/dev/`
 - `mdadm`
 - `btrfs`
@@ -39,6 +52,15 @@ Commands containing these keywords are checked against this pack:
 - `lvreduce`
 - `lvresize`
 - `pvmove`
+- `blkdiscard`
+- `cryptsetup`
+- `hdparm`
+- `nvme`
+- `badblocks`
+- `sg_format`
+- `zpool`
+- `zfs`
+- `nwipe`
 
 ### Safe Patterns (Allowed)
 
@@ -46,38 +68,25 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `dd-file-out` | `dd\s+.*of=['"]?[^/\s'"]+\.` |
-| `dd-discard` | `dd\s+.*of=['"]?/dev/(?:null\|zero\|full)['"]?(?:\s\|$)` |
-| `lsblk` | `\blsblk\b` |
-| `fdisk-list` | `fdisk\s+-l` |
-| `parted-print` | `parted\b(?:\s+--?\S+)*\s+(?:['"]?/dev/\S+['"]?\s+)?print(?:\s+(?:devices\|free\|list\|all\|\d+))?\s*$` |
-| `blkid` | `\bblkid\b` |
-| `df` | `\bdf\b` |
-| `mount-list` | `\bmount\s*$` |
-| `mkswap-check` | `mkswap\s+(?:.*\s+)?--check\b` |
-| `mdadm-detail` | `mdadm\s+--detail\b` |
-| `mdadm-examine` | `mdadm\s+--examine\b` |
-| `mdadm-query` | `mdadm\s+--query\b` |
-| `mdadm-query-short` | `mdadm\s+-Q\b` |
-| `mdadm-scan` | `mdadm\s+--scan\b` |
-| `btrfs-subvolume-list` | `btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+subvolume\s+list(?=\s\|$)` |
-| `btrfs-subvolume-show` | `btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+subvolume\s+show(?=\s\|$)` |
-| `btrfs-filesystem-show` | `btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+filesystem\s+show(?=\s\|$)` |
-| `btrfs-filesystem-df` | `btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+filesystem\s+df(?=\s\|$)` |
-| `btrfs-filesystem-usage` | `btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+filesystem\s+usage(?=\s\|$)` |
-| `btrfs-device-stats` | `btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+device\s+stats(?=\s\|$)` |
-| `btrfs-property-get` | `btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+property\s+(?:get\|list)(?=\s\|$)` |
-| `btrfs-scrub-status` | `btrfs\b(?:\s+--?\S+(?:\s+\S+)?)*\s+scrub\s+status(?=\s\|$)` |
-| `dmsetup-ls` | `dmsetup\b(?:\s+--?\S+(?:\s+\S+)?)*\s+ls(?=\s\|$)` |
-| `dmsetup-status` | `dmsetup\b(?:\s+--?\S+(?:\s+\S+)?)*\s+status(?=\s\|$)` |
-| `dmsetup-info` | `dmsetup\b(?:\s+--?\S+(?:\s+\S+)?)*\s+info(?=\s\|$)` |
-| `dmsetup-table` | `dmsetup\b(?:\s+--?\S+(?:\s+\S+)?)*\s+table(?=\s\|$)` |
-| `dmsetup-deps` | `dmsetup\b(?:\s+--?\S+(?:\s+\S+)?)*\s+deps(?=\s\|$)` |
-| `nbd-client-list` | `nbd-client\s+-l\b` |
-| `nbd-client-check` | `nbd-client\s+.*-check\b` |
-| `lvm-list` | `\b(?:lvs\|vgs\|pvs)\b` |
-| `lvm-display` | `\b(?:lvdisplay\|vgdisplay\|pvdisplay)\b` |
-| `lvm-scan` | `\b(?:lvscan\|vgscan\|pvscan)\b` |
+| `dd-discard` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?dd[ \t]+(?:(?:(?:if\|ibs\|obs\|bs\|cbs\|skip\|iseek\|seek\|oseek\|count\|conv\|iflag\|oflag\|status)=(?:[^\s;&\|<>()"'\\$`*?\[\]{}~]+\|'[^'\r\n]*'\|"[^"\\$`\r\n]*")\|[0-9]*[<>]&(?:[0-9]+\|-)\|[0-9]*<[ \t]*(?:[^\s;&\|<>()"'\\$`*?\[\]{}~]+\|'[^'\r\n]*'\|"[^"\\$`\r\n]*")\|(?:[0-9]*(?:>>?\|>\\|)\|&>>?)[ \t]*(?:/dev/(?:null\|zero\|full)\|'/dev/(?:null\|zero\|full)'\|"/dev/(?:null\|zero\|full)"\|(?!['"]?/dev/)(?:[^\s;&\|<>()"'\\$`*?\[\]{}~]+\|'[^'\r\n]*'\|"[^"\\$`\r\n]*")))[ \t]+)*(?:of=(?:/dev/(?:null\|zero\|full)\|'/dev/(?:null\|zero\|full)'\|"/dev/(?:null\|zero\|full)")\|'of=/dev/(?:null\|zero\|full)'\|"of=/dev/(?:null\|zero\|full)")(?:[ \t]+(?:(?:(?:if\|ibs\|obs\|bs\|cbs\|skip\|iseek\|seek\|oseek\|count\|conv\|iflag\|oflag\|status)=(?:[^\s;&\|<>()"'\\$`*?\[\]{}~]+\|'[^'\r\n]*'\|"[^"\\$`\r\n]*")\|[0-9]*[<>]&(?:[0-9]+\|-)\|[0-9]*<[ \t]*(?:[^\s;&\|<>()"'\\$`*?\[\]{}~]+\|'[^'\r\n]*'\|"[^"\\$`\r\n]*")\|(?:[0-9]*(?:>>?\|>\\|)\|&>>?)[ \t]*(?:/dev/(?:null\|zero\|full)\|'/dev/(?:null\|zero\|full)'\|"/dev/(?:null\|zero\|full)"\|(?!['"]?/dev/)(?:[^\s;&\|<>()"'\\$`*?\[\]{}~]+\|'[^'\r\n]*'\|"[^"\\$`\r\n]*")))\|(?:of=(?:/dev/(?:null\|zero\|full)\|'/dev/(?:null\|zero\|full)'\|"/dev/(?:null\|zero\|full)")\|'of=/dev/(?:null\|zero\|full)'\|"of=/dev/(?:null\|zero\|full)")))*[ \t]*$` |
+| `lsblk` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?lsblk(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `blkid` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?blkid(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `df` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?df(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `parted-print` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?parted[ \t]+(?:(?:-s\|--script\|-m\|--machine\|-j\|--json)[ \t]+)*(?:['"]?/dev/[^\s'";&\|<>()`$]+['"]?[ \t]+)?print(?:[ \t]+(?:devices\|free\|list\|all\|\d+))?[ \t]*$` |
+| `btrfs-subvolume-list` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?btrfs[ \t]+(?:(?:--(?:verbose\|quiet)\|-[vq]+\|--format(?:=\|[ \t]+)(?:text\|json)\|--log(?:=\|[ \t]+)(?:default\|info\|verbose\|debug\|quiet))[ \t]+)*subvolume[ \t]+list(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `btrfs-subvolume-show` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?btrfs[ \t]+(?:(?:--(?:verbose\|quiet)\|-[vq]+\|--format(?:=\|[ \t]+)(?:text\|json)\|--log(?:=\|[ \t]+)(?:default\|info\|verbose\|debug\|quiet))[ \t]+)*subvolume[ \t]+show(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `btrfs-filesystem-show` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?btrfs[ \t]+(?:(?:--(?:verbose\|quiet)\|-[vq]+\|--format(?:=\|[ \t]+)(?:text\|json)\|--log(?:=\|[ \t]+)(?:default\|info\|verbose\|debug\|quiet))[ \t]+)*filesystem[ \t]+show(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `btrfs-filesystem-df` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?btrfs[ \t]+(?:(?:--(?:verbose\|quiet)\|-[vq]+\|--format(?:=\|[ \t]+)(?:text\|json)\|--log(?:=\|[ \t]+)(?:default\|info\|verbose\|debug\|quiet))[ \t]+)*filesystem[ \t]+df(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `btrfs-filesystem-usage` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?btrfs[ \t]+(?:(?:--(?:verbose\|quiet)\|-[vq]+\|--format(?:=\|[ \t]+)(?:text\|json)\|--log(?:=\|[ \t]+)(?:default\|info\|verbose\|debug\|quiet))[ \t]+)*filesystem[ \t]+usage(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `btrfs-device-stats` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?btrfs[ \t]+(?:(?:--(?:verbose\|quiet)\|-[vq]+\|--format(?:=\|[ \t]+)(?:text\|json)\|--log(?:=\|[ \t]+)(?:default\|info\|verbose\|debug\|quiet))[ \t]+)*device[ \t]+stats(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `btrfs-property-get` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?btrfs[ \t]+(?:(?:--(?:verbose\|quiet)\|-[vq]+\|--format(?:=\|[ \t]+)(?:text\|json)\|--log(?:=\|[ \t]+)(?:default\|info\|verbose\|debug\|quiet))[ \t]+)*property[ \t]+(?:get\|list)(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `btrfs-scrub-status` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?btrfs[ \t]+(?:(?:--(?:verbose\|quiet)\|-[vq]+\|--format(?:=\|[ \t]+)(?:text\|json)\|--log(?:=\|[ \t]+)(?:default\|info\|verbose\|debug\|quiet))[ \t]+)*scrub[ \t]+status(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `dmsetup-ls` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?dmsetup[ \t]+(?:(?:-v+\|-c\|--(?:verbose\|noudevsync\|verifyudev\|readonly\|columns\|noheadings))[ \t]+)*ls(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `dmsetup-status` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?dmsetup[ \t]+(?:(?:-v+\|-c\|--(?:verbose\|noudevsync\|verifyudev\|readonly\|columns\|noheadings))[ \t]+)*status(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `dmsetup-info` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?dmsetup[ \t]+(?:(?:-v+\|-c\|--(?:verbose\|noudevsync\|verifyudev\|readonly\|columns\|noheadings))[ \t]+)*info(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `dmsetup-table` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?dmsetup[ \t]+(?:(?:-v+\|-c\|--(?:verbose\|noudevsync\|verifyudev\|readonly\|columns\|noheadings))[ \t]+)*table(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `dmsetup-deps` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?dmsetup[ \t]+(?:(?:-v+\|-c\|--(?:verbose\|noudevsync\|verifyudev\|readonly\|columns\|noheadings))[ \t]+)*deps(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$` |
+| `diskutil-readonly` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?(?i:diskutil[ \t]+(?:list\|info\|information\|activity\|listFilesystems\|apfs[ \t]+list(?:Snapshots\|Users)?)(?:[ \t]+[^;&\|\r\n<>()`$]*)?[ \t]*$)` |
 
 ### Destructive Patterns (Blocked)
 
@@ -85,10 +94,16 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
+| `tee-device` | tee/sponge into a device will OVERWRITE that device, exactly as dd would. Extremely dangerous! | high |
+| `copy-to-device` | Copying or moving onto a device OVERWRITES that device, exactly as dd would. Extremely dangerous! | high |
 | `dd-device` | dd to a block device will OVERWRITE all data on that device. Extremely dangerous! | high |
 | `dd-wipe` | dd from /dev/zero or /dev/urandom to a device will WIPE all data! | high |
+| `ddrescue-device` | ddrescue --force writes its output onto a device, overwriting all data on it, exactly as dd would. | critical |
+| `sfdisk-modify` | sfdisk rewrites the partition table: options act immediately, and a bare invocation reads a new layout from stdin. | high |
 | `fdisk-edit` | fdisk can modify partition tables and cause data loss. | high |
 | `parted-modify` | parted can modify partition tables and cause data loss. | high |
+| `sgdisk-modify` | sgdisk rewrites the GPT; --zap-all/-Z also erases the protective MBR, losing every partition. | high |
+| `gdisk-edit` | gdisk/cgdisk open the GPT for interactive editing; a write from that session destroys the partition table. | high |
 | `mkfs` | mkfs formats a partition/device and ERASES all existing data. | high |
 | `mkswap` | mkswap formats a partition as a swap area, ERASING any existing data. | high |
 | `wipefs` | wipefs removes filesystem signatures. Use with extreme caution. | high |
@@ -124,6 +139,20 @@ These patterns match potentially destructive commands:
 | `lvresize-shrink` | lvresize with negative size SHRINKS the volume. Resize filesystem first or lose data! | high |
 | `pvmove` | pvmove migrates data between physical volumes. Do NOT interrupt or data may be lost. | high |
 | `lvconvert-merge` | lvconvert --merge reverts LV to snapshot state, discarding changes since snapshot. | high |
+| `diskutil-erase` | diskutil erase operations DESTROY all data on the target disk or volume. | critical |
+| `diskutil-partition` | diskutil partitioning operations rewrite the partition map and erase data. | critical |
+| `diskutil-apfs-delete` | diskutil apfs delete/erase operations permanently remove APFS containers, volumes, or snapshots. | critical |
+| `blkdiscard` | blkdiscard discards (TRIMs) every block on the device, destroying all data instantly with no undo. | critical |
+| `cryptsetup-erase` | cryptsetup erase/luksErase/luksFormat destroys the LUKS key material; the encrypted volume becomes permanently unreadable. | critical |
+| `hdparm-security-erase` | hdparm --security-erase issues an ATA secure erase of the WHOLE drive at the firmware level. Unrecoverable. | critical |
+| `nvme-format-sanitize` | nvme format/sanitize erases an NVMe namespace (or the entire controller). All data is destroyed. | critical |
+| `badblocks-write` | badblocks -w (write mode) overwrites every block on the device with test patterns, destroying all existing data. | critical |
+| `sg_format` | sg_format --format performs a SCSI low-level format, erasing all data on the medium. | critical |
+| `zpool-destroy` | zpool destroy removes a ZFS pool and every dataset, snapshot, and byte of data it contains. | critical |
+| `zfs-destroy` | zfs destroy removes a ZFS dataset, volume, or snapshot; with -r it destroys the whole descendant tree. | critical |
+| `nwipe` | nwipe (the dban successor) overwrites an entire disk with wipe patterns; `--autonuke` targets every disk. All data is destroyed. | critical |
+| `scrub-device` | scrub overwrites a device with data-destruction patterns (DoD/Gutmann/etc.); its contents are gone. | critical |
+| `wipe-device` | wipe securely overwrites the target device, destroying all data on it. | critical |
 
 ### Allowlist Guidance
 
@@ -160,6 +189,9 @@ Commands containing these keywords are checked against this pack:
 - `chown`
 - `chgrp`
 - `setfacl`
+- `icacls`
+- `cacls`
+- `takeown`
 
 ### Safe Patterns (Allowed)
 
@@ -167,11 +199,10 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `chmod-non-recursive` | `chmod\s+(?!-[rR])(?:\d{3,4}\|[ugoa][+-][rwxXst]+)\s+[^/]` |
-| `stat` | `\bstat\b` |
-| `ls-perms` | `ls\s+.*-[a-zA-Z]*l` |
-| `getfacl` | `\bgetfacl\b` |
-| `namei` | `\bnamei\b` |
+| `stat` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?stat\b` |
+| `ls-perms` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?ls\b.*-[a-zA-Z]*l` |
+| `getfacl` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?getfacl\b` |
+| `namei` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?namei\b` |
 
 ### Destructive Patterns (Blocked)
 
@@ -182,6 +213,10 @@ These patterns match potentially destructive commands:
 | `chmod-777` | chmod 777 makes files world-writable. This is a security risk. | high |
 | `chmod-recursive-root` | chmod -R on system directories can break system permissions. | critical |
 | `chown-recursive-root` | chown -R on system directories can break system ownership. | high |
+| `chgrp-recursive-root` | chgrp -R on system directories can break system group ownership. | high |
+| `icacls-recursive-system` | icacls /t on a Windows system tree rewrites ACLs recursively and can break the system. | critical |
+| `takeown-recursive-system` | takeown /r on a Windows system tree seizes ownership recursively and is hard to undo. | high |
+| `icacls-grant-everyone` | granting Everyone full/modify/write access makes the target world-writable. | high |
 | `chmod-setuid` | Setting setuid bit (chmod u+s) is a security-sensitive operation. | high |
 | `chmod-setgid` | Setting setgid bit (chmod g+s) is a security-sensitive operation. | high |
 | `chown-to-root` | Changing ownership to root should be done carefully. | high |
@@ -224,6 +259,8 @@ Commands containing these keywords are checked against this pack:
 - `upstart`
 - `shutdown`
 - `reboot`
+- `modprobe`
+- `rmmod`
 
 ### Safe Patterns (Allowed)
 
@@ -232,13 +269,12 @@ These patterns match safe commands that are always allowed:
 | Pattern Name | Pattern |
 |--------------|----------|
 | `systemctl-status` | `systemctl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+status(?=\s\|$)` |
-| `service-status` | `service\s+\S+\s+status(?=\s\|$)` |
 | `systemctl-list` | `systemctl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+list-(?:units\|unit-files\|sockets\|timers)(?=\s\|$)` |
 | `systemctl-show` | `systemctl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+show(?=\s\|$)` |
 | `systemctl-is` | `systemctl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+is-(?:active\|enabled\|failed)(?=\s\|$)` |
 | `systemctl-reload` | `systemctl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+daemon-reload(?=\s\|$)` |
 | `systemctl-cat` | `systemctl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+cat(?=\s\|$)` |
-| `journalctl` | `\bjournalctl\b` |
+| `journalctl` | `^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&\|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&\|<>()\x22'\\$`*?\[\]{}~=]+/)?journalctl\b` |
 
 ### Destructive Patterns (Blocked)
 
@@ -254,6 +290,9 @@ These patterns match potentially destructive commands:
 | `shutdown` | shutdown will power off or restart the system. | critical |
 | `reboot` | reboot will restart the system. | critical |
 | `init-level` | init 0 shuts down, init 6 reboots the system. | critical |
+| `modprobe-remove` | Unloading a kernel module on a running host can crash or wedge the kernel. | high |
+| `rmmod` | Unloading a kernel module on a running host can crash or wedge the kernel. | high |
+| `ssh-remote-module-unload` | Unloading a kernel module on a remote host can crash or wedge its kernel. | high |
 
 ### Allowlist Guidance
 

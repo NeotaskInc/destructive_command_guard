@@ -27,12 +27,13 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `checkout-new-branch` | `(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*checkout\s+-b\s+` |
-| `checkout-orphan` | `(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*checkout\s+--orphan\s+` |
-| `restore-staged-long` | `(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*restore\b(?=\s)(?=.*\s--staged\b)(?!.*\s(?:--worktree\|-W)\b)` |
-| `restore-staged-short` | `(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*restore\b(?=\s)(?=.*\s-S\b)(?!.*\s(?:--worktree\|-W)\b)` |
-| `clean-dry-run-short` | `(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*clean\s+-[a-z]*n[a-z]*` |
-| `clean-dry-run-long` | `(?:^\|[^[:alnum:]_-])git\s+(?:\S+\s+)*clean\s+--dry-run` |
+| `checkout-new-branch` | `(?:(?:^\|[^[:alnum:]_-])git\s+(?:(?:-[cC]\|--git-dir\|--work-tree\|--namespace\|--super-prefix\|--shallow-file\|--attr-source\|--exec-path\|--config-env)\s+[^\s;&\|<>()]+\s+\|-[^\s;&\|<>()]*\s+)*\|^\s*(?:[^\s;&\|<>()]*/)?git-)checkout\s+-b\s+` |
+| `checkout-orphan` | `(?:(?:^\|[^[:alnum:]_-])git\s+(?:(?:-[cC]\|--git-dir\|--work-tree\|--namespace\|--super-prefix\|--shallow-file\|--attr-source\|--exec-path\|--config-env)\s+[^\s;&\|<>()]+\s+\|-[^\s;&\|<>()]*\s+)*\|^\s*(?:[^\s;&\|<>()]*/)?git-)checkout\s+--orphan\s+` |
+| `restore-staged-long` | `(?:(?:^\|[^[:alnum:]_-])git\s+(?:(?:-[cC]\|--git-dir\|--work-tree\|--namespace\|--super-prefix\|--shallow-file\|--attr-source\|--exec-path\|--config-env)\s+[^\s;&\|<>()]+\s+\|-[^\s;&\|<>()]*\s+)*\|^\s*(?:[^\s;&\|<>()]*/)?git-)restore\b(?=\s)(?=(?:\s+(?!--(?:\s\|$))[^\s;&\|<>()\x22']+)*\s+--staged\b)(?!.*\s(?:--worktree\|-W)\b)` |
+| `restore-staged-short` | `(?:(?:^\|[^[:alnum:]_-])git\s+(?:(?:-[cC]\|--git-dir\|--work-tree\|--namespace\|--super-prefix\|--shallow-file\|--attr-source\|--exec-path\|--config-env)\s+[^\s;&\|<>()]+\s+\|-[^\s;&\|<>()]*\s+)*\|^\s*(?:[^\s;&\|<>()]*/)?git-)restore\b(?=\s)(?=(?:\s+(?!--(?:\s\|$))[^\s;&\|<>()\x22']+)*\s+-S\b)(?!.*\s(?:--worktree\|-W)\b)` |
+| `clean-dry-run-short` | `(?:(?:^\|[^[:alnum:]_-])git\s+(?:(?:-[cC]\|--git-dir\|--work-tree\|--namespace\|--super-prefix\|--shallow-file\|--attr-source\|--exec-path\|--config-env)\s+[^\s;&\|<>()]+\s+\|-[^\s;&\|<>()]*\s+)*\|^\s*(?:[^\s;&\|<>()]*/)?git-)clean(?:\s+(?!--(?:\s\|$))[^\s;&\|<>()\x22']+)*\s+-[a-z]*n[a-z]*` |
+| `clean-dry-run-long` | `(?:(?:^\|[^[:alnum:]_-])git\s+(?:(?:-[cC]\|--git-dir\|--work-tree\|--namespace\|--super-prefix\|--shallow-file\|--attr-source\|--exec-path\|--config-env)\s+[^\s;&\|<>()]+\s+\|-[^\s;&\|<>()]*\s+)*\|^\s*(?:[^\s;&\|<>()]*/)?git-)clean(?:\s+(?!--(?:\s\|$))[^\s;&\|<>()\x22']+)*\s+--dry-run` |
+| `lfs-prune-dry-run` | `(?:(?:^\|[^[:alnum:]_-])git\s+(?:(?:-[cC]\|--git-dir\|--work-tree\|--namespace\|--super-prefix\|--shallow-file\|--attr-source\|--exec-path\|--config-env)\s+[^\s;&\|<>()]+\s+\|-[^\s;&\|<>()]*\s+)*\|^\s*(?:[^\s;&\|<>()]*/)?git-)lfs\s+prune(?:\s+(?!--(?:\s\|$))[^\s;&\|<>()\x22']+)*\s+--dry-run(?:\s\|$)` |
 
 ### Destructive Patterns (Blocked)
 
@@ -40,8 +41,19 @@ These patterns match potentially destructive commands:
 
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
+| `git-alias-semantic-unverified` | The invoked Git alias depends on shell expansion, contains a cycle, or exceeds dcg's bounded semantic analysis. | high |
+| `branch-dynamic-token` | A dynamic shell expansion in this git branch command can expand into a deletion or forced ref update. Quote the branch name or add `--` to make it a literal creation. | high |
 | `checkout-discard` | git checkout -- discards uncommitted changes permanently. Use 'git stash' first. | high |
 | `checkout-ref-discard` | git checkout <ref> -- <path> overwrites working tree. Use 'git stash' first. | high |
+| `checkout-discard-cwd` | git checkout . discards all uncommitted changes in the path. Use 'git stash' first. | high |
+| `filter-branch` | git filter-branch rewrites repository history and can permanently drop commits. Back up the refs first. | high |
+| `reflog-expire-now` | git reflog expire --expire=now destroys the reflog, removing the ability to recover lost commits. | high |
+| `checkout-force` | git checkout -f/--force discards all uncommitted changes to tracked files. Use 'git stash' first. | high |
+| `switch-discard` | git switch --discard-changes/-f discards all uncommitted changes to tracked files. Use 'git stash' first. | high |
+| `rm-force` | git rm -f deletes files even when they have uncommitted modifications. Commit or stash them first. | high |
+| `update-ref-delete` | git update-ref -d deletes a ref (e.g. a branch) outright, like git branch -D. | high |
+| `read-tree-reset` | git read-tree --reset -u overwrites the working tree like git reset --hard, destroying uncommitted changes. | critical |
+| `show-redirect-overwrite-source` | git show <ref>:<path> redirected onto the same <path> overwrites the working tree file, exactly like the denied 'git checkout <ref> -- <path>'. | high |
 | `restore-worktree` | git restore discards uncommitted changes. Use 'git stash' or 'git diff' first. | high |
 | `restore-worktree-explicit` | git restore --worktree/-W discards uncommitted changes permanently. | high |
 | `reset-hard` | git reset --hard destroys uncommitted changes. Use 'git stash' first. | critical |
@@ -49,9 +61,14 @@ These patterns match potentially destructive commands:
 | `clean-force` | git clean -f/--force removes untracked files permanently. Review with 'git clean -n' first. | critical |
 | `push-force-long` | Force push can destroy remote history. Use --force-with-lease if necessary. | critical |
 | `push-force-short` | Force push (-f) can destroy remote history. Use --force-with-lease if necessary. | critical |
-| `branch-force-delete` | git branch -D/--force deletes branches without checks. Recoverable via 'git reflog'. | medium |
+| `push-force-refspec` | A '+' refspec force-pushes that ref and can destroy remote history. Use --force-with-lease if necessary. | critical |
+| `branch-delete` | git branch deletion requires explicit user approval. | high |
+| `branch-force-delete` | git branch deletion or forced ref updates require explicit user approval. | high |
 | `stash-drop` | git stash drop deletes a single stash. Recoverable via `git fsck` (unreachable objects). | medium |
 | `stash-clear` | git stash clear permanently deletes ALL stashed changes. | critical |
+| `lfs-migrate-rewrite` | git lfs migrate import/export rewrites history — every commit in the range gets a new SHA. | high |
+| `lfs-prune` | git lfs prune deletes local LFS objects; with --force it deletes objects the remote does not have. | medium |
+| `lfs-uninstall` | git lfs uninstall removes the LFS filters and hooks, so LFS files check out as pointer text. | medium |
 
 ### Allowlist Guidance
 
@@ -78,7 +95,7 @@ risk_acknowledged = true
 
 **Pack ID:** `core.filesystem`
 
-Protects against dangerous rm -rf commands and equivalent destruction (find -delete, unlink) outside temp directories
+Protects against recursive rm commands and equivalent filesystem destruction outside literal temp subdirectories
 
 ### Keywords
 
@@ -95,6 +112,48 @@ Commands containing these keywords are checked against this pack:
 - `cp`
 - `ln`
 - `rsync`
+- `tee`
+- `sponge`
+- `install`
+- `sed`
+- `perl`
+- `Format-Volume`
+- `format-volume`
+- `FORMAT-VOLUME`
+- `Clear-Disk`
+- `clear-disk`
+- `CLEAR-DISK`
+- `vssadmin`
+- `VSSADMIN`
+- `wmic`
+- `WMIC`
+- `Win32_ShadowCopy`
+- `win32_shadowcopy`
+- `WIN32_SHADOWCOPY`
+- `.git/`
+- `.ssh/`
+- `.gnupg/`
+- `.aws/`
+- `.kube/`
+- `.docker/`
+- `.bashrc.d/`
+- `.zshrc.d/`
+- `.git\`
+- `.ssh\`
+- `.gnupg\`
+- `.aws\`
+- `.kube\`
+- `.docker\`
+- `.bashrc.d\`
+- `.zshrc.d\`
+- `.bashrc`
+- `.bash_profile`
+- `.bash_login`
+- `.profile`
+- `.zshrc`
+- `.zshenv`
+- `.zprofile`
+- `.zlogin`
 - `>/`
 - `> /`
 - `>~`
@@ -105,11 +164,25 @@ Commands containing these keywords are checked against this pack:
 - `> "`
 - `>'`
 - `> '`
+- `>\`
+- `> \`
+- `>..`
+- `> ..`
+- `>./..`
+- `> ./..`
+- `>``
+- `> ``
 - `&>`
 - `>&`
 - `>|`
 - `1>`
 - `2>`
+- `>%`
+- `> %`
+- `>!`
+- `> !`
+- `>^`
+- `> ^`
 
 ### Safe Patterns (Allowed)
 
@@ -117,38 +190,49 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `rm-rf-tmp` | `^rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+(?:/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
-| `rm-fr-tmp` | `^rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+(?:/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
-| `rm-rf-var-tmp` | `^rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+(?:/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
-| `rm-fr-var-tmp` | `^rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+(?:/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
-| `rm-r-f-tmp` | `^rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f\s+(?:/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
-| `rm-f-r-tmp` | `^rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]\s+(?:/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
-| `rm-r-f-var-tmp` | `^rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f\s+(?:/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
-| `rm-f-r-var-tmp` | `^rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]\s+(?:/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
-| `rm-recursive-force-tmp` | `^rm\s+.*--recursive.*--force\s+(?:/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
-| `rm-force-recursive-tmp` | `^rm\s+.*--force.*--recursive\s+(?:/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
-| `rm-recursive-force-var-tmp` | `^rm\s+.*--recursive.*--force\s+(?:/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
-| `rm-force-recursive-var-tmp` | `^rm\s+.*--force.*--recursive\s+(?:/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
-| `find-delete-tmp` | `^(?![^\|;&]*[\\$`])find\s+/tmp(?:/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*)?(?:\s+(?:/tmp(?:/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*)?\|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^\|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^\|;&\s]*)?)*\s*$` |
-| `find-delete-var-tmp` | `^(?![^\|;&]*[\\$`])find\s+/var/tmp(?:/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*)?(?:\s+(?:/var/tmp(?:/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*)?\|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^\|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^\|;&\s]*)?)*\s*$` |
-| `unlink-tmp` | `^(?![^\|;&]*[\\$`])unlink\s+/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s*$` |
-| `unlink-var-tmp` | `^(?![^\|;&]*[\\$`])unlink\s+/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s*$` |
+| `storage-whatif` | `(?i)^\s*(?:format-volume\|clear-disk\|remove-partition\|remove-virtualdisk\|initialize-disk\|reset-physicaldisk)\b[^\|&;\r\n'"`$@(){}]*\s-whatif(?:\s[^\|&;\r\n'"`$@(){}]*)?$` |
+| `rm-rf-tmp` | `^rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+(?:--\s+)?(?:(?:/private)?/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
+| `rm-fr-tmp` | `^rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+(?:--\s+)?(?:(?:/private)?/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
+| `rm-rf-var-tmp` | `^rm\s+-[a-zA-Z]*[rR][a-zA-Z]*f[a-zA-Z]*\s+(?:--\s+)?(?:(?:/private)?/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
+| `rm-fr-var-tmp` | `^rm\s+-[a-zA-Z]*f[a-zA-Z]*[rR][a-zA-Z]*\s+(?:--\s+)?(?:(?:/private)?/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
+| `rm-r-f-tmp` | `^rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f\s+(?:--\s+)?(?:(?:/private)?/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
+| `rm-f-r-tmp` | `^rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]\s+(?:--\s+)?(?:(?:/private)?/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
+| `rm-r-f-var-tmp` | `^rm\s+(-[a-zA-Z]+\s+)*-[rR]\s+(-[a-zA-Z]+\s+)*-f\s+(?:--\s+)?(?:(?:/private)?/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
+| `rm-f-r-var-tmp` | `^rm\s+(-[a-zA-Z]+\s+)*-f\s+(-[a-zA-Z]+\s+)*-[rR]\s+(?:--\s+)?(?:(?:/private)?/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
+| `rm-recursive-force-tmp` | `^rm\s+.*--recursive.*--force\s+(?:--\s+)?(?:(?:/private)?/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
+| `rm-force-recursive-tmp` | `^rm\s+.*--force.*--recursive\s+(?:--\s+)?(?:(?:/private)?/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
+| `rm-recursive-force-var-tmp` | `^rm\s+.*--recursive.*--force\s+(?:--\s+)?(?:(?:/private)?/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
+| `rm-force-recursive-var-tmp` | `^rm\s+.*--force.*--recursive\s+(?:--\s+)?(?:(?:/private)?/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S*(?:\s+\|$))+$` |
+| `find-delete-tmp` | `^(?![^\|;&]*[\\$`])find\s+(?:--\s+)?/tmp/+(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))(?:\./+)*(?!\.(?:/\|\s\|$))(?!\.?[*?\[])[^/\s]\S*(?:\s+(?:/tmp/+(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))(?:\./+)*(?!\.(?:/\|\s\|$))(?!\.?[*?\[])[^/\s]\S*\|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^\|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^\|;&\s]*)?)*\s*$` |
+| `find-delete-tmp-filtered-root` | `^(?![^\|;&]*[\\$`])find\s+(?:--\s+)?/tmp(?:/+\.?)*(?=\s)(?![^\|;&]*\s(?:-o\|-or\|-not\|!\|,)(?:\s\|$))(?=(?:(?!\s-(?:delete\|exec\|execdir)(?:\s\|$))[^\|;&])*\s-(?:empty(?:\s\|$)\|(?:i?name\|i?path\|i?wholename\|i?regex\|i?lname\|[acm]min\|[acm]time\|newer[a-zA-Z]*\|anewer\|cnewer\|size\|user\|uid\|group\|gid\|perm\|links\|inum\|samefile\|used)\s+['\x22]?(?:[*?.]\|\[[^\]\s]*\])*[^*?.\[\]\s'\x22\|;&]))(?:\s+(?:/tmp/+(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))(?:\./+)*(?!\.(?:/\|\s\|$))(?!\.?[*?\[])[^/\s]\S*\|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^\|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^\|;&\s]*)?)*\s*$` |
+| `find-delete-var-tmp` | `^(?![^\|;&]*[\\$`])find\s+(?:--\s+)?/var/tmp/+(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))(?:\./+)*(?!\.(?:/\|\s\|$))(?!\.?[*?\[])[^/\s]\S*(?:\s+(?:/var/tmp/+(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))(?:\./+)*(?!\.(?:/\|\s\|$))(?!\.?[*?\[])[^/\s]\S*\|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^\|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^\|;&\s]*)?)*\s*$` |
+| `find-delete-var-tmp-filtered-root` | `^(?![^\|;&]*[\\$`])find\s+(?:--\s+)?/var/tmp(?:/+\.?)*(?=\s)(?![^\|;&]*\s(?:-o\|-or\|-not\|!\|,)(?:\s\|$))(?=(?:(?!\s-(?:delete\|exec\|execdir)(?:\s\|$))[^\|;&])*\s-(?:empty(?:\s\|$)\|(?:i?name\|i?path\|i?wholename\|i?regex\|i?lname\|[acm]min\|[acm]time\|newer[a-zA-Z]*\|anewer\|cnewer\|size\|user\|uid\|group\|gid\|perm\|links\|inum\|samefile\|used)\s+['\x22]?(?:[*?.]\|\[[^\]\s]*\])*[^*?.\[\]\s'\x22\|;&]))(?:\s+(?:/var/tmp/+(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))(?:\./+)*(?!\.(?:/\|\s\|$))(?!\.?[*?\[])[^/\s]\S*\|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^\|;&\s]*)?))*\s+-delete(?:\s+-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^\|;&\s]*)?)*\s*$` |
+| `find-exec-rm-tmp` | `^(?![^\|;&]*[$`])(?![^\|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/tmp/+(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))(?:\./+)*(?!\.(?:/\|\s\|$))(?!\.?[*?\[])[^/\s]\S*(?:\s+(?:(?:/private)?/tmp/+(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))(?:\./+)*(?!\.(?:/\|\s\|$))(?!\.?[*?\[])[^/\s]\S*\|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^\|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-zA-Z]+)*\s+\{\}\s+(?:\\;\|\+)\s*$` |
+| `find-exec-rm-tmp-filtered-root` | `^(?![^\|;&]*[$`])(?![^\|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/tmp(?:/+\.?)*(?=\s)(?![^\|;&]*\s(?:-o\|-or\|-not\|!\|,)(?:\s\|$))(?=(?:(?!\s-(?:delete\|exec\|execdir)(?:\s\|$))[^\|;&])*\s-(?:empty(?:\s\|$)\|(?:i?name\|i?path\|i?wholename\|i?regex\|i?lname\|[acm]min\|[acm]time\|newer[a-zA-Z]*\|anewer\|cnewer\|size\|user\|uid\|group\|gid\|perm\|links\|inum\|samefile\|used)\s+['\x22]?(?:[*?.]\|\[[^\]\s]*\])*[^*?.\[\]\s'\x22\|;&]))(?:\s+(?:(?:/private)?/tmp/+(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))(?:\./+)*(?!\.(?:/\|\s\|$))(?!\.?[*?\[])[^/\s]\S*\|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^\|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-qs-zA-QS-Z]+)*\s+\{\}\s+(?:\\;\|\+)\s*$` |
+| `find-exec-rm-var-tmp` | `^(?![^\|;&]*[$`])(?![^\|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/var/tmp/+(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))(?:\./+)*(?!\.(?:/\|\s\|$))(?!\.?[*?\[])[^/\s]\S*(?:\s+(?:(?:/private)?/var/tmp/+(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))(?:\./+)*(?!\.(?:/\|\s\|$))(?!\.?[*?\[])[^/\s]\S*\|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^\|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-zA-Z]+)*\s+\{\}\s+(?:\\;\|\+)\s*$` |
+| `find-exec-rm-var-tmp-filtered-root` | `^(?![^\|;&]*[$`])(?![^\|;&]*\\(?!;\s*$))find\s+(?:--\s+)?(?:/private)?/var/tmp(?:/+\.?)*(?=\s)(?![^\|;&]*\s(?:-o\|-or\|-not\|!\|,)(?:\s\|$))(?=(?:(?!\s-(?:delete\|exec\|execdir)(?:\s\|$))[^\|;&])*\s-(?:empty(?:\s\|$)\|(?:i?name\|i?path\|i?wholename\|i?regex\|i?lname\|[acm]min\|[acm]time\|newer[a-zA-Z]*\|anewer\|cnewer\|size\|user\|uid\|group\|gid\|perm\|links\|inum\|samefile\|used)\s+['\x22]?(?:[*?.]\|\[[^\]\s]*\])*[^*?.\[\]\s'\x22\|;&]))(?:\s+(?:(?:/private)?/var/tmp/+(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))(?:\./+)*(?!\.(?:/\|\s\|$))(?!\.?[*?\[])[^/\s]\S*\|-[a-zA-Z][\S]*(?:\s+[^/~$\-\s][^\|;&\s]*)?))*\s+-exec(?:dir)?\s+(?:/usr)?(?:/bin/)?rm(?:\s+-[a-qs-zA-QS-Z]+)*\s+\{\}\s+(?:\\;\|\+)\s*$` |
+| `unlink-tmp` | `^(?![^\|;&]*[\\$`])unlink\s+(?:--\s+)?(?:/private)?/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s*$` |
+| `unlink-var-tmp` | `^(?![^\|;&]*[\\$`])unlink\s+(?:--\s+)?(?:/private)?/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s*$` |
 | `unlink-help` | `^unlink\s+(?:--help\|--version)\s*$` |
 | `truncate-help` | `^truncate\s+(?:--help\|--version)\s*$` |
-| `truncate-grow` | `^truncate\s+(?:-s\s+\+\S+\|--size=\+\S+)\s+\S+\s*$` |
-| `truncate-tmp` | `^(?![^\|;&]*[\\$`])truncate\s+(?:-s\s+\S+\|--size=\S+)\s+/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s*$` |
-| `truncate-var-tmp` | `^(?![^\|;&]*[\\$`])truncate\s+(?:-s\s+\S+\|--size=\S+)\s+/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s*$` |
+| `truncate-grow` | `^truncate\s+(?:-[co]*s\s*\+\S+\|--size(?:=\|\s+)\+\S+)\s+\S+\s*$` |
+| `truncate-tmp` | `^(?![^\|;&]*[\\$`])truncate\s+(?:-[co]*s\s*\S+\|--size(?:=\|\s+)\S+)\s+(?:--\s+)?(?:/private)?/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s*$` |
+| `truncate-var-tmp` | `^(?![^\|;&]*[\\$`])truncate\s+(?:-[co]*s\s*\S+\|--size(?:=\|\s+)\S+)\s+(?:--\s+)?(?:/private)?/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s*$` |
 | `shred-help` | `^shred\s+(?:--help\|--version)\s*$` |
-| `shred-tmp` | `^(?![^\|;&]*[\\$`])shred(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s\|;&]*)?\|--[a-z\-]+(?:=\S+\|\s+[^/~$\-\s][^\s\|;&]*)?))*\s+/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s\|;&]*)?\|--[a-z\-]+(?:=\S+\|\s+[^/~$\-\s][^\s\|;&]*)?))*\s*$` |
-| `shred-var-tmp` | `^(?![^\|;&]*[\\$`])shred(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s\|;&]*)?\|--[a-z\-]+(?:=\S+\|\s+[^/~$\-\s][^\s\|;&]*)?))*\s+/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s\|;&]*)?\|--[a-z\-]+(?:=\S+\|\s+[^/~$\-\s][^\s\|;&]*)?))*\s*$` |
-| `tar-remove-files-tmp` | `^(?![^\|;&]*[\\$`])tar(?=\s+[^\|;&]*--remove-files\b)(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s\|;&]*)?\|--[a-z\-]+(?:=\S+\|\s+[^/~$\-\s][^\s\|;&]*)?))*\s+/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s\|;&]*)?\|--[a-z\-]+(?:=\S+\|\s+[^/~$\-\s][^\s\|;&]*)?))*\s*$` |
-| `tar-remove-files-var-tmp` | `^(?![^\|;&]*[\\$`])tar(?=\s+[^\|;&]*--remove-files\b)(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s\|;&]*)?\|--[a-z\-]+(?:=\S+\|\s+[^/~$\-\s][^\s\|;&]*)?))*\s+/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s\|;&]*)?\|--[a-z\-]+(?:=\S+\|\s+[^/~$\-\s][^\s\|;&]*)?))*\s*$` |
-| `dd-tmp` | `^(?![^\|;&]*[\\$`])dd(?=\s+[^\|;&]*\bof=)(?:\s+(?:[a-zA-Z]+=\S+\|--?[a-zA-Z][a-zA-Z0-9\-]*(?:=\S+)?))*\s+of=['"]?/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+(?:\s+(?:(?!of=)[a-zA-Z]+=\S+\|--?[a-zA-Z][a-zA-Z0-9\-]*(?:=\S+)?))*\s*$` |
-| `dd-var-tmp` | `^(?![^\|;&]*[\\$`])dd(?=\s+[^\|;&]*\bof=)(?:\s+(?:[a-zA-Z]+=\S+\|--?[a-zA-Z][a-zA-Z0-9\-]*(?:=\S+)?))*\s+of=['"]?/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+(?:\s+(?:(?!of=)[a-zA-Z]+=\S+\|--?[a-zA-Z][a-zA-Z0-9\-]*(?:=\S+)?))*\s*$` |
+| `shred-tmp` | `^(?![^\|;&]*[\\$`])shred(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s\|;&]*)?\|--[a-z\-]+(?:=\S+\|\s+[^/~$\-\s][^\s\|;&]*)?))*\s+(?:/private)?/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s\|;&]*)?\|--[a-z\-]+(?:=\S+\|\s+[^/~$\-\s][^\s\|;&]*)?))*\s*$` |
+| `shred-var-tmp` | `^(?![^\|;&]*[\\$`])shred(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s\|;&]*)?\|--[a-z\-]+(?:=\S+\|\s+[^/~$\-\s][^\s\|;&]*)?))*\s+(?:/private)?/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s\|;&]*)?\|--[a-z\-]+(?:=\S+\|\s+[^/~$\-\s][^\s\|;&]*)?))*\s*$` |
+| `tar-remove-files-tmp` | `^(?![^\|;&]*[\\$`])tar(?=\s+[^\|;&]*--remove-files\b)(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s\|;&]*)?\|--[a-z\-]+(?:=\S+\|\s+[^/~$\-\s][^\s\|;&]*)?))*\s+(?:/private)?/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s\|;&]*)?\|--[a-z\-]+(?:=\S+\|\s+[^/~$\-\s][^\s\|;&]*)?))*\s*$` |
+| `tar-remove-files-var-tmp` | `^(?![^\|;&]*[\\$`])tar(?=\s+[^\|;&]*--remove-files\b)(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s\|;&]*)?\|--[a-z\-]+(?:=\S+\|\s+[^/~$\-\s][^\s\|;&]*)?))*\s+(?:/private)?/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s\|;&]*)?\|--[a-z\-]+(?:=\S+\|\s+[^/~$\-\s][^\s\|;&]*)?))*\s*$` |
+| `dd-tmp` | `^(?![^\|;&]*[\\$`])dd(?=\s+[^\|;&]*\bof=)(?:\s+(?:[a-zA-Z]+=\S+\|--?[a-zA-Z][a-zA-Z0-9\-]*(?:=\S+)?))*\s+of=['"]?(?:/private)?/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+(?:\s+(?:(?!of=)[a-zA-Z]+=\S+\|--?[a-zA-Z][a-zA-Z0-9\-]*(?:=\S+)?))*\s*$` |
+| `dd-var-tmp` | `^(?![^\|;&]*[\\$`])dd(?=\s+[^\|;&]*\bof=)(?:\s+(?:[a-zA-Z]+=\S+\|--?[a-zA-Z][a-zA-Z0-9\-]*(?:=\S+)?))*\s+of=['"]?(?:/private)?/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+(?:\s+(?:(?!of=)[a-zA-Z]+=\S+\|--?[a-zA-Z][a-zA-Z0-9\-]*(?:=\S+)?))*\s*$` |
 | `dd-help` | `^dd\s+(?:--help\|--version)\s*$` |
-| `mv-tmp` | `^(?![^\|;&]*[\\$`])mv(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s\|;&]*)?\|--[a-z\-]+(?:=\S+\|\s+[^/~$\-\s][^\s\|;&]*)?))*\s+(?:/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s+)+/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s*$` |
-| `mv-var-tmp` | `^(?![^\|;&]*[\\$`])mv(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s\|;&]*)?\|--[a-z\-]+(?:=\S+\|\s+[^/~$\-\s][^\s\|;&]*)?))*\s+(?:/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s+)+/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s*$` |
+| `mv-tmp` | `^(?![^\|;&]*[\\$`])mv(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s\|;&]*)?\|--[a-z\-]+(?:=\S+\|\s+[^/~$\-\s][^\s\|;&]*)?))*\s+(?:(?:/private)?/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s+)+(?:/private)?/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s*$` |
+| `mv-var-tmp` | `^(?![^\|;&]*[\\$`])mv(?:\s+(?:-[a-zA-Z][a-zA-Z0-9_-]*(?:\s+[^/~$\-\s][^\s\|;&]*)?\|--[a-z\-]+(?:=\S+\|\s+[^/~$\-\s][^\s\|;&]*)?))*\s+(?:(?:/private)?/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s+)+(?:/private)?/var/tmp/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))\S+\s*$` |
 | `mv-help` | `^mv\s+(?:--help\|--version)\s*$` |
+| `mv-to-trash` | `^(?![^\|;&]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:~/\|/home/[^/\s{]+/\|/Users/[^/\s{]+/\|(?:/private)?(?:/var)?/tmp/\|\./)?(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))[A-Za-z0-9._][^\s;\|&{]*)+[ \t]+(?:~/\.local/share/Trash\|~/\.Trash)(?:/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))[^\s;\|&{]*)?\s*$` |
+| `mv-to-trash-quoted` | `^(?![\s\S]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:~/\|/home/[^/\s'"$`;\|&{]+/\|/Users/[^/\s'"$`;\|&{]+/\|(?:/private)?(?:/var)?/tmp/\|\./)?(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))[A-Za-z0-9._][^\s;\|&'"{]*\|"(?:~/\|/home/[^/"]+/\|/Users/[^/"]+/\|(?:/private)?(?:/var)?/tmp/\|\./)?(?!\.\.(?:/\|")\|[^"]*/\.\.(?:/\|"))[A-Za-z0-9._][^"$`]*"\|'(?:~/\|/home/[^/']+/\|/Users/[^/']+/\|(?:/private)?(?:/var)?/tmp/\|\./)?(?!\.\.(?:/\|')\|[^']*/\.\.(?:/\|'))[A-Za-z0-9._][^'$`]*'))+[ \t]+(?:(?:~\|/home/[^/\s'"$`;\|&{]+\|/Users/[^/\s'"$`;\|&{]+)(?:/\.local/share/Trash\|/\.Trash)(?:/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))[^\s;\|&"'{]*)?\|"(?:~\|/home/[^/\s'"]+\|/Users/[^/\s'"]+)(?:/\.local/share/Trash\|/\.Trash)(?:/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))[^\s;\|&"']*)?"\|'(?:~\|/home/[^/\s'"]+\|/Users/[^/\s'"]+)(?:/\.local/share/Trash\|/\.Trash)(?:/(?!\.\.(?:/\|\s\|$)\|[^\s]*/\.\.(?:/\|\s\|$))[^\s;\|&"']*)?')[ \t]*$` |
+| `mv-within-home` | `^(?![\s\S]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:~\|/home/[^/\s'"$`;\|&{]+\|/Users/[^/\s'"$`;\|&{]+)/(?!\.)[^/\s'"$`;\|&{]+(?:/(?!\.\.(?:/\|\s\|$))[^/\s'"$`;\|&{]+)+/?\|"(?:~\|/home/[^/"]+\|/Users/[^/"]+)/(?!\.)[^/"$`]+(?:/(?!\.\.(?:/\|"))[^/"$`]+)+/?"\|'(?:~\|/home/[^/']+\|/Users/[^/']+)/(?!\.)[^/'$`]+(?:/(?!\.\.(?:/\|'))[^/'$`]+)+/?'))+[ \t]+(?:(?:~\|/home/[^/\s'"$`;\|&{]+\|/Users/[^/\s'"$`;\|&{]+)/(?!\.)[^/\s'"$`;\|&{]+(?:/(?!\.\.(?:/\|\s\|$))[^/\s'"$`;\|&{]+)*/?\|"(?:~\|/home/[^/"]+\|/Users/[^/"]+)/(?!\.)[^/"$`]+(?:/(?!\.\.(?:/\|"))[^/"$`]+)*/?"\|'(?:~\|/home/[^/']+\|/Users/[^/']+)/(?!\.)[^/'$`]+(?:/(?!\.\.(?:/\|'))[^/'$`]+)*/?')[ \t]*$` |
+| `mv-relative-into-home` | `^(?![\s\S]*[\\$`])mv(?:[ \t]+--?[a-zA-Z][a-zA-Z0-9-]*)*(?:[ \t]+(?:(?:\./)?(?![-~.])[^/\s'"$`;\|&{]+(?:/(?!\.\.(?:/\|\s\|$))[^/\s'"$`;\|&{]+)*/?\|"(?:\./)?(?![-~.])[^/"$`]+(?:/(?!\.\.(?:/\|"))[^/"$`]+)*/?"\|'(?:\./)?(?![-~.])[^/'$`]+(?:/(?!\.\.(?:/\|'))[^/'$`]+)*/?'))+[ \t]+(?:(?:~\|/home/[^/\s'"$`;\|&{]+\|/Users/[^/\s'"$`;\|&{]+)/(?!\.)[^/\s'"$`;\|&{]+(?:/(?!\.\.(?:/\|\s\|$))[^/\s'"$`;\|&{]+)*/?\|"(?:~\|/home/[^/"]+\|/Users/[^/"]+)/(?!\.)[^/"$`]+(?:/(?!\.\.(?:/\|"))[^/"$`]+)*/?"\|'(?:~\|/home/[^/']+\|/Users/[^/']+)/(?!\.)[^/'$`]+(?:/(?!\.\.(?:/\|'))[^/'$`]+)*/?')[ \t]*$` |
 
 ### Destructive Patterns (Blocked)
 
@@ -157,16 +241,19 @@ These patterns match potentially destructive commands:
 | Pattern Name | Reason | Severity |
 |--------------|--------|----------|
 | `sed-exec-unverified` | GNU sed executes shell input that dcg cannot statically verify. | high |
+| `tar-exec-unverified` | GNU tar executes a helper whose command or executable input dcg cannot statically verify. | high |
 | `cp-sensitive-then-delete` | archive copy of a sensitive path into temp followed by forced recursive deletion is a cross-segment data-loss bypass. EXTREMELY DANGEROUS. | critical |
 | `ln-symlink-sensitive-then-delete` | symlink from a sensitive path into temp followed by forced recursive deletion can traverse and destroy the target. EXTREMELY DANGEROUS. | critical |
 | `rsync-sensitive-then-delete` | rsync archive of a sensitive path into temp followed by forced recursive deletion is a cross-segment data-loss bypass. EXTREMELY DANGEROUS. | critical |
+| `rsync-delete-sensitive-dest` | rsync --delete into a system directory or home root mirror-deletes its contents. EXTREMELY DANGEROUS. | critical |
 | `rm-rf-root-home` | rm -rf on root or home paths is EXTREMELY DANGEROUS. This command will NOT be executed. Ask the user to run it manually if truly needed. | critical |
 | `rm-r-f-separate-root-home` | rm with separate -r -f flags targeting root or home is EXTREMELY DANGEROUS. | critical |
 | `rm-recursive-force-root-home` | rm --recursive --force targeting root or home is EXTREMELY DANGEROUS. | critical |
 | `rm-rf-general` | rm -rf is destructive and requires human approval. Explain what you want to delete and why, then ask the user to run the command manually. | high |
+| `rm-glob-home` | rm with an unexpanded glob under a home directory deletes an unbounded, shell-chosen file set and requires human approval. | high |
 | `rm-r-f-separate` | rm with separate -r -f flags is destructive and requires human approval. | high |
 | `rm-recursive-force-long` | rm --recursive --force is destructive and requires human approval. | high |
-| `find-delete-root-home` | find <sensitive-path> -delete is bytewise-equivalent to rm -rf on root/home and is EXTREMELY DANGEROUS. This command will NOT be executed. | critical |
+| `find-delete-root-home` | find ... -delete naming root, home, or a system directory requires explicit approval. dcg gates on the paths the command names, not on the -name/-maxdepth filters that may narrow what it deletes. This command will NOT be executed. | critical |
 | `find-delete-general` | find ... -delete is destructive (bytewise-equivalent to rm -rf on the matched tree) and requires human approval. | high |
 | `unlink-root-home` | unlink on a sensitive system or home path is one-shot data destruction with no recovery. EXTREMELY DANGEROUS. | critical |
 | `unlink-general` | unlink is destructive (POSIX equivalent of rm on a single file) and requires human approval. | high |
@@ -180,8 +267,18 @@ These patterns match potentially destructive commands:
 | `dd-overwrite-general` | dd with of=<file> overwrites file contents and requires human approval. | high |
 | `mv-sensitive-source-root-home` | mv touching a sensitive system or home path is the cross-segment recursive-force-delete bypass. EXTREMELY DANGEROUS. | critical |
 | `mv-dynamic-path` | mv with a shell-expanded or escaped path cannot be verified before execution. | high |
-| `redirect-truncate-root-home` | shell redirect (>, >\|, &>, >&, 1>, 2>) to a sensitive system or home path truncates the file to zero bytes. EXTREMELY DANGEROUS. | critical |
+| `credential-file-write` | writing a credential, private-key, login-shell startup, or system authentication file (`~/.ssh/*`, `~/.aws/credentials`, `~/.netrc`, `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`, `~/.docker/config.json`, `~/.kube/config`, `~/.gnupg/*`, `~/.config/gh/hosts.yml`, the token stores of cargo, gem, Vault, Terraform, gcloud, Azure, s3cmd/boto, pass and hub, `~/.pgpass`, `~/.my.cnf`, the shell rc files and `~/.bashrc.d`/`~/.zshrc.d`, `/etc/sudoers*`, `/etc/passwd`, `/etc/shadow`, `/etc/group`, `/etc/ssh/*`) with `>`, `>>`, `tee`, `cp`/`mv`/`install`/`ln`, `dd of=`, or `sed -i` — or, from PowerShell or Cmd, `Add-Content`, `Set-Content`, `Clear-Content`, `Out-File`, `Tee-Object`, `New-Item`, `Copy-Item`, `Move-Item`, `copy`, or `move` — installs persistent access or replaces the trust this machine runs on, whether or not the file exists yet. Reads and `chmod`/`chown` are unaffected; appending to `~/.ssh/known_hosts` stays allowed. | critical |
+| `git-internals-write` | writing inside a `.git` directory with `tee`, `sponge`, `cp`/`mv`/`install`, `sed -i`, `perl -i`, `dd of=`, or an embedded-code sink rewrites repository state: `.git/config` carries remotes, `insteadOf` rewrites and credential helpers, `.git/hooks/*` run on ordinary git commands, and refs and objects are the history itself. Reads are unaffected, and `.gitignore`, `.gitattributes`, `.gitmodules` and `.github/` are not this rule. | critical |
+| `redirect-truncate-root-home` | shell truncating redirect (including arbitrary numeric, named, and PowerShell all-stream forms) to an existing sensitive system or home path destroys the previous file contents. A currently absent literal target under the home directory with an existing parent is allowed (creation, not truncation — the same thing `>>` would do); existing files, dynamic paths, symlinks, missing parents, system paths, and .git internals stay blocked. | critical |
+| `redirect-truncate-git-internals-relative` | shell truncating redirect into a .git directory rewrites repository internals; a relative spelling names the same file an absolute one does. | critical |
+| `redirect-append-git-internals-relative` | shell appending redirect into a .git directory adds repository configuration or hook code that git runs on its next invocation. | critical |
 | `redirect-truncate-dynamic-path` | shell redirect to a dynamic or escaped path may truncate a sensitive file and requires human approval. | high |
+| `fork-bomb` | This is a fork bomb: it recursively spawns processes until the system is unusable. | critical |
+| `format-volume` | PowerShell Format-Volume erases a volume and everything on it. | critical |
+| `clear-disk` | PowerShell Clear-Disk removes a disk's partitions and data. | critical |
+| `vssadmin-delete-shadows` | vssadmin delete shadows destroys Volume Shadow Copies (System Restore and backups). | critical |
+| `wmic-shadowcopy-delete` | wmic shadowcopy delete destroys Volume Shadow Copies. | critical |
+| `wmi-shadowcopy-delete` | Deleting Win32_ShadowCopy instances destroys Volume Shadow Copies. | critical |
 
 ### Allowlist Guidance
 

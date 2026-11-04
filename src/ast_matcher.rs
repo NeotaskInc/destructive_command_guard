@@ -1,4280 +1,1311 @@
-//! AST-based pattern matching for heredoc and inline script content.
+//! Default policy for executable heredoc and inline-script source.
 //!
-//! This module implements Tier 3 of the heredoc detection architecture,
-//! using ast-grep-core for structural pattern matching.
-//!
-//! # Architecture
-//!
-//! ```text
-//! Content + Language
-//!      │
-//!      ▼
-//! ┌─────────────────┐
-//! │   AstMatcher    │ ─── Parse error ──► ALLOW + diagnostic
-//! │   (ast-grep)    │ ─── Timeout ──► ALLOW + diagnostic
-//! │   <5ms typical  │ ─── No match ──► ALLOW
-//! │   20ms max      │ ─── Match ──► BLOCK
-//! └─────────────────┘
-//! ```
-//!
-//! # Error Handling
-//!
-//! All errors result in fail-open behavior (ALLOW) with diagnostics:
-//! - Parse errors: Language syntax not recognized
-//! - Timeouts: Pattern matching exceeded time budget
-//! - Unknown language: No grammar available
-//!
-//! # Performance
-//!
-//! - Pattern compilation: One-time at startup
-//! - Parse: <2ms for typical heredoc sizes
-//! - Match: <1ms typical
-//! - Hard timeout: 20ms
+//! Source recovery and the configurable AST corpus live in
+//! `ast_source_analysis.rs`. This entry point also revalidates Python's
+//! temporary-directory producer grants before the evaluator can use them.
+//! An unknown or replaced factory keeps the existing recursive-deletion rule.
+
+#[path = "ast_matcher/bash_temp_policy.rs"]
+mod bash_temp_policy;
+#[path = "ast_matcher/dynamic_source.rs"]
+mod dynamic_source;
+#[path = "ast_source_analysis.rs"]
+mod source_analysis;
+#[path = "ast_matcher/tempfile_provenance.rs"]
+mod tempfile_provenance;
+
+pub use source_analysis::*;
+
+pub(crate) use bash_temp_policy::literal_temp_rm;
+pub(crate) use dynamic_source::{
+    DynamicSource, DynamicSourceReading, DynamicSourceSite, dynamic_source_reading,
+    has_dynamic_source_candidates, literal_source_reading, reads_dynamic_source,
+};
 
 use crate::heredoc::ScriptLanguage;
-use ast_grep_core::{AstGrep, Pattern};
-use ast_grep_language::SupportLang;
-use memchr::memchr_iter;
-use regex::Regex;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, mpsc};
-use std::thread;
+use std::ops::Deref;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
-/// Hard timeout for AST operations (20ms as per ADR).
-///
-/// Tests use a much more generous budget because the full suite runs thousands
-/// of AST-heavy cases in parallel.  On a loaded CI host a worker can be
-/// descheduled for hundreds of milliseconds before it parses even this tiny
-/// fixture; production builds retain the strict 20ms fail-open ceiling below.
-#[cfg(not(test))]
-const AST_TIMEOUT_MS: u64 = 20;
-#[cfg(test)]
-const AST_TIMEOUT_MS: u64 = 5_000;
+/// The default matcher used by the CLI and hooks, including producer provenance.
+/// Explicit `AstMatcher` corpora remain independently configurable as before.
+#[derive(Debug, Default)]
+pub struct DefaultPolicyMatcher;
 
-/// Maximum body size the AST matcher will parse directly.
-///
-/// Heredoc extraction already defaults to a 1 MiB body cap; keeping the direct
-/// matcher aligned prevents library callers and fuzz targets from bypassing the
-/// same fail-open budget by invoking AST parsing on much larger inputs.
-const MAX_AST_INPUT_BYTES: usize = 1024 * 1024;
+/// The entry point used by the evaluator after executable-source extraction.
+pub static DEFAULT_MATCHER: LazyLock<DefaultPolicyMatcher> =
+    LazyLock::new(DefaultPolicyMatcher::default);
 
-/// Severity level for pattern matches.
-///
-/// Determines the default action taken when a pattern matches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Severity {
-    /// Always block - no allowlist override without explicit config.
-    Critical,
-    /// Block by default, can be allowlisted.
-    High,
-    /// Warn by default (log but don't block).
-    Medium,
-    /// Log only - informational.
-    Low,
-}
+impl Deref for DefaultPolicyMatcher {
+    type Target = source_analysis::DefaultPolicyMatcher;
 
-impl Severity {
-    /// Human-readable label for this severity.
-    #[must_use]
-    pub const fn label(&self) -> &'static str {
-        match self {
-            Self::Critical => "critical",
-            Self::High => "high",
-            Self::Medium => "medium",
-            Self::Low => "low",
-        }
-    }
-
-    /// Whether this severity should block by default.
-    #[must_use]
-    pub const fn blocks_by_default(&self) -> bool {
-        matches!(self, Self::Critical | Self::High)
+    fn deref(&self) -> &Self::Target {
+        &source_analysis::DEFAULT_MATCHER
     }
 }
 
-/// Result of a pattern match.
-#[derive(Debug, Clone)]
-pub struct PatternMatch {
-    /// Stable rule ID for allowlisting (e.g., `heredoc.python.subprocess_rm`).
-    pub rule_id: String,
-    /// Human-readable reason for the match.
-    pub reason: String,
-    /// Preview of the matched text (truncated if too long).
-    pub matched_text_preview: String,
-    /// Byte offset of match start in the content.
-    pub start: usize,
-    /// Byte offset of match end in the content.
-    pub end: usize,
-    /// 1-based line number where match starts.
-    pub line_number: usize,
-    /// Severity level of this match.
-    pub severity: Severity,
-    /// Optional suggestion for safe alternative.
-    pub suggestion: Option<String>,
-}
-
-/// Error during AST matching (all errors are non-fatal, fail-open).
-#[derive(Debug, Clone)]
-pub enum MatchError {
-    /// Language not supported by ast-grep.
-    UnsupportedLanguage(ScriptLanguage),
-    /// Failed to parse content as the specified language.
-    ParseError {
-        language: ScriptLanguage,
-        detail: String,
-    },
-    /// Pattern matching exceeded timeout.
-    Timeout { elapsed_ms: u64, budget_ms: u64 },
-    /// Pattern compilation failed (should not happen with static patterns).
-    PatternError { pattern: String, detail: String },
-}
-
-impl std::fmt::Display for MatchError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnsupportedLanguage(lang) => {
-                write!(f, "unsupported language for AST matching: {lang:?}")
-            }
-            Self::ParseError { language, detail } => {
-                write!(f, "AST parse error for {language:?}: {detail}")
-            }
-            Self::Timeout {
-                elapsed_ms,
-                budget_ms,
-            } => {
-                write!(
-                    f,
-                    "AST matching timeout: {elapsed_ms}ms > {budget_ms}ms budget"
-                )
-            }
-            Self::PatternError { pattern, detail } => {
-                write!(f, "pattern compilation error for '{pattern}': {detail}")
-            }
-        }
-    }
-}
-
-/// A compiled AST pattern with metadata.
-#[derive(Debug, Clone)]
-pub struct CompiledPattern {
-    /// The pattern string (for debugging/logging).
-    pub pattern_str: String,
-    /// Stable rule ID.
-    pub rule_id: String,
-    /// Human-readable reason.
-    pub reason: String,
-    /// Match severity.
-    pub severity: Severity,
-    /// Optional safe alternative suggestion.
-    pub suggestion: Option<String>,
-}
-
-impl CompiledPattern {
-    /// Create a new compiled pattern.
-    #[must_use]
-    pub const fn new(
-        pattern_str: String,
-        rule_id: String,
-        reason: String,
-        severity: Severity,
-        suggestion: Option<String>,
-    ) -> Self {
-        Self {
-            pattern_str,
-            rule_id,
-            reason,
-            severity,
-            suggestion,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct PrecompiledPattern {
-    pattern: Pattern,
-    meta: CompiledPattern,
-}
-
-/// AST pattern matcher using ast-grep-core.
-///
-/// Holds pre-compiled patterns for each supported language.
-pub struct AstMatcher {
-    /// Patterns organized by language.
-    patterns: HashMap<ScriptLanguage, Vec<PrecompiledPattern>>,
-    /// Timeout for matching operations.
-    timeout: Duration,
-}
-
-impl Default for AstMatcher {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl AstMatcher {
-    /// Create a new matcher with default destructive patterns.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            patterns: precompile_patterns(default_patterns()),
-            timeout: Duration::from_millis(AST_TIMEOUT_MS),
-        }
-    }
-
-    /// Create a matcher with custom patterns.
-    #[must_use]
-    #[allow(clippy::missing_const_for_fn)] // HashMap is not const-constructible
-    pub fn with_patterns(patterns: HashMap<ScriptLanguage, Vec<CompiledPattern>>) -> Self {
-        Self {
-            patterns: precompile_patterns(patterns),
-            timeout: Duration::from_millis(AST_TIMEOUT_MS),
-        }
-    }
-
-    /// Create a matcher with custom timeout.
-    #[must_use]
-    #[allow(clippy::missing_const_for_fn)] // Builder pattern, not suitable for const
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self
-    }
-
-    /// Find pattern matches in the given code.
+impl DefaultPolicyMatcher {
+    /// Match executable source and revalidate its temporary producer exemptions.
     ///
     /// # Errors
     ///
-    /// Returns `MatchError` on:
-    /// - Unsupported language
-    /// - Parse failure
-    /// - Timeout
-    ///
-    /// All errors are non-fatal; callers should fail-open (allow the command).
+    /// Returns the source matcher's parsing, availability, or timeout error.
+    /// An incomplete producer proof instead withholds the optional exemption.
     pub fn find_matches(
         &self,
         code: &str,
         language: ScriptLanguage,
     ) -> Result<Vec<PatternMatch>, MatchError> {
-        let start_time = Instant::now();
-        let budget_ms = self.timeout.as_millis() as u64;
-
-        // Perl is not supported by ast-grep-language; use a conservative regex fallback.
-        if language == ScriptLanguage::Perl {
-            return find_matches_perl(code, start_time, self.timeout, budget_ms);
-        }
-
-        // Check language support FIRST (before patterns, so we report unsupported properly)
-        let Some(ast_lang) = script_language_to_ast_lang(language) else {
-            return Err(MatchError::UnsupportedLanguage(language));
-        };
-
-        // Get patterns for this language (after language support check)
-        let patterns = match self.patterns.get(&language) {
-            Some(p) if !p.is_empty() => p,
-            _ => return Ok(Vec::new()), // No patterns = no matches
-        };
-
-        if self.timeout.is_zero() || code.len() > MAX_AST_INPUT_BYTES {
-            return Err(timeout_error(start_time, budget_ms));
-        }
-
-        run_ast_match_with_timeout(
-            code.to_string(),
+        let matches = source_analysis::DEFAULT_MATCHER.find_matches(code, language)?;
+        let matches = bash_temp_policy::refine(
+            code,
             language,
-            ast_lang,
-            patterns.clone(),
-            self.timeout,
-            budget_ms,
+            matches,
+            source_analysis::protected_scan_budget(),
+        );
+        complete_python_deletion_matches(
+            code,
+            language,
+            matches,
+            source_analysis::protected_scan_budget(),
         )
     }
 
-    /// Check if any blocking patterns match (convenience method).
+    /// Match source with an explicit budget. The producer proof uses only the
+    /// time remaining after source matching, never an additional time envelope.
     ///
-    /// Returns the first blocking match, or None if no blocking patterns match.
+    /// # Errors
+    ///
+    /// Returns the source matcher's parsing, availability, or timeout error.
+    pub fn find_matches_with_timeout(
+        &self,
+        code: &str,
+        language: ScriptLanguage,
+        timeout: Duration,
+    ) -> Result<Vec<PatternMatch>, MatchError> {
+        let started = Instant::now();
+        let matches =
+            source_analysis::DEFAULT_MATCHER.find_matches_with_timeout(code, language, timeout)?;
+        let matches = bash_temp_policy::refine(
+            code,
+            language,
+            matches,
+            timeout.saturating_sub(started.elapsed()),
+        );
+        complete_python_deletion_matches(
+            code,
+            language,
+            matches,
+            timeout.saturating_sub(started.elapsed()),
+        )
+    }
+
+    /// Return the first blocking match from the complete default policy.
     #[must_use]
     pub fn has_blocking_match(&self, code: &str, language: ScriptLanguage) -> Option<PatternMatch> {
         self.find_matches(code, language)
-            .ok()
-            .and_then(|matches| matches.into_iter().find(|m| m.severity.blocks_by_default()))
+            .ok()?
+            .into_iter()
+            .find(|hit| hit.severity.blocks_by_default())
     }
 }
 
-/// Conservative exec-sink backstop for interpreter-source heredocs (#136).
-///
-/// Bodies of `python -`/`node -`/`ruby` (etc.) heredocs are masked out of the
-/// evaluator's raw-shell rescan because the language AST is authoritative. But
-/// ast-grep structural patterns only match *specific call shapes*
-/// (`child_process.execSync(...)`, `os.system(...)`, …). Aliased or
-/// indirectly-imported sinks — e.g. `const cp = require("child_process");
-/// cp.execSync("rm -rf /etc")` — slip past those patterns. Without a backstop,
-/// masking would turn such a genuinely-executing deletion into a false negative,
-/// violating the zero-false-negative invariant.
-///
-/// This scan is **name-anchored and literal-only**: it fires only when a known
-/// shell-exec sink *name* (`execSync`, `exec`, `spawnSync`, `spawn`,
-/// `os.system`, `os.popen`, `subprocess.{run,call,Popen}`, `system`, `popen`)
-/// is called with a string-literal argument whose content
-/// [`detect_shell_payload`] flags as destructive (`rm -rf …`,
-/// `git reset --hard`, …). A destructive token sitting in an inert literal with
-/// no sink call (`print("rm -rf x")`, `console.log("rm -rf x")`) does NOT match,
-/// so the reporter's false positive stays fixed.
-///
-/// Returns the first blocking match, or `None`. Language-scoped to the
-/// non-shell interpreter languages that get masked.
-#[must_use]
-pub fn scan_executing_sink_fallback(code: &str, language: ScriptLanguage) -> Option<PatternMatch> {
-    let newline_positions: Vec<usize> = memchr_iter(b'\n', code.as_bytes()).collect();
+// These are invocations of a statically named deletion member, not mere
+// lookups. Keep both quote spellings explicit: matching must not depend on a
+// grammar's treatment of quote tokens. Like the existing $M.rmtree pattern,
+// the receiver is deliberately not restricted to one module variable name.
+const PYTHON_REFLECTIVE_DELETE_CALLEES: [&str; 7] = [
+    "getattr($M, 'rmtree')",
+    "getattr($M, \"rmtree\")",
+    "$B.getattr($M, 'rmtree')",
+    "$B.getattr($M, \"rmtree\")",
+    "$M.__dict__['rmtree']",
+    "$M.__dict__[\"rmtree\"]",
+    "$M.rmtree.__call__",
+];
 
-    // Ruby has command-execution forms whose payload is NOT a quoted string
-    // literal (`%x(rm -rf /etc)`, backticks `` `rm -rf /etc` ``). Handle those
-    // (plus `IO.popen`/`Open3.*` whose payloads ARE quoted) in a dedicated pass so
-    // the heredoc masking never converts a real executing deletion into a false
-    // negative (#136).
-    if language == ScriptLanguage::Ruby {
-        if let Some(m) = scan_ruby_exec_sink_fallback(code, &newline_positions) {
-            return Some(m);
-        }
-    }
-
-    let sink_regex: &Regex = match language {
-        ScriptLanguage::JavaScript | ScriptLanguage::TypeScript => &JS_EXEC_SINK_LITERAL,
-        ScriptLanguage::Python => &PY_EXEC_SINK_LITERAL,
-        ScriptLanguage::Ruby => &RUBY_EXEC_SINK_LITERAL,
-        // Bash is never masked; Perl/Php/Go use their own primary paths and have
-        // no aliasing gap this backstop needs to close for the #136 scope.
-        _ => return None,
-    };
-
-    for caps in sink_regex.captures_iter(code) {
-        let Some(m) = caps.get(0) else { continue };
-
-        // Scan the sink call's full argument region — not just its first string
-        // literal — so a destructive payload nested inside a list/tuple literal
-        // (`subprocess.run(["sh", "-c", "rm -rf /etc"])`) is caught even when the
-        // first literal (`"sh"`) is inert (#136). The region spans from the
-        // opening paren of this match to the balanced close paren (bounded to the
-        // remainder of the source), descending into bracketed list elements.
-        let arg_region = exec_sink_arg_region(code, m.start());
-        let Some(hit) = detect_destructive_in_args(arg_region) else {
-            continue;
-        };
-
-        // Escalate destructive exec-sink payloads to a blocking severity.
-        let severity = match hit.severity {
-            Severity::Critical => Severity::Critical,
-            _ => Severity::High,
-        };
-        if !severity.blocks_by_default() {
-            continue;
-        }
-
-        let sink = caps.name("sink").map_or("exec", |s| s.as_str());
-        let lang_id = match language {
-            ScriptLanguage::JavaScript => "javascript",
-            ScriptLanguage::TypeScript => "typescript",
-            ScriptLanguage::Python => "python",
-            ScriptLanguage::Ruby => "ruby",
-            _ => "unknown",
-        };
-        let line_number = newline_positions.partition_point(|&idx| idx < m.start()) + 1;
-
-        return Some(PatternMatch {
-            rule_id: format!("heredoc.{lang_id}.exec_sink.{}", hit.rule_suffix),
-            reason: format!("{} via {sink}() exec sink", hit.reason),
-            matched_text_preview: truncate_preview(code.get(m.start()..m.end()).unwrap_or(""), 60),
-            start: m.start(),
-            end: m.end(),
-            line_number,
-            severity,
-            suggestion: hit.suggestion.map(str::to_string),
-        });
-    }
-
-    None
-}
-
-/// High-signal filesystem sink fallback for cases where the full AST pass is
-/// unavailable or too close to the hook deadline.
-///
-/// This intentionally stays narrower than the AST pattern set: it only matches
-/// Ruby `FileUtils.*` and JavaScript/TypeScript `fs.rmSync()` calls that start a
-/// source line and use a catastrophic literal target. That avoids firing on
-/// common inert cases such as comments or strings while still catching the
-/// highest-risk deletes before a fail-open timeout can turn them into false
-/// negatives.
-#[must_use]
-pub fn scan_filesystem_sink_fallback(code: &str, language: ScriptLanguage) -> Option<PatternMatch> {
-    let newline_positions: Vec<usize> = memchr_iter(b'\n', code.as_bytes()).collect();
-
-    if language == ScriptLanguage::Ruby {
-        for caps in RUBY_FILEUTILS_LITERAL.captures_iter(code) {
-            let Some(m) = caps.get(0) else { continue };
-            let Some(path) = string_literal_from_caps(&caps) else {
-                continue;
-            };
-            let catastrophic = is_catastrophic_path(path);
-            let severity = if catastrophic {
-                Severity::Critical
-            } else {
-                Severity::Medium
-            };
-            let suffix = if catastrophic { ".catastrophic" } else { "" };
-            let fn_name = caps.name("fn").map_or("rm_rf", |s| s.as_str());
-            let line_number = newline_positions.partition_point(|&idx| idx < m.start()) + 1;
-
-            return Some(PatternMatch {
-                rule_id: format!("heredoc.ruby.fileutils_{fn_name}{suffix}"),
-                reason: if catastrophic {
-                    format!(
-                        "FileUtils.{fn_name}() deletes files/directories (catastrophic target path)"
-                    )
-                } else {
-                    format!("FileUtils.{fn_name}() deletes files/directories")
-                },
-                matched_text_preview: truncate_preview(
-                    code.get(m.start()..m.end()).unwrap_or(""),
-                    60,
-                ),
-                start: m.start(),
-                end: m.end(),
-                line_number,
-                severity,
-                suggestion: Some("Verify target path carefully before running".to_string()),
-            });
-        }
-        return None;
-    }
-
-    if matches!(
-        language,
-        ScriptLanguage::JavaScript | ScriptLanguage::TypeScript
-    ) {
-        for caps in JS_FS_RMSYNC_LITERAL.captures_iter(code) {
-            let Some(m) = caps.get(0) else { continue };
-            if !is_javascript_executable_offset(code, m.start()) {
-                continue;
-            }
-            let Some(path) = string_literal_from_caps(&caps) else {
-                continue;
-            };
-            if !is_catastrophic_path(path) {
-                continue;
-            }
-
-            let lang_id = if language == ScriptLanguage::TypeScript {
-                "typescript"
-            } else {
-                "javascript"
-            };
-            let line_number = newline_positions.partition_point(|&idx| idx < m.start()) + 1;
-            return Some(PatternMatch {
-                rule_id: format!("heredoc.{lang_id}.fs_rmsync.catastrophic"),
-                reason: "fs.rmSync() deletes files/directories (catastrophic target path)"
-                    .to_string(),
-                matched_text_preview: truncate_preview(
-                    code.get(m.start()..m.end()).unwrap_or(""),
-                    60,
-                ),
-                start: m.start(),
-                end: m.end(),
-                line_number,
-                severity: Severity::Critical,
-                suggestion: Some("Verify target path carefully before running".to_string()),
-            });
-        }
-    }
-
-    None
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum JavaScriptLexState {
-    Code,
-    SingleQuoted,
-    DoubleQuoted,
-    Template,
-    LineComment,
-    BlockComment,
-}
-
-/// Return true only when `offset` is in ordinary JavaScript code. The fallback
-/// deliberately treats template interpolation as inert: missing an unusual
-/// `${fs.rmSync(...)}` backstop is safer than blocking documentation text, and
-/// the primary AST matcher still handles the executable interpolation.
-fn is_javascript_executable_offset(code: &str, offset: usize) -> bool {
-    let bytes = code.as_bytes();
-    let mut state = JavaScriptLexState::Code;
-    let mut escaped = false;
-    let mut index = 0;
-
-    while index < offset.min(bytes.len()) {
-        let byte = bytes[index];
-        let next = bytes.get(index + 1).copied();
-
-        match state {
-            JavaScriptLexState::Code => match (byte, next) {
-                (b'/', Some(b'/')) => {
-                    state = JavaScriptLexState::LineComment;
-                    index += 1;
-                }
-                (b'/', Some(b'*')) => {
-                    state = JavaScriptLexState::BlockComment;
-                    index += 1;
-                }
-                (b'\'', _) => state = JavaScriptLexState::SingleQuoted,
-                (b'"', _) => state = JavaScriptLexState::DoubleQuoted,
-                (b'`', _) => state = JavaScriptLexState::Template,
-                _ => {}
-            },
-            JavaScriptLexState::SingleQuoted => {
-                if escaped {
-                    escaped = false;
-                } else if byte == b'\\' {
-                    escaped = true;
-                } else if byte == b'\'' {
-                    state = JavaScriptLexState::Code;
-                }
-            }
-            JavaScriptLexState::DoubleQuoted => {
-                if escaped {
-                    escaped = false;
-                } else if byte == b'\\' {
-                    escaped = true;
-                } else if byte == b'"' {
-                    state = JavaScriptLexState::Code;
-                }
-            }
-            JavaScriptLexState::Template => {
-                if escaped {
-                    escaped = false;
-                } else if byte == b'\\' {
-                    escaped = true;
-                } else if byte == b'`' {
-                    state = JavaScriptLexState::Code;
-                }
-            }
-            JavaScriptLexState::LineComment => {
-                if byte == b'\n' {
-                    state = JavaScriptLexState::Code;
-                }
-            }
-            JavaScriptLexState::BlockComment => {
-                if byte == b'*' && next == Some(b'/') {
-                    state = JavaScriptLexState::Code;
-                    index += 1;
-                }
-            }
-        }
-        index += 1;
-    }
-
-    state == JavaScriptLexState::Code
-}
-
-/// Ruby-specific exec-sink backstop covering forms whose destructive payload is
-/// not a quoted string literal (`%x(...)`/`%x{...}`/`%x[...]`, backticks) as well
-/// as quoted-arg sinks (`system`/`exec`/`spawn`, `IO.popen`, `Open3.*`). Any
-/// confirmed destructive payload is escalated to a blocking severity (>= High) via
-/// the shared escalation rule, so even a non-catastrophic `rm -rf <relpath>`
-/// inside one of these sinks BLOCKS (#136).
-fn scan_ruby_exec_sink_fallback(code: &str, newline_positions: &[usize]) -> Option<PatternMatch> {
-    // 1) `%x(...)` / `%x{...}` / `%x[...]` command-substitution literals and
-    //    backticks: the payload IS the delimited text, not a nested string.
-    for caps in RUBY_PERCENT_X_LITERAL.captures_iter(code) {
-        let Some(m) = caps.get(0) else { continue };
-        let cmd = ["cmd", "cmd2", "cmd3", "cmd4"]
-            .iter()
-            .find_map(|name| caps.name(name).map(|c| c.as_str()))
-            .unwrap_or("");
-        if let Some(hit) = detect_shell_payload(cmd) {
-            return Some(ruby_exec_sink_match(code, newline_positions, m, "%x", &hit));
-        }
-    }
-    for caps in RUBY_BACKTICKS_LITERAL.captures_iter(code) {
-        let Some(m) = caps.get(0) else { continue };
-        let cmd = caps.name("cmd").map_or("", |c| c.as_str());
-        if let Some(hit) = detect_shell_payload(cmd) {
-            return Some(ruby_exec_sink_match(
-                code,
-                newline_positions,
-                m,
-                "backticks",
-                &hit,
-            ));
-        }
-    }
-
-    // 2) Quoted-arg sinks: `system`/`exec`/`spawn`, `IO.popen`, `Open3.*`. Scan
-    //    the full balanced argument region so a payload nested in a list arg
-    //    (`system("sh", "-c", "rm -rf /etc")`) is caught too.
-    for caps in RUBY_QUOTED_EXEC_SINK_LITERAL.captures_iter(code) {
-        let Some(m) = caps.get(0) else { continue };
-        let arg_region = exec_sink_arg_region(code, m.start());
-        if let Some(hit) = detect_destructive_in_args(arg_region) {
-            let sink = caps.name("sink").map_or("exec", |s| s.as_str());
-            return Some(ruby_exec_sink_match(code, newline_positions, m, sink, &hit));
-        }
-    }
-
-    None
-}
-
-fn ruby_exec_sink_match(
-    code: &str,
-    newline_positions: &[usize],
-    m: regex::Match<'_>,
-    sink: &str,
-    hit: &ShellPayloadHit,
-) -> PatternMatch {
-    // Escalate destructive exec-sink payloads to a blocking severity so even a
-    // non-catastrophic target still BLOCKS (the sink unambiguously executes).
-    let severity = match hit.severity {
-        Severity::Critical => Severity::Critical,
-        _ => Severity::High,
-    };
-    let line_number = newline_positions.partition_point(|&idx| idx < m.start()) + 1;
-    PatternMatch {
-        rule_id: format!("heredoc.ruby.exec_sink.{}", hit.rule_suffix),
-        reason: format!("{} via {sink} exec sink", hit.reason),
-        matched_text_preview: truncate_preview(code.get(m.start()..m.end()).unwrap_or(""), 60),
-        start: m.start(),
-        end: m.end(),
-        line_number,
-        severity,
-        suggestion: hit.suggestion.map(str::to_string),
-    }
-}
-
-static RUBY_PERCENT_X_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
-    // Ruby command-substitution literal: %x(...), %x{...}, %x[...], %x<...>.
-    // Capture the inner command text (single-line, no nesting of the same
-    // delimiter — sufficient for the heredoc-body destructive-token scan).
-    Regex::new(
-        r"(?m)%x(?:\((?P<cmd>[^)\n]*)\)|\{(?P<cmd2>[^}\n]*)\}|\[(?P<cmd3>[^\]\n]*)\]|<(?P<cmd4>[^>\n]*)>)",
-    )
-    .expect("ruby %x literal regex compiles")
-});
-
-static RUBY_QUOTED_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
-    // Quoted-arg Ruby exec sinks anchored on the sink NAME, with the destructive
-    // payload search running over the call's full balanced argument region:
-    //   system("rm -rf /etc") / Kernel.exec('…') / IO.popen("rm -rf /etc")
-    //   Open3.capture2("rm -rf /etc") / Open3.popen3("…") / spawn("…")
-    Regex::new(
-        r#"(?m)\b(?:(?:Kernel|Process|IO|Open3)\.)?(?P<sink>system|exec|spawn|popen|capture2e|capture2|capture3|popen2e|popen2|popen3|pipeline_r|pipeline_rw|pipeline)\b(?:\s*\(\s*|\s+)(?:"[^"\n]*"|'[^'\n]*')"#,
-    )
-    .expect("ruby quoted exec sink regex compiles")
-});
-
-static RUBY_FILEUTILS_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?m)^[ \t]*FileUtils\.(?P<fn>rm_rf|remove_dir|rm|remove)\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
-    )
-    .expect("ruby FileUtils literal regex compiles")
-});
-
-static JS_FS_RMSYNC_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?m)^[ \t]*(?:await[ \t]+)?fs\.rmSync\s*\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
-    )
-    .expect("JavaScript fs.rmSync literal regex compiles")
-});
-
-static JS_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
-    // Any aliased/inline shell-exec sink called with a string literal:
-    //   cp.execSync("rm -rf /etc") / exec('git reset --hard') / spawnSync("rm", ...
-    //   execFile("sh", ["-c", "rm -rf /etc"]) / fork("rm -rf /etc")
-    // Anchored on the sink method name, NOT the receiver, so aliasing is moot.
-    // The destructive-payload search runs over the call's full balanced argument
-    // region (`exec_sink_arg_region` + `detect_destructive_in_args`), so a payload
-    // nested in the LIST arg of execFile/execFileSync/fork is caught even when the
-    // first literal (`"sh"`) is inert (#136). Longer names precede their prefixes
-    // (`execFileSync` before `execFile` before `exec`; `spawnSync` before `spawn`)
-    // so the alternation picks the full sink.
-    Regex::new(
-        r#"(?m)\b(?P<sink>execFileSync|execFile|execSync|exec|spawnSync|spawn|fork)\s*\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
-    )
-    .expect("js exec sink literal regex compiles")
-});
-
-static PY_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
-    // Aliased/qualified Python shell sinks invoked as a call. Only the sink NAME
-    // + opening paren is anchored here; the destructive-payload search runs over
-    // the call's full balanced argument region (see `exec_sink_arg_region` +
-    // `detect_destructive_in_args`), so it descends into list/tuple elements and
-    // is not fooled by an inert first literal (#136). Longer names precede their
-    // prefixes (`check_call` before `call`) so alternation picks the full sink.
-    Regex::new(
-        r"(?m)\b(?P<sink>system|popen|check_call|check_output|call|run|Popen|getoutput|getstatusoutput)\s*\(",
-    )
-    .expect("python exec sink literal regex compiles")
-});
-
-static RUBY_EXEC_SINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
-    // Aliased/qualified Ruby shell sinks with a string-literal first arg.
-    Regex::new(
-        r#"(?m)\b(?P<sink>system|exec|spawn)\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
-    )
-    .expect("ruby exec sink literal regex compiles")
-});
-
-#[allow(clippy::cast_possible_truncation)] // Timeout values are always small
-fn timeout_error(start_time: Instant, budget_ms: u64) -> MatchError {
-    MatchError::Timeout {
-        elapsed_ms: start_time.elapsed().as_millis() as u64,
-        budget_ms,
-    }
-}
-
-fn check_ast_timeout(
-    start_time: Instant,
-    timeout: Duration,
-    budget_ms: u64,
-    cancel: &AtomicBool,
-) -> Result<(), MatchError> {
-    if cancel.load(Ordering::Relaxed) || start_time.elapsed() > timeout {
-        return Err(timeout_error(start_time, budget_ms));
-    }
-    Ok(())
-}
-
-fn run_ast_match_with_timeout(
-    code: String,
-    language: ScriptLanguage,
-    ast_lang: SupportLang,
-    patterns: Vec<PrecompiledPattern>,
-    timeout: Duration,
-    budget_ms: u64,
-) -> Result<Vec<PatternMatch>, MatchError> {
-    let start_time = Instant::now();
-    let (tx, rx) = mpsc::sync_channel(1);
-    // Shared cancellation flag: when the parent times out it flips this and
-    // returns immediately. The worker checks it inside `check_ast_timeout`
-    // (which fires between each pattern and between `find_all` iterations) so
-    // it stops promptly instead of running for another full `timeout` window
-    // after the parent has already returned. Without this, every parent
-    // timeout leaks a live worker thread for the duration of the worker's
-    // own deadline — under burst hook traffic that piles up.
-    let cancel = Arc::new(AtomicBool::new(false));
-    let worker_cancel = Arc::clone(&cancel);
-
-    // We don't `join` the handle on timeout — the worker may still hold a
-    // tree-sitter parser mid-iteration and joining would block the hook past
-    // its 200ms hard ceiling. The cancellation flag bounds the worker's own
-    // wall clock so a leaked handle still terminates promptly on its next
-    // `check_ast_timeout` call.
-    let _worker = thread::Builder::new()
-        .name("dcg-ast-match".to_string())
-        .spawn(move || {
-            // Share the parent's `start_time` semantics by also starting the
-            // worker's deadline now; cancellation is the primary stop signal.
-            let result = find_matches_ast(
-                &code,
-                language,
-                ast_lang,
-                &patterns,
-                Instant::now(),
-                timeout,
-                budget_ms,
-                &worker_cancel,
-            );
-            let _ = tx.send(result);
+static PYTHON_REFLECTIVE_DELETE_MATCHER: LazyLock<AstMatcher> = LazyLock::new(|| {
+    // Reuse the registered rule, including its target refinement, rather than
+    // harvesting a receiver's first literal ('rmtree') as the deletion path.
+    // Explicit user-created AstMatcher corpora remain unchanged.
+    let meta = source_analysis::default_patterns()
+        .remove(&ScriptLanguage::Python)
+        .and_then(|patterns| {
+            patterns
+                .into_iter()
+                .find(|meta| meta.rule_id == "heredoc.python.shutil_rmtree")
         })
-        .map_err(|err| MatchError::ParseError {
-            language,
-            detail: format!("failed to start AST parser worker: {err}"),
-        })?;
-
-    match rx.recv_timeout(timeout) {
-        Ok(result) => result,
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            cancel.store(true, Ordering::Relaxed);
-            Err(timeout_error(start_time, budget_ms))
-        }
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            cancel.store(true, Ordering::Relaxed);
-            Err(MatchError::ParseError {
-                language,
-                detail: "AST parser worker exited without a result".to_string(),
-            })
+        .expect("the default Python corpus registers its recursive-deletion rule");
+    let mut patterns = Vec::new();
+    for callee in PYTHON_REFLECTIVE_DELETE_CALLEES {
+        for pattern in [format!("{callee}($$$)"), format!("({callee})($$$)")] {
+            let mut pattern_meta = meta.clone();
+            pattern_meta.pattern_str = pattern;
+            patterns.push(pattern_meta);
         }
     }
-}
-
-fn find_matches_ast(
-    code: &str,
-    language: ScriptLanguage,
-    ast_lang: SupportLang,
-    patterns: &[PrecompiledPattern],
-    start_time: Instant,
-    timeout: Duration,
-    budget_ms: u64,
-    cancel: &AtomicBool,
-) -> Result<Vec<PatternMatch>, MatchError> {
-    let newline_positions: Vec<usize> = memchr_iter(b'\n', code.as_bytes()).collect();
-
-    // Parse the code
-    let ast = AstGrep::new(code, ast_lang);
-    let root = ast.root();
-
-    // Check timeout after parsing
-    check_ast_timeout(start_time, timeout, budget_ms, cancel)?;
-
-    let mut matches = Vec::new();
-
-    // Match each pattern
-    for compiled in patterns {
-        // Check timeout before each pattern
-        check_ast_timeout(start_time, timeout, budget_ms, cancel)?;
-
-        // Find all matches for this pattern
-        for node in root.find_all(&compiled.pattern) {
-            // Check timeout during matching (a single pattern can match many nodes)
-            check_ast_timeout(start_time, timeout, budget_ms, cancel)?;
-
-            let matched_text = node.text();
-            let range = node.range();
-
-            // Calculate line number (1-based)
-            let line_number = newline_positions.partition_point(|&idx| idx < range.start) + 1;
-
-            // Create preview (truncate if too long, UTF-8 safe)
-            let preview = truncate_preview(&matched_text, 60);
-
-            let Some(refined) = refine_match_meta(language, &compiled.meta, &matched_text) else {
-                continue;
-            };
-
-            matches.push(PatternMatch {
-                rule_id: refined.rule_id,
-                reason: refined.reason,
-                matched_text_preview: preview,
-                start: range.start,
-                end: range.end,
-                line_number,
-                severity: refined.severity,
-                suggestion: refined.suggestion,
-            });
-        }
-    }
-
-    Ok(matches)
-}
-
-/// Truncate a string to at most `max_chars` characters, UTF-8 safe.
-///
-/// If truncation occurs, appends "..." to indicate more content exists.
-fn truncate_preview(text: &str, max_chars: usize) -> String {
-    let char_count = text.chars().count();
-    if char_count <= max_chars {
-        text.to_string()
-    } else {
-        // Leave room for "..."
-        let truncate_at = max_chars.saturating_sub(3);
-        let truncated: String = text.chars().take(truncate_at).collect();
-        format!("{truncated}...")
-    }
-}
-
-/// Convert `ScriptLanguage` to ast-grep's `SupportLang`.
-const fn script_language_to_ast_lang(lang: ScriptLanguage) -> Option<SupportLang> {
-    match lang {
-        ScriptLanguage::Python => Some(SupportLang::Python),
-        ScriptLanguage::JavaScript => Some(SupportLang::JavaScript),
-        ScriptLanguage::TypeScript => Some(SupportLang::TypeScript),
-        ScriptLanguage::Ruby => Some(SupportLang::Ruby),
-        ScriptLanguage::Bash => Some(SupportLang::Bash),
-        ScriptLanguage::Go => Some(SupportLang::Go),
-        ScriptLanguage::Php => Some(SupportLang::Php),
-        ScriptLanguage::Perl | ScriptLanguage::Unknown => None,
-    }
-}
-
-// ============================================================================
-// Match refinement (payload / path analysis)
-// ============================================================================
-
-#[derive(Debug)]
-struct RefinedMatchMeta {
-    rule_id: String,
-    reason: String,
-    severity: Severity,
-    suggestion: Option<String>,
-}
-
-static JS_RECURSIVE_TRUE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)\brecursive\s*:\s*true\b").expect("js recursive:true regex compiles")
-});
-
-static JS_EXEC_SYNC_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
-    // Matches: execSync("...") / execSync('...')
-    Regex::new(r#"(?m)\bexecSync\b\s*\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#)
-        .expect("js execSync literal regex compiles")
-});
-
-static JS_SPAWN_SYNC_CMD_ARGS: LazyLock<Regex> = LazyLock::new(|| {
-    // Matches: spawnSync("cmd", [ ... ]) / spawnSync('cmd', [ ... ])
-    Regex::new(
-        r#"(?m)\bspawnSync\b\s*\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')\s*,\s*\[(?P<args>[^\]]*)\]"#,
-    )
-    .expect("js spawnSync(cmd, [args]) regex compiles")
-});
-
-static JS_ARRAY_STRING_LITERALS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?m)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#)
-        .expect("js array string literal regex compiles")
-});
-
-static JS_FIRST_STRING_ARG: LazyLock<Regex> = LazyLock::new(|| {
-    // Captures the first string literal argument in a call expression.
-    Regex::new(r#"(?m)\(\s*(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#)
-        .expect("js first string arg regex compiles")
-});
-
-static RUBY_SYSTEM_EXEC_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
-    // Matches:
-    // - system("...") / system '...'
-    // - exec("...")   / exec '...'
-    // - Kernel.system("...") / Kernel.exec("...")
-    Regex::new(
-        r#"(?m)\b(?:(?:Kernel|Process)\.)?(?P<call>system|exec)\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
-    )
-    .expect("ruby system/exec literal regex compiles")
-});
-
-static RUBY_BACKTICKS_LITERAL: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?m)`(?P<cmd>[^`\n]*)`").expect("ruby backticks regex compiles"));
-
-static RUBY_FIRST_STRING_ARG: LazyLock<Regex> = LazyLock::new(|| {
-    // Captures first string literal argument in Ruby call forms:
-    // - foo("...") / foo('...')
-    // - foo "..."  / foo '...'
-    Regex::new(r#"(?m)(?:\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#)
-        .expect("ruby first string arg regex compiles")
-});
-
-fn refine_match_meta(
-    language: ScriptLanguage,
-    meta: &CompiledPattern,
-    matched_text: &str,
-) -> Option<RefinedMatchMeta> {
-    match language {
-        ScriptLanguage::JavaScript => refine_javascript_match(meta, matched_text),
-        ScriptLanguage::TypeScript => refine_typescript_match(meta, matched_text),
-        ScriptLanguage::Ruby => refine_ruby_match(meta, matched_text),
-        ScriptLanguage::Python => Some(refine_python_match(meta, matched_text)),
-        _ => Some(RefinedMatchMeta {
-            rule_id: meta.rule_id.clone(),
-            reason: meta.reason.clone(),
-            severity: meta.severity,
-            suggestion: meta.suggestion.clone(),
-        }),
-    }
-}
-
-/// Refine a Python exec-sink match (#136).
-///
-/// Python shell sinks (`os.system`, `os.popen`, `subprocess.run/call/Popen`) are
-/// registered at `Medium` severity so a bare, benign call (e.g.
-/// `subprocess.run(["ls"])`) only warns. This refinement escalates the match to a
-/// BLOCKING severity when the first string-literal argument is a genuinely
-/// destructive shell command (`rm -rf …`, `git reset --hard`, …). This is what
-/// lets the language-aware heredoc path stay authoritative for executing sinks:
-/// an interpreter-stdin heredoc body whose only destructive token lives inside an
-/// inert literal (e.g. `print("rm -rf x")`) is masked from the raw-shell rescan,
-/// but a real `os.system("rm -rf /etc")` is caught right here.
-///
-/// Fail-safe: if the payload cannot be extracted as a literal (dynamic argument),
-/// we keep the original `Medium` warn-only meta rather than dropping the match, so
-/// the raw-shell rescan (when not masked) still has a chance to act.
-fn refine_python_match(meta: &CompiledPattern, matched_text: &str) -> RefinedMatchMeta {
-    let rule_id = meta.rule_id.as_str();
-
-    let is_exec_sink = matches!(
-        rule_id,
-        "heredoc.python.os_system"
-            | "heredoc.python.os_popen"
-            | "heredoc.python.subprocess_run"
-            | "heredoc.python.subprocess_call"
-            | "heredoc.python.subprocess_popen"
-    );
-
-    let unchanged = || RefinedMatchMeta {
-        rule_id: meta.rule_id.clone(),
-        reason: meta.reason.clone(),
-        severity: meta.severity,
-        suggestion: meta.suggestion.clone(),
-    };
-
-    if is_exec_sink {
-        // Scan *every* string literal in the call's argument list, descending
-        // into list/tuple literal elements. This catches the list-arg form
-        // `subprocess.run(["sh", "-c", "rm -rf /etc"])` whose first literal
-        // (`"sh"`) is inert but which genuinely executes `rm -rf` (#136).
-        if let Some(hit) = detect_destructive_in_args(matched_text) {
-            // A destructive shell command is being executed. Escalate to at
-            // least High so the AST path blocks even for non-catastrophic
-            // targets (the sink unambiguously runs `rm -rf`/`git reset`).
-            let severity = match hit.severity {
-                Severity::Critical => Severity::Critical,
-                _ => Severity::High,
-            };
-            return RefinedMatchMeta {
-                rule_id: format!("{rule_id}.{}", hit.rule_suffix),
-                reason: hit.reason.to_string(),
-                severity,
-                suggestion: hit.suggestion.map(str::to_string),
-            };
-        }
-
-        // Dynamic / non-destructive payload: keep warn-only meta (fail-open).
-        return unchanged();
-    }
-
-    unchanged()
-}
-
-fn refine_javascript_match(meta: &CompiledPattern, matched_text: &str) -> Option<RefinedMatchMeta> {
-    let rule_id = meta.rule_id.as_str();
-
-    if matches!(
-        rule_id,
-        "heredoc.javascript.execsync" | "heredoc.javascript.require_execsync"
-    ) {
-        let payload = JS_EXEC_SYNC_LITERAL
-            .captures(matched_text)
-            .and_then(|caps| string_literal_from_caps(&caps));
-
-        if let Some(payload) = payload {
-            return detect_shell_payload(payload).map(|hit| RefinedMatchMeta {
-                rule_id: format!("{rule_id}.{}", hit.rule_suffix),
-                reason: hit.reason.to_string(),
-                severity: hit.severity,
-                suggestion: hit.suggestion.map(str::to_string),
-            });
-        }
-
-        // Dynamic payloads: warn only (fail-open).
-        return Some(RefinedMatchMeta {
-            rule_id: meta.rule_id.clone(),
-            reason: meta.reason.clone(),
-            severity: meta.severity,
-            suggestion: meta.suggestion.clone(),
-        });
-    }
-
-    if rule_id == "heredoc.javascript.spawnsync" {
-        if let Some(caps) = JS_SPAWN_SYNC_CMD_ARGS.captures(matched_text) {
-            let cmd = string_literal_from_caps(&caps).unwrap_or("");
-            let args = caps.name("args").map_or("", |m| m.as_str());
-            let args: Vec<&str> = JS_ARRAY_STRING_LITERALS
-                .captures_iter(args)
-                .filter_map(|caps| string_literal_from_caps(&caps))
-                .collect();
-
-            if let Some(reconstructed) = reconstruct_spawn_command(cmd, &args) {
-                return detect_shell_payload(&reconstructed).map(|hit| RefinedMatchMeta {
-                    rule_id: format!("{rule_id}.{}", hit.rule_suffix),
-                    reason: hit.reason.to_string(),
-                    severity: hit.severity,
-                    suggestion: hit.suggestion.map(str::to_string),
-                });
-            }
-
-            return None;
-        }
-
-        // Dynamic spawnSync: warn only.
-        return Some(RefinedMatchMeta {
-            rule_id: meta.rule_id.clone(),
-            reason: meta.reason.clone(),
-            severity: Severity::Medium,
-            suggestion: meta.suggestion.clone(),
-        });
-    }
-
-    if rule_id.starts_with("heredoc.javascript.fs_")
-        || rule_id.starts_with("heredoc.javascript.fspromises_")
-    {
-        let path = JS_FIRST_STRING_ARG
-            .captures(matched_text)
-            .and_then(|caps| string_literal_from_caps(&caps));
-
-        let recursive_relevant = JS_RECURSIVE_TRUE.is_match(matched_text);
-        let catastrophic = path.is_some_and(is_catastrophic_path);
-
-        // For fs.rm* / fs.rmdir* we only care about recursive deletion (or catastrophic literal paths).
-        let needs_recursive = matches!(
-            rule_id,
-            "heredoc.javascript.fs_rmsync"
-                | "heredoc.javascript.fs_rmdirsync"
-                | "heredoc.javascript.fs_rm"
-                | "heredoc.javascript.fs_rmdir"
-                | "heredoc.javascript.fspromises_rm"
-                | "heredoc.javascript.fspromises_rmdir"
-        );
-
-        if needs_recursive && !recursive_relevant && !catastrophic {
-            return None;
-        }
-
-        if catastrophic {
-            return Some(RefinedMatchMeta {
-                rule_id: format!("{rule_id}.catastrophic"),
-                reason: format!("{} (catastrophic target path)", meta.reason),
-                severity: Severity::Critical,
-                suggestion: meta.suggestion.clone(),
-            });
-        }
-
-        return Some(RefinedMatchMeta {
-            rule_id: meta.rule_id.clone(),
-            reason: meta.reason.clone(),
-            severity: Severity::Medium,
-            suggestion: meta.suggestion.clone(),
-        });
-    }
-
-    Some(RefinedMatchMeta {
-        rule_id: meta.rule_id.clone(),
-        reason: meta.reason.clone(),
-        severity: meta.severity,
-        suggestion: meta.suggestion.clone(),
-    })
-}
-
-fn refine_typescript_match(meta: &CompiledPattern, matched_text: &str) -> Option<RefinedMatchMeta> {
-    let rule_id = meta.rule_id.as_str();
-
-    if matches!(
-        rule_id,
-        "heredoc.typescript.execsync" | "heredoc.typescript.require_execsync"
-    ) {
-        let payload = JS_EXEC_SYNC_LITERAL
-            .captures(matched_text)
-            .and_then(|caps| string_literal_from_caps(&caps));
-
-        if let Some(payload) = payload {
-            return detect_shell_payload(payload).map(|hit| RefinedMatchMeta {
-                rule_id: format!("{rule_id}.{}", hit.rule_suffix),
-                reason: hit.reason.to_string(),
-                severity: hit.severity,
-                suggestion: hit.suggestion.map(str::to_string),
-            });
-        }
-
-        return Some(RefinedMatchMeta {
-            rule_id: meta.rule_id.clone(),
-            reason: meta.reason.clone(),
-            severity: Severity::Medium,
-            suggestion: meta.suggestion.clone(),
-        });
-    }
-
-    if rule_id == "heredoc.typescript.spawnsync" {
-        if let Some(caps) = JS_SPAWN_SYNC_CMD_ARGS.captures(matched_text) {
-            let cmd = string_literal_from_caps(&caps).unwrap_or("");
-            let args = caps.name("args").map_or("", |m| m.as_str());
-            let args: Vec<&str> = JS_ARRAY_STRING_LITERALS
-                .captures_iter(args)
-                .filter_map(|caps| string_literal_from_caps(&caps))
-                .collect();
-
-            if let Some(reconstructed) = reconstruct_spawn_command(cmd, &args) {
-                return detect_shell_payload(&reconstructed).map(|hit| RefinedMatchMeta {
-                    rule_id: format!("{rule_id}.{}", hit.rule_suffix),
-                    reason: hit.reason.to_string(),
-                    severity: hit.severity,
-                    suggestion: hit.suggestion.map(str::to_string),
-                });
-            }
-
-            return None;
-        }
-
-        return Some(RefinedMatchMeta {
-            rule_id: meta.rule_id.clone(),
-            reason: meta.reason.clone(),
-            severity: Severity::Medium,
-            suggestion: meta.suggestion.clone(),
-        });
-    }
-
-    if rule_id.starts_with("heredoc.typescript.fs_")
-        || rule_id.starts_with("heredoc.typescript.fspromises_")
-        || rule_id == "heredoc.typescript.deno_remove"
-    {
-        let path = JS_FIRST_STRING_ARG
-            .captures(matched_text)
-            .and_then(|caps| string_literal_from_caps(&caps));
-
-        let recursive_relevant = JS_RECURSIVE_TRUE.is_match(matched_text);
-        let catastrophic = path.is_some_and(is_catastrophic_path);
-
-        let needs_recursive = matches!(
-            rule_id,
-            "heredoc.typescript.fs_rmsync"
-                | "heredoc.typescript.fs_rmdirsync"
-                | "heredoc.typescript.fs_rm"
-                | "heredoc.typescript.fs_rmdir"
-                | "heredoc.typescript.fspromises_rm"
-                | "heredoc.typescript.fspromises_rmdir"
-                | "heredoc.typescript.deno_remove"
-        );
-
-        if needs_recursive && !recursive_relevant && !catastrophic {
-            return None;
-        }
-
-        if catastrophic {
-            return Some(RefinedMatchMeta {
-                rule_id: format!("{rule_id}.catastrophic"),
-                reason: format!("{} (catastrophic target path)", meta.reason),
-                severity: Severity::Critical,
-                suggestion: meta.suggestion.clone(),
-            });
-        }
-
-        return Some(RefinedMatchMeta {
-            rule_id: meta.rule_id.clone(),
-            reason: meta.reason.clone(),
-            severity: meta.severity,
-            suggestion: meta.suggestion.clone(),
-        });
-    }
-
-    Some(RefinedMatchMeta {
-        rule_id: meta.rule_id.clone(),
-        reason: meta.reason.clone(),
-        severity: meta.severity,
-        suggestion: meta.suggestion.clone(),
-    })
-}
-
-fn refine_ruby_match(meta: &CompiledPattern, matched_text: &str) -> Option<RefinedMatchMeta> {
-    let rule_id = meta.rule_id.as_str();
-
-    if matches!(
-        rule_id,
-        "heredoc.ruby.system"
-            | "heredoc.ruby.exec"
-            | "heredoc.ruby.kernel_system"
-            | "heredoc.ruby.kernel_exec"
-            | "heredoc.ruby.backticks"
-            | "heredoc.ruby.open3_capture3"
-            | "heredoc.ruby.open3_popen3"
-    ) {
-        let payload = if rule_id == "heredoc.ruby.backticks" {
-            RUBY_BACKTICKS_LITERAL
-                .captures(matched_text)
-                .and_then(|caps| caps.name("cmd").map(|m| m.as_str()))
-        } else if rule_id.starts_with("heredoc.ruby.open3_") {
-            // Open3 methods take the command as first argument
-            RUBY_FIRST_STRING_ARG
-                .captures(matched_text)
-                .and_then(|caps| string_literal_from_caps(&caps))
-        } else {
-            RUBY_SYSTEM_EXEC_LITERAL
-                .captures(matched_text)
-                .and_then(|caps| string_literal_from_caps(&caps))
-        };
-
-        if let Some(payload) = payload {
-            return detect_shell_payload(payload).map(|hit| RefinedMatchMeta {
-                rule_id: format!("{rule_id}.{}", hit.rule_suffix),
-                reason: hit.reason.to_string(),
-                severity: hit.severity,
-                suggestion: hit.suggestion.map(str::to_string),
-            });
-        }
-
-        // Dynamic system/exec/backticks/Open3: warn only (couldn't extract literal command).
-        return Some(RefinedMatchMeta {
-            rule_id: meta.rule_id.clone(),
-            reason: meta.reason.clone(),
-            severity: Severity::Medium,
-            suggestion: meta.suggestion.clone(),
-        });
-    }
-
-    if rule_id.starts_with("heredoc.ruby.fileutils_")
-        || rule_id.starts_with("heredoc.ruby.file_")
-        || rule_id.starts_with("heredoc.ruby.dir_")
-    {
-        let path = RUBY_FIRST_STRING_ARG
-            .captures(matched_text)
-            .and_then(|caps| string_literal_from_caps(&caps));
-
-        let catastrophic = path.is_some_and(is_catastrophic_path);
-        if catastrophic {
-            return Some(RefinedMatchMeta {
-                rule_id: format!("{rule_id}.catastrophic"),
-                reason: format!("{} (catastrophic target path)", meta.reason),
-                severity: Severity::Critical,
-                suggestion: meta.suggestion.clone(),
-            });
-        }
-
-        return Some(RefinedMatchMeta {
-            rule_id: meta.rule_id.clone(),
-            reason: meta.reason.clone(),
-            severity: Severity::Medium,
-            suggestion: meta.suggestion.clone(),
-        });
-    }
-
-    Some(RefinedMatchMeta {
-        rule_id: meta.rule_id.clone(),
-        reason: meta.reason.clone(),
-        severity: meta.severity,
-        suggestion: meta.suggestion.clone(),
-    })
-}
-
-fn reconstruct_spawn_command(cmd: &str, args: &[&str]) -> Option<String> {
-    let cmd = cmd.trim();
-    if cmd.is_empty() {
-        return None;
-    }
-
-    let mut out = String::new();
-    out.push_str(cmd);
-    for arg in args {
-        out.push(' ');
-        out.push_str(arg);
-    }
-
-    Some(out)
-}
-
-// ============================================================================
-// Perl regex fallback ast_matcher (git_safety_guard-2d4)
-// ============================================================================
-
-static PERL_SYSTEM_EXEC_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
-    // Matches:
-    // - system("...") / system '...'
-    // - exec("...")   / exec '...'
-    //
-    // We intentionally only match *simple single-line* string literals to keep signal high.
-    Regex::new(
-        r#"(?m)\b(?P<call>system|exec)\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
-    )
-    .expect("perl system/exec literal regex compiles")
-});
-
-static PERL_BACKTICKS_LITERAL: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?m)`(?P<cmd>[^`\n]*)`").expect("perl backticks regex compiles"));
-
-static PERL_QX_SLASH_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
-    // Matches qx/.../ (slash delimiter only, v1).
-    Regex::new(r"(?m)\bqx\s*/(?P<cmd>(?:\\.|[^/\n])*)/").expect("perl qx// regex compiles")
-});
-
-static PERL_FILE_PATH_RMTREE_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?m)\bFile::Path::(?P<fn>rmtree|remove_tree)\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#,
-    )
-    .expect("perl File::Path rmtree/remove_tree regex compiles")
-});
-
-static PERL_UNLINK_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?m)\bunlink\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#)
-        .expect("perl unlink regex compiles")
-});
-
-static PERL_RMDIR_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?m)\brmdir\b(?:\s*\(\s*|\s+)(?:"(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)')"#)
-        .expect("perl rmdir regex compiles")
-});
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PerlShellCall {
-    System,
-    Exec,
-    Backticks,
-    Qx,
-}
-
-impl PerlShellCall {
-    #[must_use]
-    const fn id_prefix(self) -> &'static str {
-        match self {
-            Self::System => "system",
-            Self::Exec => "exec",
-            Self::Backticks => "backticks",
-            Self::Qx => "qx",
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum PerlCommentState {
-    Normal,
-    Single,
-    Double,
-    Backtick,
-}
-
-fn find_matches_perl(
-    code: &str,
-    start_time: Instant,
-    timeout: Duration,
-    budget_ms: u64,
-) -> Result<Vec<PatternMatch>, MatchError> {
-    let newline_positions: Vec<usize> = memchr_iter(b'\n', code.as_bytes()).collect();
-    let masked = mask_perl_comments(code);
-    let haystack = masked.as_ref();
-
-    let mut matches = Vec::new();
-
-    scan_perl_system_exec(
-        &mut matches,
-        code,
-        haystack,
-        &newline_positions,
-        start_time,
-        timeout,
-        budget_ms,
-    )?;
-    scan_perl_backticks(
-        &mut matches,
-        code,
-        haystack,
-        &newline_positions,
-        start_time,
-        timeout,
-        budget_ms,
-    )?;
-    scan_perl_qx(
-        &mut matches,
-        code,
-        haystack,
-        &newline_positions,
-        start_time,
-        timeout,
-        budget_ms,
-    )?;
-    scan_perl_file_path(
-        &mut matches,
-        code,
-        haystack,
-        &newline_positions,
-        start_time,
-        timeout,
-        budget_ms,
-    )?;
-    scan_perl_unlink_rmdir(
-        &mut matches,
-        code,
-        haystack,
-        &newline_positions,
-        start_time,
-        timeout,
-        budget_ms,
-    )?;
-
-    Ok(matches)
-}
-
-#[inline]
-fn perl_check_timeout(
-    start_time: Instant,
-    timeout: Duration,
-    budget_ms: u64,
-) -> Result<(), MatchError> {
-    if start_time.elapsed() > timeout {
-        let elapsed_ms = u64::try_from(start_time.elapsed().as_millis()).unwrap_or(u64::MAX);
-        return Err(MatchError::Timeout {
-            elapsed_ms,
-            budget_ms,
-        });
-    }
-    Ok(())
-}
-
-fn scan_perl_system_exec(
-    out: &mut Vec<PatternMatch>,
-    code: &str,
-    haystack: &str,
-    newline_positions: &[usize],
-    start_time: Instant,
-    timeout: Duration,
-    budget_ms: u64,
-) -> Result<(), MatchError> {
-    for caps in PERL_SYSTEM_EXEC_LITERAL.captures_iter(haystack) {
-        perl_check_timeout(start_time, timeout, budget_ms)?;
-        let Some(m) = caps.get(0) else {
-            continue;
-        };
-
-        let call = caps.name("call").map_or("", |m| m.as_str());
-        let call = match call {
-            "system" => PerlShellCall::System,
-            "exec" => PerlShellCall::Exec,
-            _ => continue,
-        };
-
-        let Some(payload) = string_literal_from_caps(&caps) else {
-            continue;
-        };
-
-        push_perl_shell_payload_match(
-            out,
-            code,
-            newline_positions,
-            call,
-            payload,
-            m.start(),
-            m.end(),
-        );
-    }
-
-    Ok(())
-}
-
-fn scan_perl_backticks(
-    out: &mut Vec<PatternMatch>,
-    code: &str,
-    haystack: &str,
-    newline_positions: &[usize],
-    start_time: Instant,
-    timeout: Duration,
-    budget_ms: u64,
-) -> Result<(), MatchError> {
-    for caps in PERL_BACKTICKS_LITERAL.captures_iter(haystack) {
-        perl_check_timeout(start_time, timeout, budget_ms)?;
-        let Some(m) = caps.get(0) else {
-            continue;
-        };
-        let Some(payload) = caps.name("cmd").map(|m| m.as_str()) else {
-            continue;
-        };
-
-        push_perl_shell_payload_match(
-            out,
-            code,
-            newline_positions,
-            PerlShellCall::Backticks,
-            payload,
-            m.start(),
-            m.end(),
-        );
-    }
-
-    Ok(())
-}
-
-fn scan_perl_qx(
-    out: &mut Vec<PatternMatch>,
-    code: &str,
-    haystack: &str,
-    newline_positions: &[usize],
-    start_time: Instant,
-    timeout: Duration,
-    budget_ms: u64,
-) -> Result<(), MatchError> {
-    for caps in PERL_QX_SLASH_LITERAL.captures_iter(haystack) {
-        perl_check_timeout(start_time, timeout, budget_ms)?;
-        let Some(m) = caps.get(0) else {
-            continue;
-        };
-        let Some(payload) = caps.name("cmd").map(|m| m.as_str()) else {
-            continue;
-        };
-
-        push_perl_shell_payload_match(
-            out,
-            code,
-            newline_positions,
-            PerlShellCall::Qx,
-            unescape_perl_qx_payload(payload).as_ref(),
-            m.start(),
-            m.end(),
-        );
-    }
-
-    Ok(())
-}
-
-fn unescape_perl_qx_payload(payload: &str) -> std::borrow::Cow<'_, str> {
-    if payload.contains("\\/") {
-        return std::borrow::Cow::Owned(payload.replace("\\/", "/"));
-    }
-    std::borrow::Cow::Borrowed(payload)
-}
-
-fn scan_perl_file_path(
-    out: &mut Vec<PatternMatch>,
-    code: &str,
-    haystack: &str,
-    newline_positions: &[usize],
-    start_time: Instant,
-    timeout: Duration,
-    budget_ms: u64,
-) -> Result<(), MatchError> {
-    for caps in PERL_FILE_PATH_RMTREE_LITERAL.captures_iter(haystack) {
-        perl_check_timeout(start_time, timeout, budget_ms)?;
-        let Some(m) = caps.get(0) else {
-            continue;
-        };
-        let Some(path) = string_literal_from_caps(&caps) else {
-            continue;
-        };
-        let fn_name = caps.name("fn").map_or("rmtree", |m| m.as_str());
-
-        let severity = if is_catastrophic_path(path) {
-            Severity::Critical
-        } else {
-            Severity::Medium
-        };
-
-        let rule_id = format!("heredoc.perl.file_path.{fn_name}");
-        let reason = format!("File::Path::{fn_name}() recursively deletes directories");
-
-        push_regex_match(
-            out,
-            code,
-            newline_positions,
-            &rule_id,
-            &reason,
-            severity,
-            Some("Verify target path carefully before running".to_string()),
-            m.start(),
-            m.end(),
-        );
-    }
-
-    Ok(())
-}
-
-fn scan_perl_unlink_rmdir(
-    out: &mut Vec<PatternMatch>,
-    code: &str,
-    haystack: &str,
-    newline_positions: &[usize],
-    start_time: Instant,
-    timeout: Duration,
-    budget_ms: u64,
-) -> Result<(), MatchError> {
-    for caps in PERL_UNLINK_LITERAL.captures_iter(haystack) {
-        perl_check_timeout(start_time, timeout, budget_ms)?;
-        let Some(m) = caps.get(0) else {
-            continue;
-        };
-        // Only match string-literal unlink; severity is warn-only by default.
-        push_regex_match(
-            out,
-            code,
-            newline_positions,
-            "heredoc.perl.unlink",
-            "unlink() deletes files",
-            Severity::Low,
-            None,
-            m.start(),
-            m.end(),
-        );
-    }
-
-    for caps in PERL_RMDIR_LITERAL.captures_iter(haystack) {
-        perl_check_timeout(start_time, timeout, budget_ms)?;
-        let Some(m) = caps.get(0) else {
-            continue;
-        };
-        push_regex_match(
-            out,
-            code,
-            newline_positions,
-            "heredoc.perl.rmdir",
-            "rmdir() deletes directories",
-            Severity::Low,
-            None,
-            m.start(),
-            m.end(),
-        );
-    }
-
-    Ok(())
-}
-
-fn mask_perl_comments(code: &str) -> std::borrow::Cow<'_, str> {
-    if !code.as_bytes().contains(&b'#') {
-        return std::borrow::Cow::Borrowed(code);
-    }
-
-    let mut out = code.as_bytes().to_vec();
-    let mut state = PerlCommentState::Normal;
-    let mut i = 0usize;
-
-    while i < out.len() {
-        match state {
-            PerlCommentState::Normal => match out[i] {
-                b'#' => {
-                    // Mask until newline (keep newline itself).
-                    let start = i;
-                    while i < out.len() && out[i] != b'\n' {
-                        i += 1;
-                    }
-                    for b in &mut out[start..i] {
-                        *b = b' ';
-                    }
-                }
-                b'\'' => {
-                    state = PerlCommentState::Single;
-                    i += 1;
-                }
-                b'"' => {
-                    state = PerlCommentState::Double;
-                    i += 1;
-                }
-                b'`' => {
-                    state = PerlCommentState::Backtick;
-                    i += 1;
-                }
-                _ => i += 1,
-            },
-            PerlCommentState::Single => {
-                if out[i] == b'\\' {
-                    i = (i + 2).min(out.len());
-                    continue;
-                }
-                if out[i] == b'\'' {
-                    state = PerlCommentState::Normal;
-                }
-                i += 1;
-            }
-            PerlCommentState::Double => {
-                if out[i] == b'\\' {
-                    i = (i + 2).min(out.len());
-                    continue;
-                }
-                if out[i] == b'"' {
-                    state = PerlCommentState::Normal;
-                }
-                i += 1;
-            }
-            PerlCommentState::Backtick => {
-                if out[i] == b'\\' {
-                    i = (i + 2).min(out.len());
-                    continue;
-                }
-                if out[i] == b'`' {
-                    state = PerlCommentState::Normal;
-                }
-                i += 1;
-            }
-        }
-    }
-
-    String::from_utf8(out).map_or(std::borrow::Cow::Borrowed(code), std::borrow::Cow::Owned)
-}
-
-fn string_literal_from_caps<'t>(caps: &regex::Captures<'t>) -> Option<&'t str> {
-    caps.name("dq")
-        .or_else(|| caps.name("sq"))
-        .map(|m| m.as_str())
-}
-
-/// Matches every single- or double-quoted string literal in a fragment of
-/// source text, exposing the inner content via the `dq`/`sq` capture groups.
-///
-/// Used to scan an exec-sink call's *entire* argument list — including string
-/// elements nested inside a list/tuple literal — for a destructive payload, so
-/// `subprocess.run(["sh", "-c", "rm -rf /etc"])` is caught even though its first
-/// literal (`"sh"`) is inert. Literals are matched independently of position, so
-/// this is intentionally permissive: it is only ever invoked once a known
-/// exec-sink call has already been identified.
-static ANY_STRING_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#""(?P<dq>[^"\n]*)"|'(?P<sq>[^'\n]*)'"#).expect("any string literal regex compiles")
-});
-
-/// Return the slice of `code` covering an exec-sink call's argument region,
-/// starting at `match_start` (the sink name) and ending at the balanced closing
-/// `)` of the call's argument list.
-///
-/// String literals are skipped so parens/brackets inside them don't perturb the
-/// depth count. If the closing paren can't be found (malformed/truncated source),
-/// the region is bounded to the end of the current line so we still scan the
-/// visible arguments. This lets [`detect_destructive_in_args`] see every literal
-/// in `subprocess.run(["sh", "-c", "rm -rf /etc"])`, not just the first.
-fn exec_sink_arg_region(code: &str, match_start: usize) -> &str {
-    let bytes = code.as_bytes();
-    let mut depth: i32 = 0;
-    let mut seen_open = false;
-    let mut quote: Option<u8> = None;
-    let mut i = match_start;
-
-    while i < bytes.len() {
-        let b = bytes[i];
-        if let Some(q) = quote {
-            // Inside a string literal: only its terminator (un-escaped) matters.
-            if b == b'\\' {
-                i += 2;
-                continue;
-            }
-            if b == q {
-                quote = None;
-            }
-            i += 1;
-            continue;
-        }
-        match b {
-            b'"' | b'\'' => quote = Some(b),
-            b'(' | b'[' | b'{' => {
-                depth += 1;
-                seen_open = true;
-            }
-            b')' | b']' | b'}' => {
-                depth -= 1;
-                if seen_open && depth <= 0 {
-                    return code
-                        .get(match_start..=i)
-                        .unwrap_or_else(|| &code[match_start..]);
-                }
-            }
-            b'\n' if !seen_open => {
-                // Sink name with no opening paren on this line: bail to line end.
-                return code
-                    .get(match_start..i)
-                    .unwrap_or_else(|| &code[match_start..]);
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-
-    &code[match_start..]
-}
-
-/// Scan **every** string literal in an exec-sink call's text for a destructive
-/// shell payload and return the first hit.
-///
-/// This descends into list/tuple literal elements (e.g. the `"rm -rf /etc"`
-/// inside `subprocess.run(["sh", "-c", "rm -rf /etc"])`), closing the list-arg
-/// exec-sink false negative where only the first literal was inspected (#136).
-/// Callers MUST only invoke this once the surrounding call is confirmed to be a
-/// real exec sink, so inert literals (`print("rm -rf x")`) never reach here.
-fn detect_destructive_in_args(call_text: &str) -> Option<ShellPayloadHit> {
-    let literals: Vec<String> = ANY_STRING_LITERAL
-        .captures_iter(call_text)
-        .filter_map(|caps| string_literal_from_caps(&caps).map(str::to_string))
-        .collect();
-
-    // 1) Each literal on its own (catches `subprocess.run(["sh","-c","rm -rf /etc"])`
-    //    where the destructive command lives in a single literal).
-    if let Some(hit) = literals.iter().find_map(|lit| detect_shell_payload(lit)) {
-        return Some(hit);
-    }
-
-    // 2) Argv-style reconstruction: a destructive command split across separate
-    //    literals (`spawnSync("rm", ["-rf", "/etc/x"])`, `exec.Command("rm","-rf","/x")`)
-    //    has no single literal that flags, so join every literal as one command
-    //    line and re-scan (#136). Safe because this runs ONLY after the call is
-    //    confirmed to be a real exec sink, so inert literals never reach here.
-    if literals.len() > 1 {
-        let joined = literals.join(" ");
-        if let Some(hit) = detect_shell_payload(&joined) {
-            return Some(hit);
-        }
-    }
-
-    None
-}
-
-fn push_perl_shell_payload_match(
-    out: &mut Vec<PatternMatch>,
-    code: &str,
-    newline_positions: &[usize],
-    call: PerlShellCall,
-    payload: &str,
-    start: usize,
-    end: usize,
-) {
-    let Some(hit) = detect_shell_payload(payload) else {
-        return;
-    };
-
-    let rule_id = format!("heredoc.perl.{}.{}", call.id_prefix(), hit.rule_suffix);
-    push_regex_match(
-        out,
-        code,
-        newline_positions,
-        &rule_id,
-        hit.reason,
-        hit.severity,
-        hit.suggestion.map(str::to_string),
-        start,
-        end,
-    );
-}
-
-struct ShellPayloadHit {
-    rule_suffix: &'static str,
-    reason: &'static str,
-    severity: Severity,
-    suggestion: Option<&'static str>,
-}
-
-fn detect_shell_payload(payload: &str) -> Option<ShellPayloadHit> {
-    for segment in payload.split(&[';', '\n', '|', '&'][..]) {
-        let segment = segment.trim();
-        if segment.is_empty() {
-            continue;
-        }
-
-        let mut tokens = segment.split_whitespace().peekable();
-        let Some(cmd) = next_shell_command(&mut tokens) else {
-            continue;
-        };
-
-        match cmd {
-            "git" => {
-                if let Some(hit) = detect_git_destructive(tokens) {
-                    return Some(hit);
-                }
-            }
-            "rm" => {
-                if let Some(hit) = detect_rm_rf_destructive(tokens) {
-                    return Some(hit);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    None
-}
-
-fn detect_git_destructive<'a, I>(mut tokens: I) -> Option<ShellPayloadHit>
-where
-    I: Iterator<Item = &'a str>,
-{
-    let sub = tokens.next()?;
-
-    if sub == "reset" {
-        if tokens.any(|t| t == "--hard") {
-            return Some(ShellPayloadHit {
-                rule_suffix: "git_reset_hard",
-                reason: "git reset --hard destroys uncommitted changes",
-                severity: Severity::High,
-                suggestion: Some("Use 'git stash' first, or prefer safer alternatives"),
-            });
-        }
-        return None;
-    }
-
-    if sub == "clean" {
-        let mut has_f = false;
-        let mut has_d = false;
-
-        for t in tokens {
-            if t == "--force" {
-                has_f = true;
-                continue;
-            }
-            if t == "--dry-run" || t == "-n" {
-                continue;
-            }
-            if t.starts_with('-') {
-                let flags = t.trim_start_matches('-');
-                has_f |= flags.contains('f');
-                has_d |= flags.contains('d');
-            }
-        }
-
-        if has_f && has_d {
-            return Some(ShellPayloadHit {
-                rule_suffix: "git_clean_fd",
-                reason: "git clean -fd permanently deletes untracked files",
-                severity: Severity::High,
-                suggestion: Some("Use 'git clean -n' first to preview deletions"),
-            });
-        }
-    }
-
-    None
-}
-
-fn detect_rm_rf_destructive<'a, I>(tokens: I) -> Option<ShellPayloadHit>
-where
-    I: Iterator<Item = &'a str>,
-{
-    let mut has_r = false;
-    let mut has_f = false;
-    let mut target: Option<&str> = None;
-    let mut options_ended = false;
-
-    for token in tokens {
-        if !options_ended && token == "--" {
-            options_ended = true;
-            continue;
-        }
-        if !options_ended && token.starts_with('-') {
-            if token == "--recursive" {
-                has_r = true;
-                continue;
-            }
-            if token == "--force" {
-                has_f = true;
-                continue;
-            }
-
-            let flags = token.trim_start_matches('-');
-            has_r |= flags.chars().any(|c| matches!(c, 'r' | 'R'));
-            has_f |= flags.contains('f');
-            continue;
-        }
-
-        target = Some(token);
-        break;
-    }
-
-    if !has_r || !has_f {
-        return None;
-    }
-
-    let target = clean_path_token(target?);
-    let catastrophic = is_catastrophic_path(target);
-
-    Some(ShellPayloadHit {
-        rule_suffix: if catastrophic {
-            "rm_rf_catastrophic"
-        } else {
-            "rm_rf"
-        },
-        reason: if catastrophic {
-            "rm -rf recursively deletes files/directories (catastrophic target path)"
-        } else {
-            "rm -rf recursively deletes files/directories"
-        },
-        severity: if catastrophic {
-            Severity::Critical
-        } else {
-            Severity::Medium
-        },
-        suggestion: Some("Verify the target path and use safer alternatives when possible"),
-    })
-}
-
-fn next_shell_command<'a, I>(tokens: &mut std::iter::Peekable<I>) -> Option<&'a str>
-where
-    I: Iterator<Item = &'a str>,
-{
-    loop {
-        let token = tokens.next()?;
-        match token {
-            "sudo" => {
-                while let Some(&next) = tokens.peek() {
-                    if !next.starts_with('-') {
-                        break;
-                    }
-                    let flag = tokens.next().unwrap_or_default();
-                    if matches!(flag, "-u" | "-g" | "-h") {
-                        let _ = tokens.next();
-                    }
-                }
-            }
-            "command" => {
-                while let Some(&next) = tokens.peek() {
-                    if next.starts_with('-') {
-                        let _ = tokens.next();
-                        continue;
-                    }
-                    break;
-                }
-            }
-            "env" => {
-                while let Some(&next) = tokens.peek() {
-                    if next.starts_with('-') || next.contains('=') {
-                        let _ = tokens.next();
-                        continue;
-                    }
-                    break;
-                }
-            }
-            _ => return Some(token),
-        }
-    }
-}
-
-fn clean_path_token(token: &str) -> &str {
-    let token = token.trim_matches(|c: char| c == '"' || c == '\'');
-    token.trim_end_matches(&[';', ',', ')', ']', '}'][..])
-}
-
-/// Check if a path contains `..` as an actual path component (not in a filename).
-///
-/// Examples:
-/// - `/tmp/../etc` → true (path traversal)
-/// - `/tmp/foo..bar` → false (dots in filename, not traversal)
-/// - `../etc` → true (relative path traversal)
-fn contains_path_traversal(path: &str) -> bool {
-    // Check for `..` as a path segment: `/../`, `/..` at end, `../` at start, or exactly `..`
-    path.contains("/../") || path.ends_with("/..") || path.starts_with("../") || path == ".."
-}
-
-fn has_path_prefix(path: &str, prefix: &str) -> bool {
-    if !path.starts_with(prefix) {
-        return false;
-    }
-    // It starts with prefix. It's a match if exact match OR next char is separator.
-    path.len() == prefix.len() || path.as_bytes()[prefix.len()] == b'/'
-}
-
-fn is_catastrophic_path(path: &str) -> bool {
-    // Root or home always catastrophic
-    if matches!(path, "/" | "~") || path.starts_with("~/") {
-        return true;
-    }
-
-    // Temp directories are safe UNLESS they contain path traversal.
-    // Path traversal can escape temp directories (e.g., /tmp/../etc -> /etc).
-    if has_path_prefix(path, "/tmp") || has_path_prefix(path, "/var/tmp") {
-        return contains_path_traversal(path);
-    }
-
-    // Standard catastrophic system paths
-    let sys_dirs = [
-        "/etc", "/home", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/var", "/boot", "/root",
-        "/opt", "/sys", "/proc", "/dev", "/mnt", "/media", "/srv", "/run",
-    ];
-
-    sys_dirs.iter().any(|&dir| has_path_prefix(path, dir))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn push_regex_match(
-    out: &mut Vec<PatternMatch>,
-    code: &str,
-    newline_positions: &[usize],
-    rule_id: &str,
-    reason: &str,
-    severity: Severity,
-    suggestion: Option<String>,
-    start: usize,
-    end: usize,
-) {
-    let line_number = newline_positions.partition_point(|&idx| idx < start) + 1;
-    let matched_text = code.get(start..end).unwrap_or("");
-    let preview = truncate_preview(matched_text, 60);
-
-    out.push(PatternMatch {
-        rule_id: rule_id.to_string(),
-        reason: reason.to_string(),
-        matched_text_preview: preview,
-        start,
-        end,
-        line_number,
-        severity,
-        suggestion,
-    });
-}
-
-/// Default patterns for heredoc scanning.
-///
-/// These patterns detect destructive operations in embedded scripts.
-/// Each pattern has a stable rule ID for allowlisting.
-#[allow(clippy::too_many_lines)]
-fn default_patterns() -> HashMap<ScriptLanguage, Vec<CompiledPattern>> {
-    let mut patterns = HashMap::new();
-
-    // Python patterns
-    patterns.insert(
+    AstMatcher::with_patterns(std::collections::HashMap::from([(
         ScriptLanguage::Python,
-        vec![
-            CompiledPattern::new(
-                "shutil.rmtree($$$)".to_string(),
-                "heredoc.python.shutil_rmtree".to_string(),
-                "shutil.rmtree() recursively deletes directories".to_string(),
-                Severity::Critical,
-                Some("Use shutil.rmtree with explicit path validation".to_string()),
-            ),
-            CompiledPattern::new(
-                "os.remove($$$)".to_string(),
-                "heredoc.python.os_remove".to_string(),
-                "os.remove() deletes files".to_string(),
-                Severity::High,
-                None,
-            ),
-            CompiledPattern::new(
-                "os.rmdir($$$)".to_string(),
-                "heredoc.python.os_rmdir".to_string(),
-                "os.rmdir() deletes directories".to_string(),
-                Severity::High,
-                None,
-            ),
-            CompiledPattern::new(
-                "os.unlink($$$)".to_string(),
-                "heredoc.python.os_unlink".to_string(),
-                "os.unlink() deletes files".to_string(),
-                Severity::High,
-                None,
-            ),
-            CompiledPattern::new(
-                "pathlib.Path($$$).unlink($$$)".to_string(),
-                "heredoc.python.pathlib_unlink".to_string(),
-                "Path.unlink() deletes files".to_string(),
-                Severity::High,
-                None,
-            ),
-            // Also match when Path is imported directly: from pathlib import Path
-            CompiledPattern::new(
-                "Path($$$).unlink($$$)".to_string(),
-                "heredoc.python.pathlib_unlink".to_string(),
-                "Path.unlink() deletes files".to_string(),
-                Severity::High,
-                None,
-            ),
-            CompiledPattern::new(
-                "pathlib.Path($$$).rmdir($$$)".to_string(),
-                "heredoc.python.pathlib_rmdir".to_string(),
-                "Path.rmdir() deletes directories".to_string(),
-                Severity::High,
-                None,
-            ),
-            // Also match when Path is imported directly
-            CompiledPattern::new(
-                "Path($$$).rmdir($$$)".to_string(),
-                "heredoc.python.pathlib_rmdir".to_string(),
-                "Path.rmdir() deletes directories".to_string(),
-                Severity::High,
-                None,
-            ),
-            // Shell execution patterns - Medium severity to avoid false positives
-            // per bead guidance: "Do not block on shell=True alone"
-            CompiledPattern::new(
-                "subprocess.run($$$)".to_string(),
-                "heredoc.python.subprocess_run".to_string(),
-                "subprocess.run() executes shell commands".to_string(),
-                Severity::Medium,
-                Some("Validate command arguments carefully".to_string()),
-            ),
-            CompiledPattern::new(
-                "subprocess.call($$$)".to_string(),
-                "heredoc.python.subprocess_call".to_string(),
-                "subprocess.call() executes shell commands".to_string(),
-                Severity::Medium,
-                Some("Validate command arguments carefully".to_string()),
-            ),
-            CompiledPattern::new(
-                "subprocess.Popen($$$)".to_string(),
-                "heredoc.python.subprocess_popen".to_string(),
-                "subprocess.Popen() spawns shell processes".to_string(),
-                Severity::Medium,
-                Some("Validate command arguments carefully".to_string()),
-            ),
-            CompiledPattern::new(
-                "os.system($$$)".to_string(),
-                "heredoc.python.os_system".to_string(),
-                "os.system() executes shell commands".to_string(),
-                Severity::Medium, // Lowered per bead: avoid "code execution exists" as default deny
-                Some("Use subprocess with explicit arguments instead".to_string()),
-            ),
-            CompiledPattern::new(
-                "os.popen($$$)".to_string(),
-                "heredoc.python.os_popen".to_string(),
-                "os.popen() executes shell commands".to_string(),
-                Severity::Medium,
-                Some("Use subprocess instead".to_string()),
-            ),
-        ],
-    );
+        patterns,
+    )]))
+});
 
-    // JavaScript/Node patterns
-    patterns.insert(
-        ScriptLanguage::JavaScript,
-        vec![
-            CompiledPattern::new(
-                "fs.rmSync($$$)".to_string(),
-                "heredoc.javascript.fs_rmsync".to_string(),
-                "fs.rmSync() deletes files/directories".to_string(),
-                Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
-                Some("Verify target path carefully before running".to_string()),
-            ),
-            CompiledPattern::new(
-                "fs.rmdirSync($$$)".to_string(),
-                "heredoc.javascript.fs_rmdirsync".to_string(),
-                "fs.rmdirSync() deletes directories".to_string(),
-                Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
-                Some("Verify target path carefully before running".to_string()),
-            ),
-            CompiledPattern::new(
-                "fs.unlinkSync($$$)".to_string(),
-                "heredoc.javascript.fs_unlinksync".to_string(),
-                "fs.unlinkSync() deletes files".to_string(),
-                Severity::Low,
-                None,
-            ),
-            CompiledPattern::new(
-                "child_process.execSync($$$)".to_string(),
-                "heredoc.javascript.execsync".to_string(),
-                "execSync() executes shell commands".to_string(),
-                Severity::Medium, // refined to block only on destructive literal payloads
-                Some("Validate command arguments carefully".to_string()),
-            ),
-            CompiledPattern::new(
-                "require('child_process').execSync($$$)".to_string(),
-                "heredoc.javascript.require_execsync".to_string(),
-                "execSync() executes shell commands".to_string(),
-                Severity::Medium, // refined to block only on destructive literal payloads
-                Some("Validate command arguments carefully".to_string()),
-            ),
-            // Spawn variants
-            CompiledPattern::new(
-                "child_process.spawnSync($$$)".to_string(),
-                "heredoc.javascript.spawnsync".to_string(),
-                "spawnSync() executes shell commands".to_string(),
-                Severity::Medium,
-                Some("Validate command and arguments carefully".to_string()),
-            ),
-            // Async versions (still dangerous)
-            CompiledPattern::new(
-                "fs.rm($$$)".to_string(),
-                "heredoc.javascript.fs_rm".to_string(),
-                "fs.rm() deletes files/directories".to_string(),
-                Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
-                Some("Verify target path carefully before running".to_string()),
-            ),
-            CompiledPattern::new(
-                "fs.rmdir($$$)".to_string(),
-                "heredoc.javascript.fs_rmdir".to_string(),
-                "fs.rmdir() deletes directories".to_string(),
-                Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
-                Some("Verify target path carefully before running".to_string()),
-            ),
-            CompiledPattern::new(
-                "fs.unlink($$$)".to_string(),
-                "heredoc.javascript.fs_unlink".to_string(),
-                "fs.unlink() deletes files".to_string(),
-                Severity::Low,
-                None,
-            ),
-            // Promise-based fs variants
-            CompiledPattern::new(
-                "fsPromises.rm($$$)".to_string(),
-                "heredoc.javascript.fspromises_rm".to_string(),
-                "fsPromises.rm() deletes files/directories".to_string(),
-                Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
-                Some("Verify target path carefully before running".to_string()),
-            ),
-            CompiledPattern::new(
-                "fsPromises.rmdir($$$)".to_string(),
-                "heredoc.javascript.fspromises_rmdir".to_string(),
-                "fsPromises.rmdir() deletes directories".to_string(),
-                Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
-                Some("Verify target path carefully before running".to_string()),
-            ),
-        ],
-    );
-
-    // TypeScript patterns (git_safety_guard-26f)
-    patterns.insert(
-        ScriptLanguage::TypeScript,
-        vec![
-            CompiledPattern::new(
-                "fs.rmSync($$$)".to_string(),
-                "heredoc.typescript.fs_rmsync".to_string(),
-                "fs.rmSync() deletes files/directories".to_string(),
-                Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
-                Some("Verify target path carefully before running".to_string()),
-            ),
-            CompiledPattern::new(
-                "fs.rmdirSync($$$)".to_string(),
-                "heredoc.typescript.fs_rmdirsync".to_string(),
-                "fs.rmdirSync() deletes directories".to_string(),
-                Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
-                Some("Verify target path carefully before running".to_string()),
-            ),
-            CompiledPattern::new(
-                "fs.unlinkSync($$$)".to_string(),
-                "heredoc.typescript.fs_unlinksync".to_string(),
-                "fs.unlinkSync() deletes files".to_string(),
-                Severity::Low,
-                None,
-            ),
-            CompiledPattern::new(
-                "Deno.remove($$$)".to_string(),
-                "heredoc.typescript.deno_remove".to_string(),
-                "Deno.remove() deletes files/directories".to_string(),
-                Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
-                Some("Verify target path carefully before running".to_string()),
-            ),
-            CompiledPattern::new(
-                "child_process.execSync($$$)".to_string(),
-                "heredoc.typescript.execsync".to_string(),
-                "execSync() executes shell commands".to_string(),
-                Severity::Medium, // refined to block only on destructive literal payloads
-                Some("Validate command arguments carefully".to_string()),
-            ),
-            CompiledPattern::new(
-                "require('child_process').execSync($$$)".to_string(),
-                "heredoc.typescript.require_execsync".to_string(),
-                "execSync() executes shell commands".to_string(),
-                Severity::Medium, // refined to block only on destructive literal payloads
-                Some("Validate command arguments carefully".to_string()),
-            ),
-            CompiledPattern::new(
-                "child_process.spawnSync($$$)".to_string(),
-                "heredoc.typescript.spawnsync".to_string(),
-                "spawnSync() executes shell commands".to_string(),
-                Severity::Medium,
-                Some("Validate command and arguments carefully".to_string()),
-            ),
-            CompiledPattern::new(
-                "fs.rm($$$)".to_string(),
-                "heredoc.typescript.fs_rm".to_string(),
-                "fs.rm() deletes files/directories".to_string(),
-                Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
-                Some("Verify target path carefully before running".to_string()),
-            ),
-            CompiledPattern::new(
-                "fs.rmdir($$$)".to_string(),
-                "heredoc.typescript.fs_rmdir".to_string(),
-                "fs.rmdir() deletes directories".to_string(),
-                Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
-                Some("Verify target path carefully before running".to_string()),
-            ),
-            CompiledPattern::new(
-                "fs.unlink($$$)".to_string(),
-                "heredoc.typescript.fs_unlink".to_string(),
-                "fs.unlink() deletes files".to_string(),
-                Severity::Low,
-                None,
-            ),
-            CompiledPattern::new(
-                "fsPromises.rm($$$)".to_string(),
-                "heredoc.typescript.fspromises_rm".to_string(),
-                "fsPromises.rm() deletes files/directories".to_string(),
-                Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
-                Some("Verify target path carefully before running".to_string()),
-            ),
-            CompiledPattern::new(
-                "fsPromises.rmdir($$$)".to_string(),
-                "heredoc.typescript.fspromises_rmdir".to_string(),
-                "fsPromises.rmdir() deletes directories".to_string(),
-                Severity::Medium, // warn-only unless catastrophic literal target (refined at match time)
-                Some("Verify target path carefully before running".to_string()),
-            ),
-        ],
-    );
-
-    // Ruby patterns (git_safety_guard-mvh)
-    patterns.insert(
-        ScriptLanguage::Ruby,
-        vec![
-            // =========================================================================
-            // Filesystem Deletion (High Signal)
-            // =========================================================================
-            CompiledPattern::new(
-                "FileUtils.rm_rf($$$)".to_string(),
-                "heredoc.ruby.fileutils_rm_rf".to_string(),
-                "FileUtils.rm_rf() recursively deletes directories".to_string(),
-                Severity::Medium, // refined to block only on catastrophic literal target
-                Some("Verify target path carefully before running".to_string()),
-            ),
-            CompiledPattern::new(
-                "FileUtils.remove_dir($$$)".to_string(),
-                "heredoc.ruby.fileutils_remove_dir".to_string(),
-                "FileUtils.remove_dir() deletes directories".to_string(),
-                Severity::Medium, // refined to block only on catastrophic literal target
-                None,
-            ),
-            CompiledPattern::new(
-                "FileUtils.rm($$$)".to_string(),
-                "heredoc.ruby.fileutils_rm".to_string(),
-                "FileUtils.rm() deletes files".to_string(),
-                Severity::Medium, // refined to block only on catastrophic literal target
-                None,
-            ),
-            CompiledPattern::new(
-                "FileUtils.remove($$$)".to_string(),
-                "heredoc.ruby.fileutils_remove".to_string(),
-                "FileUtils.remove() deletes files".to_string(),
-                Severity::Medium, // refined to block only on catastrophic literal target
-                None,
-            ),
-            CompiledPattern::new(
-                "File.delete($$$)".to_string(),
-                "heredoc.ruby.file_delete".to_string(),
-                "File.delete() removes files".to_string(),
-                Severity::Medium, // refined to block only on catastrophic literal target
-                None,
-            ),
-            CompiledPattern::new(
-                "File.unlink($$$)".to_string(),
-                "heredoc.ruby.file_unlink".to_string(),
-                "File.unlink() removes files".to_string(),
-                Severity::Medium, // refined to block only on catastrophic literal target
-                None,
-            ),
-            CompiledPattern::new(
-                "Dir.rmdir($$$)".to_string(),
-                "heredoc.ruby.dir_rmdir".to_string(),
-                "Dir.rmdir() removes directories".to_string(),
-                Severity::Medium, // refined to block only on catastrophic literal target
-                None,
-            ),
-            CompiledPattern::new(
-                "Dir.delete($$$)".to_string(),
-                "heredoc.ruby.dir_delete".to_string(),
-                "Dir.delete() removes directories".to_string(),
-                Severity::Medium, // refined to block only on catastrophic literal target
-                None,
-            ),
-            // =========================================================================
-            // Process Execution (Medium severity by default - avoid false positives)
-            // =========================================================================
-            CompiledPattern::new(
-                "system($$$)".to_string(),
-                "heredoc.ruby.system".to_string(),
-                "system() executes shell commands".to_string(),
-                Severity::Medium,
-                Some("Validate command arguments carefully".to_string()),
-            ),
-            CompiledPattern::new(
-                "exec($$$)".to_string(),
-                "heredoc.ruby.exec".to_string(),
-                "exec() replaces process with shell command".to_string(),
-                Severity::Medium,
-                Some("Validate command arguments carefully".to_string()),
-            ),
-            CompiledPattern::new(
-                "`$$$`".to_string(),
-                "heredoc.ruby.backticks".to_string(),
-                "Backticks execute shell commands".to_string(),
-                Severity::Medium,
-                Some("Validate command arguments carefully".to_string()),
-            ),
-            // Kernel.system and Kernel.exec variants
-            CompiledPattern::new(
-                "Kernel.system($$$)".to_string(),
-                "heredoc.ruby.kernel_system".to_string(),
-                "Kernel.system() executes shell commands".to_string(),
-                Severity::Medium,
-                Some("Validate command arguments carefully".to_string()),
-            ),
-            CompiledPattern::new(
-                "Kernel.exec($$$)".to_string(),
-                "heredoc.ruby.kernel_exec".to_string(),
-                "Kernel.exec() replaces process with shell command".to_string(),
-                Severity::Medium,
-                Some("Validate command arguments carefully".to_string()),
-            ),
-            // Open3 for shell execution
-            CompiledPattern::new(
-                "Open3.capture3($$$)".to_string(),
-                "heredoc.ruby.open3_capture3".to_string(),
-                "Open3.capture3() executes shell commands".to_string(),
-                Severity::Medium,
-                None,
-            ),
-            CompiledPattern::new(
-                "Open3.popen3($$$)".to_string(),
-                "heredoc.ruby.open3_popen3".to_string(),
-                "Open3.popen3() executes shell commands".to_string(),
-                Severity::Medium,
-                None,
-            ),
-        ],
-    );
-
-    // Bash patterns
-    patterns.insert(
-        ScriptLanguage::Bash,
-        vec![
-            CompiledPattern::new(
-                "rm -rf $$$".to_string(),
-                "heredoc.bash.rm_rf".to_string(),
-                "rm -rf recursively deletes files/directories".to_string(),
-                Severity::Critical,
-                Some("Verify the target path carefully before running".to_string()),
-            ),
-            CompiledPattern::new(
-                "rm -r $$$".to_string(),
-                "heredoc.bash.rm_r".to_string(),
-                "rm -r recursively deletes".to_string(),
-                Severity::High,
-                None,
-            ),
-            CompiledPattern::new(
-                "git reset --hard".to_string(),
-                "heredoc.bash.git_reset_hard".to_string(),
-                "git reset --hard discards uncommitted changes".to_string(),
-                Severity::Critical,
-                Some("Use 'git stash' to save changes first".to_string()),
-            ),
-            CompiledPattern::new(
-                "git clean -fd".to_string(),
-                "heredoc.bash.git_clean_fd".to_string(),
-                "git clean -fd deletes untracked files".to_string(),
-                Severity::High,
-                Some("Use 'git clean -n' to preview first".to_string()),
-            ),
-        ],
-    );
-
-    // Go patterns
-    patterns.insert(
-        ScriptLanguage::Go,
-        vec![
-            // Recursive deletion - always dangerous
-            CompiledPattern::new(
-                "os.RemoveAll($$$)".to_string(),
-                "heredoc.go.os_removeall".to_string(),
-                "os.RemoveAll() recursively deletes directories".to_string(),
-                Severity::Critical,
-                Some("Verify the target path carefully before running".to_string()),
-            ),
-            // File deletion
-            CompiledPattern::new(
-                "os.Remove($$$)".to_string(),
-                "heredoc.go.os_remove".to_string(),
-                "os.Remove() deletes files".to_string(),
-                Severity::High,
-                None,
-            ),
-            // Shell command execution - medium severity, refined at match time
-            CompiledPattern::new(
-                "exec.Command($$$)".to_string(),
-                "heredoc.go.exec_command".to_string(),
-                "exec.Command() executes shell commands".to_string(),
-                Severity::Medium,
-                Some("Validate command arguments carefully".to_string()),
-            ),
-            // Combined patterns for common usage
-            CompiledPattern::new(
-                "exec.Command($$$).Run()".to_string(),
-                "heredoc.go.exec_command_run".to_string(),
-                "exec.Command().Run() executes shell commands".to_string(),
-                Severity::Medium,
-                Some("Validate command arguments carefully".to_string()),
-            ),
-            CompiledPattern::new(
-                "exec.Command($$$).Output()".to_string(),
-                "heredoc.go.exec_command_output".to_string(),
-                "exec.Command().Output() executes shell commands".to_string(),
-                Severity::Medium,
-                Some("Validate command arguments carefully".to_string()),
-            ),
-            CompiledPattern::new(
-                "exec.Command($$$).CombinedOutput()".to_string(),
-                "heredoc.go.exec_command_combined_output".to_string(),
-                "exec.Command().CombinedOutput() executes shell commands".to_string(),
-                Severity::Medium,
-                Some("Validate command arguments carefully".to_string()),
-            ),
-        ],
-    );
-
-    // PHP patterns
-    patterns.insert(
-        ScriptLanguage::Php,
-        vec![
-            // File/directory deletion
-            CompiledPattern::new(
-                "unlink($$$)".to_string(),
-                "heredoc.php.unlink".to_string(),
-                "unlink() deletes files".to_string(),
-                Severity::High,
-                None,
-            ),
-            CompiledPattern::new(
-                "rmdir($$$)".to_string(),
-                "heredoc.php.rmdir".to_string(),
-                "rmdir() deletes directories".to_string(),
-                Severity::High,
-                None,
-            ),
-            // Shell execution patterns
-            CompiledPattern::new(
-                "exec($$$)".to_string(),
-                "heredoc.php.exec".to_string(),
-                "exec() executes shell commands".to_string(),
-                Severity::Medium,
-                Some("Validate command arguments carefully".to_string()),
-            ),
-            CompiledPattern::new(
-                "system($$$)".to_string(),
-                "heredoc.php.system".to_string(),
-                "system() executes shell commands".to_string(),
-                Severity::Medium,
-                Some("Validate command arguments carefully".to_string()),
-            ),
-            CompiledPattern::new(
-                "shell_exec($$$)".to_string(),
-                "heredoc.php.shell_exec".to_string(),
-                "shell_exec() executes shell commands".to_string(),
-                Severity::Medium,
-                Some("Validate command arguments carefully".to_string()),
-            ),
-            CompiledPattern::new(
-                "passthru($$$)".to_string(),
-                "heredoc.php.passthru".to_string(),
-                "passthru() executes shell commands".to_string(),
-                Severity::Medium,
-                Some("Validate command arguments carefully".to_string()),
-            ),
-            CompiledPattern::new(
-                "proc_open($$$)".to_string(),
-                "heredoc.php.proc_open".to_string(),
-                "proc_open() executes shell commands".to_string(),
-                Severity::Medium,
-                Some("Validate command arguments carefully".to_string()),
-            ),
-            CompiledPattern::new(
-                "popen($$$)".to_string(),
-                "heredoc.php.popen".to_string(),
-                "popen() executes shell commands".to_string(),
-                Severity::Medium,
-                Some("Validate command arguments carefully".to_string()),
-            ),
-            CompiledPattern::new(
-                "`$$$`".to_string(),
-                "heredoc.php.backticks".to_string(),
-                "Backticks execute shell commands in PHP".to_string(),
-                Severity::Medium,
-                Some("Validate command arguments carefully".to_string()),
-            ),
-        ],
-    );
-
-    patterns
-}
-
-/// Global default matcher instance (lazy-initialized).
-pub static DEFAULT_MATCHER: LazyLock<AstMatcher> = LazyLock::new(AstMatcher::new);
-
-fn precompile_patterns(
-    patterns: HashMap<ScriptLanguage, Vec<CompiledPattern>>,
-) -> HashMap<ScriptLanguage, Vec<PrecompiledPattern>> {
-    let mut out: HashMap<ScriptLanguage, Vec<PrecompiledPattern>> = HashMap::new();
-
-    for (language, patterns) in patterns {
-        let Some(ast_lang) = script_language_to_ast_lang(language) else {
-            continue;
-        };
-
-        let mut compiled = Vec::with_capacity(patterns.len());
-        for meta in patterns {
-            let Ok(pattern) = Pattern::try_new(&meta.pattern_str, ast_lang) else {
-                // Fail-open: skip invalid patterns silently (default patterns should be validated by tests).
-                continue;
-            };
-
-            compiled.push(PrecompiledPattern { pattern, meta });
+fn complete_python_deletion_matches(
+    code: &str,
+    language: ScriptLanguage,
+    mut matches: Vec<PatternMatch>,
+    budget: Duration,
+) -> Result<Vec<PatternMatch>, MatchError> {
+    let started = Instant::now();
+    if language == ScriptLanguage::Python
+        && code.contains("rmtree")
+        && ["getattr", "__dict__", "__call__"]
+            .iter()
+            .any(|name| code.contains(name))
+    {
+        // The ordinary AST worker supplies byte bounds, cancellation and the
+        // error contract. An incomplete extra scan is not an empty success.
+        let extra = PYTHON_REFLECTIVE_DELETE_MATCHER.find_matches_with_timeout(
+            code,
+            language,
+            budget.saturating_sub(started.elapsed()),
+        )?;
+        let mut seen: std::collections::HashSet<_> = matches
+            .iter()
+            .map(|hit| (hit.start, hit.end, hit.rule_id.clone()))
+            .collect();
+        for hit in extra {
+            if seen.insert((hit.start, hit.end, hit.rule_id.clone())) {
+                matches.push(hit);
+            }
         }
-
-        if !compiled.is_empty() {
-            out.insert(language, compiled);
-        }
+        // Keep the original finding's precedence on a tie. The supplemental
+        // corpus also resolves imported aliases; do not duplicate those hits.
+        matches.sort_by_key(|hit| hit.start);
     }
-
-    out
+    // A reflected call gets exactly the existing descendant and factory
+    // policies. New .temp matches must not bypass factory/dependency proofs.
+    // Share the remaining budget; do not grant the proof a fresh deadline.
+    Ok(tempfile_provenance::validate(
+        code,
+        language,
+        matches,
+        budget.saturating_sub(started.elapsed()),
+    ))
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
+/// Recover literal shell values only from source with execution evidence.
+///
+/// #560 was caused by promoting every unowned string containing backticks or
+/// dollar-parens to a complete shell program. A tuple, regex replacement, or
+/// opaque text-editing helper does not establish that execution context. This
+/// gate is NOT a source exemption: the evaluator still checks named sinks,
+/// interpreter operations, protected writes, and the original outer command.
+///
+/// Be conservative when a program refers to execution APIs, aliases them, or
+/// uses reflective/computed dispatch: retain the complete original recovery,
+/// including every indirect literal and exec/eval dependency. This is a
+/// program-level evidence screen, not a proof of non-execution or a taint analysis.
+/// Unknown helper calls alone do not establish a shell-command role in an
+/// isolated interpreter program. An unproved outer consumer still requires
+/// the original recovery: even a print-only program can feed a later shell.
+///
+/// The screen runs INSIDE the existing worker's permit and deadline, including
+/// parsing. No extra worker or fresh time envelope is created. A failed or
+/// incomplete screen keeps the original fail-closed analysis, not an allowance.
+pub(crate) fn interpreter_literal_shell_commands(
+    code: &str,
+    language: ScriptLanguage,
+    allow_documentation_literals: impl FnOnce() -> Option<bool> + Send + 'static,
+    budget: Duration,
+) -> Result<Vec<ReconstructedCommand>, MatchError> {
+    // The source analyzer owns the only source copy, parse, worker permit and
+    // deadline. Screen its parsed tree instead of reparsing a captured copy in
+    // the outer-consumer callback. That callback still runs first and once.
+    source_analysis::interpreter_literal_shell_commands_with_execution_evidence(
+        code,
+        language,
+        allow_documentation_literals,
+        budget,
+        true,
+    )
+}
+
+/// [`interpreter_literal_shell_commands`] for a program the outer shell
+/// expands before the interpreter reads it (an unquoted heredoc body). Its
+/// backquotes run at that expansion whatever the program then does with the
+/// string, so no candidate is screened or cut as text only a later shell
+/// might run: every one is judged whole.
+pub(crate) fn expanded_interpreter_literal_shell_commands(
+    code: &str,
+    language: ScriptLanguage,
+    allow_documentation_literals: impl FnOnce() -> Option<bool> + Send + 'static,
+    budget: Duration,
+) -> Result<Vec<ReconstructedCommand>, MatchError> {
+    source_analysis::interpreter_literal_shell_commands_with_execution_evidence(
+        code,
+        language,
+        allow_documentation_literals,
+        budget,
+        false,
+    )
+}
+
+// Retain the previous two-parse composition only as a differential oracle.
+#[cfg(test)]
+fn literal_recovery_scope(
+    code: &str,
+    language: ScriptLanguage,
+    isolated_source: bool,
+) -> Option<bool> {
+    // No source-local absence of execution APIs proves where stdout or a
+    // generated file goes. Keep the caller's stricter interpretation before
+    // attempting this screen, including pipelines, wrappers and later readers.
+    if !isolated_source {
+        return Some(false);
+    }
+    literal_source_has_execution_evidence(code, language).then_some(true)
+}
+
+// Independent bounds on this optional screen. Crossing either withholds the
+// screen, leaving the existing source analyzer's hard bounds and errors intact.
+const LITERAL_EVIDENCE_MAX_BYTES: usize = 256 * 1024;
+const LITERAL_EVIDENCE_MAX_NODES: usize = 4096;
 
 #[cfg(test)]
-#[allow(clippy::similar_names)] // `ast_matcher` vs `matches` is readable in test code
-mod tests {
+fn literal_source_has_execution_evidence(code: &str, language: ScriptLanguage) -> bool {
+    use ast_grep_core::AstGrep;
+    use ast_grep_language::SupportLang;
+
+    if code.len() > LITERAL_EVIDENCE_MAX_BYTES {
+        return true;
+    }
+    let grammar = match language {
+        ScriptLanguage::Python => SupportLang::Python,
+        ScriptLanguage::JavaScript => SupportLang::JavaScript,
+        _ => return true,
+    };
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstMatch);
+    let ast = {
+        let _parse = crate::perf::phase(crate::perf::ProfilePhase::AstParse);
+        AstGrep::try_new(code, grammar)
+    };
+    let Ok(ast) = ast else {
+        return true;
+    };
+    literal_root_has_execution_evidence(&ast.root(), language)
+}
+
+/// Whether a Python or JavaScript program may start a process or evaluate
+/// code at all: an execution API name under any arguments (a closed
+/// `subprocess.run([...])` included), or any shape the evidence screen cannot
+/// read. Other languages, oversized programs and parse failures answer yes.
+///
+/// Used where a program's capability, not its literals, is the question: an
+/// interpreter that reads its program from its own heredoc cannot run what
+/// another heredoc wrote unless that program can execute something (#591).
+pub(crate) fn program_may_execute_code(code: &str, language: ScriptLanguage) -> bool {
+    use ast_grep_core::AstGrep;
+    use ast_grep_language::SupportLang;
+
+    if code.len() > LITERAL_EVIDENCE_MAX_BYTES {
+        return true;
+    }
+    let grammar = match language {
+        ScriptLanguage::Python => SupportLang::Python,
+        ScriptLanguage::JavaScript => SupportLang::JavaScript,
+        _ => return true,
+    };
+    let _phase = crate::perf::phase(crate::perf::ProfilePhase::AstMatch);
+    let ast = {
+        let _parse = crate::perf::phase(crate::perf::ProfilePhase::AstParse);
+        AstGrep::try_new(code, grammar)
+    };
+    let Ok(ast) = ast else {
+        return true;
+    };
+    root_has_execution_evidence(&ast.root(), language, false)
+}
+
+/// Inspect the recovery worker's tree; do not derive a new source exemption.
+/// A negative answer still requires the caller's independent outer-consumer
+/// proof. All original node, syntax, callee and identifier checks remain here.
+fn literal_root_has_execution_evidence<D: ast_grep_core::Doc>(
+    root: &ast_grep_core::Node<'_, D>,
+    language: ScriptLanguage,
+) -> bool {
+    root_has_execution_evidence(root, language, true)
+}
+
+/// The evidence scan. `exempt_closed_calls` lets a [`closed_process_call`]
+/// pass, which is right when the question is whether some *other* literal
+/// may run, and wrong when it is whether the program can run anything.
+fn root_has_execution_evidence<D: ast_grep_core::Doc>(
+    root: &ast_grep_core::Node<'_, D>,
+    language: ScriptLanguage,
+    exempt_closed_calls: bool,
+) -> bool {
+    for (index, node) in root.dfs().enumerate() {
+        if index >= LITERAL_EVIDENCE_MAX_NODES || node.is_error() || node.is_missing() {
+            return true;
+        }
+        let kind = node.kind();
+        if matches!(kind.as_ref(), "call" | "call_expression") {
+            let Some(function) = node.field("function") else {
+                return true;
+            };
+            if !matches!(
+                function.kind().as_ref(),
+                "identifier" | "attribute" | "member_expression"
+            ) || language == ScriptLanguage::JavaScript
+                && node
+                    .field("arguments")
+                    .is_none_or(|arguments| arguments.kind().as_ref() != "arguments")
+            {
+                // Computed calls, returned callables, tagged templates, and
+                // parenthesized dispatch keep the original conservative scan.
+                return true;
+            }
+        }
+        if language == ScriptLanguage::JavaScript
+            && matches!(
+                kind.as_ref(),
+                "import_statement" | "new_expression" | "subscript_expression"
+            )
+        {
+            // ESM imports and computed members may expose/alias execution
+            // capabilities without a literal terminal method name.
+            return true;
+        }
+        if language == ScriptLanguage::Python
+            && kind.as_ref() == "import_from_statement"
+            && node.text().contains('*')
+        {
+            return true;
+        }
+        if matches!(kind.as_ref(), "identifier" | "property_identifier") {
+            let name = node.text();
+            // Python normalizes Unicode names; JavaScript accepts identifier
+            // escapes. Unmodeled spellings cannot exclude an execution API.
+            if !name.is_ascii()
+                || name.contains('\\')
+                || name.starts_with("__")
+                || (literal_execution_name(name.as_ref())
+                    && !(exempt_closed_calls
+                        && closed_process_call(&node, name.as_ref(), language)))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether `name_node` names the callee of a process call that no string
+/// with shell substitution syntax can reach: `subprocess.run(['git', 'show',
+/// 'origin/main:f'], capture_output=True)`, `re.compile(r'\s+$')` (#560).
+///
+/// The callee is a process API ([`closed_process_call_name`]) under a plain
+/// dotted name, and every argument is a literal (a string, number, boolean
+/// or `None`, or a list, tuple or keyword argument of those) whose value
+/// holds no backquote and no `$(`. No other value of the program can reach
+/// such a call, and the named-sink scanners judge its own arguments, so it
+/// is no evidence that some other literal runs. A reference that is not a
+/// call (`f = os.system`), a computed receiver, a variable or a call among
+/// the arguments, and code evaluation or reflection under any arguments all
+/// remain evidence.
+fn closed_process_call<D: ast_grep_core::Doc>(
+    name_node: &ast_grep_core::Node<'_, D>,
+    name: &str,
+    language: ScriptLanguage,
+) -> bool {
+    let Some(parent) = name_node.parent() else {
+        return false;
+    };
+    let (callee, attribute_form) = match parent.kind().as_ref() {
+        "call" | "call_expression" => (name_node.clone(), false),
+        "attribute" | "member_expression" => {
+            let terminal = match language {
+                ScriptLanguage::Python => parent.field("attribute"),
+                _ => parent.field("property"),
+            };
+            if terminal.is_none_or(|terminal| terminal.range() != name_node.range())
+                || parent
+                    .field("object")
+                    .is_none_or(|object| !plain_dotted_name(&object, 0))
+            {
+                return false;
+            }
+            (parent, true)
+        }
+        _ => return false,
+    };
+    let Some(call) = callee.parent() else {
+        return false;
+    };
+    let Some(arguments) = call.field("arguments") else {
+        return false;
+    };
+    let closed = closed_process_call_name(name, attribute_form)
+        && matches!(call.kind().as_ref(), "call" | "call_expression")
+        && call
+            .field("function")
+            .is_some_and(|function| function.range() == callee.range())
+        && matches!(arguments.kind().as_ref(), "argument_list" | "arguments")
+        && arguments
+            .children()
+            .filter(|argument| argument.is_named() && argument.kind().as_ref() != "comment")
+            .all(|argument| closed_literal_argument(&argument, language, 0));
+    if !closed {
+        return false;
+    }
+    // `re.compile(…)` builds a pattern and `fork()` copies this program; any
+    // other call runs a command line, which must not be one that can run a
+    // file this program may have written (`['sh', 'm.sh']`, `'./gen'`).
+    (attribute_form && name == "compile")
+        || matches!(name, "fork" | "forkpty")
+        || closed_call_command_line(&arguments, language)
+            .is_some_and(|line| !crate::heredoc::shell_text_may_run_generated_code(&line))
+}
+
+/// The command line a [`closed_process_call`] runs, as shell text: string
+/// arguments as written (a command string), list items as quoted words
+/// (`['git', 'show', 'x']`), in argument order, from the positional arguments
+/// and Python's `args=`. Under a `shell=` keyword a list's items are joined
+/// as written, since its first item is a command string. `None` when there
+/// is none, or when an `executable=` keyword names the program separately.
+fn closed_call_command_line<D: ast_grep_core::Doc>(
+    arguments: &ast_grep_core::Node<'_, D>,
+    language: ScriptLanguage,
+) -> Option<String> {
+    fn word<D: ast_grep_core::Doc>(
+        node: &ast_grep_core::Node<'_, D>,
+        language: ScriptLanguage,
+    ) -> Option<String> {
+        match node.kind().as_ref() {
+            "string" | "template_string" | "concatenated_string" => {
+                source_analysis::static_interpreter_literal(node, language, 0)
+            }
+            "integer" | "float" | "number" => Some(node.text().to_string()),
+            _ => None,
+        }
+    }
+    let through_shell = arguments.children().any(|argument| {
+        argument.kind().as_ref() == "keyword_argument"
+            && argument
+                .field("name")
+                .is_some_and(|keyword| keyword.text().as_ref() == "shell")
+    });
+    let mut parts: Vec<String> = Vec::new();
+    for argument in arguments
+        .children()
+        .filter(|argument| argument.is_named() && argument.kind().as_ref() != "comment")
+    {
+        let value = match argument.kind().as_ref() {
+            "keyword_argument" => {
+                let keyword = argument.field("name")?;
+                match keyword.text().as_ref() {
+                    "executable" => return None,
+                    "args" => argument.field("value")?,
+                    _ => continue,
+                }
+            }
+            _ => argument,
+        };
+        match value.kind().as_ref() {
+            "list" | "tuple" | "array" => {
+                let words: Option<Vec<String>> = value
+                    .children()
+                    .filter(|item| item.is_named() && item.kind().as_ref() != "comment")
+                    .map(|item| word(&item, language))
+                    .collect();
+                let words = words?;
+                parts.push(if through_shell {
+                    words.join(" ")
+                } else {
+                    shell_words::join(words)
+                });
+            }
+            _ => parts.push(word(&value, language)?),
+        }
+    }
+    let line = parts.join(" ");
+    (!line.trim().is_empty()).then_some(line)
+}
+
+/// The [`literal_execution_name`]s that start a process rather than evaluate
+/// code or look a callable up: `system`, `run`, `Popen`, `spawn*`, `exec*`
+/// other than `exec` itself, and `compile` when it is a method (`re.compile`;
+/// the builtin `compile` makes code for `exec`).
+fn closed_process_call_name(name: &str, attribute_form: bool) -> bool {
+    (name.starts_with("exec") && !matches!(name, "exec" | "execfile"))
+        || name.starts_with("spawn")
+        || name.starts_with("popen")
+        || matches!(
+            name,
+            "system"
+                | "Popen"
+                | "run"
+                | "call"
+                | "check_call"
+                | "check_output"
+                | "getoutput"
+                | "getstatusoutput"
+                | "create_subprocess_shell"
+                | "create_subprocess_exec"
+                | "posix_spawn"
+                | "posix_spawnp"
+                | "fork"
+                | "forkpty"
+                | "startfile"
+        )
+        || (attribute_form && name == "compile")
+}
+
+/// `os`, `subprocess`, `asyncio.subprocess`: identifiers joined by member
+/// access, with no call, subscript or other expression a value could hide in.
+fn plain_dotted_name<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+    depth: usize,
+) -> bool {
+    if depth >= 16 {
+        return false;
+    }
+    match node.kind().as_ref() {
+        "identifier" => true,
+        "attribute" | "member_expression" => node
+            .field("object")
+            .is_some_and(|object| plain_dotted_name(&object, depth + 1)),
+        _ => false,
+    }
+}
+
+/// An argument of a [`closed_process_call`]: a literal whose decoded value has
+/// no shell substitution syntax, or a list, tuple or keyword argument of them.
+fn closed_literal_argument<D: ast_grep_core::Doc>(
+    node: &ast_grep_core::Node<'_, D>,
+    language: ScriptLanguage,
+    depth: usize,
+) -> bool {
+    if depth >= 8 {
+        return false;
+    }
+    match node.kind().as_ref() {
+        "integer" | "float" | "number" | "true" | "false" | "none" | "null" => true,
+        "string" | "template_string" | "concatenated_string" => {
+            source_analysis::static_interpreter_literal(node, language, 0)
+                .is_some_and(|value| !value.contains('`') && !value.contains("$("))
+        }
+        "list" | "tuple" | "array" | "parenthesized_expression" => node
+            .children()
+            .filter(|item| item.is_named() && item.kind().as_ref() != "comment")
+            .all(|item| closed_literal_argument(&item, language, depth + 1)),
+        "keyword_argument" => node
+            .field("value")
+            .is_some_and(|value| closed_literal_argument(&value, language, depth + 1)),
+        _ => false,
+    }
+}
+
+fn literal_execution_name(name: &str) -> bool {
+    // References count, not just direct calls: f = os.system; f(value), imports
+    // with aliases, and methods in nested callbacks retain the original scan.
+    // Names are deliberately a superset: an unrelated run()/call() may still
+    // need review, but a familiar execution API never gains a new exemption.
+    name.starts_with("exec")
+        || name.starts_with("spawn")
+        || name.starts_with("popen")
+        || matches!(
+            name,
+            "system"
+                | "popen"
+                | "Popen"
+                | "run"
+                | "call"
+                | "check_call"
+                | "check_output"
+                | "getoutput"
+                | "getstatusoutput"
+                | "create_subprocess_shell"
+                | "create_subprocess_exec"
+                | "shell"
+                | "sh"
+                | "bash"
+                | "zsh"
+                | "dash"
+                | "ksh"
+                | "fish"
+                | "posix_spawn"
+                | "posix_spawnp"
+                | "fork"
+                | "forkpty"
+                | "startfile"
+                | "pexpect"
+                | "pty"
+                | "eval"
+                | "compile"
+                | "getattr"
+                | "setattr"
+                | "delattr"
+                | "globals"
+                | "locals"
+                | "vars"
+                | "import_module"
+                | "importlib"
+                | "runpy"
+                | "ctypes"
+                | "Function"
+                | "AsyncFunction"
+                | "GeneratorFunction"
+                | "constructor"
+                | "Reflect"
+                | "global"
+                | "globalThis"
+                | "window"
+                | "process"
+                | "module"
+                | "require"
+        )
+}
+
+#[cfg(test)]
+mod shared_literal_ast_tests {
     use super::*;
-    use std::collections::HashMap;
 
-    #[test]
-    fn severity_labels() {
-        assert_eq!(Severity::Critical.label(), "critical");
-        assert_eq!(Severity::High.label(), "high");
-        assert_eq!(Severity::Medium.label(), "medium");
-        assert_eq!(Severity::Low.label(), "low");
+    type Snapshot = Result<Vec<(String, usize, usize)>, String>;
+
+    fn snapshot(result: Result<Vec<ReconstructedCommand>, MatchError>) -> Snapshot {
+        result
+            .map(|commands| {
+                commands
+                    .into_iter()
+                    .map(|command| (command.command, command.start, command.end))
+                    .collect()
+            })
+            .map_err(|error| error.to_string())
     }
 
-    #[test]
-    fn severity_blocking() {
-        assert!(Severity::Critical.blocks_by_default());
-        assert!(Severity::High.blocks_by_default());
-        assert!(!Severity::Medium.blocks_by_default());
-        assert!(!Severity::Low.blocks_by_default());
+    fn incumbent(code: &str, language: ScriptLanguage, isolated: bool) -> Snapshot {
+        let result = match literal_recovery_scope(code, language, isolated) {
+            Some(allow_documentation) => source_analysis::interpreter_literal_shell_commands_inner(
+                code,
+                language,
+                allow_documentation,
+            ),
+            None => Ok(Vec::new()),
+        };
+        snapshot(result)
     }
 
-    #[test]
-    fn match_error_display() {
-        let errors = vec![
-            MatchError::UnsupportedLanguage(ScriptLanguage::Perl),
-            MatchError::ParseError {
-                language: ScriptLanguage::Python,
-                detail: "syntax error".to_string(),
-            },
-            MatchError::Timeout {
-                elapsed_ms: 25,
-                budget_ms: 20,
-            },
-            MatchError::PatternError {
-                pattern: "bad pattern".to_string(),
-                detail: "invalid syntax".to_string(),
-            },
-        ];
+    fn shared(code: &str, language: ScriptLanguage, isolated: bool) -> Snapshot {
+        snapshot(
+            source_analysis::interpreter_literal_shell_commands_inner_with_execution_evidence(
+                code, language, isolated, true,
+            ),
+        )
+    }
 
-        for err in errors {
-            let display = format!("{err}");
-            assert!(!display.is_empty());
+    fn execution_source(language: ScriptLanguage, lines: usize) -> String {
+        match language {
+            ScriptLanguage::Python => format!(
+                "import os\n{}command = 'echo $(git reset --hard)'\ndispatch = os.system\ndispatch(command)\n",
+                "value = 1\n".repeat(lines),
+            ),
+            ScriptLanguage::JavaScript => format!(
+                "const cp = require('child_process');\n{}const command = 'echo $(git reset --hard)';\nconst dispatch = cp.execSync; dispatch(command);\n",
+                "var value = 1;\n".repeat(lines),
+            ),
+            _ => unreachable!("the fixture covers the two literal-recovery languages"),
         }
     }
 
     #[test]
-    fn matcher_default_has_patterns() {
-        let ast_matcher = AstMatcher::new();
-        assert!(!ast_matcher.patterns.is_empty());
-        assert!(ast_matcher.patterns.contains_key(&ScriptLanguage::Python));
-        assert!(
-            ast_matcher
-                .patterns
-                .contains_key(&ScriptLanguage::JavaScript)
-        );
-        assert!(ast_matcher.patterns.contains_key(&ScriptLanguage::Ruby));
-        assert!(ast_matcher.patterns.contains_key(&ScriptLanguage::Bash));
-    }
-
-    #[test]
-    fn python_positive_match() {
-        let ast_matcher = AstMatcher::new();
-        let code = "import shutil\nshutil.rmtree('/tmp/test')";
-
-        let matches = ast_matcher.find_matches(code, ScriptLanguage::Python);
-        match matches {
-            Ok(m) => {
-                assert!(!m.is_empty(), "should match shutil.rmtree");
-                assert_eq!(m[0].rule_id, "heredoc.python.shutil_rmtree");
-                assert!(m[0].severity.blocks_by_default());
+    fn shared_literal_ast_matches_the_two_parse_execution_reference() {
+        for language in [ScriptLanguage::Python, ScriptLanguage::JavaScript] {
+            for lines in [0, 40, 300] {
+                let source = execution_source(language, lines);
+                for isolated in [false, true] {
+                    let expected = incumbent(&source, language, isolated);
+                    let actual = shared(&source, language, isolated);
+                    assert_eq!(actual, expected, "{language:?}, {lines}, {isolated}");
+                    let commands = actual.expect("complete execution fixture");
+                    assert!(
+                        commands
+                            .iter()
+                            .any(|(command, _, _)| { command == "echo $(git reset --hard)" }),
+                        "an indirect executable payload must survive AST sharing"
+                    );
+                    for (_, start, end) in commands {
+                        assert!(source.get(start..end).is_some(), "original UTF-8 byte span");
+                    }
+                }
             }
-            Err(e) => panic!("unexpected error: {e}"),
         }
     }
 
     #[test]
-    fn python_negative_match() {
-        let ast_matcher = AstMatcher::new();
-        let code = "import os\nprint('hello world')";
-
-        let matches = ast_matcher.find_matches(code, ScriptLanguage::Python);
-        match matches {
-            Ok(m) => assert!(m.is_empty(), "should not match safe code"),
-            Err(e) => panic!("unexpected error: {e}"),
+    fn shared_literal_ast_preserves_data_and_outer_consumer_boundaries() {
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                "text = ('echo $(git reset --hard)', 'data')\nprint(text)",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const text = ['echo $(git reset --hard)', 'data']; console.log(text);",
+            ),
+            (
+                ScriptLanguage::Python,
+                "text = 'élève $(git reset --hard)'\nedit(text)",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const text = 'élève $(git reset --hard)'; edit(text);",
+            ),
+        ] {
+            for isolated in [false, true] {
+                let actual = shared(source, language, isolated);
+                assert_eq!(actual, incumbent(source, language, isolated), "{source}");
+                let commands = actual.expect("complete literal fixture");
+                assert_eq!(commands.is_empty(), isolated, "{source}");
+            }
         }
-    }
-
-    mod javascript_positive_fixtures {
-        use super::*;
-
-        #[test]
-        fn fs_rmsync_catastrophic_blocks() {
-            let ast_matcher = AstMatcher::new();
-            let code = "const fs = require('fs');\nfs.rmSync('/etc', { recursive: true });";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::JavaScript)
-                .unwrap();
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                "import os\nf = getattr(os, 'system')\nf('$(git reset --hard)')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "def f(value):\n    os.system(value)\nf('$(git reset --hard)')",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const f = cp['execSync']; f('$(git reset --hard)');",
+            ),
+            (ScriptLanguage::JavaScript, "tag`echo $(git reset --hard)`;"),
+        ] {
+            let actual = shared(source, language, true);
+            assert_eq!(actual, incumbent(source, language, true), "{source}");
             assert!(
-                matches
-                    .iter()
-                    .any(|m| m.rule_id == "heredoc.javascript.fs_rmsync.catastrophic"),
-                "catastrophic fs.rmSync should be detected"
-            );
-            let hit = matches
-                .into_iter()
-                .find(|m| m.rule_id == "heredoc.javascript.fs_rmsync.catastrophic")
-                .unwrap();
-            assert!(hit.severity.blocks_by_default());
-        }
-
-        #[test]
-        fn fs_rmsync_non_catastrophic_warns_only() {
-            let ast_matcher = AstMatcher::new();
-            let code = "const fs = require('fs');\nfs.rmSync('./dist', { recursive: true });";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::JavaScript)
-                .unwrap();
-            assert!(
-                matches
-                    .iter()
-                    .any(|m| m.rule_id == "heredoc.javascript.fs_rmsync"),
-                "non-catastrophic recursive rmSync should be detected"
-            );
-            let hit = matches
-                .into_iter()
-                .find(|m| m.rule_id == "heredoc.javascript.fs_rmsync")
-                .unwrap();
-            assert!(!hit.severity.blocks_by_default());
-        }
-
-        #[test]
-        fn execsync_git_reset_hard_blocks() {
-            let ast_matcher = AstMatcher::new();
-            let code = "const child_process = require('child_process');\nchild_process.execSync('git reset --hard');";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::JavaScript)
-                .unwrap();
-            assert!(
-                matches
-                    .iter()
-                    .any(|m| m.rule_id.ends_with(".git_reset_hard")
-                        && m.severity.blocks_by_default()),
-                "execSync('git reset --hard') should block"
-            );
-        }
-
-        #[test]
-        fn execsync_rm_rf_non_catastrophic_warns_only() {
-            let ast_matcher = AstMatcher::new();
-            let code = "const child_process = require('child_process');\nchild_process.execSync('rm -rf ./build');";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::JavaScript)
-                .unwrap();
-            assert!(
-                matches.iter().any(|m| m.rule_id.ends_with(".rm_rf")),
-                "execSync('rm -rf ./build') should be detected"
-            );
-            let hit = matches
-                .into_iter()
-                .find(|m| m.rule_id.ends_with(".rm_rf"))
-                .unwrap();
-            assert!(!hit.severity.blocks_by_default());
-        }
-
-        #[test]
-        fn spawnsync_rm_rf_catastrophic_blocks() {
-            let ast_matcher = AstMatcher::new();
-            let code = "const child_process = require('child_process');\nchild_process.spawnSync('rm', ['-rf', '/']);";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::JavaScript)
-                .unwrap();
-            assert!(
-                matches
-                    .iter()
-                    .any(|m| m.rule_id.ends_with(".rm_rf_catastrophic")
-                        && m.severity.blocks_by_default()),
-                "spawnSync('rm', ['-rf','/']) should block"
-            );
-        }
-
-        #[test]
-        fn fs_rmsync_path_traversal_escapes_tmp_blocks() {
-            // Path traversal from /tmp to /etc should be detected as catastrophic
-            let ast_matcher = AstMatcher::new();
-            let code = "const fs = require('fs');\nfs.rmSync('/tmp/../etc', { recursive: true });";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::JavaScript)
-                .unwrap();
-            assert!(
-                matches
-                    .iter()
-                    .any(|m| m.rule_id == "heredoc.javascript.fs_rmsync.catastrophic"),
-                "path traversal /tmp/../etc should be detected as catastrophic"
-            );
-            let hit = matches
-                .into_iter()
-                .find(|m| m.rule_id == "heredoc.javascript.fs_rmsync.catastrophic")
-                .unwrap();
-            assert!(hit.severity.blocks_by_default());
-        }
-    }
-
-    mod javascript_negative_fixtures {
-        use super::*;
-
-        #[test]
-        fn printed_dangerous_string_does_not_match() {
-            let ast_matcher = AstMatcher::new();
-            let code = "console.log('rm -rf /');";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::JavaScript)
-                .unwrap();
-            assert!(matches.is_empty());
-        }
-
-        #[test]
-        fn require_child_process_alone_does_not_match() {
-            let ast_matcher = AstMatcher::new();
-            let code = "require('child_process');";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::JavaScript)
-                .unwrap();
-            assert!(matches.is_empty());
-        }
-
-        #[test]
-        fn execsync_safe_payload_does_not_match() {
-            let ast_matcher = AstMatcher::new();
-            let code = "const child_process = require('child_process');\nchild_process.execSync('git status');";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::JavaScript)
-                .unwrap();
-            assert!(matches.is_empty());
-        }
-
-        #[test]
-        fn fs_rmsync_without_recursive_does_not_match() {
-            let ast_matcher = AstMatcher::new();
-            let code = "const fs = require('fs');\nfs.rmSync('./file.txt');";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::JavaScript)
-                .unwrap();
-            assert!(matches.is_empty());
-        }
-
-        #[test]
-        fn spawnsync_echo_does_not_match() {
-            let ast_matcher = AstMatcher::new();
-            let code = "const child_process = require('child_process');\nchild_process.spawnSync('echo', ['rm -rf /']);";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::JavaScript)
-                .unwrap();
-            assert!(matches.is_empty());
-        }
-
-        #[test]
-        fn fs_rmsync_tmp_dotdot_in_filename_does_not_block() {
-            // Filenames with consecutive dots are NOT path traversal
-            let ast_matcher = AstMatcher::new();
-            let code =
-                "const fs = require('fs');\nfs.rmSync('/tmp/foo..bar', { recursive: true });";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::JavaScript)
-                .unwrap();
-            // Should match as medium severity (warn), NOT as catastrophic
-            assert!(
-                !matches.iter().any(|m| m.rule_id.contains("catastrophic")),
-                "foo..bar is a filename, not path traversal"
+                !actual.expect("complete reflective fixture").is_empty(),
+                "{source}"
             );
         }
     }
 
     #[test]
-    fn unsupported_language_returns_error() {
-        let ast_matcher = AstMatcher::new();
-        let code = "print 'hello perl';";
-
-        let result = ast_matcher.find_matches(code, ScriptLanguage::Unknown);
-        assert!(matches!(result, Err(MatchError::UnsupportedLanguage(_))));
-    }
-
-    #[test]
-    fn zero_timeout_fails_open_before_parsing_malformed_input() {
-        let ast_matcher = AstMatcher::new().with_timeout(Duration::ZERO);
-        let mut code = "function f() {".to_string();
-        code.push_str(&"(".repeat(256 * 1024));
-
-        let start = Instant::now();
-        let result = ast_matcher.find_matches(&code, ScriptLanguage::JavaScript);
-
-        assert!(
-            matches!(result, Err(MatchError::Timeout { .. })),
-            "zero timeout should fail open before AST parsing starts"
+    fn shared_literal_ast_keeps_incomplete_analysis_and_cheap_gates() {
+        let oversized = format!(
+            "#{}\ntext = '$(git reset --hard)'",
+            "x".repeat(LITERAL_EVIDENCE_MAX_BYTES)
         );
-        // The matches!(Err(Timeout)) check above is the real regression guard. This
-        // timing bound only documents "returned promptly without parsing"; it is
-        // deliberately generous so scheduler preemption under heavy parallel load
-        // can't flake it (parsing the 256K-token malformed input would take far
-        // longer than this ceiling).
-        assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "zero-timeout malformed input should return immediately"
+        // Past the evidence screen's node bound and denser than one node per
+        // source byte, which bounds the recovery's tree at any length.
+        let many_nodes = format!(
+            "{}text = '$(git reset --hard)'",
+            "0;".repeat(4 * LITERAL_EVIDENCE_MAX_NODES)
         );
-    }
-
-    #[test]
-    fn oversized_input_fails_open_without_ast_parse() {
-        let ast_matcher = AstMatcher::new().with_timeout(Duration::from_secs(10));
-        let code = "x = 1\n".repeat((MAX_AST_INPUT_BYTES / 6) + 2);
-        assert!(code.len() > MAX_AST_INPUT_BYTES);
-
-        let start = Instant::now();
-        let result = ast_matcher.find_matches(&code, ScriptLanguage::Python);
-
-        assert!(
-            matches!(result, Err(MatchError::Timeout { .. })),
-            "oversized direct matcher input should fail open on the budget guard"
-        );
-        // As above, the matches!(Err(Timeout)) check is the real guard; this
-        // generous timing bound only documents the early return and avoids
-        // load-induced flakes.
-        assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "oversized input should not enter ast-grep parsing"
-        );
-    }
-
-    #[test]
-    fn happy_path_still_matches_with_bounded_worker() {
-        let ast_matcher = AstMatcher::new().with_timeout(Duration::from_millis(250));
-        let code = "import shutil\nshutil.rmtree('/tmp/test')";
-
-        let matches = ast_matcher
-            .find_matches(code, ScriptLanguage::Python)
-            .expect("small valid input should parse within the worker budget");
-
-        assert!(
-            matches
-                .iter()
-                .any(|m| m.rule_id == "heredoc.python.shutil_rmtree"),
-            "bounded worker should preserve normal AST matches"
-        );
-    }
-
-    #[test]
-    fn has_blocking_match_returns_first_blocker() {
-        let ast_matcher = AstMatcher::new();
-        let code = "import shutil\nshutil.rmtree('/danger')";
-
-        let result = ast_matcher.has_blocking_match(code, ScriptLanguage::Python);
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().rule_id, "heredoc.python.shutil_rmtree");
-    }
-
-    #[test]
-    fn has_blocking_match_returns_none_for_safe_code() {
-        let ast_matcher = AstMatcher::new();
-        let code = "x = 1 + 2";
-
-        let result = ast_matcher.has_blocking_match(code, ScriptLanguage::Python);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn has_blocking_match_fails_open_on_error() {
-        let ast_matcher = AstMatcher::new();
-        let code = "some perl code";
-
-        // Unknown is unsupported - should fail open (return None, not panic)
-        let result = ast_matcher.has_blocking_match(code, ScriptLanguage::Unknown);
-        assert!(result.is_none());
-    }
-
-    mod perl_positive_fixtures {
-        use super::*;
-
-        #[test]
-        fn perl_system_rm_rf_catastrophic_blocks() {
-            let ast_matcher = AstMatcher::new();
-            let code = "system(\"rm -rf /\");\n";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Perl)
-                .expect("perl ast_matcher should run");
-            assert!(!matches.is_empty());
-            assert!(matches[0].rule_id.contains("rm_rf"));
-            assert!(matches[0].severity.blocks_by_default());
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                "import os\ntext = '$(git reset --hard)'\nos.system(",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const text = '$(git reset --hard)'; cp.execSync(",
+            ),
+            (ScriptLanguage::Python, oversized.as_str()),
+            (ScriptLanguage::Python, many_nodes.as_str()),
+        ] {
+            for isolated in [false, true] {
+                let actual = shared(source, language, isolated);
+                assert_eq!(
+                    actual,
+                    incumbent(source, language, isolated),
+                    "{language:?}"
+                );
+                assert!(
+                    actual.is_err(),
+                    "an incomplete tree cannot become empty success"
+                );
+            }
         }
-
-        #[test]
-        fn perl_system_rm_rf_non_catastrophic_warns_only() {
-            let ast_matcher = AstMatcher::new();
-            let code = "system('rm -rf ./build');\n";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Perl)
-                .expect("perl ast_matcher should run");
-            assert!(!matches.is_empty());
-            assert!(matches[0].rule_id.contains("rm_rf"));
-            assert!(!matches[0].severity.blocks_by_default());
-        }
-
-        #[test]
-        fn perl_backticks_git_reset_hard_blocks() {
-            let ast_matcher = AstMatcher::new();
-            let code = "`git reset --hard`;\n";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Perl)
-                .expect("perl ast_matcher should run");
-            assert!(!matches.is_empty());
-            assert!(matches[0].rule_id.contains("git_reset_hard"));
-            assert!(matches[0].severity.blocks_by_default());
-        }
-
-        #[test]
-        fn perl_qx_rm_rf_catastrophic_blocks() {
-            let ast_matcher = AstMatcher::new();
-            let code = "qx/rm -rf \\/etc/;\n";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Perl)
-                .expect("perl ast_matcher should run");
-            assert!(!matches.is_empty());
-            assert!(matches[0].rule_id.contains("rm_rf"));
-            assert!(matches[0].severity.blocks_by_default());
-        }
-
-        #[test]
-        fn perl_file_path_rmtree_warns_by_default() {
-            // Use longer timeout for test reliability (default 20ms can be flaky under load)
-            let ast_matcher = AstMatcher::new().with_timeout(std::time::Duration::from_millis(100));
-            let code = "use File::Path;\nFile::Path::rmtree(\"/tmp/test\");\n";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Perl)
-                .expect("perl ast_matcher should run within 100ms");
-            assert!(
-                matches
-                    .iter()
-                    .any(|m| m.rule_id == "heredoc.perl.file_path.rmtree"),
-                "should match File::Path::rmtree"
-            );
-            let rmtree = matches
-                .into_iter()
-                .find(|m| m.rule_id == "heredoc.perl.file_path.rmtree")
-                .expect("rmtree match present");
-            assert!(!rmtree.severity.blocks_by_default());
-        }
-    }
-
-    mod perl_negative_fixtures {
-        use super::*;
-
-        #[test]
-        fn perl_comments_do_not_match() {
-            let ast_matcher = AstMatcher::new();
-            let code = "# system(\"rm -rf /\")\nprint \"ok\";\n";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Perl)
-                .expect("perl ast_matcher should run");
-            assert!(
-                matches.is_empty(),
-                "commented-out dangerous code is not executed"
-            );
-        }
-
-        #[test]
-        fn perl_printing_dangerous_string_does_not_match() {
-            let ast_matcher = AstMatcher::new();
-            let code = "print \"rm -rf /\";\n";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Perl)
-                .expect("perl ast_matcher should run");
-            assert!(
-                matches.is_empty(),
-                "printed strings are data, not execution"
-            );
-        }
-    }
-
-    #[test]
-    fn match_includes_line_number() {
-        let ast_matcher = AstMatcher::new();
-        let code = "x = 1\ny = 2\nshutil.rmtree('/test')";
-
-        let matches = ast_matcher
-            .find_matches(code, ScriptLanguage::Python)
-            .expect("should parse");
-        assert!(!matches.is_empty());
-        assert_eq!(matches[0].line_number, 3); // shutil.rmtree is on line 3
-    }
-
-    #[test]
-    fn match_preview_truncates_long_text() {
-        let ast_matcher = AstMatcher::new();
-        // Create code with a very long argument
-        let long_path = "/very/long/path/".repeat(10);
-        let code = format!("import shutil\nshutil.rmtree('{long_path}')");
-
-        let results = ast_matcher
-            .find_matches(&code, ScriptLanguage::Python)
-            .expect("should parse");
-        assert!(!results.is_empty());
-        // Preview should be truncated
-        assert!(results[0].matched_text_preview.len() <= 63);
-        assert!(results[0].matched_text_preview.ends_with("..."));
-    }
-
-    #[test]
-    fn empty_code_returns_no_matches() {
-        let ast_matcher = AstMatcher::new();
-
-        let results = ast_matcher
-            .find_matches("", ScriptLanguage::Python)
-            .expect("should parse empty code");
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn default_matcher_is_lazy_initialized() {
-        // Just verify it can be accessed without panic
-        let _ = &*DEFAULT_MATCHER;
-        assert!(!DEFAULT_MATCHER.patterns.is_empty());
-    }
-
-    #[test]
-    fn default_patterns_all_precompile() {
-        let raw = default_patterns();
-        let expected: HashMap<ScriptLanguage, usize> =
-            raw.iter().map(|(lang, pats)| (*lang, pats.len())).collect();
-
-        let compiled = precompile_patterns(raw);
-
-        for (lang, expected_len) in expected {
-            let got = compiled.get(&lang).map_or(0, std::vec::Vec::len);
-            assert_eq!(
-                got, expected_len,
-                "all default patterns should compile for {lang:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn truncate_preview_handles_utf8_safely() {
-        // Test with ASCII
-        assert_eq!(truncate_preview("hello", 10), "hello");
-        assert_eq!(truncate_preview("hello world!", 8), "hello...");
-
-        // Test with multi-byte UTF-8 (emojis are 4 bytes each)
-        let emojis = "🎉🎊🎁🎄🎅";
-        assert_eq!(truncate_preview(emojis, 10), emojis); // 5 chars, fits
-        assert_eq!(truncate_preview(emojis, 4), "🎉..."); // truncates to 1 emoji + ...
-
-        // Test with CJK characters (3 bytes each)
-        let cjk = "你好世界";
-        assert_eq!(truncate_preview(cjk, 10), cjk); // 4 chars, fits
-        assert_eq!(truncate_preview(cjk, 4), cjk); // exactly 4 chars, fits
-        assert_eq!(truncate_preview(cjk, 3), "..."); // 4 > 3, truncates (no room for even 1 char + "...")
-
-        // Edge cases
-        assert_eq!(truncate_preview("", 10), "");
-        assert_eq!(truncate_preview("ab", 3), "ab");
-        assert_eq!(truncate_preview("abc", 3), "abc");
-        assert_eq!(truncate_preview("abcd", 3), "...");
-    }
-
-    mod ruby_positive_fixtures {
-        use super::*;
-
-        #[test]
-        fn fileutils_rm_rf_catastrophic_blocks() {
-            let ast_matcher = AstMatcher::new();
-            let code = "require 'fileutils'\nFileUtils.rm_rf('/')";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Ruby)
-                .unwrap();
-            assert!(
-                matches
-                    .iter()
-                    .any(|m| m.rule_id == "heredoc.ruby.fileutils_rm_rf.catastrophic"
-                        && m.severity.blocks_by_default()),
-                "catastrophic FileUtils.rm_rf should block"
-            );
-        }
-
-        #[test]
-        fn fileutils_rm_rf_non_catastrophic_warns_only() {
-            let ast_matcher = AstMatcher::new();
-            let code = "require 'fileutils'\nFileUtils.rm_rf('./tmp')";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Ruby)
-                .unwrap();
-            assert!(
-                matches
-                    .iter()
-                    .any(|m| m.rule_id == "heredoc.ruby.fileutils_rm_rf"
-                        && !m.severity.blocks_by_default()),
-                "non-catastrophic FileUtils.rm_rf should warn only"
-            );
-        }
-
-        #[test]
-        fn system_rm_rf_catastrophic_blocks() {
-            let ast_matcher = AstMatcher::new();
-            let code = "system('rm -rf /')";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Ruby)
-                .unwrap();
-            assert!(
-                matches
-                    .iter()
-                    .any(|m| m.rule_id.ends_with(".rm_rf_catastrophic")
-                        && m.severity.blocks_by_default()),
-                "system('rm -rf /') should block"
-            );
-        }
-
-        #[test]
-        fn backticks_rm_rf_catastrophic_blocks() {
-            let ast_matcher = AstMatcher::new();
-            let code = "`rm -rf /`";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Ruby)
-                .unwrap();
-            assert!(
-                matches
-                    .iter()
-                    .any(|m| m.rule_id.ends_with(".rm_rf_catastrophic")
-                        && m.severity.blocks_by_default()),
-                "backticks `rm -rf /` should block"
-            );
-        }
-
-        #[test]
-        fn exec_git_reset_hard_blocks() {
-            let ast_matcher = AstMatcher::new();
-            let code = "exec('git reset --hard HEAD~1')";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Ruby)
-                .unwrap();
-            assert!(
-                matches
-                    .iter()
-                    .any(|m| m.rule_id.ends_with(".git_reset_hard")
-                        && m.severity.blocks_by_default()),
-                "exec('git reset --hard ...') should block"
-            );
-        }
-
-        #[test]
-        fn open3_capture3_rm_rf_catastrophic_blocks() {
-            let ast_matcher = AstMatcher::new();
-            let code = "require 'open3'\nOpen3.capture3('rm -rf /')";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Ruby)
-                .unwrap();
-            assert!(
-                matches
-                    .iter()
-                    .any(|m| m.rule_id.ends_with(".rm_rf_catastrophic")
-                        && m.severity.blocks_by_default()),
-                "Open3.capture3('rm -rf /') should block"
-            );
-        }
-
-        #[test]
-        fn open3_popen3_git_reset_hard_blocks() {
-            let ast_matcher = AstMatcher::new();
-            let code = "Open3.popen3('git reset --hard') { |i,o,e,t| }";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Ruby)
-                .unwrap();
-            assert!(
-                matches
-                    .iter()
-                    .any(|m| m.rule_id.ends_with(".git_reset_hard")
-                        && m.severity.blocks_by_default()),
-                "Open3.popen3('git reset --hard') should block"
-            );
-        }
-    }
-
-    mod ruby_negative_fixtures {
-        use super::*;
-
-        #[test]
-        fn puts_dangerous_string_does_not_match() {
-            let ast_matcher = AstMatcher::new();
-            let code = "puts 'rm -rf /'";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Ruby)
-                .unwrap();
-            assert!(matches.is_empty());
-        }
-
-        #[test]
-        fn system_safe_payload_does_not_match() {
-            let ast_matcher = AstMatcher::new();
-            let code = "system('git status')";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Ruby)
-                .unwrap();
-            assert!(matches.is_empty());
-        }
-
-        #[test]
-        fn open3_capture3_safe_payload_does_not_match() {
-            let ast_matcher = AstMatcher::new();
-            let code = "Open3.capture3('git status')";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Ruby)
-                .unwrap();
-            assert!(
-                matches.is_empty(),
-                "Open3.capture3 with safe payload should not match"
-            );
-        }
-
-        #[test]
-        fn backticks_safe_payload_does_not_match() {
-            let ast_matcher = AstMatcher::new();
-            let code = "`echo hello`";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Ruby)
-                .unwrap();
-            assert!(matches.is_empty());
-        }
-
-        #[test]
-        fn require_only_does_not_match() {
-            let ast_matcher = AstMatcher::new();
-            let code = "require 'fileutils'";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Ruby)
-                .unwrap();
-            assert!(matches.is_empty());
-        }
-
-        #[test]
-        fn file_delete_under_tmp_warns_only() {
-            let ast_matcher = AstMatcher::new();
-            let code = "File.delete('/tmp/test.txt')";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Ruby)
-                .unwrap();
-            assert!(
-                matches
-                    .iter()
-                    .any(|m| m.rule_id == "heredoc.ruby.file_delete"
-                        && !m.severity.blocks_by_default()),
-                "File.delete under /tmp should warn only"
-            );
-        }
-    }
-
-    mod typescript_positive_fixtures {
-        use super::*;
-
-        #[test]
-        fn fs_rmsync_catastrophic_blocks_with_type_assertion() {
-            let ast_matcher = AstMatcher::new();
-            let code =
-                "import * as fs from 'fs';\nfs.rmSync('/etc' as string, { recursive: true });";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::TypeScript)
-                .unwrap();
-            assert!(
-                matches
-                    .iter()
-                    .any(|m| m.rule_id == "heredoc.typescript.fs_rmsync.catastrophic"
-                        && m.severity.blocks_by_default()),
-                "catastrophic fs.rmSync should block"
-            );
-        }
-
-        #[test]
-        fn fs_rmsync_non_catastrophic_warns_only() {
-            let ast_matcher = AstMatcher::new();
-            let code = "import * as fs from 'fs';\nfs.rmSync('./dist', { recursive: true });";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::TypeScript)
-                .unwrap();
-            assert!(
-                matches
-                    .iter()
-                    .any(|m| m.rule_id == "heredoc.typescript.fs_rmsync"
-                        && !m.severity.blocks_by_default()),
-                "non-catastrophic recursive rmSync should warn only"
-            );
-        }
-
-        #[test]
-        fn execsync_git_reset_hard_blocks_inside_decorated_class() {
-            let ast_matcher = AstMatcher::new();
-            let code = "import * as child_process from 'child_process';\n@sealed\nclass Danger {\n  run(): void {\n    require('child_process').execSync('git reset --hard');\n  }\n}\n";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::TypeScript)
-                .unwrap();
-            assert!(
-                matches
-                    .iter()
-                    .any(|m| m.rule_id.ends_with(".git_reset_hard")
-                        && m.severity.blocks_by_default()),
-                "execSync('git reset --hard') should block"
-            );
-        }
-
-        #[test]
-        fn spawnsync_rm_rf_catastrophic_blocks_in_generic_function() {
-            let ast_matcher = AstMatcher::new();
-            let code = "import * as child_process from 'child_process';\nfunction go<T extends string>(x: T): void {\n  child_process.spawnSync('rm', ['-rf', '/']);\n}\n";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::TypeScript)
-                .unwrap();
-            assert!(
-                matches
-                    .iter()
-                    .any(|m| m.rule_id.ends_with(".rm_rf_catastrophic")
-                        && m.severity.blocks_by_default()),
-                "spawnSync('rm', ['-rf','/']) should block"
-            );
-        }
-
-        #[test]
-        fn deno_remove_catastrophic_blocks() {
-            let ast_matcher = AstMatcher::new();
-            let code = "type Path = string;\nconst p: Path = '/etc';\nDeno.remove('/etc', { recursive: true });";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::TypeScript)
-                .unwrap();
-            assert!(
-                matches.iter().any(
-                    |m| m.rule_id == "heredoc.typescript.deno_remove.catastrophic"
-                        && m.severity.blocks_by_default()
+        for source in [
+            "text = '$(git reset --hard)'",
+            "import os\ntext = '$(git reset --hard)'\nos.system(text)",
+        ] {
+            assert!(matches!(
+                interpreter_literal_shell_commands(
+                    source,
+                    ScriptLanguage::Python,
+                    || panic!("zero budget must stop before the callback or parser"),
+                    Duration::ZERO,
                 ),
-                "catastrophic Deno.remove should block"
-            );
+                Err(MatchError::Timeout { .. })
+            ));
         }
-    }
-
-    mod typescript_negative_fixtures {
-        use super::*;
-
-        #[test]
-        fn execsync_safe_payload_does_not_match() {
-            let ast_matcher = AstMatcher::new();
-            let code = "require('child_process').execSync('git status');";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::TypeScript)
-                .unwrap();
-            assert!(matches.is_empty());
-        }
-
-        #[test]
-        fn fs_rmsync_without_recursive_does_not_match() {
-            let ast_matcher = AstMatcher::new();
-            let code = "import * as fs from 'fs';\nfs.rmSync('./file.txt' as string);";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::TypeScript)
-                .unwrap();
-            assert!(matches.is_empty());
-        }
-
-        #[test]
-        fn printed_dangerous_string_does_not_match() {
-            let ast_matcher = AstMatcher::new();
-            let code = "console.log('rm -rf /');";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::TypeScript)
-                .unwrap();
-            assert!(matches.is_empty());
-        }
-
-        #[test]
-        fn require_child_process_alone_does_not_match() {
-            let ast_matcher = AstMatcher::new();
-            let code = "require('child_process');";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::TypeScript)
-                .unwrap();
-            assert!(matches.is_empty());
-        }
-
-        #[test]
-        fn spawnsync_echo_does_not_match() {
-            let ast_matcher = AstMatcher::new();
-            let code = "import * as child_process from 'child_process';\nchild_process.spawnSync('echo', ['rm -rf /']);";
-
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::TypeScript)
-                .unwrap();
-            assert!(matches.is_empty());
-        }
+        assert!(
+            interpreter_literal_shell_commands(
+                "print('ordinary text')",
+                ScriptLanguage::Python,
+                || panic!("the no-candidate fast path must not run the callback"),
+                Duration::ZERO,
+            )
+            .expect("no candidates need no recovery budget")
+            .is_empty()
+        );
     }
 
     #[test]
-    fn bash_positive_match() {
-        let ast_matcher = AstMatcher::new();
-        let code = "rm -rf /tmp/dangerous";
+    fn shared_literal_worker_preserves_the_outer_callback_contract() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let matches = ast_matcher.find_matches(code, ScriptLanguage::Bash);
-        match matches {
-            Ok(m) => {
-                assert!(!m.is_empty(), "should match rm -rf");
-                assert!(m[0].rule_id.contains("bash"));
-                assert!(m[0].severity.blocks_by_default());
+        // A callback declining an unsupported extraction must run before the
+        // interpreter parser. These deliberately malformed programs would be
+        // errors if tree construction moved ahead of that decision.
+        for (language, source) in [
+            (ScriptLanguage::Python, "print('$(git reset --hard)'"),
+            (ScriptLanguage::JavaScript, "edit('$(git reset --hard)'"),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed = Arc::clone(&calls);
+            let commands = interpreter_literal_shell_commands(
+                source,
+                language,
+                move || {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                    None
+                },
+                Duration::from_secs(5),
+            )
+            .expect("unsupported extraction stays with its original analysis path");
+            assert!(commands.is_empty());
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+        }
+
+        // Exercise the actual worker for both consumer modes, not just the
+        // inner recovery function. Verify source spans and payloads after the
+        // worker has released its source, tree, and permit.
+        for language in [ScriptLanguage::Python, ScriptLanguage::JavaScript] {
+            let source = execution_source(language, 40);
+            for isolated in [false, true] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let observed = Arc::clone(&calls);
+                let actual = snapshot(interpreter_literal_shell_commands(
+                    &source,
+                    language,
+                    move || {
+                        observed.fetch_add(1, Ordering::Relaxed);
+                        Some(isolated)
+                    },
+                    Duration::from_secs(5),
+                ));
+                let expected = incumbent(&source, language, isolated);
+                assert!(
+                    expected.as_ref().is_ok_and(|commands| !commands.is_empty()),
+                    "the execution reference must be complete and nonempty"
+                );
+                assert_eq!(actual, expected, "{language:?}, isolated={isolated}");
+                assert_eq!(calls.load(Ordering::Relaxed), 1);
             }
-            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+
+    /// Same-process paired component comparison, not a shipping hook gate.
+    /// Timed work includes each strategy's parser(s), scans and output allocation.
+    /// Fixture construction and output comparison are outside both timers.
+    #[test]
+    #[ignore = "paired component benchmark; run release with --test-threads=1"]
+    fn paired_shared_literal_ast_benchmark() {
+        use std::hint::black_box;
+
+        const RUNS: usize = 60;
+        const WARMUP: usize = 6;
+        for (shape, language, lines, isolated) in [
+            ("python_small", ScriptLanguage::Python, 0, true),
+            ("python_40", ScriptLanguage::Python, 40, true),
+            ("python_300", ScriptLanguage::Python, 300, true),
+            ("javascript_small", ScriptLanguage::JavaScript, 0, true),
+            ("javascript_40", ScriptLanguage::JavaScript, 40, true),
+            ("javascript_300", ScriptLanguage::JavaScript, 300, true),
+            ("unproved_consumer_300", ScriptLanguage::Python, 300, false),
+        ] {
+            let source = execution_source(language, lines);
+            let expected = incumbent(&source, language, isolated).expect("reference completes");
+            assert!(
+                !expected.is_empty(),
+                "do not benchmark missing recovery as success"
+            );
+            let mut old_ns = Vec::with_capacity(RUNS);
+            let mut shared_ns = Vec::with_capacity(RUNS);
+            for pair in 0..WARMUP + RUNS {
+                for use_shared in [pair % 2 == 0, pair % 2 != 0] {
+                    let started = Instant::now();
+                    let actual = if use_shared {
+                        shared(black_box(&source), language, isolated)
+                    } else {
+                        incumbent(black_box(&source), language, isolated)
+                    };
+                    let elapsed_ns = started.elapsed().as_nanos();
+                    assert_eq!(actual.as_ref(), Ok(&expected), "{shape}");
+                    if pair >= WARMUP {
+                        if use_shared {
+                            shared_ns.push(elapsed_ns);
+                        } else {
+                            old_ns.push(elapsed_ns);
+                        }
+                    }
+                    let _ = black_box(actual);
+                }
+            }
+            println!(
+                "{}",
+                serde_json::json!({
+                    "kind": "paired_shared_literal_ast",
+                    "scope": "in_process_literal_recovery",
+                    "reference_source": "36596fab6ca26aa5d40a70f4acbdced3db0d1886",
+                    "reference": "previous_composition_with_shared_predicates",
+                    "shape": shape,
+                    "source_bytes": source.len(),
+                    "runs": RUNS,
+                    "warmup": WARMUP,
+                    "old_ns": old_ns,
+                    "shared_ns": shared_ns,
+                })
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod literal_execution_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn python_reflective_rmtree_uses_the_existing_path_policy() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            id: String,
+            decision: String,
+            source: String,
+        }
+        let cases: Vec<Case> = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/python_reflective_rmtree.json"
+        )))
+        .expect("valid reflective-deletion verdict fixtures");
+        assert!(!cases.is_empty());
+        for case in cases {
+            let matches = DEFAULT_MATCHER
+                .find_matches_with_timeout(
+                    &case.source,
+                    ScriptLanguage::Python,
+                    Duration::from_secs(5),
+                )
+                .unwrap_or_else(|error| panic!("{}: {error:?}", case.id));
+            assert_eq!(
+                matches.iter().any(|hit| hit.severity.blocks_by_default()),
+                case.decision == "deny",
+                "{}: {}",
+                case.id,
+                case.source,
+            );
         }
     }
 
     #[test]
-    fn bash_negative_match() {
-        let ast_matcher = AstMatcher::new();
-        let code = "echo 'hello world'";
+    fn reflective_deletion_budget_exhaustion_is_not_a_clean_result() {
+        assert!(
+            complete_python_deletion_matches(
+                "import shutil\ngetattr(shutil, 'rmtree')('/tmp')",
+                ScriptLanguage::Python,
+                Vec::new(),
+                Duration::ZERO,
+            )
+            .is_err()
+        );
+        assert!(
+            complete_python_deletion_matches(
+                "print('ready')",
+                ScriptLanguage::Python,
+                Vec::new(),
+                Duration::ZERO,
+            )
+            .expect("unrelated source does not start a supplemental scan")
+            .is_empty()
+        );
+    }
 
-        let matches = ast_matcher.find_matches(code, ScriptLanguage::Bash);
-        match matches {
-            Ok(m) => assert!(m.is_empty(), "should not match safe code"),
-            Err(e) => panic!("unexpected error: {e}"),
+    #[test]
+    fn reflective_deletion_merge_preserves_primary_rule_identity() {
+        let source = "import shutil\nfrom shutil import rmtree as wipe\nwipe('/tmp')\ngetattr(shutil, 'copy')";
+        let original = source_analysis::DEFAULT_MATCHER
+            .find_matches_with_timeout(source, ScriptLanguage::Python, Duration::from_secs(5))
+            .expect("complete primary deletion analysis");
+        let primary = original
+            .iter()
+            .find(|hit| hit.rule_id == "heredoc.python.shutil_rmtree")
+            .expect("the imported deletion has the established rule")
+            .clone();
+        let matches = complete_python_deletion_matches(
+            source,
+            ScriptLanguage::Python,
+            original,
+            Duration::from_secs(5),
+        )
+        .expect("complete supplemental scan");
+        assert_eq!(
+            matches.iter().filter(|hit| **hit == primary).count(),
+            1,
+            "do not duplicate or replace the primary finding",
+        );
+    }
+
+    #[test]
+    fn unproved_outer_consumers_keep_the_original_recovery_560() {
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                "text = 'echo $(git reset --hard)'\nprint(text)",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const text = 'echo $(git reset --hard)'; console.log(text);",
+            ),
+        ] {
+            assert_eq!(literal_recovery_scope(source, language, false), Some(false));
+            assert_eq!(literal_recovery_scope(source, language, true), None);
         }
     }
 
-    // =========================================================================
-    // Python Fixture Tests (git_safety_guard-beq)
-    // =========================================================================
-
-    /// Positive fixtures: patterns that MUST match (Critical/High severity = blocks)
-    mod python_positive_fixtures {
-        use super::*;
-
-        #[test]
-        fn shutil_rmtree_blocks() {
-            let ast_matcher = AstMatcher::new();
-            let code = "import shutil\nshutil.rmtree('/dangerous/path')";
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Python)
-                .unwrap();
-            assert!(!matches.is_empty(), "shutil.rmtree must match");
-            assert_eq!(matches[0].rule_id, "heredoc.python.shutil_rmtree");
-            assert!(matches[0].severity.blocks_by_default());
-        }
-
-        #[test]
-        fn os_remove_blocks() {
-            let ast_matcher = AstMatcher::new();
-            let code = "import os\nos.remove('/etc/passwd')";
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Python)
-                .unwrap();
-            assert!(!matches.is_empty(), "os.remove must match");
-            assert_eq!(matches[0].rule_id, "heredoc.python.os_remove");
-            assert!(matches[0].severity.blocks_by_default());
-        }
-
-        #[test]
-        fn os_rmdir_blocks() {
-            let ast_matcher = AstMatcher::new();
-            let code = "import os\nos.rmdir('/important/dir')";
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Python)
-                .unwrap();
-            assert!(!matches.is_empty(), "os.rmdir must match");
-            assert_eq!(matches[0].rule_id, "heredoc.python.os_rmdir");
-            assert!(matches[0].severity.blocks_by_default());
-        }
-
-        #[test]
-        fn os_unlink_blocks() {
-            let ast_matcher = AstMatcher::new();
-            let code = "import os\nos.unlink('/critical/file')";
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Python)
-                .unwrap();
-            assert!(!matches.is_empty(), "os.unlink must match");
-            assert_eq!(matches[0].rule_id, "heredoc.python.os_unlink");
-            assert!(matches[0].severity.blocks_by_default());
-        }
-
-        #[test]
-        fn pathlib_unlink_blocks() {
-            let ast_matcher = AstMatcher::new();
-            let code = "from pathlib import Path\nPath('/secret').unlink()";
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Python)
-                .unwrap();
-            assert!(!matches.is_empty(), "pathlib.Path().unlink() must match");
-            assert_eq!(matches[0].rule_id, "heredoc.python.pathlib_unlink");
-            assert!(matches[0].severity.blocks_by_default());
-        }
-
-        #[test]
-        fn pathlib_rmdir_blocks() {
-            let ast_matcher = AstMatcher::new();
-            let code = "from pathlib import Path\nPath('/danger/dir').rmdir()";
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Python)
-                .unwrap();
-            assert!(!matches.is_empty(), "pathlib.Path().rmdir() must match");
-            assert_eq!(matches[0].rule_id, "heredoc.python.pathlib_rmdir");
-            assert!(matches[0].severity.blocks_by_default());
-        }
-
-        #[test]
-        fn subprocess_run_warns() {
-            // subprocess.run is Medium severity - warns but doesn't block by default
-            // per bead: "Do not block on shell=True alone"
-            let ast_matcher = AstMatcher::new();
-            let code = "import subprocess\nsubprocess.run(['ls', '-la'])";
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Python)
-                .unwrap();
-            assert!(!matches.is_empty(), "subprocess.run must match");
-            assert_eq!(matches[0].rule_id, "heredoc.python.subprocess_run");
+    #[test]
+    fn python_data_literals_do_not_establish_shell_execution_560() {
+        for source in [
+            "import re\ns = re.sub(r'x$', \"it's `tool --help`\", 'x')",
+            "y = ('x', \"it's `tool --help`\")",
+            "y = f('x', \"it's `tool --help`\")",
+            "rep('''use core::fav;\nfn with_store<R>(\n/// The items `zone` belongs to (`list_items`).''')",
+            "import sys\nnew = ('echo $(date)\\n' '(cd t && task >\"$W/out-$SHA.log\")\\n' + old)",
+            "text = \"os.system('echo $(date)')\"\nwrite_example(text)",
+            "# os.system and eval are documentation, not references\ny = ('$(date)', 'text')",
+        ] {
             assert!(
-                !matches[0].severity.blocks_by_default(),
-                "Medium should not block"
-            );
-        }
-
-        #[test]
-        fn subprocess_run_list_arg_destructive_blocks() {
-            // Regression (#136): a destructive payload nested inside a LIST arg
-            // must escalate to blocking even though the first element ("sh") is
-            // inert. `subprocess.run(["sh","-c","rm -rf /etc"])` really executes
-            // `sh -c "rm -rf /etc"`, so it must BLOCK, not warn.
-            let ast_matcher = AstMatcher::new();
-            let code = "import subprocess\nsubprocess.run([\"sh\",\"-c\",\"rm -rf /etc\"])";
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Python)
-                .unwrap();
-            assert!(!matches.is_empty(), "subprocess.run(list) must match");
-            assert!(
-                matches[0].severity.blocks_by_default(),
-                "destructive list-arg payload must escalate to blocking, got {:?} ({})",
-                matches[0].severity,
-                matches[0].rule_id
-            );
-            assert!(
-                matches[0]
-                    .rule_id
-                    .starts_with("heredoc.python.subprocess_run"),
-                "unexpected rule id: {}",
-                matches[0].rule_id
-            );
-        }
-
-        #[test]
-        fn subprocess_popen_list_arg_destructive_blocks() {
-            // Regression (#136): same hole via subprocess.Popen([...]).
-            let ast_matcher = AstMatcher::new();
-            let code = "import subprocess\nsubprocess.Popen([\"sh\",\"-c\",\"rm -rf /etc\"])";
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Python)
-                .unwrap();
-            assert!(!matches.is_empty(), "subprocess.Popen(list) must match");
-            assert!(
-                matches[0].severity.blocks_by_default(),
-                "destructive list-arg payload via Popen must block, got {:?} ({})",
-                matches[0].severity,
-                matches[0].rule_id
-            );
-        }
-
-        #[test]
-        fn subprocess_run_list_arg_inert_warns() {
-            // Guard against over-block: a benign list arg must stay warn-only.
-            let ast_matcher = AstMatcher::new();
-            let code = "import subprocess\nsubprocess.run([\"sh\",\"-c\",\"rm -rf ./build\"])";
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Python)
-                .unwrap();
-            // rm -rf in an exec sink still escalates (the sink unambiguously runs
-            // it), but a non-rm benign command must remain warn-only.
-            let benign = "import subprocess\nsubprocess.run([\"ls\",\"-la\"])";
-            let benign_matches = ast_matcher
-                .find_matches(benign, ScriptLanguage::Python)
-                .unwrap();
-            assert!(
-                !benign_matches.is_empty(),
-                "benign subprocess.run(list) still matches at warn level"
-            );
-            assert!(
-                !benign_matches[0].severity.blocks_by_default(),
-                "benign list arg must not block"
-            );
-            // The destructive build-dir case still blocks (rm -rf via exec sink).
-            assert!(
-                matches[0].severity.blocks_by_default(),
-                "rm -rf via exec sink blocks regardless of target"
-            );
-        }
-
-        #[test]
-        fn os_system_warns() {
-            // os.system is Medium severity - warns but doesn't block by default
-            let ast_matcher = AstMatcher::new();
-            let code = "import os\nos.system('echo hello')";
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Python)
-                .unwrap();
-            assert!(!matches.is_empty(), "os.system must match");
-            assert_eq!(matches[0].rule_id, "heredoc.python.os_system");
-            assert!(
-                !matches[0].severity.blocks_by_default(),
-                "Medium should not block"
+                !literal_source_has_execution_evidence(source, ScriptLanguage::Python),
+                "interpreter data was promoted to a shell program: {source}"
             );
         }
     }
 
-    /// Negative fixtures: patterns that must NOT match (safe code)
-    mod python_negative_fixtures {
-        use super::*;
-
-        #[test]
-        fn print_statement_does_not_match() {
-            let ast_matcher = AstMatcher::new();
-            // String containing destructive command text is NOT executed
-            let code = "print('rm -rf /')";
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Python)
-                .unwrap();
-            assert!(matches.is_empty(), "print statement must not match");
-        }
-
-        #[test]
-        fn import_alone_does_not_match() {
-            let ast_matcher = AstMatcher::new();
-            // Just importing doesn't execute anything dangerous
-            let code = "import shutil\nimport os\nimport subprocess";
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Python)
-                .unwrap();
-            assert!(matches.is_empty(), "imports alone must not match");
-        }
-
-        #[test]
-        fn inert_list_literal_assigned_then_printed_does_not_match() {
-            // Regression guard (#136): a destructive token inside a list that is
-            // merely assigned and printed (no exec sink) must stay ALLOWED. Only
-            // actual exec-sink CALLS escalate, never inert list literals.
-            let ast_matcher = AstMatcher::new();
-            let code = "x = [\"sh\",\"-c\",\"rm -rf /etc\"]\nprint(x)";
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Python)
-                .unwrap();
+    #[test]
+    fn javascript_data_literals_do_not_establish_shell_execution_560() {
+        for source in [
+            "const text = \"it's `tool --help`\"; edit(text);",
+            "const pair = ['x', \"it's `tool --help`\"];",
+            "const text = 'fn with_store<R>( `zone`'; rep(text);",
+            "const text = '(task >\"$W/out.log\") $(date)'; edit(text);",
+            "const text = \"execSync('echo $(date)')\"; writeExample(text);",
+        ] {
             assert!(
-                matches.is_empty(),
-                "inert list literal must not match, got {matches:?}"
+                !literal_source_has_execution_evidence(source, ScriptLanguage::JavaScript),
+                "interpreter data was promoted to a shell program: {source}"
             );
-            // The conservative exec-sink backstop must also stay silent here.
-            assert!(
-                scan_executing_sink_fallback(code, ScriptLanguage::Python).is_none(),
-                "exec-sink fallback must not fire on an inert list literal"
-            );
-        }
-
-        #[test]
-        fn comment_does_not_match() {
-            let ast_matcher = AstMatcher::new();
-            // Comments mentioning dangerous operations are not executed
-            let code = "# shutil.rmtree('/') would be dangerous\nx = 1";
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Python)
-                .unwrap();
-            assert!(matches.is_empty(), "comments must not match");
-        }
-
-        #[test]
-        fn safe_file_operations_do_not_match() {
-            let ast_matcher = AstMatcher::new();
-            // Safe file operations should not trigger
-            let code = r"
-import os
-os.path.exists('/tmp/test')
-os.path.isfile('/tmp/test')
-os.listdir('/tmp')
-with open('/tmp/log.txt', 'w') as f:
-    f.write('hello')
-";
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Python)
-                .unwrap();
-            assert!(matches.is_empty(), "safe file operations must not match");
-        }
-
-        #[test]
-        fn string_variable_does_not_match() {
-            let ast_matcher = AstMatcher::new();
-            // String that looks like dangerous code but is just data
-            let code = r#"
-dangerous_cmd = "shutil.rmtree('/')"
-docs = "Example: os.remove(path)"
-"#;
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Python)
-                .unwrap();
-            assert!(matches.is_empty(), "string literals must not match");
-        }
-
-        #[test]
-        fn docstring_does_not_match() {
-            let ast_matcher = AstMatcher::new();
-            let code = r#"
-def cleanup():
-    """
-    Warning: Do not call shutil.rmtree('/') as it will delete everything.
-    Use os.remove() for single files only.
-    """
-    pass
-"#;
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Python)
-                .unwrap();
-            assert!(matches.is_empty(), "docstrings must not match");
-        }
-
-        #[test]
-        fn safe_tmp_cleanup_in_context() {
-            let ast_matcher = AstMatcher::new();
-            // This tests structural matching - the pattern matches but this is
-            // about whether we match at all (we do), not about path safety
-            // NOTE: This test verifies the pattern DOES match (as expected)
-            // Path-based filtering would be a separate concern
-            let code = "import shutil\nshutil.rmtree('/tmp/build_artifacts')";
-            let matches = ast_matcher
-                .find_matches(code, ScriptLanguage::Python)
-                .unwrap();
-            // Pattern matching finds this - path filtering is separate policy
-            assert!(!matches.is_empty(), "shutil.rmtree matches structurally");
         }
     }
 
-    mod catastrophic_paths {
-        use super::*;
-
-        #[test]
-        fn test_is_catastrophic_path_loose_prefix() {
-            // These should NOT be catastrophic
-            assert!(!is_catastrophic_path("/bin_logs"));
-            assert!(!is_catastrophic_path("/usr_local"));
-            assert!(!is_catastrophic_path("/etc_backup"));
-            assert!(!is_catastrophic_path("/home_page.html"));
-        }
-
-        #[test]
-        fn test_is_catastrophic_path_strict_prefix() {
-            // These SHOULD be catastrophic
-            assert!(is_catastrophic_path("/bin"));
-            assert!(is_catastrophic_path("/bin/"));
-            assert!(is_catastrophic_path("/bin/sh"));
-            assert!(is_catastrophic_path("/usr"));
-            assert!(is_catastrophic_path("/usr/local"));
-            assert!(is_catastrophic_path("/etc/passwd"));
-        }
-
-        #[test]
-        fn test_is_catastrophic_path_var() {
-            // /var should be catastrophic
-            assert!(is_catastrophic_path("/var"));
-            assert!(is_catastrophic_path("/var/www"));
-            assert!(is_catastrophic_path("/var/log"));
-        }
-
-        #[test]
-        fn test_is_catastrophic_path_tmp_backup_not_catastrophic() {
-            // /tmp_backup should NOT be matched as /tmp (and thus fall through to sys_dirs check)
-            // Since it's not in sys_dirs, it should return false.
-            assert!(!is_catastrophic_path("/tmp_backup"));
-        }
-
-        // ---- #136: Python exec-sink refinement & exec-sink backstop ---------
-
-        fn rmrf() -> String {
-            format!("{}{}{}", "rm", " -", "rf")
-        }
-
-        #[test]
-        fn python_os_system_destructive_literal_escalates_to_blocking() {
-            let matcher = AstMatcher::new();
-            let code = format!("import os\nos.system(\"{} /etc/important\")", rmrf());
-            let matches = matcher.find_matches(&code, ScriptLanguage::Python).unwrap();
+    #[test]
+    fn direct_indirect_and_reflective_execution_keep_full_recovery_560() {
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                "import os\ns = 'echo $(date); task >\"$W/out\"'\nos.system(s)",
+            ),
+            (
+                ScriptLanguage::Python,
+                "from os import system as dispatch\ns = 'echo $(date)'\ndispatch(s)",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess as p\nf = p.run\nf('echo $(date)', shell=True)",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import os\nos.posix_spawn('/bin/sh', ['sh', '-c', 'echo $(date)'], {})",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import os\nf = getattr(os, 'sys' + 'tem')\nf('echo $(date)')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import os\ns = 'git reset --hard'\nexec('os.system(s)')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "from helpers import *\nf('echo $(date)')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "def helper(s):\n    os.system(s)\nhelper('echo $(date)')",
+            ),
+            (ScriptLanguage::Python, "ｅxec('echo $(date)')"),
+            (
+                ScriptLanguage::JavaScript,
+                "const cp = require('child_process'); const s = 'echo $(date)'; cp.execSync(s);",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "import {execSync as dispatch} from 'node:child_process'; dispatch('echo $(date)');",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "const f = cp['exe' + 'cSync']; f('echo $(date)');",
+            ),
+            (ScriptLanguage::JavaScript, "Function('return process')();"),
+            (ScriptLanguage::JavaScript, "tag`echo $(date)`;"),
+            (ScriptLanguage::JavaScript, r"e\u0076al('echo $(date)');"),
+            (
+                ScriptLanguage::JavaScript,
+                "const handler = value => cp.execSync(value); handler('echo $(date)');",
+            ),
+        ] {
             assert!(
-                matches
-                    .iter()
-                    .any(|m| m.rule_id.starts_with("heredoc.python.os_system")
-                        && m.severity.blocks_by_default()),
-                "os.system(rm -rf /etc) must escalate to a blocking severity: {matches:?}"
+                literal_source_has_execution_evidence(source, language),
+                "execution evidence must retain every original recovery rule: {source}"
             );
         }
+    }
 
-        #[test]
-        fn python_os_system_benign_literal_warns_only() {
-            let matcher = AstMatcher::new();
-            let code = "import os\nos.system(\"echo hello\")";
-            let matches = matcher.find_matches(code, ScriptLanguage::Python).unwrap();
-            // The os.system match is still reported but must remain warn-only.
+    #[test]
+    fn incomplete_evidence_is_not_an_absence_proof_560() {
+        for (language, source) in [
+            (ScriptLanguage::Python, "f('$(date)'"),
+            (ScriptLanguage::JavaScript, "edit('$(date)'"),
+            (ScriptLanguage::Ruby, "puts '$(date)'"),
+        ] {
+            assert!(literal_source_has_execution_evidence(source, language));
+        }
+        let large = format!("#{}", "x".repeat(LITERAL_EVIDENCE_MAX_BYTES));
+        assert!(literal_source_has_execution_evidence(
+            &large,
+            ScriptLanguage::Python
+        ));
+        let many_nodes = "pass\n".repeat(LITERAL_EVIDENCE_MAX_NODES);
+        assert!(literal_source_has_execution_evidence(
+            &many_nodes,
+            ScriptLanguage::Python
+        ));
+    }
+
+    #[test]
+    fn data_volume_does_not_invent_an_execution_use_560() {
+        let source = "text = 'example $(date) with `tool --help`'\n".repeat(160);
+        assert!(!literal_source_has_execution_evidence(
+            &source,
+            ScriptLanguage::Python
+        ));
+        let with_sink = format!("{source}os.system(text)\n");
+        assert!(literal_source_has_execution_evidence(
+            &with_sink,
+            ScriptLanguage::Python
+        ));
+    }
+
+    /// A process call whose every argument is a literal without substitution
+    /// syntax runs a fixed command line. That is no evidence that another
+    /// literal runs, unless the command line can run a file the program
+    /// wrote (#560).
+    #[test]
+    fn closed_process_calls_count_only_when_they_can_run_generated_code_560() {
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nc = subprocess.run(['git', 'show', 'origin/main:F.md'], capture_output=True, text=True, check=True).stdout\nb = \"it's `x`\"",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.check_output(['git', 'diff', '--stat'], cwd='/w')\nb = '`x`'",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import re\np = re.compile(r'Some\\(x\\)')\nt = 'Option<(A, B)> `x`'",
+            ),
+            (
+                ScriptLanguage::JavaScript,
+                "cp.execSync('git status'); const t = 'it is `x`';",
+            ),
+        ] {
             assert!(
-                matches
-                    .iter()
-                    .filter(|m| m.rule_id.starts_with("heredoc.python.os_system"))
-                    .all(|m| !m.severity.blocks_by_default()),
-                "benign os.system must stay warn-only: {matches:?}"
+                !literal_source_has_execution_evidence(source, language),
+                "a closed call became evidence: {source}"
+            );
+            // The capability question keeps every execution name.
+            assert!(
+                program_may_execute_code(source, language),
+                "a process call must still count as a capability: {source}"
             );
         }
-
-        #[test]
-        fn python_print_literal_has_no_match() {
-            let matcher = AstMatcher::new();
-            // print() is not a registered sink: a destructive token in its inert
-            // literal yields no AST match at all.
-            let code = format!("print(\"{} /etc/important\")", rmrf());
-            let matches = matcher.find_matches(&code, ScriptLanguage::Python).unwrap();
+        for (language, source) in [
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(['sh', 'm.sh'])",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(['./m.sh'])",
+            ),
+            (ScriptLanguage::Python, "import os\nos.system('bash m.sh')"),
+            (
+                ScriptLanguage::Python,
+                "import os\nos.system('git status; ./m.sh')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(['git', '-c', 'core.pager=sh', 'log'])",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(['env', 'PATH=.', 'ls'])",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run('make', shell=True)",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(['git status; sh m.sh'], shell=True)",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(['ls'], executable='/bin/sh')",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(['echo', '$(date)'])",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nsubprocess.run(args)",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import subprocess\nrun = subprocess.run",
+            ),
+            (
+                ScriptLanguage::Python,
+                "import os\nos.execv('/bin/git', ['git', 'log'])",
+            ),
+            (ScriptLanguage::Python, "code = compile('x', 'f', 'exec')"),
+            (ScriptLanguage::JavaScript, "cp.execSync('sh m.sh');"),
+            (
+                ScriptLanguage::JavaScript,
+                "cp.spawnSync('git', ['-c', 'alias.x=!sh', 'x']);",
+            ),
+        ] {
             assert!(
-                matches.is_empty(),
-                "inert print() literal must not match any python pattern: {matches:?}"
-            );
-        }
-
-        #[test]
-        fn fallback_catches_aliased_execsync_literal() {
-            let code = format!(
-                "const cp = require(\"child_process\")\ncp.execSync(\"{} /etc/important\")",
-                rmrf()
-            );
-            let hit = scan_executing_sink_fallback(&code, ScriptLanguage::JavaScript);
-            assert!(
-                hit.is_some_and(|m| m.severity.blocks_by_default()),
-                "aliased execSync(rm -rf /etc) must be caught by the backstop"
-            );
-        }
-
-        #[test]
-        fn fallback_ignores_inert_literal_without_sink() {
-            let code = format!("const x = \"{} /etc\"\nconsole.log(x)", rmrf());
-            assert!(
-                scan_executing_sink_fallback(&code, ScriptLanguage::JavaScript).is_none(),
-                "no exec sink => backstop must not fire"
-            );
-        }
-
-        #[test]
-        fn fallback_ignores_console_log_literal() {
-            let code = format!("console.log(\"{} build\")", rmrf());
-            assert!(
-                scan_executing_sink_fallback(&code, ScriptLanguage::JavaScript).is_none(),
-                "console.log is not an exec sink => backstop must not fire"
-            );
-        }
-
-        #[test]
-        fn fallback_does_not_run_for_bash() {
-            let code = format!("{} /etc/important", rmrf());
-            assert!(
-                scan_executing_sink_fallback(&code, ScriptLanguage::Bash).is_none(),
-                "bash bodies are never masked, so the backstop is a no-op for them"
-            );
-        }
-
-        #[test]
-        fn filesystem_fallback_catches_ruby_fileutils_catastrophic() {
-            let code = "require \"fileutils\"\nFileUtils.rm_rf(\"/\")";
-            let hit = scan_filesystem_sink_fallback(code, ScriptLanguage::Ruby);
-            assert!(
-                hit.is_some_and(|m| m.rule_id == "heredoc.ruby.fileutils_rm_rf.catastrophic"
-                    && m.severity.blocks_by_default()),
-                "catastrophic FileUtils.rm_rf must be caught by fallback"
-            );
-        }
-
-        #[test]
-        fn filesystem_fallback_catches_javascript_rmsync_catastrophic() {
-            let code = "const fs = require('fs');\nfs.rmSync('/etc', { recursive: true });";
-            let hit = scan_filesystem_sink_fallback(code, ScriptLanguage::JavaScript);
-            assert!(
-                hit.is_some_and(|m| m.rule_id == "heredoc.javascript.fs_rmsync.catastrophic"
-                    && m.severity.blocks_by_default()),
-                "catastrophic fs.rmSync must be caught before the bounded AST pass"
-            );
-        }
-
-        #[test]
-        fn filesystem_fallback_ignores_javascript_comment_and_template_text() {
-            let comment = "/*\nfs.rmSync('/')\n*/";
-            let template = "const docs = `\nfs.rmSync('/')\n`;";
-            assert!(
-                scan_filesystem_sink_fallback(comment, ScriptLanguage::JavaScript).is_none(),
-                "commented fs.rmSync call must not fire fallback"
-            );
-            assert!(
-                scan_filesystem_sink_fallback(template, ScriptLanguage::JavaScript).is_none(),
-                "template text containing fs.rmSync must not fire fallback"
-            );
-        }
-
-        #[test]
-        fn filesystem_fallback_ignores_non_catastrophic_javascript_target() {
-            let code = "fs.rmSync('./dist', { recursive: true });";
-            assert!(
-                scan_filesystem_sink_fallback(code, ScriptLanguage::JavaScript).is_none(),
-                "non-catastrophic targets remain warn-only in the primary AST matcher"
-            );
-        }
-
-        #[test]
-        fn filesystem_fallback_ignores_ruby_fileutils_in_comment() {
-            let code = "# FileUtils.rm_rf(\"/\")";
-            assert!(
-                scan_filesystem_sink_fallback(code, ScriptLanguage::Ruby).is_none(),
-                "commented FileUtils call must not fire fallback"
-            );
-        }
-
-        #[test]
-        fn filesystem_fallback_ignores_ruby_fileutils_in_string() {
-            let code = "puts 'FileUtils.rm_rf(\"/\")'";
-            assert!(
-                scan_filesystem_sink_fallback(code, ScriptLanguage::Ruby).is_none(),
-                "inert string containing FileUtils call must not fire fallback"
-            );
-        }
-
-        #[test]
-        fn fallback_catches_python_list_arg_destructive() {
-            // Regression (#136): the backstop must descend into list elements, so
-            // a destructive payload after an inert "sh" first element is caught.
-            let code = format!(
-                "import subprocess\nsubprocess.run([\"sh\",\"-c\",\"{} /etc\"])",
-                rmrf()
-            );
-            let hit = scan_executing_sink_fallback(&code, ScriptLanguage::Python);
-            assert!(
-                hit.is_some_and(|m| m.severity.blocks_by_default()),
-                "destructive list-arg payload must be caught by the backstop"
-            );
-        }
-
-        #[test]
-        fn fallback_catches_python_aliased_check_call_list_arg() {
-            // check_call has no dedicated AST rule; the backstop must still catch
-            // its destructive list-arg form (#136).
-            let code = format!(
-                "import subprocess as s\ns.check_call([\"sh\",\"-c\",\"{} /etc\"])",
-                rmrf()
-            );
-            let hit = scan_executing_sink_fallback(&code, ScriptLanguage::Python);
-            assert!(
-                hit.is_some_and(|m| m.severity.blocks_by_default()),
-                "check_call(list) destructive payload must be caught by the backstop"
-            );
-        }
-
-        #[test]
-        fn fallback_ignores_python_inert_list_literal() {
-            // An inert list literal that is never passed to an exec sink must not
-            // trip the backstop, even though it contains a destructive token.
-            let code = format!("x = [\"sh\",\"-c\",\"{} build\"]\nprint(x)", rmrf());
-            assert!(
-                scan_executing_sink_fallback(&code, ScriptLanguage::Python).is_none(),
-                "inert list literal must not fire the python backstop"
+                literal_source_has_execution_evidence(source, language),
+                "this call can run what the program wrote: {source}"
             );
         }
     }

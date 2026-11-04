@@ -1,19 +1,24 @@
 //! Allowlist file parsing and layered loading.
 //!
 //! This module implements loading of allowlist entries from three layers:
-//! - Project: `.dcg/allowlist.toml` at repo root
+//! - Project: `.dcg/allowlist.toml` at repo root, active only when the user
+//!   explicitly selects that repository's `.dcg.toml` through `DCG_CONFIG`
 //! - User: `~/.config/dcg/allowlist.toml`
 //! - System: `/etc/dcg/allowlist.toml` (optional)
 //!
 //! Test override:
 //! - `DCG_ALLOWLIST_SYSTEM_PATH` can override the system allowlist path
-//!   (useful for hermetic E2E tests).
+//!   (useful for hermetic E2E tests). The override is an explicit user trust
+//!   decision for that file, while its loaded entries retain System-layer
+//!   identity and precedence.
 //!
 //! Design goals:
 //! - Strongly-typed model (`AllowEntry`, `AllowSelector`)
 //! - Robust parsing: invalid TOML or invalid entries must not crash the hook
-//! - Explicit, testable layering precedence (project > user > system)
+//! - Explicit, testable layering precedence (trusted project > user > system)
+//! - No trust grants from repository contents alone
 
+use std::cell::OnceCell;
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::fs;
@@ -190,6 +195,20 @@ impl LayeredAllowlist {
         user: Option<PathBuf>,
         system: Option<PathBuf>,
     ) -> Self {
+        Self::load_from_paths_with_system_source(
+            project,
+            user,
+            system,
+            crate::config::ConfigSource::System,
+        )
+    }
+
+    fn load_from_paths_with_system_source(
+        project: Option<PathBuf>,
+        user: Option<PathBuf>,
+        system: Option<PathBuf>,
+        system_source: crate::config::ConfigSource,
+    ) -> Self {
         let mut layers: Vec<LoadedAllowlistLayer> = Vec::new();
 
         if let Some(path) = project {
@@ -212,7 +231,7 @@ impl LayeredAllowlist {
             layers.push(LoadedAllowlistLayer {
                 layer: AllowlistLayer::System,
                 path: path.clone(),
-                file: load_allowlist_file(AllowlistLayer::System, &path),
+                file: load_allowlist_file_with_source(AllowlistLayer::System, &path, system_source),
             });
         }
 
@@ -225,6 +244,56 @@ impl LayeredAllowlist {
     /// exact-command only. The config field is named `additional_allowlist`, but
     /// accepting these strings as regexes would create a bypass path without the
     /// normal `risk_acknowledged` review gate.
+    /// A copy of this allowlist with one extra in-memory layer granting
+    /// exactly the given `pack_id:pattern_name` rules, evaluated first.
+    ///
+    /// Used for scoped re-evaluation: a grant that applies to a specific
+    /// rule set (rebase recovery) must suppress only those rules, so that
+    /// every other pattern on the same command line keeps its own verdict.
+    /// The layer carries no paths, conditions, or expiry — the caller has
+    /// already decided the grant applies to this invocation.
+    #[must_use]
+    pub fn with_rule_grants(&self, rules: &[(&str, &str)], reason: &str, source: &str) -> Self {
+        let entries: Vec<AllowEntry> = rules
+            .iter()
+            .map(|(pack_id, pattern_name)| AllowEntry {
+                selector: AllowSelector::Rule(RuleId {
+                    pack_id: (*pack_id).to_string(),
+                    pattern_name: (*pattern_name).to_string(),
+                }),
+                reason: reason.to_string(),
+                added_by: Some(source.to_string()),
+                added_at: None,
+                expires_at: None,
+                ttl: None,
+                session: None,
+                session_id: None,
+                context: None,
+                conditions: HashMap::new(),
+                environments: Vec::new(),
+                paths: None,
+                risk_acknowledged: false,
+            })
+            .collect();
+
+        let mut relaxed = self.clone();
+        if entries.is_empty() {
+            return relaxed;
+        }
+        relaxed.layers.insert(
+            0,
+            LoadedAllowlistLayer {
+                layer: AllowlistLayer::Agent,
+                path: PathBuf::from(format!("<{source}>")),
+                file: AllowlistFile {
+                    entries,
+                    errors: Vec::new(),
+                },
+            },
+        );
+        relaxed
+    }
+
     pub fn prepend_agent_exact_commands(&mut self, agent_key: &str, commands: &[String]) {
         let entries: Vec<AllowEntry> = commands
             .iter()
@@ -274,8 +343,9 @@ impl LayeredAllowlist {
     /// Note: This performs exact rule ID matching without wildcard expansion.
     /// Use `match_rule` for wildcard-aware matching.
     ///
-    /// This is a backward-compatible wrapper around `lookup_rule_at_path` with `cwd = None`.
-    /// For path-aware matching, use `lookup_rule_at_path` instead.
+    /// Wrapper around `lookup_rule_at_path` with an unknown `cwd`, which makes
+    /// every directory-scoped (`paths = [...]`) entry inapplicable. Callers
+    /// that know where the command runs must use `lookup_rule_at_path`.
     ///
     /// Skips entries that are expired, have unmet conditions, or lack risk ack.
     #[must_use]
@@ -299,8 +369,9 @@ impl LayeredAllowlist {
     ///
     /// * `pack_id` - The pack identifier to match
     /// * `pattern_name` - The pattern name to match (supports wildcard `*`)
-    /// * `cwd` - Optional current working directory for path-based filtering.
-    ///   If None, path restrictions are ignored (backward compatibility).
+    /// * `cwd` - The directory the guarded command runs in. `None` means it
+    ///   could not be determined, and every `paths = [...]` entry then fails
+    ///   closed rather than applying against an unrelated directory (#387).
     #[must_use]
     pub fn match_rule_at_path(
         &self,
@@ -313,12 +384,19 @@ impl LayeredAllowlist {
             return None;
         }
 
-        let current_session_id = current_session_id();
+        let mut cached_session_id = SessionIdCache::Unresolved;
+        let cwd = cwd.map(ScopeCwd::new);
+        // Ids this rule was split out of (#509). An entry for one of them
+        // still covers the rule, but only when no entry names the rule itself
+        // (or the pack wildcard) in any layer.
+        let legacy_names = crate::packs::legacy_rule_names(pack_id, pattern_name);
+        let mut legacy_hit: Option<AllowlistHit<'_>> = None;
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
                 // Skip entries that are invalid or don't match path restrictions
-                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id.as_deref()) {
+                let current_session_id = session_id_for_entry(entry, &mut cached_session_id);
+                if !is_entry_valid_at_path_with_session(entry, cwd.as_ref(), current_session_id) {
                     continue;
                 }
 
@@ -336,16 +414,31 @@ impl LayeredAllowlist {
                         entry,
                     });
                 }
+
+                // The agent layer's rule entries are in-memory grants
+                // (`with_rule_grants`) for exactly the finding they name; a
+                // grant past `branch-force-delete` must not also hide a
+                // `branch-delete` finding on the same line.
+                if legacy_hit.is_none()
+                    && layer.layer != AllowlistLayer::Agent
+                    && legacy_names.contains(&rule_id.pattern_name.as_str())
+                {
+                    legacy_hit = Some(AllowlistHit {
+                        layer: layer.layer,
+                        entry,
+                    });
+                }
             }
         }
 
-        None
+        legacy_hit
     }
 
-    /// Find the first allowlist entry that matches a rule (backward-compatible, no path filtering).
+    /// Find the first allowlist entry that matches a rule, with no known cwd.
     ///
-    /// This is a convenience wrapper around `match_rule_at_path` with `cwd = None`.
-    /// For path-aware matching, use `match_rule_at_path` instead.
+    /// Wrapper around `match_rule_at_path` with an unknown `cwd`, which makes
+    /// every directory-scoped (`paths = [...]`) entry inapplicable. Callers
+    /// that know where the command runs must use `match_rule_at_path`.
     #[must_use]
     pub fn match_rule(&self, pack_id: &str, pattern_name: &str) -> Option<AllowlistHit<'_>> {
         self.match_rule_at_path(pack_id, pattern_name, None)
@@ -353,8 +446,10 @@ impl LayeredAllowlist {
 
     /// Find the first allowlist entry that matches an exact command string.
     ///
-    /// This is a backward-compatible wrapper around `match_exact_command_at_path` with `cwd = None`.
-    /// For path-aware matching, use `match_exact_command_at_path` instead.
+    /// Wrapper around `match_exact_command_at_path` with an unknown `cwd`,
+    /// which makes every directory-scoped (`paths = [...]`) entry
+    /// inapplicable. Callers that know where the command runs must use
+    /// `match_exact_command_at_path`.
     #[must_use]
     pub fn match_exact_command(&self, command: &str) -> Option<AllowlistHit<'_>> {
         self.match_exact_command_at_path(command, None)
@@ -379,11 +474,13 @@ impl LayeredAllowlist {
         rule: &RuleId,
         cwd: Option<&Path>,
     ) -> Option<(&AllowEntry, AllowlistLayer)> {
-        let current_session_id = current_session_id();
+        let mut cached_session_id = SessionIdCache::Unresolved;
+        let cwd = cwd.map(ScopeCwd::new);
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
-                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id.as_deref()) {
+                let current_session_id = session_id_for_entry(entry, &mut cached_session_id);
+                if !is_entry_valid_at_path_with_session(entry, cwd.as_ref(), current_session_id) {
                     continue;
                 }
 
@@ -404,11 +501,13 @@ impl LayeredAllowlist {
         command: &str,
         cwd: Option<&Path>,
     ) -> Option<AllowlistHit<'_>> {
-        let current_session_id = current_session_id();
+        let mut cached_session_id = SessionIdCache::Unresolved;
+        let cwd = cwd.map(ScopeCwd::new);
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
-                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id.as_deref()) {
+                let current_session_id = session_id_for_entry(entry, &mut cached_session_id);
+                if !is_entry_valid_at_path_with_session(entry, cwd.as_ref(), current_session_id) {
                     continue;
                 }
 
@@ -447,11 +546,13 @@ impl LayeredAllowlist {
         command: &str,
         cwd: Option<&Path>,
     ) -> Option<AllowlistHit<'_>> {
-        let current_session_id = current_session_id();
+        let mut cached_session_id = SessionIdCache::Unresolved;
+        let cwd = cwd.map(ScopeCwd::new);
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
-                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id.as_deref()) {
+                let current_session_id = session_id_for_entry(entry, &mut cached_session_id);
+                if !is_entry_valid_at_path_with_session(entry, cwd.as_ref(), current_session_id) {
                     continue;
                 }
 
@@ -514,11 +615,13 @@ impl LayeredAllowlist {
         command: &str,
         cwd: Option<&Path>,
     ) -> Option<AllowlistHit<'_>> {
-        let current_session_id = current_session_id();
+        let mut cached_session_id = SessionIdCache::Unresolved;
+        let cwd = cwd.map(ScopeCwd::new);
 
         for layer in &self.layers {
             for entry in &layer.file.entries {
-                if !is_entry_valid_at_path_with_session(entry, cwd, current_session_id.as_deref()) {
+                let current_session_id = session_id_for_entry(entry, &mut cached_session_id);
+                if !is_entry_valid_at_path_with_session(entry, cwd.as_ref(), current_session_id) {
                     continue;
                 }
 
@@ -556,10 +659,7 @@ pub fn command_prefix_safely_matches(command: &str, prefix: &str) -> bool {
             return false;
         }
     }
-    if tail_has_shell_chain_metachars(tail) {
-        return false;
-    }
-    true
+    !tail_has_shell_chain_metachars(tail)
 }
 
 /// Built-in command prefixes for *inspection wrappers* — see dcg#132.
@@ -670,6 +770,43 @@ pub fn is_dcg_self_inspection_call(command: &str) -> bool {
             .all(|segment| segment_is_dcg_inspection_call(segment))
 }
 
+/// Segment-scoped form of [`is_dcg_self_inspection_call`] (dcg#289).
+///
+/// [`is_dcg_self_inspection_call`] answers "is this *whole command* a dcg
+/// diagnostic?"; this answers the same question for one already shell-split
+/// segment, so a compound command can exempt the diagnostic segment alone
+/// while every other segment is still evaluated normally (see
+/// `evaluator::mask_dcg_self_inspection_segments`).
+///
+/// The safety contract is unchanged and comes from the same
+/// [`parse_simple_command_argv`] gate: the segment's executable must be dcg,
+/// the first non-flag token must be a diagnostic subcommand, and any
+/// redirection, command/process substitution, backtick, or subshell inside the
+/// segment refuses the answer.
+///
+/// One guard is *stricter* here than in the whole-command form. A double-quoted
+/// substitution (`dcg test "$(rm -rf /)"`) tokenizes as inert argument data,
+/// and [`is_dcg_self_inspection_call`] can rely on the splitter emitting the
+/// substituted command as a separate segment that fails its all-segments test.
+/// A segment-scoped caller has no such backstop — masking that segment would
+/// erase a command the shell really does execute — so any substitution or
+/// backtick anywhere in the segment, quoted or not, refuses the answer.
+#[must_use]
+pub fn is_dcg_self_inspection_segment(segment: &str) -> bool {
+    // Cheap gate: skip the tokenize work unless the binary name appears.
+    if !segment.contains("dcg") && !segment.contains("destructive_command_guard") {
+        return false;
+    }
+    if segment.contains("$(")
+        || segment.contains('`')
+        || segment.contains("<(")
+        || segment.contains(">(")
+    {
+        return false;
+    }
+    segment_is_dcg_inspection_call(segment)
+}
+
 /// Returns `true` when a single (already shell-split) segment is a bare
 /// `dcg <test|explain|classify> ...` invocation with no redirection.
 fn segment_is_dcg_inspection_call(segment: &str) -> bool {
@@ -685,11 +822,28 @@ fn segment_is_dcg_inspection_call(segment: &str) -> bool {
     if !is_dcg_binary_name(arg0) {
         return false;
     }
-    // Skip leading global option flags (`--robot`, `--no-color`, `-v`, ...) and
-    // require the first non-flag token to be a known diagnostic subcommand.
-    for token in tokens {
-        if token.starts_with('-') {
-            continue;
+    // Global options have the same arity here as in `cli::Cli`. In particular,
+    // `dcg --agent test allow-once ...` is a grant, not a diagnostic: `test`
+    // is the agent name. Skipping flags without consuming their values would
+    // exempt the whole mutating command before the guardrails pack sees it.
+    while let Some(token) = tokens.next() {
+        match token.as_str() {
+            "--agent" => {
+                if tokens.next().is_none() {
+                    return false;
+                }
+                continue;
+            }
+            "--robot" | "--verbose" | "--quiet" | "--legacy-output" | "--no-color"
+            | "--no-suggestions" | "-q" => continue,
+            _ if token.starts_with("--agent=") => continue,
+            _ if token.starts_with('-') => {
+                if token.len() > 1 && token[1..].bytes().all(|byte| byte == b'v') {
+                    continue;
+                }
+                return false;
+            }
+            _ => {}
         }
         return DCG_INSPECTION_SUBCOMMANDS.contains(&token.as_str());
     }
@@ -701,7 +855,14 @@ fn segment_is_dcg_inspection_call(segment: &str) -> bool {
 /// binary name.
 fn is_dcg_binary_name(arg0: &str) -> bool {
     let base = arg0.rsplit(['/', '\\']).next().unwrap_or(arg0);
-    base == "dcg" || base == "destructive_command_guard"
+    let stem = base
+        .get(..base.len().saturating_sub(4))
+        .filter(|_| {
+            base.get(base.len().saturating_sub(4)..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".exe"))
+        })
+        .unwrap_or(base);
+    stem.eq_ignore_ascii_case("dcg") || stem.eq_ignore_ascii_case("destructive_command_guard")
 }
 
 /// Tokenize a single shell command segment into its argv words, honoring shell
@@ -991,6 +1152,11 @@ fn parse_timestamp(timestamp: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     None
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static CURRENT_SESSION_ID_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Resolve the current shell session identifier.
 ///
 /// Resolution order:
@@ -998,6 +1164,9 @@ fn parse_timestamp(timestamp: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 /// 2. Linux process fingerprint from parent PID + stdin TTY path
 #[must_use]
 pub fn current_session_id() -> Option<String> {
+    #[cfg(test)]
+    CURRENT_SESSION_ID_CALLS.with(|calls| calls.set(calls.get() + 1));
+
     if let Ok(from_env) = std::env::var("DCG_SESSION_ID") {
         let trimmed = from_env.trim();
         if !trimmed.is_empty() {
@@ -1060,6 +1229,47 @@ fn session_scope_matches(entry: &AllowEntry, current_session_id: Option<&str>) -
     bound_session_id == current_session_id
 }
 
+/// Resolve process/TTY identity only when an entry is actually session-scoped.
+///
+/// Ordinary and empty allowlists do not consult the session identifier at all.
+/// When a lookup contains multiple session-scoped entries, cache the result for
+/// that lookup so `/proc` is sampled once while preserving the existing
+/// per-lookup freshness boundary.
+enum SessionIdCache {
+    Unresolved,
+    Unavailable,
+    Resolved(String),
+}
+
+fn session_id_for_entry<'a>(
+    entry: &AllowEntry,
+    cached_session_id: &'a mut SessionIdCache,
+) -> Option<&'a str> {
+    session_id_for_entry_with(entry, cached_session_id, current_session_id)
+}
+
+fn session_id_for_entry_with<'a>(
+    entry: &AllowEntry,
+    cached_session_id: &'a mut SessionIdCache,
+    resolve_session_id: impl FnOnce() -> Option<String>,
+) -> Option<&'a str> {
+    if entry.session != Some(true) {
+        return None;
+    }
+
+    if matches!(cached_session_id, SessionIdCache::Unresolved) {
+        *cached_session_id = match resolve_session_id() {
+            Some(session_id) => SessionIdCache::Resolved(session_id),
+            None => SessionIdCache::Unavailable,
+        };
+    }
+
+    match cached_session_id {
+        SessionIdCache::Resolved(session_id) => Some(session_id.as_str()),
+        SessionIdCache::Unresolved | SessionIdCache::Unavailable => None,
+    }
+}
+
 /// Check if all conditions on an allowlist entry are satisfied.
 ///
 /// Conditions are a map of `KEY=VALUE` pairs that must match environment variables.
@@ -1093,64 +1303,281 @@ pub const fn has_required_risk_ack(entry: &AllowEntry) -> bool {
     }
 }
 
-/// Check if the current working directory matches the path patterns in an allowlist entry.
+/// Whether an entry's grant is restricted to particular directories.
 ///
-/// Returns `true` if:
-/// - No paths are specified (None) - the rule applies globally
-/// - The paths list is empty - the rule applies globally
-/// - Any path pattern matches the given CWD using glob matching
-///
-/// Glob semantics:
-/// - `*` matches any single path component
-/// - `**` matches zero or more path components
-/// - `?` matches any single character
-/// - `[abc]` matches any char in brackets
+/// An absent `paths`, an empty `paths`, and a `paths` containing `"*"` all
+/// mean "everywhere", so those entries are not directory-scoped and need no
+/// working directory to evaluate. Everything else is a grant that only exists
+/// inside the named directories.
 #[must_use]
-pub fn path_matches(entry: &AllowEntry, cwd: &Path) -> bool {
-    let Some(ref patterns) = entry.paths else {
-        // No paths specified = global allow
+pub fn entry_is_path_scoped(entry: &AllowEntry) -> bool {
+    entry
+        .paths
+        .as_ref()
+        .is_some_and(|patterns| !patterns.is_empty() && !patterns.iter().any(|p| p == "*"))
+}
+
+/// Recognize path scopes that cover every absolute working directory.
+///
+/// This is an audit-only property. Recursive universal globs still require a
+/// known cwd when matching, so this must not replace [`entry_is_path_scoped`]
+/// in the evaluator. Normalize and resolve literal prefixes exactly as the
+/// runtime matcher does; a spelling such as `/./**/*` has no real restriction.
+pub(crate) fn entry_has_unrestricted_path_scope(entry: &AllowEntry) -> bool {
+    if !entry_is_path_scoped(entry) {
+        return true;
+    }
+
+    entry.paths.as_ref().is_some_and(|patterns| {
+        patterns.iter().any(|pattern| {
+            glob_has_unrestricted_path_scope(&normalize_scope_text(pattern))
+                || cached_pattern_prefix(pattern)
+                    .is_some_and(|resolved| glob_has_unrestricted_path_scope(&resolved))
+        })
+    })
+}
+
+/// Prove universality for the star/separator subset of the runtime glob syntax.
+///
+/// In `glob::Pattern`, `**/` is one recursive token: its following separator is
+/// consumed by the parser. With no remaining literal separator, recursive
+/// tokens and an optional final `*` cover every path. With one separator, a `*`
+/// immediately before it covers the first or penultimate component while a
+/// recursive token on either side covers any depth. Without that component
+/// wildcard, the separator can only be the Unix root and the suffix must cover
+/// any depth: a recursive prefix cannot stop midway through a component. A
+/// final literal `/` would exclude ordinary cwd paths.
+/// More restrictive syntax and unions of individually bounded patterns are
+/// intentionally not classified from a handful of sample directories.
+fn glob_has_unrestricted_path_scope(pattern: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if glob::Pattern::new(pattern).is_err() {
+        return false;
+    }
+
+    let bytes = pattern.as_bytes();
+    let mut index = 0;
+    let mut has_recursive = false;
+    let mut recursive_after_separator = false;
+    let mut component_before_separator = false;
+    let mut literal_separators = 0;
+    let mut ends_with_separator = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'*' => {
+                index += 1;
+                if bytes.get(index) == Some(&b'*') {
+                    has_recursive = true;
+                    recursive_after_separator |= literal_separators == 1;
+                    index += 1;
+                    // Pattern validation above guarantees a whole-component
+                    // `**`; its optional trailing slash is part of the token.
+                    if bytes.get(index) == Some(&b'/') {
+                        index += 1;
+                    }
+                }
+                ends_with_separator = false;
+            }
+            b'/' => {
+                literal_separators += 1;
+                if literal_separators > 1 {
+                    return false;
+                }
+                component_before_separator =
+                    bytes[..index].ends_with(b"*") && !bytes[..index].ends_with(b"**");
+                index += 1;
+                ends_with_separator = true;
+            }
+            _ => return false,
+        }
+    }
+
+    has_recursive
+        && !ends_with_separator
+        && (literal_separators == 0
+            || component_before_separator
+            || (cfg!(unix) && recursive_after_separator))
+}
+
+/// The string form of a working directory used for path-scope glob matching.
+///
+/// Symlinks are resolved first. A scope is a claim about a real directory, and
+/// a symlinked name whose target lies outside the scope must not borrow the
+/// grant (`/scoped/link` -> `/etc`). When the directory cannot be
+/// canonicalized — it does not exist, or is unreadable — the literal path is
+/// used; that can only fail to match, never over-match.
+#[must_use]
+pub fn scope_match_path(cwd: &Path) -> String {
+    normalize_resolved_path(&cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf()))
+}
+
+/// Render a resolved path in the form scope patterns are written in.
+///
+/// Separators become `/` (patterns are matched that way on every platform),
+/// and Windows' extended-length canonical form is unwrapped: `canonicalize`
+/// returns `\\?\C:\work`, which no user would ever write a `paths = [...]`
+/// pattern against.
+pub(crate) fn normalize_resolved_path(path: &Path) -> String {
+    normalize_scope_text(&path.to_string_lossy())
+}
+
+/// `/`-separate `text` and unwrap Windows' extended-length prefix.
+///
+/// Applied to patterns as well as to working directories: a pattern written
+/// in canonical form — `\\?\C:\proj\**`, which is what the interactive
+/// "current directory only" scope used to store — otherwise never matched,
+/// because the `?` of the prefix is a glob wildcard and the working directory
+/// it is compared with is unwrapped.
+fn normalize_scope_text(text: &str) -> String {
+    let text = text.replace('\\', "/");
+    if let Some(rest) = text.strip_prefix("//?/UNC/") {
+        return format!("//{rest}");
+    }
+    if let Some(rest) = text.strip_prefix("//?/") {
+        return rest.to_string();
+    }
+    text
+}
+
+/// Canonicalize the leading literal directory prefix of a glob pattern.
+///
+/// Working directories are matched in canonical (symlink-resolved) form, so a
+/// pattern written against a symlinked prefix — `/tmp/scratch/**` on macOS,
+/// where `/tmp` is a symlink to `/private/tmp` — has to be resolved the same
+/// way or it could never match the directory the user meant. Only the leading
+/// components free of glob metacharacters are resolved; the globbed tail is
+/// left untouched.
+///
+/// Returns `None` when there is nothing to resolve (a relative pattern, a
+/// pattern that globs from the root, or a prefix that does not exist), and
+/// when resolution is a no-op.
+fn canonicalize_pattern_prefix(pattern: &str) -> Option<String> {
+    // Patterns are matched with `/` separators on every platform, without the
+    // extended-length prefix (whose `?` would end the literal prefix).
+    let pattern = normalize_scope_text(pattern);
+    // A relative pattern has nothing to anchor to, and must not be given one.
+    if !Path::new(&pattern).is_absolute() {
+        return None;
+    }
+
+    let mut literal: Vec<&str> = Vec::new();
+    let mut globbed: Vec<&str> = Vec::new();
+    for component in pattern.split('/') {
+        if globbed.is_empty() && !component.contains(['*', '?', '[', ']']) {
+            literal.push(component);
+        } else {
+            globbed.push(component);
+        }
+    }
+
+    // On POSIX `literal[0]` is the empty string before the leading `/`, on
+    // Windows it is the drive (`C:`); either way a pattern whose very first
+    // real component is globbed has no prefix worth resolving.
+    if literal.len() < 2 {
+        return None;
+    }
+
+    let literal_prefix = literal.join("/");
+    let canonical = normalize_resolved_path(&Path::new(&literal_prefix).canonicalize().ok()?);
+    if canonical == literal_prefix {
+        return None;
+    }
+
+    if globbed.is_empty() {
+        Some(canonical)
+    } else {
+        Some(format!(
+            "{}/{}",
+            canonical.trim_end_matches('/'),
+            globbed.join("/")
+        ))
+    }
+}
+
+// Process-wide cache of canonicalized glob-pattern prefixes. Resolution is a
+// syscall per pattern and the same handful of allowlist patterns are re-tested
+// on every command, so the answer (including "nothing to resolve") is memoized
+// the way compiled `pattern = "..."` regexes are.
+fn scope_prefix_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// [`canonicalize_pattern_prefix`], memoized for the life of the process.
+fn cached_pattern_prefix(pattern: &str) -> Option<String> {
+    let cache = scope_prefix_cache();
+    let mut guard = match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard
+        .entry(pattern.to_string())
+        .or_insert_with(|| canonicalize_pattern_prefix(pattern))
+        .clone()
+}
+
+/// A working directory prepared for path-scope matching.
+///
+/// Canonicalizing is a syscall, and a layered lookup tests the scope of every
+/// entry in every layer against the same directory. This resolves it at most
+/// once per lookup, and only if a directory-scoped entry actually needs it.
+pub struct ScopeCwd<'a> {
+    raw: &'a Path,
+    resolved: OnceCell<String>,
+}
+
+impl<'a> ScopeCwd<'a> {
+    /// Prepare `cwd` for scope matching. No work happens until it is used.
+    #[must_use]
+    pub const fn new(cwd: &'a Path) -> Self {
+        Self {
+            raw: cwd,
+            resolved: OnceCell::new(),
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        self.resolved.get_or_init(|| scope_match_path(self.raw))
+    }
+}
+
+/// Check whether a working directory falls inside an allowlist entry's scope.
+///
+/// Returns `true` when the entry is not directory-scoped at all, or when the
+/// canonical form of `cwd` matches one of its patterns (each pattern is tried
+/// as written and with its literal prefix canonicalized).
+#[must_use]
+pub fn entry_path_matches_cwd(entry: &AllowEntry, cwd: &Path) -> bool {
+    entry_scope_contains(entry, &ScopeCwd::new(cwd))
+}
+
+/// [`entry_path_matches_cwd`] against an already-prepared working directory.
+#[must_use]
+fn entry_scope_contains(entry: &AllowEntry, cwd: &ScopeCwd<'_>) -> bool {
+    if !entry_is_path_scoped(entry) {
+        return true;
+    }
+    let Some(patterns) = entry.paths.as_deref() else {
         return true;
     };
 
-    if patterns.is_empty() {
-        // Empty paths list = global allow
-        return true;
-    }
+    let cwd = cwd.as_str();
+    patterns.iter().any(|pattern| {
+        path_matches_glob(pattern, cwd)
+            || cached_pattern_prefix(pattern)
+                .is_some_and(|resolved| path_matches_glob(&resolved, cwd))
+    })
+}
 
-    let cwd_str = cwd.to_string_lossy();
-
-    for pattern in patterns {
-        // Handle special case: "*" alone means global allow
-        if pattern == "*" {
-            return true;
-        }
-
-        // Use glob pattern matching
-        match glob::Pattern::new(pattern) {
-            Ok(glob_pattern) => {
-                // Try matching the path directly
-                if glob_pattern.matches(&cwd_str) {
-                    return true;
-                }
-                // Also try with normalized path (resolved symlinks)
-                if let Ok(canonical) = cwd.canonicalize() {
-                    if glob_pattern.matches(&canonical.to_string_lossy()) {
-                        return true;
-                    }
-                }
-            }
-            Err(e) => {
-                // Invalid glob pattern - log warning and continue
-                tracing::warn!(
-                    pattern = pattern,
-                    error = %e,
-                    "invalid glob pattern in allowlist entry, skipping"
-                );
-            }
-        }
-    }
-
-    false
+/// Check if a working directory matches the path patterns in an allowlist entry.
+///
+/// Thin wrapper over [`entry_path_matches_cwd`]; see there for the matching
+/// rules.
+#[must_use]
+pub fn path_matches(entry: &AllowEntry, cwd: &Path) -> bool {
+    entry_path_matches_cwd(entry, cwd)
 }
 
 /// Check if an allowlist entry passes basic validity checks (without path matching).
@@ -1175,11 +1602,14 @@ pub fn is_entry_valid(entry: &AllowEntry) -> bool {
 /// - It passes basic validity checks (not expired, session scope matches, conditions met, risk ack)
 /// - The path matches the entry's path patterns (if specified)
 ///
-/// If `cwd` is None, path matching is skipped (entry applies if basic validity passes).
+/// If `cwd` is `None` the working directory could not be determined, and every
+/// directory-scoped entry fails closed: only entries with no `paths` scope
+/// (or `paths = ["*"]`) can apply.
 #[must_use]
 pub fn is_entry_valid_at_path(entry: &AllowEntry, cwd: Option<&Path>) -> bool {
     let current_session_id = current_session_id();
-    is_entry_valid_at_path_with_session(entry, cwd, current_session_id.as_deref())
+    let cwd = cwd.map(ScopeCwd::new);
+    is_entry_valid_at_path_with_session(entry, cwd.as_ref(), current_session_id.as_deref())
 }
 
 #[must_use]
@@ -1193,21 +1623,22 @@ fn is_entry_valid_with_session(entry: &AllowEntry, current_session_id: Option<&s
 #[must_use]
 fn is_entry_valid_at_path_with_session(
     entry: &AllowEntry,
-    cwd: Option<&Path>,
+    cwd: Option<&ScopeCwd<'_>>,
     current_session_id: Option<&str>,
 ) -> bool {
     if !is_entry_valid_with_session(entry, current_session_id) {
         return false;
     }
 
-    // If no CWD provided, skip path matching (backward compatibility)
+    // No working directory to test against. A `paths = [...]` entry is a
+    // permission granted *for a directory*; with the directory unknown there is
+    // nothing to grant, so the entry does not apply (issue #387). Entries with
+    // no path scope were granted everywhere and are unaffected.
     let Some(cwd) = cwd else {
-        return true;
+        return !entry_is_path_scoped(entry);
     };
 
-    // Convert Path to string for glob matching
-    let cwd_str = cwd.to_string_lossy();
-    entry_path_matches(entry, &cwd_str)
+    entry_scope_contains(entry, cwd)
 }
 
 /// Validate and optionally warn about expiration date format.
@@ -1380,8 +1811,8 @@ pub fn validate_glob_pattern(pattern: &str) -> Result<(), String> {
 /// Path separators are normalized to `/` for cross-platform compatibility.
 #[must_use]
 pub fn path_matches_glob(pattern: &str, path: &str) -> bool {
-    let normalized_path = path.replace('\\', "/");
-    let normalized_pattern = pattern.replace('\\', "/");
+    let normalized_path = normalize_scope_text(path);
+    let normalized_pattern = normalize_scope_text(pattern);
 
     if normalized_pattern == "*" {
         return true;
@@ -1450,7 +1881,7 @@ pub fn resolve_path_for_matching(
         absolute_path
     };
 
-    Ok(resolved.to_string_lossy().replace('\\', "/"))
+    Ok(normalize_resolved_path(&resolved))
 }
 
 /// Load allowlist files using the default locations.
@@ -1462,48 +1893,93 @@ pub fn load_default_allowlists() -> LayeredAllowlist {
     if crate::config::policy_files_disabled() {
         return LayeredAllowlist::default();
     }
-    let project = std::env::current_dir()
-        .ok()
-        .map(|cwd| project_allowlist_path(&cwd));
+    let project = std::env::current_dir().ok().and_then(|cwd| {
+        crate::config::explicitly_trusts_project_policy(&cwd).then(|| project_allowlist_path(&cwd))
+    });
 
-    // Check XDG-style path first (~/.config/dcg/), then platform-native
-    let user = dirs::home_dir()
-        .map(|h| h.join(".config").join("dcg").join("allowlist.toml"))
-        .filter(|p| p.exists())
-        .or_else(|| dirs::config_dir().map(|d| d.join("dcg").join("allowlist.toml")));
+    let user = Some(user_allowlist_path());
 
-    // System allowlist is optional; keep the fixed path but treat missing as empty.
-    // Allow tests to override via env for hermetic E2E (no reliance on real /etc).
-    let system = std::env::var("DCG_ALLOWLIST_SYSTEM_PATH").map_or_else(
-        |_| Some(crate::config::system_config_dir().join("allowlist.toml")),
-        |path| {
-            let trimmed = path.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(PathBuf::from(trimmed))
-            }
-        },
-    );
+    let system_override = std::env::var("DCG_ALLOWLIST_SYSTEM_PATH").ok();
+    let (system, system_source) = system_allowlist_location(system_override.as_deref());
 
-    LayeredAllowlist::load_from_paths(project, user, system)
+    LayeredAllowlist::load_from_paths_with_system_source(project, user, system, system_source)
+}
+
+fn system_allowlist_location(
+    override_path: Option<&str>,
+) -> (Option<PathBuf>, crate::config::ConfigSource) {
+    // The default platform system path is privileged and must satisfy the
+    // strict System source policy. An environment override is instead an
+    // explicit user trust decision for that selected file; it still loads as
+    // the System allowlist layer so labels and precedence remain unchanged.
+    let Some(path) = override_path else {
+        return (
+            Some(crate::config::system_config_dir().join("allowlist.toml")),
+            crate::config::ConfigSource::System,
+        );
+    };
+
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        (None, crate::config::ConfigSource::Untrusted)
+    } else {
+        (
+            Some(PathBuf::from(trimmed)),
+            crate::config::ConfigSource::Untrusted,
+        )
+    }
+}
+
+/// Resolve the user allowlist path with the same precedence used by CLI
+/// mutations: explicit XDG location, existing `~/.config/dcg`, then the
+/// platform-native config directory.
+pub(crate) fn user_allowlist_path() -> PathBuf {
+    if let Ok(xdg_home) = std::env::var("XDG_CONFIG_HOME")
+        && let Some(xdg_home) = crate::config::resolve_config_path_value(&xdg_home, None)
+    {
+        return xdg_home.join("dcg").join("allowlist.toml");
+    }
+
+    if let Some(home) = crate::config::home_dir() {
+        let xdg_path = home.join(".config").join("dcg").join("allowlist.toml");
+        if xdg_path.exists() {
+            return xdg_path;
+        }
+    }
+
+    crate::config::user_config_dir()
+        .unwrap_or_else(|| {
+            crate::config::home_dir()
+                .unwrap_or_default()
+                .join(".config")
+        })
+        .join("dcg")
+        .join("allowlist.toml")
 }
 
 /// Resolve the project allowlist that governs `start`.
 ///
 /// Git repositories are rooted at their repository root. Outside Git, the
 /// nearest ancestor that already contains `.dcg/allowlist.toml` governs the
-/// directory tree; if no such file exists, explicit `--project` writes begin a
-/// new project scope at `start`.
+/// directory tree. The CLI separately enforces the explicit project-policy
+/// trust requirement before any project-layer mutation.
 pub(crate) fn project_allowlist_path(start: &Path) -> PathBuf {
-    if let Some(root) =
-        crate::config::find_repo_root(start, crate::config::REPO_ROOT_SEARCH_MAX_HOPS)
-    {
+    project_allowlist_path_within(start, crate::config::REPO_ROOT_SEARCH_MAX_HOPS)
+}
+
+/// [`project_allowlist_path`] with the upward search limited to `max_hops`
+/// parents of `start` (both for the repository root and for an existing
+/// allowlist). Tests pass the depth of their temporary tree so the answer
+/// does not depend on what lies above it: a temporary directory created
+/// inside a checkout (as a remote build worker's `TMPDIR` can be) would
+/// otherwise resolve to that checkout's root.
+fn project_allowlist_path_within(start: &Path, max_hops: usize) -> PathBuf {
+    if let Some(root) = crate::config::find_repo_root(start, max_hops) {
         return root.join(".dcg").join("allowlist.toml");
     }
 
     let mut current = Some(start);
-    for _ in 0..=crate::config::REPO_ROOT_SEARCH_MAX_HOPS {
+    for _ in 0..=max_hops {
         let Some(dir) = current else {
             break;
         };
@@ -1517,18 +1993,27 @@ pub(crate) fn project_allowlist_path(start: &Path) -> PathBuf {
     start.join(".dcg").join("allowlist.toml")
 }
 
-fn load_allowlist_file(layer: AllowlistLayer, path: &Path) -> AllowlistFile {
-    if !path.exists() {
-        return AllowlistFile::default();
-    }
-
-    // System layer is privileged: refuse symlinks to user-writable targets.
-    // Other layers only enforce the size cap (still want bounded reads).
+pub(crate) fn load_allowlist_file(layer: AllowlistLayer, path: &Path) -> AllowlistFile {
+    // System-layer callers use the privileged source policy by default. The
+    // default loader bypasses this wrapper only for an explicitly selected
+    // `DCG_ALLOWLIST_SYSTEM_PATH`, whose path selection is the trust decision.
     let source = if layer == AllowlistLayer::System {
         crate::config::ConfigSource::System
     } else {
         crate::config::ConfigSource::Untrusted
     };
+
+    load_allowlist_file_with_source(layer, path, source)
+}
+
+fn load_allowlist_file_with_source(
+    layer: AllowlistLayer,
+    path: &Path,
+    source: crate::config::ConfigSource,
+) -> AllowlistFile {
+    if !path.exists() {
+        return AllowlistFile::default();
+    }
 
     let Some(content) = crate::config::read_config_file_bounded(path, source) else {
         return AllowlistFile {
@@ -1537,7 +2022,7 @@ fn load_allowlist_file(layer: AllowlistLayer, path: &Path) -> AllowlistFile {
                 layer,
                 path: path.to_path_buf(),
                 entry_index: None,
-                message: "failed to read allowlist file (missing, too large, or unsafe symlink)"
+                message: "failed to read allowlist file (missing, too large, or rejected by source policy)"
                     .to_string(),
             }],
         };
@@ -1796,11 +2281,16 @@ fn get_timestamp_string(tbl: &toml::value::Table, key: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    // These tests bound the upward search to their temporary tree: the
+    // system temporary directory can itself sit inside a Git checkout (a
+    // remote build worker points `TMPDIR` at `<checkout>/.rch-tmp`), and an
+    // unbounded search then answers with that checkout's root.
+
     #[test]
     fn project_allowlist_path_falls_back_to_cwd_outside_git() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(
-            project_allowlist_path(tmp.path()),
+            project_allowlist_path_within(tmp.path(), 0),
             tmp.path().join(".dcg").join("allowlist.toml")
         );
     }
@@ -1814,7 +2304,12 @@ mod tests {
         let nested = tmp.path().join("a").join("b");
         std::fs::create_dir_all(&nested).unwrap();
 
-        assert_eq!(project_allowlist_path(&nested), root_allowlist);
+        assert_eq!(project_allowlist_path_within(&nested, 2), root_allowlist);
+        // Below the bound, the nested directory governs itself.
+        assert_eq!(
+            project_allowlist_path_within(&nested, 1),
+            nested.join(".dcg").join("allowlist.toml")
+        );
     }
 
     #[test]
@@ -1825,9 +2320,82 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
 
         assert_eq!(
+            project_allowlist_path_within(&nested, 2),
+            tmp.path().join(".dcg").join("allowlist.toml")
+        );
+    }
+
+    /// The production entry point searches the full default depth.
+    #[test]
+    fn project_allowlist_path_searches_the_default_depth() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        let nested = tmp.path().join("a").join("b").join("c");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(
             project_allowlist_path(&nested),
             tmp.path().join(".dcg").join("allowlist.toml")
         );
+    }
+
+    #[test]
+    fn explicit_system_path_uses_user_trust_without_changing_layer_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("allowlist.toml");
+        std::fs::write(
+            &path,
+            r#"
+                [[allow]]
+                rule = "core.git:reset-hard"
+                reason = "explicit system-path override"
+            "#,
+        )
+        .unwrap();
+
+        // Make the leaf itself ineligible for the privileged System source,
+        // independently of the ownership/mode of the test runner's temp root.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        }
+
+        let (default_path, default_source) = system_allowlist_location(None);
+        assert_eq!(
+            default_path,
+            Some(crate::config::system_config_dir().join("allowlist.toml"))
+        );
+        assert_eq!(default_source, crate::config::ConfigSource::System);
+
+        let strict = LayeredAllowlist::load_from_paths(None, None, Some(path.clone()));
+        assert_eq!(strict.layers.len(), 1);
+        assert_eq!(strict.layers[0].layer, AllowlistLayer::System);
+        assert!(strict.layers[0].file.entries.is_empty());
+        assert_eq!(strict.layers[0].file.errors.len(), 1);
+
+        let (explicit_path, explicit_source) =
+            system_allowlist_location(Some(path.to_str().expect("UTF-8 temp path")));
+        assert_eq!(explicit_path, Some(path.clone()));
+        assert_eq!(explicit_source, crate::config::ConfigSource::Untrusted);
+
+        let explicit = LayeredAllowlist::load_from_paths_with_system_source(
+            None,
+            None,
+            explicit_path,
+            explicit_source,
+        );
+        assert_eq!(explicit.layers.len(), 1);
+        assert_eq!(explicit.layers[0].layer, AllowlistLayer::System);
+        assert_eq!(explicit.layers[0].path, path);
+        assert!(explicit.layers[0].file.errors.is_empty());
+        assert_eq!(explicit.layers[0].file.entries.len(), 1);
+
+        let hit = explicit
+            .match_rule("core.git", "reset-hard")
+            .expect("explicit override entry should load");
+        assert_eq!(hit.layer, AllowlistLayer::System);
     }
 
     // ----- command_prefix tail-injection regression tests -----
@@ -2252,6 +2820,86 @@ mod tests {
         assert_eq!(hit.entry.reason, "allow all git rules in this pack");
     }
 
+    /// #509: an entry for `branch-force-delete` keeps covering the split-out
+    /// `branch-delete`, an entry for `branch-delete` covers only itself, and an
+    /// in-memory grant for the old id stays exact.
+    #[test]
+    fn legacy_rule_entry_covers_split_rule_but_grants_stay_exact_509() {
+        let layer_with = |layer: AllowlistLayer, pattern: &str, reason: &str| {
+            let mut entry = make_test_entry();
+            entry.selector = AllowSelector::Rule(RuleId {
+                pack_id: "core.git".to_string(),
+                pattern_name: pattern.to_string(),
+            });
+            entry.reason = reason.to_string();
+            LoadedAllowlistLayer {
+                layer,
+                path: PathBuf::from("test"),
+                file: AllowlistFile {
+                    entries: vec![entry],
+                    errors: Vec::new(),
+                },
+            }
+        };
+
+        let legacy = LayeredAllowlist {
+            layers: vec![layer_with(
+                AllowlistLayer::User,
+                "branch-force-delete",
+                "legacy",
+            )],
+        };
+        assert!(
+            legacy
+                .match_rule("core.git", "branch-force-delete")
+                .is_some()
+        );
+        let hit = legacy
+            .match_rule("core.git", "branch-delete")
+            .expect("legacy entry still covers the split-out rule");
+        assert_eq!(hit.entry.reason, "legacy");
+        assert!(
+            legacy.match_rule("other.pack", "branch-delete").is_none(),
+            "the legacy link is pack-specific"
+        );
+
+        let split = LayeredAllowlist {
+            layers: vec![layer_with(AllowlistLayer::User, "branch-delete", "split")],
+        };
+        assert!(split.match_rule("core.git", "branch-delete").is_some());
+        assert!(
+            split
+                .match_rule("core.git", "branch-force-delete")
+                .is_none(),
+            "the new id must not allow the forced forms"
+        );
+
+        // An exact entry in a lower layer is preferred over a legacy entry in
+        // a higher one: the more specific id wins.
+        let mixed = LayeredAllowlist {
+            layers: vec![
+                layer_with(AllowlistLayer::Project, "branch-force-delete", "legacy"),
+                layer_with(AllowlistLayer::User, "branch-delete", "split"),
+            ],
+        };
+        let hit = mixed.match_rule("core.git", "branch-delete").expect("hit");
+        assert_eq!(hit.entry.reason, "split");
+
+        // A re-evaluation grant past `branch-force-delete` must not also hide
+        // a `branch-delete` finding.
+        let granted = LayeredAllowlist { layers: Vec::new() }.with_rule_grants(
+            &[("core.git", "branch-force-delete")],
+            "grant",
+            "test",
+        );
+        assert!(
+            granted
+                .match_rule("core.git", "branch-force-delete")
+                .is_some()
+        );
+        assert!(granted.match_rule("core.git", "branch-delete").is_none());
+    }
+
     // ==========================================================================
     // Entry validity tests (expiration, conditions, risk acknowledgement)
     // ==========================================================================
@@ -2275,6 +2923,166 @@ mod tests {
             paths: None,
             risk_acknowledged: false,
         }
+    }
+
+    fn layered_allowlist_for_session_resolution_tests(
+        session_id: Option<&str>,
+    ) -> LayeredAllowlist {
+        let toml = r#"
+            [[allow]]
+            rule = "core.git:reset-hard"
+            reason = "rule selector"
+
+            [[allow]]
+            rule = "core.git:*"
+            reason = "second rule selector"
+
+            [[allow]]
+            exact_command = "exact candidate"
+            reason = "exact selector"
+
+            [[allow]]
+            command_prefix = "prefix candidate"
+            reason = "prefix selector"
+
+            [[allow]]
+            pattern = "^pattern candidate$"
+            reason = "pattern selector"
+            risk_acknowledged = true
+        "#;
+        let mut file = parse_allowlist_toml(AllowlistLayer::Project, Path::new("dummy"), toml);
+        if let Some(session_id) = session_id {
+            for entry in &mut file.entries {
+                entry.session = Some(true);
+                entry.session_id = Some(session_id.to_string());
+            }
+        }
+        LayeredAllowlist {
+            layers: vec![LoadedAllowlistLayer {
+                layer: AllowlistLayer::Project,
+                path: PathBuf::from("dummy"),
+                file,
+            }],
+        }
+    }
+
+    fn reset_session_id_resolution_count() {
+        CURRENT_SESSION_ID_CALLS.with(|calls| calls.set(0));
+    }
+
+    fn assert_session_id_resolution_count(expected: usize, lookup: impl FnOnce()) {
+        reset_session_id_resolution_count();
+        lookup();
+        CURRENT_SESSION_ID_CALLS.with(|calls| assert_eq!(calls.get(), expected));
+    }
+
+    #[test]
+    fn layered_allowlist_entry_points_skip_session_resolution_for_ordinary_entries() {
+        let allowlist = layered_allowlist_for_session_resolution_tests(None);
+        let exact_rule = RuleId::parse("core.git:reset-hard").expect("valid rule id");
+
+        assert_session_id_resolution_count(0, || {
+            assert!(
+                allowlist
+                    .match_rule_at_path("core.git", "reset-hard", None)
+                    .is_some()
+            );
+        });
+        assert_session_id_resolution_count(0, || {
+            assert!(allowlist.lookup_rule_at_path(&exact_rule, None).is_some());
+        });
+        assert_session_id_resolution_count(0, || {
+            assert!(
+                allowlist
+                    .match_exact_command_at_path("exact candidate", None)
+                    .is_some()
+            );
+        });
+        assert_session_id_resolution_count(0, || {
+            assert!(
+                allowlist
+                    .match_command_prefix_at_path("prefix candidate --safe", None)
+                    .is_some()
+            );
+        });
+        assert_session_id_resolution_count(0, || {
+            assert!(
+                allowlist
+                    .match_pattern_at_path("pattern candidate", None)
+                    .is_some()
+            );
+        });
+    }
+
+    #[test]
+    fn layered_allowlist_entry_points_cache_one_session_resolution_per_lookup() {
+        let current = current_session_id().unwrap_or_default();
+        let mismatched = if current == "dcg-test-session-a" {
+            "dcg-test-session-b"
+        } else {
+            "dcg-test-session-a"
+        };
+        let allowlist = layered_allowlist_for_session_resolution_tests(Some(mismatched));
+        let exact_rule = RuleId::parse("core.git:reset-hard").expect("valid rule id");
+
+        assert_session_id_resolution_count(1, || {
+            assert!(
+                allowlist
+                    .match_rule_at_path("core.git", "reset-hard", None)
+                    .is_none()
+            );
+        });
+        assert_session_id_resolution_count(1, || {
+            assert!(allowlist.lookup_rule_at_path(&exact_rule, None).is_none());
+        });
+        assert_session_id_resolution_count(1, || {
+            assert!(
+                allowlist
+                    .match_exact_command_at_path("exact candidate", None)
+                    .is_none()
+            );
+        });
+        assert_session_id_resolution_count(1, || {
+            assert!(
+                allowlist
+                    .match_command_prefix_at_path("prefix candidate --safe", None)
+                    .is_none()
+            );
+        });
+        assert_session_id_resolution_count(1, || {
+            assert!(
+                allowlist
+                    .match_pattern_at_path("pattern candidate", None)
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn session_id_cache_resolves_unavailable_once_across_session_entries() {
+        let mut first_entry = make_test_entry();
+        first_entry.session = Some(true);
+        let mut second_entry = make_test_entry();
+        second_entry.session = Some(true);
+        let resolver_calls = std::cell::Cell::new(0);
+        let mut cached_session_id = SessionIdCache::Unresolved;
+
+        let resolve_unavailable = || {
+            resolver_calls.set(resolver_calls.get() + 1);
+            None
+        };
+        assert_eq!(
+            session_id_for_entry_with(&first_entry, &mut cached_session_id, resolve_unavailable),
+            None
+        );
+        assert!(matches!(cached_session_id, SessionIdCache::Unavailable));
+
+        assert_eq!(
+            session_id_for_entry_with(&second_entry, &mut cached_session_id, resolve_unavailable),
+            None
+        );
+        assert!(matches!(cached_session_id, SessionIdCache::Unavailable));
+        assert_eq!(resolver_calls.get(), 1);
     }
 
     #[test]
@@ -2796,6 +3604,25 @@ mod tests {
     }
 
     #[test]
+    fn extended_length_patterns_match_like_their_plain_spelling() {
+        // `canonicalize` on Windows yields `\\?\C:\proj`; the interactive
+        // "current directory only" scope stored exactly that, and its `?` is
+        // a glob wildcard, so the grant never applied.
+        assert!(path_matches_glob(r"\\?\C:\proj", r"C:\proj"));
+        assert!(path_matches_glob(r"\\?\C:\proj\**", r"C:\proj\sub\dir"));
+        assert!(path_matches_glob(r"C:\proj\**", r"\\?\C:\proj\sub"));
+        assert!(path_matches_glob(
+            r"\\?\UNC\server\share\**",
+            r"\\server\share\team"
+        ));
+        assert!(!path_matches_glob(r"\\?\C:\proj\**", r"C:\other"));
+        assert_eq!(
+            normalize_resolved_path(Path::new(r"\\?\C:\proj")),
+            "C:/proj"
+        );
+    }
+
+    #[test]
     fn test_path_matches_glob_star_any() {
         // "*" alone matches anything
         assert!(path_matches_glob("*", "/any/path/here"));
@@ -2903,6 +3730,216 @@ mod tests {
 
         assert!(entry_path_matches(&entry, "/home/user/projects/app"));
         assert!(!entry_path_matches(&entry, "/var/log/app.log"));
+    }
+
+    // ---- Issue #387: directory scoping is a grant, so it fails closed. ----
+
+    #[test]
+    fn entry_is_path_scoped_only_for_real_restrictions() {
+        let mut entry = make_test_entry();
+        assert!(!entry_is_path_scoped(&entry), "no paths key = everywhere");
+
+        entry.paths = Some(Vec::new());
+        assert!(!entry_is_path_scoped(&entry), "empty paths = everywhere");
+
+        entry.paths = Some(vec!["*".to_string()]);
+        assert!(!entry_is_path_scoped(&entry), "\"*\" = everywhere");
+
+        entry.paths = Some(vec!["/srv/scratch/**".to_string()]);
+        assert!(entry_is_path_scoped(&entry));
+    }
+
+    #[test]
+    fn unrestricted_scope_audit_recognizes_equivalent_recursive_globs() {
+        for pattern in [
+            "**", "**/", "**/*", "**/**", "**/**/*", "**/*/**", "**/*/*", "*/**", "*/**/*",
+            r"\\?/**", r"\\?/*",
+        ] {
+            let mut entry = make_test_entry();
+            entry.paths = Some(vec![pattern.to_string()]);
+            assert!(validate_glob_pattern(pattern).is_ok(), "{pattern}");
+            assert!(entry_has_unrestricted_path_scope(&entry), "{pattern}");
+
+            // These are regression witnesses against the actual matcher, not
+            // the basis for the diagnostic's structural universality proof.
+            for cwd in [
+                "/",
+                "/etc",
+                "/home/review/.private/deep",
+                "/workspace/日本語",
+                "C:/",
+                "C:/Users/reviewer/project",
+                "//server/share/.private/deep",
+            ] {
+                assert!(path_matches_glob(pattern, cwd), "{pattern} vs {cwd}");
+            }
+
+            assert!(entry_is_path_scoped(&entry), "{pattern}");
+            assert!(
+                !is_entry_valid_at_path(&entry, None),
+                "auditing {pattern} must preserve unknown-cwd matching behavior"
+            );
+        }
+    }
+
+    #[test]
+    fn unrestricted_scope_audit_preserves_bounded_globs() {
+        for pattern in [
+            "/tmp/**",
+            "/reviewed/workspace/**",
+            "**/workspace/**",
+            "**/*.rs",
+            "projects/**",
+            "*/*",
+            "/*/**",
+            "**/*/",
+            "**/*/*/*",
+            "**//",
+            "**//*",
+            "[abc]/**",
+            "?/**",
+            "***",
+            "[",
+        ] {
+            let mut entry = make_test_entry();
+            entry.paths = Some(vec![pattern.to_string()]);
+            assert!(!entry_has_unrestricted_path_scope(&entry), "{pattern}");
+        }
+
+        // Root coverage alone does not establish universality: a required
+        // trailing slash still excludes normal canonical working directories.
+        assert!(path_matches_glob("**/*/", "/"));
+        assert!(!path_matches_glob("**/*/", "/etc"));
+        assert!(!path_matches_glob("/*/**", "/"));
+        assert!(path_matches_glob("**//*", "/etc"));
+        assert!(!path_matches_glob("**//*", "/etc/deep"));
+
+        let mut entry = make_test_entry();
+        entry.paths = Some(vec!["/tmp/**".to_string(), "**/*".to_string()]);
+        assert!(entry_has_unrestricted_path_scope(&entry));
+    }
+
+    #[test]
+    fn unrestricted_scope_audit_respects_platform_roots() {
+        for pattern in ["/**", "/**/", "/**/*", "/**/**", "/**/**/*", "**//**"] {
+            let mut entry = make_test_entry();
+            entry.paths = Some(vec![pattern.to_string()]);
+            assert_eq!(
+                entry_has_unrestricted_path_scope(&entry),
+                cfg!(unix),
+                "{pattern}"
+            );
+            for cwd in ["/", "/etc", "/home/review/.private/deep"] {
+                assert!(path_matches_glob(pattern, cwd), "{pattern} vs {cwd}");
+            }
+            assert!(!path_matches_glob(pattern, "C:/Users/reviewer"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unrestricted_scope_audit_uses_runtime_canonical_prefixes() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root_link = temp.path().join("root-link");
+        let scoped_link = temp.path().join("scoped-link");
+        std::os::unix::fs::symlink("/", &root_link).expect("root symlink");
+        std::os::unix::fs::symlink(temp.path(), &scoped_link).expect("scoped symlink");
+
+        let mut entry = make_test_entry();
+        for pattern in [
+            "/./**/*".to_string(),
+            format!("{}/**/*", root_link.display()),
+        ] {
+            entry.paths = Some(vec![pattern.clone()]);
+            assert!(entry_has_unrestricted_path_scope(&entry), "{pattern}");
+            for cwd in ["/", "/etc", "/var/tmp"] {
+                assert!(
+                    entry_path_matches_cwd(&entry, Path::new(cwd)),
+                    "{pattern} vs {cwd}"
+                );
+            }
+        }
+
+        entry.paths = Some(vec![format!("{}/**/*", scoped_link.display())]);
+        assert!(!entry_has_unrestricted_path_scope(&entry));
+        assert!(!entry_path_matches_cwd(&entry, Path::new("/")));
+    }
+
+    #[test]
+    fn unknown_cwd_denies_a_scoped_entry_but_not_an_unscoped_one() {
+        let mut entry = make_test_entry();
+        assert!(
+            is_entry_valid_at_path(&entry, None),
+            "an unscoped grant applies everywhere, including with no cwd"
+        );
+
+        entry.paths = Some(vec!["/srv/scratch/**".to_string()]);
+        assert!(
+            !is_entry_valid_at_path(&entry, None),
+            "a directory-scoped grant cannot apply when the directory is unknown"
+        );
+
+        entry.paths = Some(vec!["*".to_string()]);
+        assert!(
+            is_entry_valid_at_path(&entry, None),
+            "an explicit global scope is not a restriction"
+        );
+    }
+
+    #[test]
+    fn relative_scope_patterns_do_not_match_absolute_directories() {
+        let mut entry = make_test_entry();
+        entry.paths = Some(vec!["projects/**".to_string(), "projects".to_string()]);
+        assert!(!path_matches(&entry, Path::new("/home/user/projects")));
+        assert!(!path_matches(&entry, Path::new("/home/user/projects/app")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scope_matching_resolves_symlinks_on_both_sides() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical root");
+        let inside = root.join("inside");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&inside).expect("mkdir inside");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+
+        let mut entry = make_test_entry();
+        entry.paths = Some(vec![
+            inside.to_string_lossy().to_string(),
+            format!("{}/**", inside.to_string_lossy()),
+        ]);
+
+        assert!(path_matches(&entry, &inside));
+        assert!(!path_matches(&entry, &outside));
+
+        // A symlink whose name sits inside the scope but whose target does not
+        // must not borrow the grant.
+        let escape = inside.join("escape");
+        std::os::unix::fs::symlink(&outside, &escape).expect("symlink");
+        assert!(
+            !path_matches(&entry, &escape),
+            "a symlink out of the scope is out of the scope"
+        );
+
+        // A pattern written against a symlinked prefix names its target.
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&inside, &link).expect("symlink");
+        let mut linked = make_test_entry();
+        linked.paths = Some(vec![link.to_string_lossy().to_string()]);
+        assert!(path_matches(&linked, &inside));
+        assert!(!path_matches(&linked, &outside));
+    }
+
+    #[test]
+    fn canonicalize_pattern_prefix_ignores_unresolvable_patterns() {
+        assert_eq!(canonicalize_pattern_prefix("relative/**"), None);
+        assert_eq!(canonicalize_pattern_prefix("/**"), None);
+        assert_eq!(
+            canonicalize_pattern_prefix("/definitely/not/here/**"),
+            None,
+            "a prefix that does not exist resolves to nothing"
+        );
     }
 
     #[test]
@@ -3135,6 +4172,29 @@ mod tests {
     }
 
     #[test]
+    fn dcg_self_inspection_consumes_global_option_values() {
+        for command in [
+            "dcg --agent codex --robot test 'rm -rf /'",
+            "dcg --agent='test' -vv explain 'git reset --hard'",
+            "dcg --no-suggestions --legacy-output --no-color classify 'git clean -fd'",
+        ] {
+            assert!(is_dcg_self_inspection_call(command), "{command}");
+            assert!(is_dcg_self_inspection_segment(command), "{command}");
+        }
+        for command in [
+            "dcg --agent test allow-once abc123 --yes",
+            "dcg --agent explain uninstall",
+            "dcg --agent classify allowlist add core.git:reset-hard --reason reviewed",
+            "dcg --agent test",
+            "dcg --agent",
+            "dcg --unknown-option test 'rm -rf /'",
+        ] {
+            assert!(!is_dcg_self_inspection_call(command), "{command}");
+            assert!(!is_dcg_self_inspection_segment(command), "{command}");
+        }
+    }
+
+    #[test]
     fn dcg_self_inspection_allows_path_qualified_binary() {
         assert!(is_dcg_self_inspection_call(
             "/usr/local/bin/dcg test \"rm -rf /\""
@@ -3144,6 +4204,15 @@ mod tests {
         ));
         assert!(is_dcg_self_inspection_call(
             "~/.local/bin/dcg test \"git reset --hard\""
+        ));
+        assert!(is_dcg_self_inspection_call(
+            r#"dcg.exe test "Send-MailMessage -To outside@example.test""#
+        ));
+        assert!(is_dcg_self_inspection_call(
+            r#""C:\Program Files\dcg\DCG.EXE" explain "scp report.csv user@outside.example:/drop/""#
+        ));
+        assert!(is_dcg_self_inspection_call(
+            r#"destructive_command_guard.exe classify "rd /s /q C:\data""#
         ));
     }
 
@@ -3246,5 +4315,37 @@ mod tests {
         assert!(!is_dcg_self_inspection_call(
             "dcg test \"rm -rf /\" && dcg install"
         ));
+    }
+
+    #[test]
+    fn issue_289_dcg_self_inspection_segment_matches_a_single_segment() {
+        assert!(is_dcg_self_inspection_segment("dcg test rm -rf /"));
+        assert!(is_dcg_self_inspection_segment("dcg explain \"rm -rf /\""));
+        assert!(is_dcg_self_inspection_segment(
+            "/usr/local/bin/dcg --robot classify 'rm -rf /'"
+        ));
+        // Leading whitespace is ordinary word separation.
+        assert!(is_dcg_self_inspection_segment("  dcg test rm -rf /"));
+    }
+
+    #[test]
+    fn issue_289_dcg_self_inspection_segment_keeps_the_whole_command_guards() {
+        // Not dcg in executable position.
+        assert!(!is_dcg_self_inspection_segment("foo dcg test rm -rf /"));
+        assert!(!is_dcg_self_inspection_segment("mydcg test rm -rf /"));
+        assert!(!is_dcg_self_inspection_segment("sudo dcg test rm -rf /"));
+        // Not a diagnostic subcommand.
+        assert!(!is_dcg_self_inspection_segment("dcg hook rm -rf /"));
+        assert!(!is_dcg_self_inspection_segment("dcg testfoo rm -rf /"));
+        // Substitutions, backticks, subshells, and redirects refuse it.
+        assert!(!is_dcg_self_inspection_segment("dcg test \"$(rm -rf /)\""));
+        assert!(!is_dcg_self_inspection_segment(
+            "dcg explain \"`rm -rf /`\""
+        ));
+        assert!(!is_dcg_self_inspection_segment("dcg test <(rm -rf /)"));
+        assert!(!is_dcg_self_inspection_segment("dcg test x > /etc/passwd"));
+        // Shell reserved words are the caller's problem, not this predicate's.
+        assert!(!is_dcg_self_inspection_segment("do dcg test rm -rf /"));
+        assert!(!is_dcg_self_inspection_segment(""));
     }
 }

@@ -35,6 +35,11 @@ use std::time::{Duration, Instant};
 /// still catching catastrophic regex backtracking (which would be 10s+).
 pub const PATTERN_MATCH_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// A first sample above this ceiling is already far beyond scheduler jitter and
+/// should fail immediately instead of spending another multi-second interval
+/// confirming an obvious pathological match.
+const PATTERN_MATCH_HARD_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Assert that a pack blocks a command with a reason containing the expected substring.
 ///
 /// # Panics
@@ -283,16 +288,39 @@ pub fn assert_matches_within_budget(pack: &Pack, command: &str) {
 
     let start = Instant::now();
     let _ = pack.check(command);
-    let elapsed = start.elapsed();
+    let first_elapsed = start.elapsed();
+
+    if first_elapsed < PATTERN_MATCH_TIMEOUT {
+        return;
+    }
 
     assert!(
-        elapsed < PATTERN_MATCH_TIMEOUT,
-        "Pattern matching for command '{}' in pack '{}' took {:?}, exceeding budget of {:?}.\n\
+        first_elapsed < PATTERN_MATCH_HARD_TIMEOUT,
+        "Pattern matching for command '{}' in pack '{}' took {:?}, exceeding hard budget of {:?}.\n\
          This may indicate catastrophic regex backtracking.",
         command,
         pack.id,
-        elapsed,
-        PATTERN_MATCH_TIMEOUT
+        first_elapsed,
+        PATTERN_MATCH_HARD_TIMEOUT
+    );
+
+    // Wall-clock timing can include an unrelated scheduler preemption. Confirm
+    // a marginal overrun once; a real regex regression remains slow on the
+    // immediate retry, while a one-off deschedule does not make the gate flaky.
+    let retry_start = Instant::now();
+    let _ = pack.check(command);
+    let retry_elapsed = retry_start.elapsed();
+
+    assert!(
+        retry_elapsed < PATTERN_MATCH_TIMEOUT,
+        "Pattern matching for command '{}' in pack '{}' exceeded budget of {:?} twice \
+         (first: {:?}, retry: {:?}).\n\
+         This may indicate catastrophic regex backtracking.",
+        command,
+        pack.id,
+        PATTERN_MATCH_TIMEOUT,
+        first_elapsed,
+        retry_elapsed
     );
 }
 
@@ -482,15 +510,30 @@ pub fn validate_pack(pack: &Pack) {
 /// This is a sanity check to ensure no regex syntax errors exist.
 #[track_caller]
 pub fn assert_patterns_compile(pack: &Pack) {
-    // Safe patterns
-    for pattern in &pack.safe_patterns {
-        // Just accessing the regex is enough - it's compiled at pack creation
-        let _ = pattern.regex.as_str();
+    for (index, pattern) in pack.safe_patterns.iter().enumerate() {
+        if let Err(error) = crate::packs::regex_engine::CompiledRegex::new(pattern.regex.as_str()) {
+            panic!(
+                "Pack '{}' safe pattern '{}' (index {}) failed to compile: {}\n  Pattern: {}",
+                pack.id,
+                pattern.name,
+                index,
+                error,
+                pattern.regex.as_str()
+            );
+        }
     }
 
-    // Destructive patterns
-    for pattern in &pack.destructive_patterns {
-        let _ = pattern.regex.as_str();
+    for (index, pattern) in pack.destructive_patterns.iter().enumerate() {
+        if let Err(error) = crate::packs::regex_engine::CompiledRegex::new(pattern.regex.as_str()) {
+            panic!(
+                "Pack '{}' destructive pattern '{}' (index {}) failed to compile: {}\n  Pattern: {}",
+                pack.id,
+                pattern.name.unwrap_or("<unnamed>"),
+                index,
+                error,
+                pattern.regex.as_str()
+            );
+        }
     }
 }
 
@@ -670,12 +713,11 @@ impl<'a> LoggedPackTestRunner<'a> {
                 "Expected pack '{}' to allow command '{}' but it was blocked",
                 self.pack.id, command
             );
-        } else {
-            self.logger
-                .log_pattern_match("none", command, false, duration_us);
-            self.logger
-                .log_test_result_detailed("assert_allows", true, "", None, Some(command));
         }
+        self.logger
+            .log_pattern_match("none", command, false, duration_us);
+        self.logger
+            .log_test_result_detailed("assert_allows", true, "", None, Some(command));
     }
 
     /// Run a batch of blocking assertions.
@@ -786,10 +828,12 @@ impl EvalSnapshot {
         let decision = match result.decision {
             EvaluationDecision::Allow => "allow",
             EvaluationDecision::Deny => "deny",
+            EvaluationDecision::Indeterminate => "indeterminate",
         };
 
         let effective_mode = result.effective_mode.map(|m| match m {
             DecisionMode::Deny => "deny".to_string(),
+            DecisionMode::Ask => "ask".to_string(),
             DecisionMode::Warn => "warn".to_string(),
             DecisionMode::Log => "log".to_string(),
         });
@@ -1013,7 +1057,28 @@ pub fn load_corpus_dir(
 /// ```
 #[must_use]
 pub fn eval_snapshot(command: &str) -> EvalSnapshot {
-    eval_snapshot_with_config(command, &Config::default())
+    eval_snapshot_with_config(command, &corpus_config())
+}
+
+/// The configuration the regression corpus is judged under: the defaults,
+/// minus the packs that are default-on only on Windows builds.
+///
+/// The corpus is one set of expectations for every host. `windows.filesystem`
+/// and `windows.system` join the defaults only under `cfg(windows)`, and their
+/// all-dialect fallback reads POSIX text such as `$(echo hello)` or
+/// `rm -r -f /tmp/x` as PowerShell, so the same corpus reported eight
+/// "failures" on native Windows that were a different pack set, not a
+/// regression (bd-bl3b). A Windows hook still evaluates `Bash` payloads as
+/// POSIX; the Windows packs have their own tests.
+#[must_use]
+pub fn corpus_config() -> Config {
+    let mut config = Config::default();
+    config.packs.disabled.extend(
+        ["windows.filesystem", "windows.system"]
+            .into_iter()
+            .map(String::from),
+    );
+    config
 }
 
 /// Evaluate a command with a specific configuration and return a snapshot.
@@ -1121,7 +1186,7 @@ pub fn diff_snapshots(expected: &EvalSnapshot, actual: &EvalSnapshot) -> Option<
 #[allow(clippy::missing_errors_doc, clippy::too_many_lines)]
 pub fn verify_corpus_case(case: &CorpusTestCase, category: CorpusCategory) -> Result<(), String> {
     // Get both snapshot (for most checks) and full result (for reason_contains check)
-    let config = Config::default();
+    let config = corpus_config();
     let enabled_packs = config.enabled_pack_ids();
     let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
     let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);

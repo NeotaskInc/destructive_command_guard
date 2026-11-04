@@ -1,0 +1,93 @@
+name: Bash scanner safety
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - .cargo/config.toml
+      - .github/workflows/scanner-safety.yml
+      - scripts/check_scanner_safety.py
+      - scripts/test_check_scanner_safety.py
+      - scripts/scanner_brace_probe.c
+      - src/ast_matcher.rs
+      - src/heredoc.rs
+      - src/scanner_regression_tests.rs
+      # src/lib.rs declares the module: undeclare it and the regressions stop
+      # running, which is exactly when this workflow needs to run.
+      - src/lib.rs
+      - tests/repro_442_source_modules_are_declared.rs
+      - tests/repro_442_vendored_scanner_is_linked.rs
+      - vendor/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scanner-safety-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  scanner-safety:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_BUILD_JOBS: 2
+      RCH_ENABLED: 0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify the scanner gate rejects detected defects
+        run: python3 -m unittest discover -s scripts -p test_check_scanner_safety.py -v
+      - name: Test the vendored scanner across all Unicode scalars
+        run: python3 scripts/check_scanner_safety.py prepare
+      - name: Activate the repository-pinned Rust toolchain
+        run: |
+          toolchain=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy
+      - name: Compile and run the actual ast-grep regressions
+        id: focused
+        run: |
+          set -euo pipefail
+          # `cargo test <filter>` exits 0 when the filter matches nothing, so the
+          # count is asserted rather than assumed. Until the module was declared
+          # in src/lib.rs this step passed while running zero tests, and every
+          # step below gated on its success inherited that vacuous pass.
+          count=$(cargo test --locked --lib scanner_regression_tests -- --list \
+            | sed -nE 's/^([0-9]+) tests?,.*/\1/p')
+          echo "scanner_regression_tests discovered: ${count:-0}"
+          if [ "${count:-0}" -lt 2 ]; then
+            echo "::error::expected at least 2 scanner_regression_tests; the module is not wired into src/lib.rs"
+            exit 1
+          fi
+          cargo test --locked --lib scanner_regression_tests
+          cargo test --locked --test repro_442_source_modules_are_declared
+          # Those regressions pass on an unpatched build too, so assert
+          # separately that the patched scanner is the one Cargo linked.
+          cargo test --locked --test repro_442_vendored_scanner_is_linked
+      - name: Repeated complete lib gate, without retries or test skips
+        if: ${{ !cancelled() && steps.focused.outcome == 'success' }}
+        run: python3 scripts/check_scanner_safety.py repeat --runs 12
+      - name: Check all targets
+        if: ${{ !cancelled() && steps.focused.outcome == 'success' }}
+        run: cargo check --locked --all-targets
+      - name: Clippy all targets
+        if: ${{ !cancelled() && steps.focused.outcome == 'success' }}
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Check formatting
+        if: always()
+        run: cargo fmt --check
+      - name: Retain every native and lib-run log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scanner-safety-${{ github.sha }}
+          path: |
+            target/scanner-safety/*.log
+            target/scanner-safety/*.json
+          if-no-files-found: error

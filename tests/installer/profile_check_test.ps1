@@ -11,28 +11,257 @@ function Check([bool]$cond, [string]$msg) {
     if ($cond) { Write-Host "  ok: $msg" } else { Write-Host "  FAIL: $msg" -ForegroundColor Red; $script:failures++ }
 }
 
+# The block's two quoted-invocation detection lines, verbatim (issue #503).
+$singleQuotedLine = @'
+        if ($dcgCmd -match '^&\s*''((?:[^'']|'''')*)''') { $dcgExe = $Matches[1] -replace '''''', '''' }
+'@
+$singleQuotedLine = $singleQuotedLine.Trim()
+$doubleQuotedLine = @'
+        elseif ($dcgCmd -match '^&\s*"([^"]*)"') { $dcgExe = $Matches[1] }
+'@
+$doubleQuotedLine = $doubleQuotedLine.Trim()
+
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("dcg_profile_" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tmp | Out-Null
 try {
     $profilePath = Join-Path $tmp 'sub\Microsoft.PowerShell_profile.ps1'  # parent dir must be created
 
-    $s1 = Add-DcgProfileCheck -ProfilePath $profilePath
+    $s1 = Add-DcgProfileCheck -ProfilePath $profilePath -AlsoRepairPaths @()
     Check ($s1 -eq 'added') "first run returns 'added' (got '$s1')"
     Check (Test-Path $profilePath) "profile created (incl. parent dir)"
 
     $content = Get-Content -Raw $profilePath
     Check ($content.Contains('# dcg: warn if the Claude Code hook')) "marker present"
-    Check ($content.Contains('Hook missing from ~/.claude/settings.json')) "warning text present"
+    Check ($content.Contains('Hook missing from $dcgSettings')) "warning names the checked settings path"
+    Check ($content.Contains('$env:CLAUDE_CONFIG_DIR')) "startup check resolves the active Claude configuration"
+
+    $savedClaudeDir = $env:CLAUDE_CONFIG_DIR
+    try {
+        $env:CLAUDE_CONFIG_DIR = Join-Path $tmp 'active config'
+        New-Item -ItemType Directory -Force $env:CLAUDE_CONFIG_DIR | Out-Null
+        $activeSettings = Join-Path $env:CLAUDE_CONFIG_DIR 'settings.json'
+        [System.IO.File]::WriteAllText($activeSettings, '{}')
+        # A function is sufficient for the profile's Get-Command dcg guard.
+        function dcg { }
+        $warning = (& ([scriptblock]::Create($script:DcgProfileCheckBlock)) 6>&1 | Out-String)
+        Check ($warning.Contains($activeSettings)) "missing active hook warns with its path"
+        [System.IO.File]::WriteAllText($activeSettings, '{"hooks":{"PreToolUse":[{"hooks":[{"command":"dcg"}]}]}}')
+        $warning = (& ([scriptblock]::Create($script:DcgProfileCheckBlock)) 6>&1 | Out-String)
+        Check ([string]::IsNullOrWhiteSpace($warning)) "protected active configuration is quiet"
+    } finally { $env:CLAUDE_CONFIG_DIR = $savedClaudeDir }
 
     $perr = $null
     [void][System.Management.Automation.Language.Parser]::ParseInput($content, [ref]$null, [ref]$perr)
     Check (($null -eq $perr) -or ($perr.Count -eq 0)) "appended profile parses as valid PowerShell"
 
-    $s2 = Add-DcgProfileCheck -ProfilePath $profilePath
+    # --- Detection-expression coverage (issue #282) ---
+    # The profile block must recognize every command shape dcg's installers
+    # write, including the PowerShell quoted-invocation form `& '...' [args]`.
+    # $detect mirrors the block's detection lines verbatim; the Contains checks
+    # below pin the shipped block to this copy so they cannot drift apart.
+    $detect = {
+        param([string]$command)
+        $dcgCmd = $command.Trim()
+        if ($dcgCmd -match '^&\s*''((?:[^'']|'''')*)''') { $dcgExe = $Matches[1] -replace '''''', '''' }
+        elseif ($dcgCmd -match '^&\s*"([^"]*)"') { $dcgExe = $Matches[1] }
+        else { $dcgExe = (($dcgCmd -split '\s+')[0]).Trim('"').Trim("'") }
+        ((($dcgExe -split '[\\/]')[-1]) -replace '\.exe$','' -ieq 'dcg')
+    }
+    Check ($content.Contains($singleQuotedLine)) "profile block contains single-quoted invocation branch"
+    Check ($content.Contains($doubleQuotedLine)) "profile block contains double-quoted invocation branch"
+    Check ($content.Contains('else { $dcgExe = (($dcgCmd -split ''\s+'')[0]).Trim(''"'').Trim("''") }')) "profile block contains bare-token branch"
+    Check ($content.Contains('if ((($dcgExe -split ''[\\/]'')[-1]) -replace ''\.exe$'','''' -ieq ''dcg'') { $dcgHas = $true }')) "profile block contains leaf comparison"
+
+    foreach ($case in @(
+        "& 'C:\Users\x\.local\bin\dcg.exe' hook",
+        "& 'C:\Users\x\.local\bin\dcg.exe'",
+        "& 'C:\Users\user\.local\bin\dcg.exe'",
+        "& 'C:\Users\O''Brien\.local\bin\dcg.exe'",
+        "&'C:\Users\O''Brien\dcg.exe' hook",
+        "  & 'C:\Users\x\.local\bin\dcg.exe'  ",
+        '& "C:\Users\x\.local\bin\dcg.exe"',
+        '& "C:\Users\x\.local\bin\dcg.exe" hook',
+        'C:\Users\x\.local\bin\dcg.exe',
+        '/home/u/.local/bin/dcg',
+        '"/home/u/.local/bin/dcg"',
+        'dcg',
+        'dcg.exe',
+        'DCG.EXE'
+    )) {
+        Check (& $detect $case) "detects dcg hook command: $case"
+    }
+    foreach ($case in @(
+        "& 'C:\tools\other.exe' hook",
+        "& 'C:\Users\O''dcg\other.exe'",
+        "& 'C:\dcg.exe\other.exe'",
+        'notdcg.exe',
+        '/usr/bin/notdcg',
+        ''
+    )) {
+        Check (-not (& $detect $case)) "rejects non-dcg command: $case"
+    }
+
+    $s2 = Add-DcgProfileCheck -ProfilePath $profilePath -AlsoRepairPaths @()
     Check ($s2 -eq 'already') "second run returns 'already' (got '$s2')"
 
     $count = ([regex]::Matches((Get-Content -Raw $profilePath), [regex]::Escape('# dcg: warn if the Claude Code hook'))).Count
     Check ($count -eq 1) "marker appears exactly once (idempotent)"
+
+    # --- Stale-block replacement (issue #282 follow-up) ---
+    # A profile carrying the pre-#282 block (same marker, naive path split) must
+    # be repaired in place by a re-run, not skipped as "already".
+    $staleBlock = @'
+# dcg: warn if the Claude Code hook was silently removed
+if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.claude\settings.json")) {
+  try {
+    $dcgCfg = Get-Content -Raw "$HOME\.claude\settings.json" | ConvertFrom-Json
+    $dcgHas = $false
+    foreach ($dcgE in @($dcgCfg.hooks.PreToolUse)) {
+      foreach ($dcgH in @($dcgE.hooks)) {
+        if (((([string]$dcgH.command) -split '[\\/]')[-1]) -replace '\.exe$','' -ieq 'dcg') { $dcgHas = $true }
+      }
+    }
+    if (-not $dcgHas) { Write-Host '[dcg] Hook missing from ~/.claude/settings.json - run: dcg install' -ForegroundColor Yellow }
+  } catch { }
+}
+'@
+    $stalePath = Join-Path $tmp 'stale_profile.ps1'
+    Set-Content -Path $stalePath -Value ("# user stuff before`n" + $staleBlock + "`n# user stuff after")
+
+    $s3 = Add-DcgProfileCheck -ProfilePath $stalePath -AlsoRepairPaths @()
+    Check ($s3 -eq 'updated') "stale pre-#282 block is replaced, returns 'updated' (got '$s3')"
+
+    $staleContent = Get-Content -Raw $stalePath
+    Check ($staleContent.Contains($singleQuotedLine)) "repaired profile contains current quoted-invocation branch"
+    Check (-not $staleContent.Contains("if (((([string]`$dcgH.command) -split '[\\/]')[-1])")) "naive pre-#282 detection line removed"
+    Check ($staleContent.Contains('# user stuff before')) "content before the block preserved"
+    Check ($staleContent.Contains('# user stuff after')) "content after the block preserved"
+    $staleCount = ([regex]::Matches($staleContent, [regex]::Escape('# dcg: warn if the Claude Code hook'))).Count
+    Check ($staleCount -eq 1) "repaired profile has marker exactly once"
+    $perr2 = $null
+    [void][System.Management.Automation.Language.Parser]::ParseInput($staleContent, [ref]$null, [ref]$perr2)
+    Check (($null -eq $perr2) -or ($perr2.Count -eq 0)) "repaired profile parses as valid PowerShell"
+
+    $s4 = Add-DcgProfileCheck -ProfilePath $stalePath -AlsoRepairPaths @()
+    Check ($s4 -eq 'already') "repaired profile is stable on the next run (got '$s4')"
+
+    # --- The #282-era block is stale too (issue #503) ---
+    # Its lazy `(.+?)['"]` capture ended a single-quoted path at a doubled
+    # `''`, so a profile holding it must be repaired to the current block.
+    $block282 = @'
+# dcg: warn if the Claude Code hook was silently removed
+if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.claude\settings.json")) {
+  try {
+    $dcgCfg = Get-Content -Raw "$HOME\.claude\settings.json" | ConvertFrom-Json
+    $dcgHas = $false
+    foreach ($dcgE in @($dcgCfg.hooks.PreToolUse)) {
+      foreach ($dcgH in @($dcgE.hooks)) {
+        $dcgCmd = ([string]$dcgH.command).Trim()
+        if ($dcgCmd -match '^&\s*[''"](.+?)[''"]') { $dcgExe = $Matches[1] }
+        else { $dcgExe = (($dcgCmd -split '\s+')[0]).Trim('"').Trim("'") }
+        if ((($dcgExe -split '[\\/]')[-1]) -replace '\.exe$','' -ieq 'dcg') { $dcgHas = $true }
+      }
+    }
+    if (-not $dcgHas) { Write-Host '[dcg] Hook missing from ~/.claude/settings.json - run: dcg install' -ForegroundColor Yellow }
+  } catch { }
+}
+'@
+    $path282 = Join-Path $tmp 'block282_profile.ps1'
+    Set-Content -Path $path282 -Value $block282
+    $s282 = Add-DcgProfileCheck -ProfilePath $path282 -AlsoRepairPaths @()
+    Check ($s282 -eq 'updated') "#282-era block is replaced (got '$s282')"
+    Check ((Get-Content -Raw $path282).Contains($singleQuotedLine)) "#282-era block now carries the literal-aware branch"
+
+    # --- Line-ending insensitivity ---
+    # A profile holding the CURRENT block but with CRLF endings (git autocrlf
+    # checkout, editor re-save) must be recognized as up to date, not rewritten
+    # on every run; a STALE block with CRLF endings must still be repaired.
+    $currentCrlf = Join-Path $tmp 'current_crlf_profile.ps1'
+    [System.IO.File]::WriteAllText($currentCrlf,
+        ("# before`n" + $script:DcgProfileCheckMarker + "`n" + $script:DcgProfileCheckBlock + "`n# after`n").Replace("`r`n", "`n").Replace("`n", "`r`n"))
+    $s6 = Add-DcgProfileCheck -ProfilePath $currentCrlf -AlsoRepairPaths @()
+    Check ($s6 -eq 'already') "current block with CRLF endings is 'already', not rewritten (got '$s6')"
+
+    $staleCrlf = Join-Path $tmp 'stale_crlf_profile.ps1'
+    [System.IO.File]::WriteAllText($staleCrlf, $staleBlock.Replace("`r`n", "`n").Replace("`n", "`r`n"))
+    $s7 = Add-DcgProfileCheck -ProfilePath $staleCrlf -AlsoRepairPaths @()
+    Check ($s7 -eq 'updated') "stale block with CRLF endings is repaired (got '$s7')"
+    $staleCrlfContent = Get-Content -Raw $staleCrlf
+    Check ($staleCrlfContent.Contains($singleQuotedLine)) "CRLF stale profile now contains current detection"
+    $perr3 = $null
+    [void][System.Management.Automation.Language.Parser]::ParseInput($staleCrlfContent, [ref]$null, [ref]$perr3)
+    Check (($null -eq $perr3) -or ($perr3.Count -eq 0)) "repaired CRLF profile parses as valid PowerShell"
+    $s8 = Add-DcgProfileCheck -ProfilePath $staleCrlf -AlsoRepairPaths @()
+    Check ($s8 -eq 'already') "repaired CRLF profile is stable on the next run (got '$s8')"
+
+    # --- Cross-host repair ---
+    # A stale block in the OTHER host's profile (e.g. WindowsPowerShell 5.1's
+    # profile.ps1 while installing under pwsh 7) is repaired, but a profile
+    # without the marker is never created or touched.
+    $otherStale = Join-Path $tmp 'other_host_profile.ps1'
+    Set-Content -Path $otherStale -Value $staleBlock
+    $missingOther = Join-Path $tmp 'no_such_profile.ps1'
+    $mainPath2 = Join-Path $tmp 'main_profile2.ps1'
+    $s5 = Add-DcgProfileCheck -ProfilePath $mainPath2 -AlsoRepairPaths @($otherStale, $missingOther)
+    Check ($s5 -eq 'added') "main profile added while repairing other host (got '$s5')"
+    $otherContent = Get-Content -Raw $otherStale
+    Check ($otherContent.Contains($singleQuotedLine)) "other host's stale block repaired"
+    Check (-not (Test-Path $missingOther)) "non-existent other profile is not created"
+
+    # A current main profile plus a stale other-host profile reports "updated"
+    # (something changed), not "already".
+    $otherStale2 = Join-Path $tmp 'other_host_profile2.ps1'
+    Set-Content -Path $otherStale2 -Value $staleBlock
+    $s9 = Add-DcgProfileCheck -ProfilePath $mainPath2 -AlsoRepairPaths @($otherStale2)
+    Check ($s9 -eq 'updated') "current main + stale other host reports 'updated' (got '$s9')"
+    $s10 = Add-DcgProfileCheck -ProfilePath $mainPath2 -AlsoRepairPaths @($otherStale2)
+    Check ($s10 -eq 'already') "main + other host both current reports 'already' (got '$s10')"
+
+    # Execute the shipped block against isolated configurations. For default
+    # cases substitute only the read-only $HOME variable's name in the test
+    # copy, so the operator's actual settings can never be read or changed.
+    $savedClaudeConfigDir = $env:CLAUDE_CONFIG_DIR
+    try {
+        function dcg { }
+        $selectedDir = Join-Path $tmp 'active config [work]'
+        New-Item -ItemType Directory -Path $selectedDir | Out-Null
+        $selectedSettings = Join-Path $selectedDir 'settings.json'
+        $env:CLAUDE_CONFIG_DIR = $selectedDir
+        $blockToRun = [scriptblock]::Create($script:DcgProfileCheckBlock)
+        $missingWarning = & $blockToRun 6>&1 | Out-String
+        Check ($missingWarning.Contains("Hook missing from $selectedSettings")) 'missing active settings emits a warning naming its path'
+
+        Set-Content -LiteralPath $selectedSettings -Value '{"model":"keep-me"}'
+        $unprotectedWarning = & $blockToRun 6>&1 | Out-String
+        Check ($unprotectedWarning.Contains("Hook missing from $selectedSettings")) 'unprotected active settings emits a warning'
+
+        Set-Content -LiteralPath $selectedSettings -Value '{"hooks":{"PreToolUse":[{"matcher":"Bash|PowerShell|Monitor","hooks":[{"type":"command","command":"dcg"}]}]}}'
+        $protectedOutput = & $blockToRun 6>&1 | Out-String
+        Check ([string]::IsNullOrWhiteSpace($protectedOutput)) 'protected active settings does not emit a warning'
+
+        Push-Location $tmp
+        try {
+            $env:CLAUDE_CONFIG_DIR = 'relative config'
+            $relativeSettings = Join-Path (Join-Path $tmp 'relative config') 'settings.json'
+            $relativeWarning = & $blockToRun 6>&1 | Out-String
+            Check ($relativeWarning.Contains("Hook missing from $relativeSettings")) 'relative selection is resolved from the current directory at startup'
+        } finally { Pop-Location }
+
+        $dcgTestHome = Join-Path $tmp 'default-home'
+        New-Item -ItemType Directory -Path $dcgTestHome | Out-Null
+        $defaultBlock = [scriptblock]::Create($script:DcgProfileCheckBlock.Replace('$HOME', '$dcgTestHome'))
+        foreach ($selector in @($null, '')) {
+            $env:CLAUDE_CONFIG_DIR = $selector
+            $defaultMissingOutput = & $defaultBlock 6>&1 | Out-String
+            Check ([string]::IsNullOrWhiteSpace($defaultMissingOutput)) 'unset/empty selection keeps the legacy skip when default settings are absent'
+        }
+        $defaultDir = Join-Path $dcgTestHome '.claude'
+        New-Item -ItemType Directory -Path $defaultDir | Out-Null
+        $defaultSettings = Join-Path $defaultDir 'settings.json'
+        Set-Content -LiteralPath $defaultSettings -Value '{"model":"keep-default-model"}'
+        $defaultUnprotectedOutput = & $defaultBlock 6>&1 | Out-String
+        Check ($defaultUnprotectedOutput.Contains("Hook missing from $defaultSettings")) 'an existing default file without a hook still warns'
+    } finally { $env:CLAUDE_CONFIG_DIR = $savedClaudeConfigDir }
 } finally { Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue }
 
 if ($script:failures -gt 0) { Write-Host "$script:failures FAILURE(S)" -ForegroundColor Red; exit 1 }

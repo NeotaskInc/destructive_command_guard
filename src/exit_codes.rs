@@ -13,6 +13,11 @@
 //! | 3 | `EXIT_CONFIG_ERROR` | Configuration error |
 //! | 4 | `EXIT_PARSE_ERROR` | Parse/input error |
 //! | 5 | `EXIT_IO_ERROR` | IO error |
+//! | 141 | `EXIT_BROKEN_PIPE` | Output reader went away (`EPIPE`) |
+//!
+//! Hook mode (no subcommand) has its own contract: the verdict is the JSON on
+//! stdout and the process exits 0 — except when a blocking verdict could not
+//! be written, which exits [`EXIT_HOOK_BLOCK`] (2).
 //!
 //! # Usage
 //!
@@ -78,6 +83,47 @@ pub const EXIT_PARSE_ERROR: i32 = 4;
 /// - Permission denied reading/writing files
 /// - Database access fails
 pub const EXIT_IO_ERROR: i32 = 5;
+
+/// The process's stdout or stderr reader went away mid-write (`EPIPE`).
+///
+/// `128 + SIGPIPE(13)`: the status a shell reports for a C tool killed by
+/// `SIGPIPE`, so `dcg … | head -1` under `set -o pipefail` looks exactly like
+/// `cat … | head -1`. dcg reaches it through a clean `process::exit` from the
+/// broken-pipe panic backstop (issue #389) — never through a signal death,
+/// so there is no core dump and no `SIGABRT`. `SIGPIPE` itself stays
+/// ignored: see `output::emit` for why a hook binary must not die on a
+/// stderr write while its verdict on stdout may still have a reader.
+pub const EXIT_BROKEN_PIPE: i32 = 141;
+
+/// Hook mode only: a blocking verdict (deny, ask, or indeterminate) could
+/// not be written to stdout, so the exit status carries the block instead.
+///
+/// Every hook protocol dcg speaks reads its decision from stdout JSON on
+/// exit 0, and every one of them treats exit 0 with *no* JSON as "proceed".
+/// When the stdout write itself fails (`EPIPE` — the host closed the pipe
+/// before the verdict was written) exit 0 would therefore convert a deny
+/// into an allow. Exit 2 is the blocking exit status of the Claude Code hook
+/// contract and of every protocol that copied it (Gemini CLI, Copilot CLI,
+/// Crush, Grok); the remaining protocols log a non-zero exit as a hook
+/// failure and fail open, which is no worse than exit 0. The per-protocol
+/// table lives on `HookProtocol::undeliverable_block_exit_code`.
+///
+/// This is the same number as [`EXIT_WARNING`], which belongs to robot-mode
+/// subcommands (`dcg --robot test --fail-on warn`); the two never share a
+/// process. Hook mode never exits 2 for any other reason.
+///
+/// Reasonix (#358) is the one protocol that reads *only* the exit status, so
+/// there exit 2 is also the ordinary blocking answer, not just the fallback.
+pub const EXIT_HOOK_BLOCK: i32 = 2;
+
+/// Hook-mode warning status for Reasonix (#358).
+///
+/// Reasonix shows a hook's output only when the hook does not pass, and
+/// treats any status other than 0 and 2 as a non-blocking warning. A dcg
+/// warn-mode verdict therefore exits 1 there: the command proceeds and the
+/// warning is visible. Every other protocol carries warnings in stdout JSON
+/// beside exit 0.
+pub const EXIT_REASONIX_WARNING: i32 = 1;
 
 /// Convert an exit code constant to [`std::process::ExitCode`].
 ///

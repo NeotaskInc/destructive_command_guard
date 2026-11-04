@@ -7,11 +7,13 @@
 //!
 //! 1. **Explicit flag**: `--agent=<name>` CLI flag for manual override
 //! 2. **Environment variables**: Most agents set identifying env vars
-//! 3. **Parent process inspection** (fallback): Check process tree for agent names
+//! 3. **Parent process inspection** (fallback, Unix only): Check the parent
+//!    process name for an agent
 //!
 //! # Supported Agents
 //!
-//! - Claude Code: `CLAUDE_CODE=1` or `CLAUDE_SESSION_ID` env var
+//! - Claude Code: `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ID`
+//!   (what Claude Code exports), or the older `CLAUDE_CODE` / `CLAUDE_SESSION_ID`
 //! - Augment Code: `AUGMENT_AGENT=1` or `AUGMENT_CONVERSATION_ID` env var
 //! - Aider: `AIDER_SESSION=1` env var
 //! - Continue: `CONTINUE_SESSION_ID` env var
@@ -29,8 +31,31 @@
 //!   subprocesses). `agy` reads Claude-Code-compatible `PreToolUse` hooks from
 //!   `~/.gemini/config/hooks.json` (with `~/.gemini/antigravity-cli/hooks.json`
 //!   symlinked to it for backward compatibility).
+//! - OpenCode: `OPENCODE=1` env var, set by dcg's generated OpenCode plugin
+//!   (`dcg install --opencode`, a `tool.execute.before` plugin at
+//!   `~/.config/opencode/plugins/dcg-guard.js`) when it spawns dcg (#318).
+//! - Crush (Charm): `CRUSH=1` env var, which Crush sets for every hook it runs
+//!   and every command its `bash` tool executes (alongside `AGENT=crush` /
+//!   `AI_AGENT=crush`, which are too generic to trust). Exact `crush`
+//!   parent-process basename is a fallback (#388).
+//! - Oh My Pi (`omp`): the generated OMP extension invokes dcg with the
+//!   explicit `--agent omp` flag (`dcg install --omp`). Exact `omp` and
+//!   `oh-my-pi` parent-process basenames are also recognized as a fallback.
+//! - Muse Code (Meta): runs hooks in a cleared environment, so `dcg install
+//!   --muse` writes the explicit `--agent muse` flag into the hook command
+//!   (#572). It is deliberately not inferred from a parent process name.
+//! - Amp: the generated plugin (`dcg install --amp`) passes `--agent amp`
+//!   (#577). No process name is consulted (`amp` is also an editor's name).
+//! - Factory Droid: `dcg install --droid` passes `--agent droid`; its documented
+//!   `FACTORY_PROJECT_DIR` hook variable and exact `droid` process basename
+//!   are fallbacks. Hook mode also recognizes the distinctive `Execute` tool.
 //! - Pi (earendil-works `pi` coding agent): `PI_CODING_AGENT=true` env var (set
 //!   by `pi` into the environment of the subprocesses it spawns).
+//! - Posit Assistant: `PA_PROJECT_DIR=<workspace root>` env var, set in every
+//!   hook subprocess per its hook contract. Posit Assistant reads
+//!   Claude-Code-compatible `PreToolUse` hooks from
+//!   `~/.posit/assistant/settings.json`; the `pa` terminal client is also
+//!   recognized as a parent-process name.
 //!
 //! # Usage
 //!
@@ -51,6 +76,7 @@ use serde::{Deserialize, Serialize};
 /// Agent detection is stable within a process, so we use a longer TTL.
 const CACHE_TTL: Duration = Duration::from_secs(300);
 
+#[cfg(any(unix, test))]
 const WINDOWS_EXECUTABLE_SUFFIXES: &[&str] = &[".exe", ".cmd", ".bat", ".ps1"];
 
 /// Known AI coding agents that dcg can detect and configure per-agent policies for.
@@ -87,6 +113,49 @@ pub enum Agent {
     /// earendil-works Pi coding agent (`pi`). Injects `PI_CODING_AGENT=true`
     /// into the environment of the subprocesses it spawns.
     Pi,
+    /// Posit Assistant (Posit Software, PBC), spanning the Positron/RStudio
+    /// extension and the `pa` terminal client. Reads Claude-Code-compatible
+    /// `PreToolUse` hooks from `~/.posit/assistant/settings.json` and sets
+    /// `PA_PROJECT_DIR=<workspace root>` in hook subprocesses.
+    /// See <https://positron.posit.co/assistant/>.
+    PositAssistant,
+    /// OpenCode (opencode.ai). Guarded through a dcg-generated
+    /// `tool.execute.before` plugin (`dcg install --opencode`), which spawns
+    /// dcg with `OPENCODE=1` in the environment (#318).
+    OpenCode,
+    /// Oh My Pi (`omp`). Guarded through a dcg-generated `tool_call` extension
+    /// (`dcg install --omp`) that invokes dcg with `--agent omp`.
+    Omp,
+    /// Charm Crush (<https://github.com/charmbracelet/crush>). Reads flat
+    /// `hooks.PreToolUse[{command, matcher, name, timeout}]` entries from
+    /// `~/.config/crush/crush.json` (or a project `crush.json` /
+    /// `.crush.json`), pipes `{"event":"PreToolUse","tool_name":"bash",
+    /// "tool_input":{"command":...}}` to the hook's stdin, and sets `CRUSH=1`
+    /// in every hook and `bash`-tool subprocess (#388).
+    Crush,
+    /// Reasonix (<https://github.com/esengine/DeepSeek-Reasonix>). Reads
+    /// `hooks.PreToolUse[{match, command, timeout}]` from
+    /// `~/.reasonix/settings.json` (`%APPDATA%\reasonix\settings.json` on
+    /// Windows), pipes `{"event":"PreToolUse","cwd":...,"toolName":"bash",
+    /// "toolArgs":{"command":...}}` to the hook's stdin, and blocks on exit 2
+    /// (#358). Identified from that wire shape; it sets no marker variable.
+    Reasonix,
+    /// Muse Code, Meta's terminal coding agent
+    /// (<https://dev.meta.ai/docs/muse-code>). Reads `hooks.PreToolUse`
+    /// matcher groups from `${XDG_CONFIG_HOME:-~/.config}/muse/settings.json`
+    /// and pipes a Codex-shaped payload (`turn_id`, `tool_name: "shell"` or
+    /// `"exec_command"`) to the hook. Muse clears the hook environment, so the
+    /// installer writes `--agent muse` into the hook command (#572).
+    Muse,
+    /// Amp (<https://ampcode.com>). Guarded through a dcg-generated plugin
+    /// (`dcg install --amp`) whose `tool.call` handler runs `dcg --agent amp`
+    /// for every shell command (#577).
+    Amp,
+    /// Factory Droid (<https://docs.factory.com/harness/hooks>). Its `Execute`
+    /// tool sends Claude-compatible `PreToolUse` payloads. The installer pins
+    /// this identity with `--agent droid` so profiles also work when the hook
+    /// environment is cleared or the payload cannot be parsed (#617).
+    Droid,
     /// A custom agent specified by name.
     Custom(String),
     /// Unknown or undetected agent.
@@ -113,6 +182,14 @@ impl Agent {
             Self::Grok => "grok",
             Self::Antigravity => "antigravity",
             Self::Pi => "pi",
+            Self::PositAssistant => "posit-assistant",
+            Self::OpenCode => "opencode",
+            Self::Omp => "omp",
+            Self::Crush => "crush",
+            Self::Reasonix => "reasonix",
+            Self::Muse => "muse",
+            Self::Amp => "amp",
+            Self::Droid => "droid",
             Self::Custom(name) => name,
             Self::Unknown => "unknown",
         }
@@ -135,6 +212,14 @@ impl Agent {
                 | Self::Grok
                 | Self::Antigravity
                 | Self::Pi
+                | Self::PositAssistant
+                | Self::OpenCode
+                | Self::Omp
+                | Self::Crush
+                | Self::Reasonix
+                | Self::Muse
+                | Self::Amp
+                | Self::Droid
         )
     }
 
@@ -157,6 +242,13 @@ impl Agent {
     /// - `"codex"`, `"codex-cli"`, `"codex_cli"` -> `CodexCli`
     /// - `"gemini"`, `"gemini-cli"`, `"gemini_cli"` -> `GeminiCli`
     /// - `"cursor"`, `"cursor-ide"`, `"cursor_ide"` -> `CursorIde`
+    /// - `"posit-assistant"`, `"posit_assistant"`, `"posit"`, `"pa"` -> `PositAssistant`
+    /// - `"omp"`, `"oh-my-pi"` -> `Omp`
+    /// - `"crush"`, `"charm-crush"` -> `Crush`
+    /// - `"reasonix"`, `"deepseek-reasonix"` -> `Reasonix`
+    /// - `"muse"`, `"muse-code"` -> `Muse`
+    /// - `"amp"`, `"ampcode"` -> `Amp`
+    /// - `"droid"`, `"factory-droid"`, `"factory"` -> `Droid`
     /// - `"unknown"` -> `Unknown`
     /// - Any other value -> `Custom(value)`
     #[must_use]
@@ -175,6 +267,14 @@ impl Agent {
             "grok" | "grokcli" | "grokbuild" | "xai" | "xaigrok" => Self::Grok,
             "agy" | "antigravity" | "antigravitycli" => Self::Antigravity,
             "pi" | "picli" | "picodingagent" => Self::Pi,
+            "positassistant" | "posit" | "pa" => Self::PositAssistant,
+            "opencode" | "opencodecli" => Self::OpenCode,
+            "omp" | "ohmypi" => Self::Omp,
+            "crush" | "charmcrush" | "crushcli" => Self::Crush,
+            "reasonix" | "deepseekreasonix" => Self::Reasonix,
+            "muse" | "musecode" | "metamuse" => Self::Muse,
+            "amp" | "ampcode" => Self::Amp,
+            "droid" | "factorydroid" | "factory" | "droidcli" => Self::Droid,
             "unknown" => Self::Unknown,
             _ => Self::Custom(name.to_string()),
         }
@@ -196,6 +296,14 @@ impl fmt::Display for Agent {
             Self::Grok => write!(f, "Grok (xAI)"),
             Self::Antigravity => write!(f, "Antigravity CLI"),
             Self::Pi => write!(f, "Pi"),
+            Self::PositAssistant => write!(f, "Posit Assistant"),
+            Self::OpenCode => write!(f, "OpenCode"),
+            Self::Omp => write!(f, "Oh My Pi"),
+            Self::Crush => write!(f, "Crush"),
+            Self::Reasonix => write!(f, "Reasonix"),
+            Self::Muse => write!(f, "Muse Code"),
+            Self::Amp => write!(f, "Amp"),
+            Self::Droid => write!(f, "Factory Droid"),
             Self::Custom(name) => write!(f, "{name}"),
             Self::Unknown => write!(f, "Unknown"),
         }
@@ -396,7 +504,25 @@ fn non_empty_agent_name(value: &str) -> Option<String> {
 ///
 /// Checks for known environment variables set by AI coding agents.
 fn detect_from_environment() -> Option<DetectionResult> {
-    // Claude Code detection
+    // Claude Code detection. What Claude Code actually exports to its tool and
+    // hook processes is `CLAUDECODE=1`, `CLAUDE_CODE_ENTRYPOINT` and
+    // `CLAUDE_CODE_SESSION_ID`; only the older `CLAUDE_CODE` /
+    // `CLAUDE_SESSION_ID` spellings were checked, so a live Claude Code session
+    // was detected as `unknown` — `[agents.claude-code]` profiles never applied,
+    // and on Windows every hook paid the parent-process fallback.
+    for marker in [
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_SESSION_ID",
+    ] {
+        if std::env::var_os(marker).is_some() {
+            return Some(DetectionResult::new(
+                Agent::ClaudeCode,
+                DetectionMethod::Environment,
+                Some(marker.to_string()),
+            ));
+        }
+    }
     if std::env::var("CLAUDE_CODE").is_ok() {
         return Some(DetectionResult::new(
             Agent::ClaudeCode,
@@ -563,6 +689,34 @@ fn detect_from_environment() -> Option<DetectionResult> {
         ));
     }
 
+    // OpenCode detection. dcg's generated OpenCode plugin
+    // (`dcg install --opencode`) spawns dcg with `OPENCODE=1` (#318), and
+    // OpenCode itself now sets it for its shell-tool commands (#508,
+    // anomalyco/opencode#51975). Presence-only, like the markers above. The
+    // generic `AI_AGENT=opencode` is not consulted: OpenCode keeps an outer
+    // agent's value there, so it can name another tool.
+    if std::env::var("OPENCODE").is_ok() {
+        return Some(DetectionResult::new(
+            Agent::OpenCode,
+            DetectionMethod::Environment,
+            Some("OPENCODE".to_string()),
+        ));
+    }
+
+    // Crush (Charm) detection. Crush sets `CRUSH=1` (plus `AGENT=crush` and
+    // `AI_AGENT=crush`) in the environment of every hook it runs and every
+    // command its `bash` tool executes — documented under "Execution model"
+    // in Crush's hooks guide and implemented by `shell.CrushEnvMarkers()`.
+    // Presence-only, like the markers above. The generic `AGENT`/`AI_AGENT`
+    // names are deliberately not consulted: other tools may set them.
+    if std::env::var("CRUSH").is_ok() {
+        return Some(DetectionResult::new(
+            Agent::Crush,
+            DetectionMethod::Environment,
+            Some("CRUSH".to_string()),
+        ));
+    }
+
     // Pi (earendil-works) detection. The `pi` coding agent injects
     // `PI_CODING_AGENT=true` into the environment of the subprocesses it
     // spawns. As with the other env markers we only check for the variable's
@@ -572,6 +726,33 @@ fn detect_from_environment() -> Option<DetectionResult> {
             Agent::Pi,
             DetectionMethod::Environment,
             Some("PI_CODING_AGENT".to_string()),
+        ));
+    }
+
+    // Posit Assistant detection. Its hook contract sets
+    // `PA_PROJECT_DIR=<workspace root>` in every hook subprocess, which is what
+    // dcg sees when invoked as a `PreToolUse` hook. Presence-only, like the
+    // markers above. Deliberately checked LAST: the variable describes the
+    // surrounding workspace rather than the direct caller, so any agent that
+    // names itself explicitly (e.g. a Claude Code hook running in a terminal
+    // Posit Assistant spawned) must win.
+    if std::env::var("PA_PROJECT_DIR").is_ok() {
+        return Some(DetectionResult::new(
+            Agent::PositAssistant,
+            DetectionMethod::Environment,
+            Some("PA_PROJECT_DIR".to_string()),
+        ));
+    }
+
+    // Factory documents this variable for hooks. Like PA_PROJECT_DIR it
+    // describes a workspace and may be inherited by another agent, so keep
+    // existing identifying markers ahead of it. Installed hooks use the
+    // explicit --agent droid flag, which takes precedence over all env vars.
+    if std::env::var_os("FACTORY_PROJECT_DIR").is_some() {
+        return Some(DetectionResult::new(
+            Agent::Droid,
+            DetectionMethod::Environment,
+            Some("FACTORY_PROJECT_DIR".to_string()),
         ));
     }
 
@@ -644,40 +825,18 @@ fn parent_process_args_from_ps(pid: &str) -> Option<String> {
     first_non_empty_line(&String::from_utf8_lossy(&output.stdout)).map(str::to_string)
 }
 
-/// Detect agent from parent process on Windows.
+/// Windows has no parent-process fallback.
+///
+/// It used to launch `powershell.exe` with two `Get-CimInstance` queries on
+/// every hook invocation that had no agent environment marker. Measured on a
+/// Windows 11 host, that took each Bash command from ~33 ms to ~1010 ms, and
+/// it rarely identified anything: agents run hooks through a shell (Claude
+/// Code's Windows hook entry is `"shell": "powershell"`), so the parent is the
+/// shell, not the agent. std exposes no safe parent-pid API on Windows, so the
+/// environment markers are the detection path there.
 #[cfg(windows)]
-fn detect_from_parent_process() -> Option<DetectionResult> {
-    parent_process_name_from_windows(std::process::id())
-        .and_then(|name| detection_from_process_name(&name))
-}
-
-#[cfg(windows)]
-fn parent_process_name_from_windows(current_pid: u32) -> Option<String> {
-    let script = format!(
-        "$p = Get-CimInstance Win32_Process -Filter 'ProcessId = {current_pid}'; \
-         if ($null -eq $p) {{ exit 1 }}; \
-         $parent = Get-CimInstance Win32_Process -Filter \"ProcessId = $($p.ParentProcessId)\"; \
-         if ($null -eq $parent) {{ exit 1 }}; \
-         Write-Output $parent.Name"
-    );
-
-    ["powershell.exe", "powershell", "pwsh"]
-        .iter()
-        .find_map(|program| windows_parent_name_with(program, &script))
-}
-
-#[cfg(windows)]
-fn windows_parent_name_with(program: &str, script: &str) -> Option<String> {
-    let output = std::process::Command::new(program)
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    first_non_empty_line(&String::from_utf8_lossy(&output.stdout)).map(str::to_string)
+const fn detect_from_parent_process() -> Option<DetectionResult> {
+    None
 }
 
 /// Detect agent from parent process on platforms without a safe implementation.
@@ -686,6 +845,8 @@ fn detect_from_parent_process() -> Option<DetectionResult> {
     None
 }
 
+// Process-name matching backs only the Unix parent-process fallback.
+#[cfg(any(unix, test))]
 fn detection_from_process_name(raw_process_name: &str) -> Option<DetectionResult> {
     let process_name = normalize_process_name(raw_process_name)?;
     let agent = agent_from_process_name(&process_name)?;
@@ -696,10 +857,12 @@ fn detection_from_process_name(raw_process_name: &str) -> Option<DetectionResult
     ))
 }
 
+#[cfg(any(unix, test))]
 fn normalize_process_name(raw_process_name: &str) -> Option<String> {
     first_non_empty_line(raw_process_name).map(str::to_lowercase)
 }
 
+#[cfg(any(unix, test))]
 fn first_non_empty_line(value: &str) -> Option<&str> {
     value.lines().map(str::trim).find(|line| !line.is_empty())
 }
@@ -740,6 +903,7 @@ fn nul_separated_args_to_string(bytes: &[u8]) -> Option<String> {
 /// executable, while later tokens are only considered when they look like
 /// path-like executable/script arguments. This avoids misclassifying ordinary
 /// arguments such as `cargo test codex` or URL paths ending in `/codex`.
+#[cfg(any(unix, test))]
 fn agent_from_process_name(process_name: &str) -> Option<Agent> {
     for (index, token) in process_name.split_whitespace().enumerate() {
         if index > 0 && !is_path_like_process_token(token) {
@@ -753,6 +917,7 @@ fn agent_from_process_name(process_name: &str) -> Option<Agent> {
     None
 }
 
+#[cfg(any(unix, test))]
 fn is_path_like_process_token(token: &str) -> bool {
     let token = token.trim_matches(['"', '\'']);
     !token.starts_with('-')
@@ -760,6 +925,7 @@ fn is_path_like_process_token(token: &str) -> bool {
         && (token.contains('/') || token.contains('\\'))
 }
 
+#[cfg(any(unix, test))]
 fn executable_basename(token: &str) -> String {
     let normalized = token
         .trim_matches(['"', '\''])
@@ -774,6 +940,7 @@ fn executable_basename(token: &str) -> String {
     last.to_string()
 }
 
+#[cfg(any(unix, test))]
 fn agent_for_basename(basename: &str) -> Option<Agent> {
     // Exact-match table. New aliases for the same agent go in the same arm.
     // Substring matching is intentionally NOT used: a tool whose name merely
@@ -792,6 +959,19 @@ fn agent_for_basename(basename: &str) -> Option<Agent> {
         "grok" | "grok-cli" | "grok-build" => Some(Agent::Grok),
         "agy" | "antigravity" | "antigravity-cli" => Some(Agent::Antigravity),
         "pi" | "pi-cli" => Some(Agent::Pi),
+        "opencode" => Some(Agent::OpenCode),
+        "omp" | "oh-my-pi" => Some(Agent::Omp),
+        "crush" => Some(Agent::Crush),
+        "reasonix" => Some(Agent::Reasonix),
+        "droid" => Some(Agent::Droid),
+        // No "muse" entry: Muse Code is identified only by the explicit
+        // `--agent muse` its installed hook carries (#572). That identity
+        // changes the profile and the answer shape, so it must not follow an
+        // ancestor process (a Codex session started from a Muse shell, or
+        // the unrelated MusE sequencer binary).
+        // "pa" is a dangerous prefix (pacman, pactl, pass, patch, ...); the
+        // exact-match table is what keeps those from misclassifying.
+        "pa" | "posit-assistant" => Some(Agent::PositAssistant),
         _ => None,
     }
 }
@@ -839,6 +1019,9 @@ mod tests {
         assert_eq!(Agent::Grok.config_key(), "grok");
         assert_eq!(Agent::Antigravity.config_key(), "antigravity");
         assert_eq!(Agent::Pi.config_key(), "pi");
+        assert_eq!(Agent::PositAssistant.config_key(), "posit-assistant");
+        assert_eq!(Agent::OpenCode.config_key(), "opencode");
+        assert_eq!(Agent::Omp.config_key(), "omp");
         assert_eq!(Agent::Unknown.config_key(), "unknown");
         assert_eq!(
             Agent::Custom("my-agent".to_string()).config_key(),
@@ -892,6 +1075,16 @@ mod tests {
         assert_eq!(Agent::from_name("pi-cli"), Agent::Pi);
         assert_eq!(Agent::from_name("pi_cli"), Agent::Pi);
         assert_eq!(Agent::from_name("PI_CODING_AGENT"), Agent::Pi);
+        assert_eq!(Agent::from_name("posit-assistant"), Agent::PositAssistant);
+        assert_eq!(Agent::from_name("posit_assistant"), Agent::PositAssistant);
+        assert_eq!(Agent::from_name("PositAssistant"), Agent::PositAssistant);
+        assert_eq!(Agent::from_name("posit"), Agent::PositAssistant);
+        assert_eq!(Agent::from_name("pa"), Agent::PositAssistant);
+        assert_eq!(Agent::from_name("PA"), Agent::PositAssistant);
+        assert_eq!(Agent::from_name("omp"), Agent::Omp);
+        assert_eq!(Agent::from_name("OMP"), Agent::Omp);
+        assert_eq!(Agent::from_name("oh-my-pi"), Agent::Omp);
+        assert_eq!(Agent::from_name("oh_my_pi"), Agent::Omp);
 
         // Custom agents
         assert_eq!(
@@ -914,6 +1107,9 @@ mod tests {
         assert_eq!(format!("{}", Agent::Grok), "Grok (xAI)");
         assert_eq!(format!("{}", Agent::Antigravity), "Antigravity CLI");
         assert_eq!(format!("{}", Agent::Pi), "Pi");
+        assert_eq!(format!("{}", Agent::PositAssistant), "Posit Assistant");
+        assert_eq!(format!("{}", Agent::OpenCode), "OpenCode");
+        assert_eq!(format!("{}", Agent::Omp), "Oh My Pi");
         assert_eq!(format!("{}", Agent::Unknown), "Unknown");
         assert_eq!(
             format!("{}", Agent::Custom("MyAgent".to_string())),
@@ -932,8 +1128,47 @@ mod tests {
         assert!(Agent::Grok.is_known());
         assert!(Agent::Antigravity.is_known());
         assert!(Agent::Pi.is_known());
+        assert!(Agent::PositAssistant.is_known());
+        assert!(Agent::OpenCode.is_known());
+        assert!(Agent::Omp.is_known());
         assert!(!Agent::Unknown.is_known());
         assert!(!Agent::Custom("x".to_string()).is_known());
+    }
+
+    #[test]
+    fn test_droid_identity_mappings() {
+        assert_eq!(Agent::Droid.config_key(), "droid");
+        assert!(Agent::Droid.is_known());
+        assert_eq!(Agent::Droid.to_string(), "Factory Droid");
+        for name in [
+            "droid",
+            "Droid",
+            "factory-droid",
+            "factory_droid",
+            "factory",
+            "droid-cli",
+        ] {
+            assert_eq!(Agent::from_name(name), Agent::Droid, "{name}");
+        }
+        let explicit = explicit_agent_from_args(["dcg", "--agent", "droid"]);
+        assert_eq!(
+            from_explicit(explicit.as_deref().unwrap()).agent,
+            Agent::Droid
+        );
+        for process in [
+            "droid",
+            "/home/user/.local/bin/droid",
+            r"C:\tools\droid.exe",
+        ] {
+            assert_eq!(
+                agent_from_process_name(process),
+                Some(Agent::Droid),
+                "{process}"
+            );
+        }
+        for process in ["android", "droid-helper", "factory", "/tmp/droid-notes.txt"] {
+            assert_eq!(agent_from_process_name(process), None, "{process}");
+        }
     }
 
     #[test]
@@ -1015,6 +1250,30 @@ mod tests {
             agent_from_process_name("/home/user/.local/bin/pi"),
             Some(Agent::Pi)
         );
+        assert_eq!(agent_from_process_name("omp"), Some(Agent::Omp));
+        assert_eq!(agent_from_process_name("oh-my-pi"), Some(Agent::Omp));
+        assert_eq!(
+            agent_from_process_name("/home/user/.local/bin/omp"),
+            Some(Agent::Omp)
+        );
+        assert_eq!(agent_from_process_name("pa"), Some(Agent::PositAssistant));
+        assert_eq!(
+            agent_from_process_name("posit-assistant"),
+            Some(Agent::PositAssistant)
+        );
+        assert_eq!(
+            agent_from_process_name("/usr/local/bin/pa"),
+            Some(Agent::PositAssistant)
+        );
+        assert_eq!(
+            agent_from_process_name("pa.exe"),
+            Some(Agent::PositAssistant)
+        );
+        // Wrapper-style invocation of a script-hosted client.
+        assert_eq!(
+            agent_from_process_name("node /usr/local/lib/node_modules/pa"),
+            Some(Agent::PositAssistant)
+        );
     }
 
     #[test]
@@ -1067,6 +1326,20 @@ mod tests {
         assert_eq!(agent_from_process_name("pip3"), None);
         assert_eq!(agent_from_process_name("xpi"), None);
         assert_eq!(agent_from_process_name("pi-helper"), None);
+        assert_eq!(agent_from_process_name("ompi"), None);
+        assert_eq!(agent_from_process_name("omp-helper"), None);
+        assert_eq!(agent_from_process_name("oh-my-pi-helper"), None);
+        // "pa" is even shorter and a common prefix; only the exact basename
+        // (or "posit-assistant") may match.
+        assert_eq!(agent_from_process_name("pacman"), None);
+        assert_eq!(agent_from_process_name("pactl"), None);
+        assert_eq!(agent_from_process_name("pass"), None);
+        assert_eq!(agent_from_process_name("patch"), None);
+        assert_eq!(agent_from_process_name("panic"), None);
+        assert_eq!(agent_from_process_name("pa-helper"), None);
+        assert_eq!(agent_from_process_name("xpa"), None);
+        assert_eq!(agent_from_process_name("posit"), None);
+        assert_eq!(agent_from_process_name("posit-assistant-helper"), None);
     }
 
     #[test]
@@ -1200,14 +1473,13 @@ mod tests {
 #[cfg(test)]
 mod env_tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Mutex to serialize tests that manipulate environment variables.
-    /// This prevents race conditions when tests run in parallel.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    use crate::test_env;
 
     /// All known agent environment variable keys.
     const AGENT_ENV_VARS: &[&str] = &[
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_SESSION_ID",
         "CLAUDE_CODE",
         "CLAUDE_SESSION_ID",
         "AUGMENT_AGENT",
@@ -1225,21 +1497,30 @@ mod env_tests {
         "GROK_HOOK_EVENT",
         "GROK_WORKSPACE_ROOT",
         "ANTIGRAVITY_CONVERSATION_ID",
+        "OPENCODE",
+        "CRUSH",
         "PI_CODING_AGENT",
+        "PA_PROJECT_DIR",
+        "FACTORY_PROJECT_DIR",
     ];
 
     fn with_env_var<F, R>(key: &str, value: &str, f: F) -> R
     where
         F: FnOnce() -> R,
     {
-        // Acquire lock to prevent race conditions with parallel tests
-        let _lock = ENV_LOCK.lock().unwrap();
+        with_env_vars(&[(key, value)], f)
+    }
+
+    fn with_env_vars<F, R>(vars: &[(&str, &str)], f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        // The crate-wide lock, so a writer in `hook` or `interactive` cannot
+        // run concurrently with this one (#445).
+        let _lock = test_env::lock();
 
         // Clear cache before test
         clear_cache();
-
-        // SAFETY: We hold ENV_LOCK during all tests that modify environment
-        // variables, preventing concurrent modifications.
 
         // Save and clear all agent env vars (to avoid ambient env interference)
         let saved: Vec<_> = AGENT_ENV_VARS
@@ -1251,8 +1532,10 @@ mod env_tests {
             for &k in AGENT_ENV_VARS {
                 std::env::remove_var(k);
             }
-            // Set the test env var
-            std::env::set_var(key, value);
+            // Set the test env vars
+            for &(key, value) in vars {
+                std::env::set_var(key, value);
+            }
         }
 
         // Run test
@@ -1261,10 +1544,10 @@ mod env_tests {
         // SAFETY: See above
         unsafe {
             // Clean up - restore original values
-            std::env::remove_var(key);
             for (k, v) in saved {
-                if let Some(val) = v {
-                    std::env::set_var(k, val);
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
                 }
             }
         }
@@ -1291,6 +1574,25 @@ mod env_tests {
             assert_eq!(result.method, DetectionMethod::Environment);
             assert_eq!(result.matched_value, Some("CLAUDE_SESSION_ID".to_string()));
         });
+    }
+
+    /// The markers Claude Code really exports to hook and tool processes.
+    /// Checked against a live session: `CLAUDECODE=1`, `CLAUDE_CODE_ENTRYPOINT`
+    /// and `CLAUDE_CODE_SESSION_ID` are set; `CLAUDE_CODE` is not.
+    #[test]
+    fn test_detect_claude_code_live_markers() {
+        for marker in [
+            "CLAUDECODE",
+            "CLAUDE_CODE_ENTRYPOINT",
+            "CLAUDE_CODE_SESSION_ID",
+        ] {
+            with_env_var(marker, "1", || {
+                let result = detect_agent_with_details();
+                assert_eq!(result.agent, Agent::ClaudeCode, "{marker}");
+                assert_eq!(result.method, DetectionMethod::Environment, "{marker}");
+                assert_eq!(result.matched_value.as_deref(), Some(marker));
+            });
+        }
     }
 
     #[test]
@@ -1432,6 +1734,156 @@ mod env_tests {
     }
 
     #[test]
+    fn test_detect_opencode_env() {
+        // #318: dcg's generated OpenCode plugin spawns dcg with OPENCODE=1.
+        with_env_var("OPENCODE", "1", || {
+            let result = detect_agent_with_details();
+            assert_eq!(result.agent, Agent::OpenCode);
+            assert_eq!(result.method, DetectionMethod::Environment);
+            assert_eq!(result.matched_value, Some("OPENCODE".to_string()));
+        });
+    }
+
+    #[test]
+    fn test_opencode_identity_mappings() {
+        assert_eq!(Agent::OpenCode.config_key(), "opencode");
+        assert!(Agent::OpenCode.is_known());
+        assert_eq!(Agent::from_name("opencode"), Agent::OpenCode);
+        assert_eq!(Agent::from_name("OpenCode"), Agent::OpenCode);
+        assert_eq!(format!("{}", Agent::OpenCode), "OpenCode");
+        assert_eq!(agent_from_process_name("opencode"), Some(Agent::OpenCode));
+        // Near-misses must not match the exact-name table.
+        assert_eq!(agent_from_process_name("opencoder"), None);
+    }
+
+    #[test]
+    fn test_detect_crush_env() {
+        // #388: Crush sets CRUSH=1 for hook subprocesses (and bash-tool
+        // commands); the generic AGENT/AI_AGENT markers are not consulted.
+        with_env_var("CRUSH", "1", || {
+            let result = detect_agent_with_details();
+            assert_eq!(result.agent, Agent::Crush);
+            assert_eq!(result.method, DetectionMethod::Environment);
+            assert_eq!(result.matched_value, Some("CRUSH".to_string()));
+        });
+    }
+
+    #[test]
+    fn test_detect_droid_from_documented_hook_environment() {
+        with_env_var("FACTORY_PROJECT_DIR", "/work/project", || {
+            let result = detect_agent_with_details();
+            assert_eq!(result.agent, Agent::Droid);
+            assert_eq!(result.method, DetectionMethod::Environment);
+            assert_eq!(result.matched_value.as_deref(), Some("FACTORY_PROJECT_DIR"));
+        });
+    }
+
+    #[test]
+    fn test_droid_workspace_marker_preserves_existing_agent_priority() {
+        with_env_vars(
+            &[("FACTORY_PROJECT_DIR", "/work"), ("CLAUDECODE", "1")],
+            || {
+                assert_eq!(detect_agent_with_details().agent, Agent::ClaudeCode);
+            },
+        );
+    }
+
+    #[test]
+    fn test_crush_env_beats_weak_posit_marker() {
+        // PA_PROJECT_DIR describes the surrounding workspace; a hook that
+        // names itself must win.
+        with_env_vars(&[("PA_PROJECT_DIR", "/work"), ("CRUSH", "1")], || {
+            let result = detect_agent_with_details();
+            assert_eq!(result.agent, Agent::Crush);
+        });
+    }
+
+    #[test]
+    fn test_crush_identity_mappings() {
+        assert_eq!(Agent::Crush.config_key(), "crush");
+        assert!(Agent::Crush.is_known());
+        assert_eq!(Agent::from_name("crush"), Agent::Crush);
+        assert_eq!(Agent::from_name("Crush"), Agent::Crush);
+        assert_eq!(Agent::from_name("charm-crush"), Agent::Crush);
+        assert_eq!(format!("{}", Agent::Crush), "Crush");
+        assert_eq!(agent_from_process_name("crush"), Some(Agent::Crush));
+        assert_eq!(
+            agent_from_process_name("/usr/local/bin/crush"),
+            Some(Agent::Crush)
+        );
+        // Near-misses must not match the exact-name table.
+        assert_eq!(agent_from_process_name("crusher"), None);
+        assert_eq!(agent_from_process_name("crush-tui"), None);
+    }
+
+    /// #358: Reasonix sets no environment marker, so its process name (and
+    /// the hook protocol) are what identify it.
+    #[test]
+    fn test_reasonix_identity_mappings() {
+        assert_eq!(Agent::Reasonix.config_key(), "reasonix");
+        assert!(Agent::Reasonix.is_known());
+        assert_eq!(Agent::from_name("reasonix"), Agent::Reasonix);
+        assert_eq!(Agent::from_name("Reasonix"), Agent::Reasonix);
+        assert_eq!(Agent::from_name("deepseek-reasonix"), Agent::Reasonix);
+        assert_eq!(format!("{}", Agent::Reasonix), "Reasonix");
+        assert_eq!(agent_from_process_name("reasonix"), Some(Agent::Reasonix));
+        assert_eq!(
+            agent_from_process_name("/opt/homebrew/bin/reasonix"),
+            Some(Agent::Reasonix)
+        );
+        assert_eq!(agent_from_process_name("reasonixd"), None);
+    }
+
+    /// #572: Muse Code clears the hook environment, so the explicit
+    /// `--agent muse` is what identifies it; a process name never does.
+    #[test]
+    fn test_muse_identity_mappings() {
+        assert_eq!(Agent::Muse.config_key(), "muse");
+        assert!(Agent::Muse.is_known());
+        assert!(!Agent::Muse.is_explicit());
+        for name in ["muse", "Muse", "muse-code", "muse_code", "meta-muse"] {
+            assert_eq!(Agent::from_name(name), Agent::Muse, "{name}");
+        }
+        assert_eq!(format!("{}", Agent::Muse), "Muse Code");
+        let explicit = explicit_agent_from_args(["dcg", "--agent", "muse"]);
+        assert_eq!(
+            from_explicit(explicit.as_deref().unwrap()).agent,
+            Agent::Muse
+        );
+        assert_eq!(agent_from_process_name("muse"), None);
+        assert_eq!(agent_from_process_name("/home/u/.local/bin/muse"), None);
+    }
+
+    /// #577: dcg's Amp plugin passes `--agent amp`, which selects `[agents.amp]`.
+    #[test]
+    fn test_amp_identity_mappings() {
+        assert_eq!(Agent::Amp.config_key(), "amp");
+        assert!(Agent::Amp.is_known());
+        for name in ["amp", "Amp", "ampcode", "AMP"] {
+            assert_eq!(Agent::from_name(name), Agent::Amp, "{name}");
+        }
+        assert_eq!(format!("{}", Agent::Amp), "Amp");
+        let explicit = explicit_agent_from_args(["dcg", "--agent", "amp"]);
+        assert_eq!(
+            from_explicit(explicit.as_deref().unwrap()).agent,
+            Agent::Amp
+        );
+        assert_eq!(agent_from_process_name("amp"), None);
+    }
+
+    #[test]
+    fn test_omp_identity_mappings() {
+        assert_eq!(Agent::Omp.config_key(), "omp");
+        assert!(Agent::Omp.is_known());
+        assert_eq!(Agent::from_name("omp"), Agent::Omp);
+        assert_eq!(Agent::from_name("oh-my-pi"), Agent::Omp);
+        assert_eq!(format!("{}", Agent::Omp), "Oh My Pi");
+        assert_eq!(agent_from_process_name("omp"), Some(Agent::Omp));
+        assert_eq!(agent_from_process_name("oh-my-pi"), Some(Agent::Omp));
+        assert_eq!(agent_from_process_name("omp-helper"), None);
+    }
+
+    #[test]
     fn test_detect_pi_coding_agent_env() {
         with_env_var("PI_CODING_AGENT", "true", || {
             let result = detect_agent_with_details();
@@ -1453,9 +1905,53 @@ mod env_tests {
     }
 
     #[test]
+    fn test_detect_posit_assistant_project_dir_env() {
+        // `PA_PROJECT_DIR` is the marker dcg actually sees: Posit Assistant's
+        // hook contract sets it in every hook subprocess.
+        with_env_var("PA_PROJECT_DIR", "/home/user/project", || {
+            let result = detect_agent_with_details();
+            assert_eq!(result.agent, Agent::PositAssistant);
+            assert_eq!(result.method, DetectionMethod::Environment);
+            assert_eq!(result.matched_value, Some("PA_PROJECT_DIR".to_string()));
+        });
+    }
+
+    #[test]
+    fn test_posit_assistant_env_loses_to_explicit_agent_markers() {
+        // `PA_PROJECT_DIR` describes the surrounding workspace, not the direct
+        // caller: another agent can invoke dcg from inside a Posit Assistant
+        // workspace (e.g. a Claude Code hook in a spawned terminal). An agent
+        // that identifies itself explicitly must win, so `PA_PROJECT_DIR` is
+        // checked last among the env markers.
+        with_env_vars(
+            &[
+                ("PA_PROJECT_DIR", "/home/user/project"),
+                ("CLAUDE_CODE", "1"),
+            ],
+            || {
+                let result = detect_agent_with_details();
+                assert_eq!(result.agent, Agent::ClaudeCode);
+            },
+        );
+
+        // Pi is the marker checked immediately before Posit Assistant, so this
+        // pins "last", not merely "after Claude Code".
+        with_env_vars(
+            &[
+                ("PA_PROJECT_DIR", "/home/user/project"),
+                ("PI_CODING_AGENT", "true"),
+            ],
+            || {
+                let result = detect_agent_with_details();
+                assert_eq!(result.agent, Agent::Pi);
+            },
+        );
+    }
+
+    #[test]
     fn test_detect_unknown_no_env() {
-        // Acquire lock to prevent race conditions with parallel tests
-        let _lock = ENV_LOCK.lock().unwrap();
+        // The crate-wide lock (#445).
+        let _lock = test_env::lock();
 
         let saved: Vec<_> = AGENT_ENV_VARS
             .iter()
@@ -1464,8 +1960,8 @@ mod env_tests {
 
         // Ensure no agent env vars are set
         clear_cache();
-        // SAFETY: We hold ENV_LOCK during this test, preventing concurrent
-        // modifications to environment variables.
+        // SAFETY: this test holds `test_env::lock()`, which excludes every
+        // other env WRITER in the crate. Readers are not excluded; see #445.
         unsafe {
             for &k in AGENT_ENV_VARS {
                 std::env::remove_var(k);

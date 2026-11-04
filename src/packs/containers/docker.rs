@@ -19,17 +19,17 @@ const SYSTEM_PRUNE_SUGGESTIONS: &[PatternSuggestion] = &[
         "docker system df -v",
         "Preview what would be removed without deleting anything",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "docker system prune --filter 'until=24h'",
-        "Only removes items older than 24 hours",
+        "Only removes items older than 24 hours — still a prune, so it is gated as well",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "docker container prune",
-        "Remove only stopped containers (preserves images and volumes)",
+        "Remove only stopped containers (preserves images and volumes) — gated as well",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "docker image prune",
-        "Remove only dangling images (preserves containers and volumes)",
+        "Remove only dangling images (preserves containers and volumes) — gated as well",
     ),
 ];
 
@@ -39,9 +39,9 @@ const VOLUME_PRUNE_SUGGESTIONS: &[PatternSuggestion] = &[
         "docker volume ls -q -f dangling=true",
         "List unused volumes first to review what would be deleted",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "docker volume rm {volume-name}",
-        "Remove specific volumes by name instead of all unused",
+        "Removes named volumes instead of all unused — still deletes volume data, so dcg gates it too",
     ),
     PatternSuggestion::new(
         "docker volume inspect {volume-name}",
@@ -91,9 +91,9 @@ const RM_FORCE_SUGGESTIONS: &[PatternSuggestion] = &[
         "docker stop {container} && docker rm {container}",
         "Graceful shutdown with SIGTERM before removal",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "docker container prune",
-        "Remove stopped containers with confirmation prompt",
+        "Removes only stopped containers — still a prune, so dcg gates it too",
     ),
     PatternSuggestion::new(
         "docker ps -a | grep {container}",
@@ -107,9 +107,9 @@ const RMI_FORCE_SUGGESTIONS: &[PatternSuggestion] = &[
         "docker rmi {image}",
         "Remove without force - fails safely if image is in use",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "docker image prune",
-        "Remove only dangling (untagged) images",
+        "Removes only dangling images — still a prune, so dcg gates it too",
     ),
     PatternSuggestion::new(
         "docker ps -a --filter ancestor={image}",
@@ -139,9 +139,9 @@ const STOP_ALL_SUGGESTIONS: &[PatternSuggestion] = &[
         "docker stop {container-name}",
         "Stop specific containers by name",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "docker stop $(docker ps -q -f name={pattern})",
-        "Stop containers matching a name filter",
+        "Stop containers matching a name filter — dcg gates any stop over a $(docker ps …) expansion",
     ),
     PatternSuggestion::new(
         "docker ps --format '{{.Names}}: {{.Status}}'",
@@ -328,10 +328,22 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Consider keeping recent containers for debugging.",
             CONTAINER_PRUNE_SUGGESTIONS
         ),
-        // rm -f (force remove containers)
+        // rm -f / `<management command> rm -f` (force removal). The force flag
+        // must be an option word of this docker command itself (#548):
+        // - every `[ \t]+`-separated word is one shell word, so quoted strings
+        //   and escapes stay inside it, and an unquoted `;`, `&`, `|` or a
+        //   newline ends the command;
+        // - the flag must start a word, so a hyphenated operand
+        //   (`cve-followup`, `probe-xf`), a later command's `-f`
+        //   (`; grep -f`), or `--platform` behind an unknown launcher no longer
+        //   supplies the `f`.
+        // Global options before the subcommand, one management word
+        // (`container`, `image`, `compose`, `node`, ...), flags after operands
+        // (`docker rm c1 -f`), clusters (`-vf`) and quoted flags still match,
+        // including Bash's `$'-f'` and `$"-f"` spellings of the same word.
         destructive_pattern!(
             "rm-force",
-            r"docker\b.*?\brm\s+.*(?:-[a-zA-Z0-9]*f|--force)",
+            r#"\bdocker(?:\.exe)?['"]?(?:(?:[ \t]|\\\n)+--?[A-Za-z][\w.-]*(?:=(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+)|(?:[ \t]|\\\n)+(?!-)(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))?)*(?:(?:[ \t]|\\\n)+[a-z][a-z0-9-]*(?:(?:[ \t]|\\\n)+--?[A-Za-z][\w.-]*(?:=(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+)|(?:[ \t]|\\\n)+(?!-)(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))?)*)?(?:[ \t]|\\\n)+['"]?(?:rm|remove)['"]?(?:(?:[ \t]|\\\n)+(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))*?(?:[ \t]|\\\n)+(?:\$?['"])?(?:-[A-Za-z0-9]*f[A-Za-z0-9]*|--force(?:=(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))?)['"]?(?=[\s;&|)'"]|$)"#,
             "docker rm -f forcibly removes containers, potentially losing data.",
             High,
             "docker rm -f forcibly stops and removes containers. This is dangerous because:\n\n\
@@ -346,10 +358,11 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              docker ps -a | grep <container>",
             RM_FORCE_SUGGESTIONS
         ),
-        // rmi -f (force remove images)
+        // rmi -f (force remove images), scoped to its own option words like
+        // rm-force above (#548). `docker image rm -f` is caught by rm-force.
         destructive_pattern!(
             "rmi-force",
-            r"docker\b.*?\brmi\s+.*(?:-[a-zA-Z0-9]*f|--force)",
+            r#"\bdocker(?:\.exe)?['"]?(?:(?:[ \t]|\\\n)+--?[A-Za-z][\w.-]*(?:=(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+)|(?:[ \t]|\\\n)+(?!-)(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))?)*(?:[ \t]|\\\n)+['"]?rmi['"]?(?:(?:[ \t]|\\\n)+(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))*?(?:[ \t]|\\\n)+(?:\$?['"])?(?:-[A-Za-z0-9]*f[A-Za-z0-9]*|--force(?:=(?>(?:'[^']*'|"(?:[^"\\]|\\[\s\S])*"|\\.|[<>]&|&>|[^\s;&|'"\\])+))?)['"]?(?=[\s;&|)'"]|$)"#,
             "docker rmi -f forcibly removes images even if in use.",
             High,
             "docker rmi -f forcibly removes images, even if containers are using them. \
@@ -399,7 +412,8 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              - Other users' containers are affected\n\n\
              Be specific instead:\n  \
              docker stop <container-name>     # Stop by name\n  \
-             docker stop $(docker ps -q -f name=myapp)  # Filter by name\n\n\
+             docker stop $(docker ps -q -f name=myapp)  # Filter by name (dcg gates \
+             any stop over a $(docker ps ...) expansion, so this form still needs approval)\n\n\
              Preview what would be stopped:\n  \
              docker ps --format '{{.Names}}: {{.Status}}'",
             STOP_ALL_SUGGESTIONS
@@ -463,6 +477,68 @@ mod tests {
         assert_blocks(&pack, "docker rmi -nf image", "forcibly removes"); // Combined flags (no-prune + force)
 
         assert_allows(&pack, "docker rmi image");
+    }
+
+    #[test]
+    fn force_flag_must_be_an_option_word_of_the_same_command_548() {
+        let pack = create_pack();
+        // The `f` came from an operand, another command on the line, or an
+        // unrelated `docker run` option. None of these force-removes anything.
+        for command in [
+            "docker image rm cve-followup/web:1.2",
+            "docker rmi cve-followup/web:1.2",
+            "docker rm probe-xf",
+            "docker image rm 'cve-followup/web:1.2'",
+            "docker image rm -- cve-followup/web:1.2",
+            "docker rm probe-a probe-b; docker ps -a --format '{{.Names}}'",
+            "docker network rm probe-net && grep -f patterns.txt file.txt",
+            "cat docker-compose.yml && rm -f /tmp/a",
+            "docker run --rm probe:1 sh -c 'x --abc-fil y 2>&1'",
+            "docker run --rm img; docker image inspect img --format u",
+            "flock /tmp/l docker run --rm --platform linux/arm64 alpine true",
+            "echo x | xargs docker run --rm --platform linux/arm64 alpine true",
+            "npx -y some-runner -- docker run --rm --platform linux/arm64 alpine true",
+            "mytool run -- docker run --rm --platform linux/arm64 alpine true",
+            "docker rm c1\ngrep -f patterns.txt file.txt",
+            "docker rm \"my -f container\"",
+            "docker rm 'a;b -f'",
+        ] {
+            assert_allows(&pack, command);
+        }
+
+        // Genuine force removals stay blocked wherever the flag sits.
+        for (command, rule) in [
+            ("docker rm -f probe-a", "rm-force"),
+            ("docker rm c1 -f", "rm-force"),
+            ("docker rm --force probe-a", "rm-force"),
+            ("docker rm --force=true probe-a", "rm-force"),
+            ("docker rm -vf c1", "rm-force"),
+            ("docker container rm -f c1", "rm-force"),
+            ("docker container remove -f c1", "rm-force"),
+            ("docker image rm -f img", "rm-force"),
+            ("docker compose -f prod.yml rm -f", "rm-force"),
+            ("docker --debug container rm -f c1", "rm-force"),
+            ("docker -H tcp://host:2375 rm -f c1", "rm-force"),
+            ("flock /tmp/l docker rm -f c1", "rm-force"),
+            ("echo c1 | xargs docker rm -f", "rm-force"),
+            ("docker ps -a; docker rm -f c1", "rm-force"),
+            ("docker rm $(docker ps -aq) -f", "rm-force"),
+            ("docker rm c1 2>&1 -f", "rm-force"),
+            ("docker rm 'a;b' -f c1", "rm-force"),
+            ("docker rm \"-f\" c1", "rm-force"),
+            ("docker rm $'-f' c1", "rm-force"),
+            ("docker rm $\"-f\" c1", "rm-force"),
+            ("docker container rm $'--force' c1", "rm-force"),
+            ("\"docker\" rm -f c1", "rm-force"),
+            ("docker 'rm' -f c1", "rm-force"),
+            ("docker rm \\\n  -f c1", "rm-force"),
+            ("docker.exe rm -f c1", "rm-force"),
+            ("docker rmi -f img", "rmi-force"),
+            ("docker rmi img --force", "rmi-force"),
+            ("docker rmi $'-f' img", "rmi-force"),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
     }
 
     #[test]

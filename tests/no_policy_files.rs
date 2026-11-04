@@ -9,11 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn dcg_binary() -> PathBuf {
-    let mut path = std::env::current_exe().expect("current_exe");
-    path.pop();
-    path.pop();
-    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
-    path
+    PathBuf::from(env!("CARGO_BIN_EXE_dcg"))
 }
 
 struct Fixture {
@@ -21,6 +17,8 @@ struct Fixture {
     repo: PathBuf,
     home: PathBuf,
     system_allowlist: PathBuf,
+    /// `DCG_CONFIG`: how a caller makes a project's own policy trusted.
+    selected_config: std::cell::RefCell<Option<PathBuf>>,
 }
 
 impl Fixture {
@@ -36,7 +34,14 @@ impl Fixture {
             repo,
             system_allowlist: base.join("system-allowlist.toml"),
             home,
+            selected_config: std::cell::RefCell::new(None),
         }
+    }
+
+    /// Select a config file through `DCG_CONFIG`. Selecting the repository's
+    /// `.dcg.toml` is what makes its project policy trusted.
+    fn select_config(&self, path: &Path) {
+        *self.selected_config.borrow_mut() = Some(path.to_path_buf());
     }
 
     fn plant(&self, path: &Path, contents: &str) {
@@ -45,18 +50,14 @@ impl Fixture {
     }
 
     #[cfg(unix)]
+    /// The user layers live under XDG_CONFIG_HOME, which `run` sets.
     fn user_dcg_dir(&self) -> PathBuf {
-        self.home.join(".config").join("dcg")
+        self.home.join("xdg").join("dcg")
     }
 
-    fn run(&self, switch: Switch, command: &str) -> Output {
+    fn command(&self) -> Command {
         let mut cmd = Command::new(dcg_binary());
-        cmd.arg("--robot");
-        if switch == Switch::Flag {
-            cmd.arg("--no-policy-files");
-        }
-        cmd.args(["test", "--with-packs", "database.postgresql", command])
-            .current_dir(&self.repo)
+        cmd.current_dir(&self.repo)
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
             .env("XDG_CONFIG_HOME", self.home.join("xdg"))
@@ -65,9 +66,22 @@ impl Fixture {
             .env_remove("DCG_CONFIG")
             .env_remove("DCG_ALLOW_ONCE_PATH")
             .env_remove("DCG_NO_POLICY_FILES");
+        if let Some(path) = self.selected_config.borrow().as_ref() {
+            cmd.env("DCG_CONFIG", path);
+        }
+        cmd
+    }
+
+    fn run(&self, switch: Switch, command: &str) -> Output {
+        let mut cmd = self.command();
+        cmd.arg("--robot");
+        if switch == Switch::Flag {
+            cmd.arg("--no-policy-files");
+        }
         if switch == Switch::Env {
             cmd.env("DCG_NO_POLICY_FILES", "1");
         }
+        cmd.args(["test", "--with-packs", "database.postgresql", command]);
         cmd.output().expect("run dcg")
     }
 }
@@ -120,9 +134,11 @@ fn project_allowlist_is_ignored() {
         &fixture.repo.join(".dcg").join("allowlist.toml"),
         "[[allow]]\nrule = \"core.filesystem:redirect-truncate-root-home\"\nreason = \"planted\"\n",
     );
+    fixture.plant(&fixture.repo.join(".dcg.toml"), "");
+    fixture.select_config(&fixture.repo.join(".dcg.toml"));
     assert_planted_policy_is_ignored(
         &fixture,
-        "echo x > /etc/passwd",
+        "echo x > /etc/hosts",
         "core.filesystem:redirect-truncate-root-home",
     );
 }
@@ -134,6 +150,7 @@ fn project_config_cannot_disable_a_default_pack() {
         &fixture.repo.join(".dcg.toml"),
         "[packs]\ndisabled = [\"system.disk\"]\n",
     );
+    fixture.select_config(&fixture.repo.join(".dcg.toml"));
     assert_planted_policy_is_ignored(&fixture, "mkfs.ext4 /dev/sda", "system.disk:mkfs");
 }
 
@@ -144,7 +161,19 @@ fn project_config_cannot_disable_packs_the_caller_enabled() {
         &fixture.repo.join(".dcg.toml"),
         "[packs]\ndisabled = [\"database\"]\n",
     );
-    assert_planted_policy_is_ignored(&fixture, "dropdb prod", "database.postgresql:dropdb-cli");
+    fixture.select_config(&fixture.repo.join(".dcg.toml"));
+    // Since upstream 0.16 a trusted config can no longer disable a pack the
+    // caller enables with --with-packs, so the caller's pack decides in every
+    // switch state.
+    for switch in [Switch::Off, Switch::Flag, Switch::Env] {
+        let output = fixture.run(switch, "dropdb prod");
+        let json = decision(&output);
+        assert_eq!(output.status.code(), Some(1), "{switch:?}: {json}");
+        assert_eq!(
+            json["rule_id"], "database.postgresql:dropdb-cli",
+            "{switch:?}: {json}"
+        );
+    }
 }
 
 #[test]
@@ -154,6 +183,7 @@ fn project_config_allow_override_is_ignored() {
         &fixture.repo.join(".dcg.toml"),
         "[overrides]\nallow = [\"rm -rf /etc\"]\n",
     );
+    fixture.select_config(&fixture.repo.join(".dcg.toml"));
     assert_planted_policy_is_ignored(&fixture, "rm -rf /etc", "core.filesystem:rm-rf-root-home");
 }
 
@@ -166,7 +196,7 @@ fn system_allowlist_is_ignored() {
     );
     assert_planted_policy_is_ignored(
         &fixture,
-        "echo x > /etc/passwd",
+        "echo x > /etc/hosts",
         "core.filesystem:redirect-truncate-root-home",
     );
 }
@@ -199,30 +229,70 @@ fn user_config_allow_override_is_ignored() {
     assert_planted_policy_is_ignored(&fixture, "rm -rf /etc", "core.filesystem:rm-rf-root-home");
 }
 
+/// An allow-once grant is only honored when it is real: the hook's denial
+/// records a pending exception and `dcg allow-once <code>` redeems it. The
+/// switched runs come first and must not consume the single-use grant, so the
+/// final run without the switch proves the grant was live throughout.
 #[cfg(unix)]
 #[test]
-fn allow_once_entry_is_ignored() {
+fn allow_once_grant_is_ignored() {
+    use std::io::Write as _;
+
     let fixture = Fixture::new();
-    let entry = serde_json::json!({
-        "schema_version": 1,
-        "source_short_code": "000000",
-        "source_full_hash": "planted",
-        "created_at": "2026-01-01T00:00:00Z",
-        "expires_at": "2099-01-01T00:00:00Z",
-        "scope_kind": "project",
-        "scope_path": "/",
-        "command_raw": "rm -rf /",
-        "command_redacted": "rm -rf /",
-        "reason": "planted",
-        "single_use": false,
-        "consumed_at": null,
-        "force_allow_config": true,
+    let command = "git reset --hard HEAD~1";
+    let hook_input = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": command },
+        "cwd": fixture.repo,
     });
-    fixture.plant(
-        &fixture.user_dcg_dir().join("allow_once.jsonl"),
-        &format!("{entry}\n"),
+    let mut hook = fixture
+        .command()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn dcg hook");
+    hook.stdin
+        .take()
+        .expect("hook stdin")
+        .write_all(hook_input.to_string().as_bytes())
+        .expect("write hook input");
+    let denial = hook.wait_with_output().expect("dcg hook");
+    let denial_text = String::from_utf8_lossy(&denial.stdout);
+    let code: String = denial_text
+        .split("allow-once ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("the hook's denial names an allow-once code: {denial_text}"))
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    assert_eq!(code.len(), 6, "allow-once code in: {denial_text}");
+    let redeemed = fixture
+        .command()
+        .args(["allow-once", &code, "--yes"])
+        .output()
+        .expect("dcg allow-once");
+    assert!(
+        redeemed.status.success(),
+        "redeem the grant: {}",
+        String::from_utf8_lossy(&redeemed.stderr)
     );
-    assert_planted_policy_is_ignored(&fixture, "rm -rf /", "core.filesystem:rm-rf-root-home");
+
+    for switch in [Switch::Flag, Switch::Env] {
+        let output = fixture.run(switch, command);
+        let json = decision(&output);
+        assert_eq!(output.status.code(), Some(1), "{switch:?}: {json}");
+        assert_eq!(json["rule_id"], "core.git:reset-hard", "{switch:?}: {json}");
+    }
+    let baseline = fixture.run(Switch::Off, command);
+    assert_eq!(
+        (
+            baseline.status.code(),
+            decision(&baseline)["decision"].clone()
+        ),
+        (Some(0), serde_json::json!("allow")),
+        "the grant must allow `{command}` without the switch, or this case proves nothing"
+    );
 }
 
 #[test]

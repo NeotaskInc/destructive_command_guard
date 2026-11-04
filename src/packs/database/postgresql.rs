@@ -8,6 +8,174 @@
 
 use crate::packs::{DestructivePattern, Pack, PatternSuggestion, SafePattern};
 use crate::{destructive_pattern, safe_pattern};
+use std::borrow::Cow;
+
+/// Blank out *nested* PostgreSQL block comments so a statement behind one is
+/// still visible to the pack's patterns (#432).
+///
+/// **PostgreSQL block comments nest; MySQL's do not.** The shared
+/// `truncate-table` expression skips a comment with
+/// `/\*(?:[^*]|\*+[^*/])*\*+/`, which ends at the first `*/` — right for MySQL,
+/// wrong here, so `/* /* */ */ TRUNCATE TABLE users;` had its statement hidden
+/// behind what dcg read as the comment's tail. Verified against PostgreSQL 18:
+/// that command truncates.
+///
+/// Arbitrary nesting is not a regular language, so this is a scanner rather
+/// than a wider regex. Four rules keep it from becoming a false-negative
+/// machine of its own, which the first draft was:
+///
+/// * **Only nested comments are blanked.** A comment that never reaches depth
+///   two is left alone, because the pattern's own skip group already handles
+///   it. Everything that used to match still matches byte for byte.
+/// * **Only closed comments are blanked.** An unterminated `/*` is left alone
+///   rather than swallowing the rest of the input. PostgreSQL rejects it as a
+///   syntax error, so nothing runs either way — but this text is a *shell*
+///   command line, where `/*` is also a glob, and blanking to the end of
+///   `rm -rf /*/*; dropdb mydb` would hide the `dropdb` from this pack.
+/// * **`--` is not treated as a comment at all.** In the shell text these
+///   patterns run against, `--` is the end-of-options separator:
+///   `ssh host -- dropdb mydb` is a real denial, and blanking from `--` to the
+///   end of the line withdrew it. A leading `-- …` SQL comment needs no help,
+///   because the expression already anchors on `\r?\n` before the statement.
+/// * **Strings are not comments.** `'…'` (with `''` escapes), `"…"` and
+///   `$tag$…$tag$` bodies are copied through untouched, so a literal
+///   containing `/*` neither starts a comment nor gets blanked.
+///
+/// The mask is **length preserving**: every blanked byte becomes a space and
+/// every newline is kept, so byte offsets in the masked view are byte offsets
+/// in the original, spans still map back, and the `\r?\n`-anchored
+/// alternatives still see their line structure.
+pub(crate) fn mask_comments(sql: &str) -> Cow<'_, str> {
+    if !sql.contains("/*") {
+        return Cow::Borrowed(sql);
+    }
+
+    let bytes = sql.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+
+        match byte {
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                let (end, max_depth, closed) = block_comment_extent(bytes, index);
+                if closed && max_depth >= 2 {
+                    for &inner in &bytes[index..end] {
+                        out.push(if inner == b'\n' || inner == b'\r' {
+                            inner
+                        } else {
+                            b' '
+                        });
+                    }
+                } else {
+                    out.extend_from_slice(&bytes[index..end]);
+                }
+                index = end;
+            }
+            b'\'' | b'"' => {
+                let quote = byte;
+                out.push(byte);
+                index += 1;
+                while index < bytes.len() {
+                    out.push(bytes[index]);
+                    if bytes[index] == quote {
+                        // A doubled quote is an escaped quote, not the end.
+                        if bytes.get(index + 1) == Some(&quote) {
+                            out.push(quote);
+                            index += 2;
+                            continue;
+                        }
+                        index += 1;
+                        break;
+                    }
+                    index += 1;
+                }
+            }
+            b'$' => {
+                if let Some(tag_end) = dollar_quote_tag_end(bytes, index) {
+                    let tag = &bytes[index..=tag_end];
+                    out.extend_from_slice(tag);
+                    index = tag_end + 1;
+                    // Copy the body through to the closing tag, or to the end
+                    // of input when it is never closed.
+                    let closing = find_subslice(&bytes[index..], tag).map(|at| index + at);
+                    let stop = closing.map_or(bytes.len(), |at| at + tag.len());
+                    out.extend_from_slice(&bytes[index..stop]);
+                    index = stop;
+                } else {
+                    out.push(byte);
+                    index += 1;
+                }
+            }
+            _ => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+
+    debug_assert_eq!(out.len(), bytes.len(), "masking must preserve byte offsets");
+    match String::from_utf8(out) {
+        Ok(masked) if masked != sql => Cow::Owned(masked),
+        // Masking only ever replaces ASCII bytes with ASCII spaces, so a
+        // decode failure is impossible; fail open rather than panic if that
+        // reasoning ever stops holding.
+        _ => Cow::Borrowed(sql),
+    }
+}
+
+/// Walk a block comment starting at `start` (which must be `/*`).
+///
+/// Returns the byte index just past the comment, the deepest nesting it
+/// reached, and whether it closed. A comment that does not close reports the
+/// end of input, so the caller can leave it untouched.
+fn block_comment_extent(bytes: &[u8], start: usize) -> (usize, usize, bool) {
+    let mut index = start + 2;
+    let mut depth = 1usize;
+    let mut max_depth = 1usize;
+    while index < bytes.len() {
+        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            depth += 1;
+            max_depth = max_depth.max(depth);
+            index += 2;
+            continue;
+        }
+        if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') {
+            depth -= 1;
+            index += 2;
+            if depth == 0 {
+                return (index, max_depth, true);
+            }
+            continue;
+        }
+        index += 1;
+    }
+    (bytes.len(), max_depth, false)
+}
+
+/// The index of the final `$` of a dollar-quote tag starting at `start`, if the
+/// bytes there are one. Tags are `$$` or `$name$` with an identifier body.
+fn dollar_quote_tag_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut index = start + 1;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'$' => return Some(index),
+            b'_' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' => index += 1,
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
 
 // ============================================================================
 // Suggestion constants (must be 'static for the pattern struct)
@@ -56,9 +224,9 @@ const DROP_SCHEMA_SUGGESTIONS: &[PatternSuggestion] = &[
         "SELECT table_name FROM information_schema.tables WHERE table_schema = '{schema_name}'",
         "List all tables in the schema",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "DROP SCHEMA {schema_name} RESTRICT",
-        "Use RESTRICT to fail if schema is not empty",
+        "RESTRICT fails if the schema is not empty — still a DROP, so it is gated as well",
     ),
 ];
 
@@ -68,9 +236,9 @@ const TRUNCATE_TABLE_SUGGESTIONS: &[PatternSuggestion] = &[
         "SELECT COUNT(*) FROM {tablename}",
         "Check how many rows would be deleted",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "BEGIN; TRUNCATE {tablename}; -- ROLLBACK or COMMIT",
-        "Wrap in transaction for rollback capability",
+        "Wrap in a transaction for rollback capability — the TRUNCATE inside is gated as well",
     ),
     PatternSuggestion::new(
         "CREATE TABLE {tablename}_backup AS SELECT * FROM {tablename}",
@@ -88,13 +256,13 @@ const DELETE_WITHOUT_WHERE_SUGGESTIONS: &[PatternSuggestion] = &[
         "SELECT COUNT(*) FROM {tablename}",
         "Check how many rows exist",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "TRUNCATE TABLE {tablename}",
-        "Use TRUNCATE if you truly want all rows deleted (faster)",
+        "Faster if you truly want all rows gone — but TRUNCATE is gated as well",
     ),
-    PatternSuggestion::new(
+    PatternSuggestion::gated(
         "BEGIN; DELETE FROM {tablename}; -- ROLLBACK or COMMIT",
-        "Wrap in transaction for rollback capability",
+        "Wrap in a transaction for rollback capability — the unfiltered DELETE is gated as well",
     ),
 ];
 
@@ -133,7 +301,7 @@ pub fn create_pack() -> Pack {
                       TRUNCATE, and dropdb",
         keywords: &[
             "psql", "dropdb", "DROP", "TRUNCATE", "pg_dump", "postgres", "DELETE", "delete",
-            "drop", "truncate",
+            "drop", "truncate", "UPDATE",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
@@ -219,7 +387,10 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // TRUNCATE (faster than DELETE, no rollback)
         destructive_pattern!(
             "truncate-table",
-            r"(?i)\bTRUNCATE\s+(?:TABLE\s+)?[a-zA-Z_]",
+            // Keep byte-identical to `crate::packs::database::TRUNCATE_TABLE_PATTERN`
+            // (asserted by `truncate_table_pattern_is_shared`); the rationale
+            // for every constraint lives on that constant. Issue #403.
+            r#"(?i)(?:(?:^|[;"'`])(?:\s|/\*(?:[^*]|\*+[^*/])*\*+/)*|\r?\n(?:\s|/\*(?:[^*]|\*+[^*/])*\*+/)*(?=TRUNCATE\s+TABLE\b)|/\*!\d*\s*)(?<![-\w.$])TRUNCATE\s+(?:TABLE\s+)?(?:ONLY\s+)?[A-Za-z_][A-Za-z0-9_$]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_$]*)*(?![A-Za-z0-9_$]*[-.])\s*(?:[;,)"'`]|\*/|$|\s+(?:CASCADE|RESTRICT|RESTART|CONTINUE|IDENTITY)\b)"#,
             "TRUNCATE permanently deletes all rows without logging individual deletions.",
             High,
             "TRUNCATE is faster than DELETE but more dangerous:\n\n\
@@ -239,7 +410,7 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
         // DELETE without WHERE (deletes all rows)
         destructive_pattern!(
             "delete-without-where",
-            r#"(?i)DELETE\s+FROM\s+(?:(?:[a-zA-Z_][a-zA-Z0-9_]*|"[^"]+")(?:\.(?:[a-zA-Z_][a-zA-Z0-9_]*|"[^"]+"))?)\s*(?:;|$)"#,
+            r#"(?i)\bDELETE\s+FROM\s+(?:(?:[a-zA-Z_][a-zA-Z0-9_]*|"[^"]+")(?:\.(?:[a-zA-Z_][a-zA-Z0-9_]*|"[^"]+"))?)\s*(?:;|$)"#,
             "DELETE without WHERE clause deletes ALL rows. Add a WHERE clause or use TRUNCATE intentionally.",
             High,
             "DELETE without WHERE removes ALL rows from the table:\n\n\
@@ -254,6 +425,38 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              SELECT COUNT(*) FROM tablename;  -- all rows!\n  \
              SELECT * FROM tablename LIMIT 10;",
             DELETE_WITHOUT_WHERE_SUGGESTIONS
+        ),
+        // UPDATE without WHERE rewrites every row — the same unscoped blast
+        // radius as the DELETE rule above, which denied while this allowed.
+        destructive_pattern!(
+            "update-without-where",
+            // Keep byte-identical to `crate::packs::database::UPDATE_WITHOUT_WHERE_PATTERN`.
+            r#"(?i)\bUPDATE\s+(?:(?:LOW_PRIORITY|IGNORE|ONLY|OR\s+(?:ROLLBACK|ABORT|REPLACE|FAIL|IGNORE))\s+)*(?:[A-Za-z_][\w$]*|"[^"]+"|`[^`]+`|\[[^\]]+\])(?:\s*\.\s*(?:[A-Za-z_][\w$]*|"[^"]+"|`[^`]+`|\[[^\]]+\]))?\s+(?:(?:AS\s+)?(?!SET\b)[A-Za-z_]\w*\s+)?SET\b(?:(?!\bWHERE\b)[^;])*(?:;|$)"#,
+            "UPDATE without WHERE clause overwrites the column in ALL rows. Add a WHERE clause.",
+            High,
+            "UPDATE without WHERE changes every row in the table, replacing whatever values \
+             were there. Unless it runs inside a transaction you then roll back, the previous \
+             values are gone.\n\n\
+             Scope it:\n  \
+             UPDATE tablename SET col = value WHERE condition;\n\n\
+             Preview what would change:\n  \
+             SELECT COUNT(*) FROM tablename WHERE condition;\n\n\
+             Or wrap it: BEGIN; UPDATE …; SELECT …; ROLLBACK/COMMIT;"
+        ),
+        // ALTER TABLE … DROP COLUMN deletes that column's data for every row.
+        // `ALTER COLUMN c DROP DEFAULT | NOT NULL | IDENTITY | EXPRESSION` and
+        // `DROP CONSTRAINT` change metadata only and stay allowed.
+        destructive_pattern!(
+            "drop-column",
+            // Keep byte-identical to `crate::packs::database::DROP_COLUMN_PATTERN`.
+            r#"(?i)\bALTER\s+TABLE\b[^;]*?\bDROP\s+(?:COLUMN\s+)?(?:IF\s+EXISTS\s+)?(?!(?:CONSTRAINT|DEFAULT|NOT\s+NULL|IDENTITY|EXPRESSION|INDEX|KEY|PRIMARY\s+KEY|FOREIGN\s+KEY|CHECK)\b)[A-Za-z_"`\[]"#,
+            "ALTER TABLE ... DROP COLUMN permanently deletes that column's data in every row.",
+            High,
+            "Dropping a column removes its values from every row. PostgreSQL does not keep \
+             them anywhere you can restore from without a backup.\n\n\
+             Back up the column first:\n  \
+             CREATE TABLE tablename_col_backup AS SELECT id, col FROM tablename;\n\n\
+             Or keep it for now: stop reading it in the application, then drop it later."
         ),
         // dropdb CLI command
         destructive_pattern!(
@@ -302,6 +505,50 @@ mod tests {
     use super::*;
     use crate::packs::Severity;
     use crate::packs::test_helpers::*;
+
+    /// Issue #403: Tailwind's `truncate` utility class is not SQL DDL.
+    ///
+    /// The class list is the overwhelmingly common spelling in current
+    /// frontend code, and `truncate` followed by another class satisfied the
+    /// old "word, whitespace, letter" pattern, so ordinary React/TypeScript
+    /// edits could not be made through any shell command.
+    #[test]
+    fn tailwind_truncate_class_is_not_ddl() {
+        let pack = create_pack();
+        for command in [
+            "truncate line-through",
+            "TRUNCATE line-through",
+            "truncate text-sm",
+            "truncate flex-1",
+            "echo class=\"min-w-0 truncate line-through\"",
+            "bun run build -- --class truncate line-through",
+            // The `\b`-after-punctuation class: a word boundary also exists
+            // after `.` and `-`, so these used to match.
+            "x.truncate 5",
+            "cargo run -- --no-truncate output",
+        ] {
+            assert_allows(&pack, command);
+        }
+    }
+
+    /// The same expression must still see every real spelling of the DDL.
+    #[test]
+    fn truncate_ddl_spellings_still_block() {
+        let pack = create_pack();
+        for command in [
+            "truncate table users",
+            "TRUNCATE TABLE users",
+            "truncate users",
+            "truncate users;",
+            "truncate only users",
+            "TRUNCATE TABLE public.users",
+            "truncate foo CASCADE",
+            "truncate table a, b",
+            "TRUNCATE users RESTART IDENTITY",
+        ] {
+            assert_blocks_with_pattern(&pack, command, "truncate-table");
+        }
+    }
 
     #[test]
     fn test_delete_without_where() {
@@ -403,6 +650,39 @@ mod tests {
     }
 
     #[test]
+    fn truncate_pattern_requires_statement_position() {
+        // Regression #394: the rule matched the word `truncate` anywhere in
+        // argv, so a plain file read whose operand happened to be named like a
+        // SQL identifier was denied as "would delete database rows". An operand
+        // of another command is never in statement position.
+        let pack = create_pack();
+        for command in [
+            "cat truncate x",
+            "sort truncate b",
+            "wc -l truncate x",
+            "ls truncate x",
+            "head -5 truncate x",
+            "diff truncate other",
+            "cp truncate backup",
+        ] {
+            assert_no_match(&pack, command);
+        }
+
+        // Every real execution path opens the statement where SQL can start:
+        // text start (a heredoc body or a reconstructed pipeline payload), an
+        // opening quote, or the previous statement's `;`.
+        assert_blocks(&pack, "TRUNCATE TABLE users", "TRUNCATE");
+        assert_blocks(&pack, "psql -c \"TRUNCATE TABLE users\"", "TRUNCATE");
+        assert_blocks(&pack, "psql --command 'TRUNCATE users'", "TRUNCATE");
+        assert_blocks(
+            &pack,
+            "psql -c \"BEGIN; TRUNCATE users; COMMIT;\"",
+            "TRUNCATE",
+        );
+        assert_blocks(&pack, "TRUNCATE TABLE public.users CASCADE", "TRUNCATE");
+    }
+
+    #[test]
     fn dropdb_pattern_requires_word_boundary() {
         // Regression: `dropdb-cli` regex previously was `dropdb\s+`, so any
         // word ending in `dropdb` (e.g. `superdropdb mydb` or
@@ -416,5 +696,157 @@ mod tests {
         // Real dropdb still blocks.
         assert_blocks(&pack, "dropdb mydb", "dropdb");
         assert_blocks(&pack, "/usr/bin/dropdb mydb", "dropdb");
+    }
+    /// #432: PostgreSQL block comments nest, so a comment-skipping expression
+    /// that ends at the first `*/` hides the statement behind it. Verified on a
+    /// live PostgreSQL 18 instance by the reporter: the first command below
+    /// truncates a seeded table.
+    ///
+    /// The masking is applied by the evaluator, which is where the decision is
+    /// made, so the verdicts are asserted there
+    /// (`evaluator::tests::nested_sql_comments_do_not_hide_the_statement_issue_432`).
+    /// What this test pins is that the statement survives masking at all — the
+    /// pack's own patterns match a *masked* view, and if the mask ate the
+    /// statement no rule could fire.
+    #[test]
+    fn nested_block_comments_leave_the_following_statement_visible() {
+        let pack = create_pack();
+        for command in [
+            "/* /* */ */ TRUNCATE TABLE users;",
+            "/* /* /* */ */ */ TRUNCATE TABLE users;",
+            "/* x */ TRUNCATE TABLE users;",
+            "/*/* nested without spaces */*/ TRUNCATE TABLE users;",
+            "-- a line comment\nTRUNCATE TABLE users;",
+            "/* multi\n   line\n   /* nested */ */\nTRUNCATE TABLE users;",
+        ] {
+            let masked = mask_comments(command);
+            assert!(
+                masked.contains("TRUNCATE TABLE users;"),
+                "masking must not eat the statement: {command:?} -> {masked:?}"
+            );
+            assert_blocks(&pack, masked.as_ref(), "TRUNCATE");
+        }
+    }
+
+    /// Everything the mask must leave exactly as it found it. The first draft
+    /// of this masker blanked `--` to end of line and swallowed unterminated
+    /// comments, and both withdrew real denials from shell text — `--` is the
+    /// end-of-options separator (`ssh host -- dropdb mydb`) and `/*` is a glob.
+    #[test]
+    fn comment_masking_only_touches_nested_closed_comments() {
+        for unchanged in [
+            "SELECT 1;",
+            // Not nested: the pattern's own skip group already handles it, so
+            // masking here could only change behaviour that already works.
+            "/* plain */ TRUNCATE TABLE users;",
+            // `--` is shell syntax here, not a SQL comment.
+            "ssh example-host -- dropdb mydb",
+            "-- drop it\nTRUNCATE TABLE users;",
+            // Unterminated: left alone rather than blanked to the end, because
+            // `/*` is also a shell glob.
+            "/* unterminated TRUNCATE TABLE users;",
+            "rm -rf /*/*; dropdb mydb",
+            // Strings and dollar-quoted bodies are data.
+            "SELECT '/* /* */ */ not a comment';",
+            "SELECT 'it''s /* /* */ */ fine';",
+            "SELECT $$ /* /* */ */ body $$; TRUNCATE TABLE users;",
+            "SELECT $tag$ /* /* */ */ body $tag$;",
+            "SELECT $1 FROM t;",
+        ] {
+            assert_eq!(
+                mask_comments(unchanged),
+                unchanged,
+                "must be left unchanged: {unchanged:?}"
+            );
+        }
+
+        // A nested, closed comment is blanked, and only it.
+        assert_eq!(
+            mask_comments("/* /* */ */ TRUNCATE TABLE users;"),
+            "            TRUNCATE TABLE users;"
+        );
+        let source = "SELECT 1; /*/* c */*/ TRUNCATE TABLE users;";
+        let masked = mask_comments(source);
+        assert_eq!(masked.len(), source.len());
+        assert!(masked.starts_with("SELECT 1; "), "{masked:?}");
+        assert!(masked.ends_with(" TRUNCATE TABLE users;"), "{masked:?}");
+        assert!(
+            !masked.contains('*'),
+            "the comment must be gone: {masked:?}"
+        );
+
+        // Length and line structure are preserved, so spans and the
+        // `\r?\n`-anchored alternatives keep working.
+        for source in [
+            "/* /* */ */ TRUNCATE TABLE users;",
+            "/* multi\n   /* nested */ */\nTRUNCATE TABLE users;",
+        ] {
+            let masked = mask_comments(source);
+            assert_eq!(
+                masked.len(),
+                source.len(),
+                "masking must preserve byte offsets: {source:?} -> {masked:?}"
+            );
+            assert_eq!(
+                masked.lines().count(),
+                source.lines().count(),
+                "newlines must survive: {source:?} -> {masked:?}"
+            );
+        }
+    }
+
+    /// An unterminated block comment is left alone: PostgreSQL rejects it as a
+    /// syntax error so nothing runs, and blanking it would hide later commands
+    /// in the same shell line from this pack.
+    #[test]
+    fn an_unterminated_comment_is_left_alone() {
+        let pack = create_pack();
+        assert_eq!(
+            mask_comments("/* TRUNCATE TABLE users;"),
+            "/* TRUNCATE TABLE users;"
+        );
+        assert_no_match(&pack, "/* TRUNCATE TABLE users;");
+        // And a later statement on the same line is still reachable.
+        let masked = mask_comments("rm -rf /*/*; dropdb mydb");
+        assert!(masked.contains("dropdb mydb"), "{masked:?}");
+    }
+
+    /// Unscoped UPDATE and DROP COLUMN destroy data like the already-denied
+    /// unscoped DELETE and DROP TABLE, and were allowed.
+    #[test]
+    fn unscoped_update_and_drop_column_are_denied() {
+        let pack = create_pack();
+        for (command, rule) in [
+            ("UPDATE users SET admin = true;", "update-without-where"),
+            (
+                "update public.users set email = null",
+                "update-without-where",
+            ),
+            ("UPDATE users AS u SET name = 'x'", "update-without-where"),
+            ("ALTER TABLE users DROP COLUMN email;", "drop-column"),
+            ("alter table users drop email", "drop-column"),
+            (
+                "ALTER TABLE users DROP COLUMN IF EXISTS email",
+                "drop-column",
+            ),
+            (
+                "ALTER TABLE users ADD COLUMN x int, DROP COLUMN y",
+                "drop-column",
+            ),
+        ] {
+            assert_blocks_with_pattern(&pack, command, rule);
+        }
+        for command in [
+            "UPDATE users SET admin = true WHERE id = 1;",
+            "update users set x = 1 where x is null",
+            "ALTER TABLE users ALTER COLUMN email DROP NOT NULL",
+            "ALTER TABLE users ALTER COLUMN email DROP DEFAULT",
+            "ALTER TABLE users DROP CONSTRAINT users_email_key",
+            "ALTER TABLE users ADD COLUMN email text",
+            "apt update",
+            "brew update && brew upgrade",
+        ] {
+            assert_no_match(&pack, command);
+        }
     }
 }

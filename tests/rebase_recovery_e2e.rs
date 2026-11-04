@@ -7,19 +7,17 @@
 //! - Consumes the permit after a single successful allow.
 //! - Does NOT unblock unrelated destructive commands (e.g. `git reset --hard`).
 
+#[path = "common/history.rs"]
+mod history_test;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use destructive_command_guard::history::HistoryDb;
-use fsqlite_types::value::SqliteValue;
+use destructive_command_guard::history::{ENV_HISTORY_DIAGNOSTICS, HistoryDb, SqliteValue};
 
 fn dcg_binary() -> PathBuf {
-    let mut path = std::env::current_exe().unwrap();
-    path.pop(); // deps
-    path.pop(); // debug
-    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
-    path
+    PathBuf::from(env!("CARGO_BIN_EXE_dcg"))
 }
 
 /// Run the dcg hook with `command` and `cwd`, returning stdout.
@@ -41,7 +39,9 @@ fn run_hook_in_with_env(
 
     let mut cmd = Command::new(dcg_binary());
     cmd.current_dir(cwd)
-        // Keep tests hermetic: don't share the test user's real dcg state.
+        // Keep tests hermetic: don't share the test user's real dcg state
+        // or inherit a history-disable / hook-timeout override from the host.
+        .env_clear()
         .env("HOME", cwd)
         .env("USERPROFILE", cwd)
         .env("XDG_CONFIG_HOME", cwd.join("xdg"))
@@ -65,9 +65,9 @@ fn run_hook_in_with_env(
 
 fn sv_to_string(value: &SqliteValue) -> String {
     match value {
-        SqliteValue::Text(s) => s.to_string(),
+        SqliteValue::Text(s) => s.clone(),
         SqliteValue::Integer(i) => i.to_string(),
-        SqliteValue::Float(f) => f.to_string(),
+        SqliteValue::Real(f) => f.to_string(),
         SqliteValue::Null => String::new(),
         SqliteValue::Blob(_) => String::new(),
     }
@@ -158,14 +158,90 @@ fn allows_checkout_discard_during_rebase() {
     );
 }
 
+/// Every worktree-discard spelling recovers, and nothing else does.
+///
+/// `RECOVERY_PATTERNS` is a list of rule NAMES, so it silently falls behind the
+/// moment `core.git` gains another way to spell the same discard. That is not
+/// hypothetical: `checkout-discard-cwd` was added without being listed, and the
+/// damage was wider than the one new spelling. Recovery unblocked the
+/// `checkout-discard` that `git checkout -- .` reports, the residual re-scan
+/// then matched the unlisted `checkout-discard-cwd` on the same line, and the
+/// deny stood — so five spellings stopped recovering, including ones whose own
+/// rule had been listed since the feature shipped.
+///
+/// This asserts the behaviour instead of the list. A new rule in this family
+/// fails here by doing the wrong thing, which is the only version of this check
+/// that cannot itself go stale.
+///
+/// The second half is what keeps it honest: a rebase in progress must not be a
+/// skeleton key. `reset --hard`, `clean`, a force push, and the two history
+/// rewrites added alongside `checkout-discard-cwd` all stay denied.
+#[test]
+fn recovery_covers_every_worktree_discard_spelling() {
+    let repo = TempRepo::new("discard-spelling-matrix");
+    repo.start_rebase_merge();
+    let outside = TempRepo::new("discard-spelling-outside");
+
+    for command in [
+        "git checkout -- .",
+        "git checkout .",
+        "git checkout -- src/",
+        "git checkout ./src",
+        "git checkout HEAD .",
+        "git checkout HEAD -- .",
+        "git checkout main -- .",
+        "git restore .",
+        "git restore -- .",
+        "git restore src/",
+        "git restore --worktree .",
+    ] {
+        let during = run_hook_in(&repo.root, command);
+        assert!(
+            during.trim().is_empty(),
+            "a rebase is in progress, so {command:?} is the recovery operation \
+             this module exists for and must be allowed; got: {during}"
+        );
+
+        // The same spelling outside a rebase must still deny, or the row above
+        // is measuring a rule that stopped matching rather than recovery.
+        let normally = run_hook_in(&outside.root, command);
+        assert!(
+            !normally.trim().is_empty(),
+            "{command:?} must still be blocked outside a rebase; got: {normally}"
+        );
+    }
+
+    // A recovery signal unblocks the discard family and nothing else.
+    for command in [
+        concat!("git re", "set --hard"),
+        concat!("git cl", "ean -fd"),
+        concat!("git pu", "sh --force"),
+        "git filter-branch --all",
+        "git reflog expire --expire=now --all",
+    ] {
+        let during = run_hook_in(&repo.root, command);
+        assert!(
+            !during.trim().is_empty(),
+            "a rebase in progress must not unblock {command:?}; got: {during}"
+        );
+    }
+}
+
 #[test]
 fn rebase_recovery_history_records_final_allow_only() {
+    history_test::retry_history_scenario("rebase recovery history", rebase_history_attempt);
+}
+
+fn rebase_history_attempt() -> Result<(), history_test::IncompleteHistoryFlush> {
     let repo = TempRepo::new("history-final-outcome");
     repo.start_rebase_merge();
 
     let config_path = repo.root.join("config.toml");
     let history_path = repo.root.join("history.db");
     fs::write(&config_path, "[history]\nenabled = true\n").unwrap();
+    // Schema creation is covered by history_integration. Close setup before
+    // spawning the real hook, which keeps its unmodified production deadline.
+    drop(HistoryDb::open(Some(history_path.clone())).expect("initialize history"));
 
     let output = run_hook_in_with_env(
         &repo.root,
@@ -173,6 +249,7 @@ fn rebase_recovery_history_records_final_allow_only() {
         &[
             ("DCG_CONFIG", &config_path),
             ("DCG_HISTORY_DB", &history_path),
+            (ENV_HISTORY_DIAGNOSTICS, Path::new("1")),
         ],
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -186,6 +263,7 @@ fn rebase_recovery_history_records_final_allow_only() {
         stdout.trim().is_empty(),
         "expected allow (empty output), got: {stdout}"
     );
+    history_test::check_history_after_exit(&history_path, 1, &output, "rebase final allow")?;
 
     let db = HistoryDb::open(Some(history_path)).expect("open history db");
     assert_eq!(db.count_commands().expect("count commands"), 1);
@@ -198,6 +276,7 @@ fn rebase_recovery_history_records_final_allow_only() {
 
     assert_eq!(sv_to_string(&values[0]), "allow");
     assert_eq!(sv_to_string(&values[1]), "rebase-recovery");
+    Ok(())
 }
 
 #[test]

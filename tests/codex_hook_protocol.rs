@@ -14,6 +14,23 @@ use std::io::{ErrorKind, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+/// Semantic protocol tests must not accidentally become deadline tests when
+/// the host is busy or the full integration suite runs in parallel. Tests that
+/// exercise the production deadline pass their own explicit value instead — see
+/// `codex_hook_deadline_exhaustion_is_indeterminate`, which uses 200ms — so
+/// raising this constant cannot weaken the deadline coverage.
+///
+/// 5000ms was not enough. These tests spawn the real binary, which costs ~50ms
+/// unloaded; but on a many-core CI or developer host running all 114 test
+/// binaries in parallel, one spawn can lose two orders of magnitude to
+/// contention. When it does, evaluation hits the hook deadline and dcg returns
+/// its bounded fallback — still a DENY, so the guard behaves correctly, but a
+/// deny with no rule attribution. The assertions here check *which* rule fired,
+/// so they failed intermittently while the product was working exactly as
+/// designed. Observed twice in one session, on different tests, with the
+/// pre-change binary measuring identical latency.
+const SEMANTIC_TEST_TIMEOUT_MS: &str = "30000";
+
 // ---------------------------------------------------------------------------
 // HookOutcome — typed subprocess result with postmortem diagnostics
 // ---------------------------------------------------------------------------
@@ -129,14 +146,9 @@ impl fmt::Debug for HookOutcome {
 // Binary discovery
 // ---------------------------------------------------------------------------
 
-/// Path to the dcg binary (same workspace-relative discovery as
-/// tests/agent_hook_output.rs).
+/// Path to the exact dcg binary Cargo built for this integration test.
 fn dcg_binary() -> PathBuf {
-    let mut path = std::env::current_exe().unwrap();
-    path.pop(); // test binary name
-    path.pop(); // deps/
-    path.push(format!("dcg{}", std::env::consts::EXE_SUFFIX));
-    path
+    PathBuf::from(env!("CARGO_BIN_EXE_dcg"))
 }
 
 // ---------------------------------------------------------------------------
@@ -183,6 +195,18 @@ fn build_claude_payload(command: &str) -> String {
   "tool_use_id": "toolu_01TEST"
 }}"#
     )
+}
+
+/// Point a payload's `cwd` at a directory that exists.
+///
+/// Allow-once codes and pending records are scoped to the payload `cwd`, and
+/// dcg fails closed (a deny with no code and no record) when that `cwd` is not
+/// a real directory (#387). Tests of the allow-once flow therefore cannot use
+/// the builders' fixed `/tmp/test-workdir`, which exists only by accident.
+fn with_payload_cwd(payload: &str, cwd: &std::path::Path) -> String {
+    let mut payload: serde_json::Value = serde_json::from_str(payload).expect("hook payload");
+    payload["cwd"] = serde_json::json!(cwd);
+    payload.to_string()
 }
 
 /// Build a complete Gemini CLI `BeforeTool` payload for `run_shell_command`.
@@ -235,6 +259,12 @@ pub fn run_hook_raw(json_bytes: &[u8], extra_env: &[(&str, &str)]) -> HookOutcom
         .env("TEMP", &tmp_path)
         .env("TMP", &tmp_path)
         .env("NO_COLOR", "1")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
+        .env("DCG_HEREDOC_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
+        // The third budget. Raising the other two left the AST matcher on its
+        // 20ms release constant, which no environment could reach, so a
+        // descheduled worker still lost the rule id (#438).
+        .env("DCG_AST_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -300,6 +330,12 @@ pub fn run_hook_raw_with_config(
         .env("TEMP", &tmp_path)
         .env("TMP", &tmp_path)
         .env("NO_COLOR", "1")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
+        .env("DCG_HEREDOC_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
+        // The third budget. Raising the other two left the AST matcher on its
+        // 20ms release constant, which no environment could reach, so a
+        // descheduled worker still lost the rule id (#438).
+        .env("DCG_AST_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -334,7 +370,11 @@ pub fn run_hook_raw_with_config(
 
 /// Run dcg with a Codex 0.125.0+ payload for the given command.
 pub fn run_codex_hook(command: &str) -> HookOutcome {
-    run_codex_hook_with_env(command, &[], &[])
+    run_codex_hook_with_env(
+        command,
+        &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
+        &[],
+    )
 }
 
 /// Run dcg with a Codex payload, additional env vars, and env removals.
@@ -349,7 +389,11 @@ pub fn run_codex_hook_with_env(
 
 /// Run dcg with a Claude Code payload for the given command.
 pub fn run_claude_hook(command: &str) -> HookOutcome {
-    run_claude_hook_with_env(command, &[], &[])
+    run_claude_hook_with_env(
+        command,
+        &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
+        &[],
+    )
 }
 
 /// Run dcg with a Claude Code payload, additional env vars, and env removals.
@@ -394,6 +438,32 @@ fn smoke_codex_destructive_command_blocked() {
     );
 }
 
+/// Regression for #213: late filesystem rules used to exceed the default
+/// 200 ms hook budget on a cold one-shot process and then disappear as an
+/// empty-stdout allow. A completed rule denial and a conservative deadline
+/// denial are both valid outcomes; silence is never valid for these commands.
+#[test]
+fn cold_deadline_never_silently_allows_late_filesystem_rules() {
+    for command in [
+        "unlink /etc/passwd",
+        "truncate -s 0 /etc/passwd",
+        "shred -u /etc/passwd",
+        "tar --remove-files -cf out.tar /etc",
+        "dd if=/dev/zero of=/etc/passwd",
+        "echo x > /etc/passwd",
+    ] {
+        let outcome = run_codex_hook_with_env(command, &[("DCG_HOOK_TIMEOUT_MS", "200")], &[]);
+        assert!(
+            outcome.is_codex_block_shape(),
+            "cold default-budget evaluation must deny or report indeterminate, never silently allow {command:?}\n{outcome}"
+        );
+        assert!(
+            !outcome.is_allow_shape(),
+            "deadline exhaustion must not be encoded as allow for {command:?}\n{outcome}"
+        );
+    }
+}
+
 #[test]
 fn smoke_claude_destructive_command_blocked() {
     let outcome = run_claude_hook("git reset --hard HEAD~1");
@@ -401,6 +471,54 @@ fn smoke_claude_destructive_command_blocked() {
         outcome.is_claude_block_shape(),
         "destructive command via Claude should produce exit 0 + hookSpecificOutput JSON\n{outcome}"
     );
+}
+
+/// The native Bash hook keeps the caller's POSIX quoting. Pack-only tests did
+/// not catch the path where raw quoted argv0 skipped both unlink rules (#550).
+#[test]
+fn claude_hook_quoted_unlink_keeps_destructive_commands_blocked_issue_550() {
+    for command in [
+        "'unlink' /home/user/notes.txt",
+        "\"unlink\" /etc/passwd",
+        "u'n'l'i'n'k' /etc/passwd",
+        "'/usr/bin/unlink' /etc/passwd",
+        "sudo 'unlink' /etc/passwd",
+        "'unlink' /tmp/scratch; 'unlink' /etc/passwd",
+    ] {
+        let outcome = run_claude_hook(command);
+        assert!(
+            outcome.is_claude_block_shape(),
+            "quoted unlink must deny {command:?}\n{outcome}"
+        );
+        let json = outcome.stdout_json();
+        assert_eq!(
+            json["hookSpecificOutput"]["permissionDecision"], "deny",
+            "{command:?}\n{outcome}"
+        );
+        assert_eq!(
+            json["hookSpecificOutput"]["ruleId"], "core.filesystem:unlink-root-home",
+            "the unlink rule must run, not merely exhaust the budget: {command:?}\n{outcome}"
+        );
+    }
+}
+
+#[test]
+fn claude_hook_quoted_unlink_keeps_data_and_literal_temp_exceptions_issue_550() {
+    for command in [
+        "ob sync-unlink --path /home/user/vault",
+        "foo --unlink /tmp/x",
+        "cat unlink /tmp/x",
+        "'unlink' /tmp/scratch",
+        "u'n'l'i'n'k' -- /var/tmp/cache",
+        "'unlink' '/tmp/file with spaces'",
+        "'unlink' --help",
+    ] {
+        let outcome = run_claude_hook(command);
+        assert!(
+            outcome.is_allow_shape(),
+            "data or a literal temp/help unlink must remain allowed: {command:?}\n{outcome}"
+        );
+    }
 }
 
 /// Regression for #125 (part b, dcg-side): on Windows, Codex executes shell
@@ -505,6 +623,175 @@ fn copilot_powershell_tool_args_blocks_destructive_command() {
     assert_eq!(json.as_object().map(serde_json::Map::len), Some(2));
     assert!(json.get("ruleId").is_none(), "{outcome}");
     assert!(json.get("continue").is_none(), "{outcome}");
+}
+
+#[test]
+fn explicit_powershell_tool_decodes_backticks_only_in_shell_syntax() {
+    let destructive = serde_json::json!({
+        "turn_id": "turn-powershell-dialect",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "PowerShell",
+        "tool_input": { "command": "g`it branch -`d feature" },
+    })
+    .to_string();
+    let blocked = run_hook_raw(
+        destructive.as_bytes(),
+        &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
+    );
+    assert!(
+        blocked.is_codex_block_shape(),
+        "PowerShell syntax escapes must not hide git branch -d\n{blocked}"
+    );
+
+    let option_operand = serde_json::json!({
+        "turn_id": "turn-powershell-dialect-safe",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "pwsh",
+        "tool_input": { "command": "g`it branch --format -`d" },
+    })
+    .to_string();
+    let allowed = run_hook_raw(
+        option_operand.as_bytes(),
+        &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
+    );
+    assert!(
+        allowed.is_allow_shape(),
+        "a decoded -d consumed as --format data must remain allowed\n{allowed}"
+    );
+}
+
+#[test]
+fn explicit_cmd_tool_decodes_carets_only_in_shell_syntax() {
+    let destructive = serde_json::json!({
+        "turn_id": "turn-cmd-dialect",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "cmd.exe",
+        "tool_input": { "command": "g^it branch ^-d feature" },
+    })
+    .to_string();
+    let blocked = run_hook_raw(
+        destructive.as_bytes(),
+        &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
+    );
+    assert!(
+        blocked.is_codex_block_shape(),
+        "cmd.exe syntax escapes must not hide git branch -d\n{blocked}"
+    );
+
+    let option_operand = serde_json::json!({
+        "turn_id": "turn-cmd-dialect-safe",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "cmd",
+        "tool_input": { "command": "g^it branch --format ^-d" },
+    })
+    .to_string();
+    let allowed = run_hook_raw(
+        option_operand.as_bytes(),
+        &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
+    );
+    assert!(
+        allowed.is_allow_shape(),
+        "a decoded -d consumed as --format data must remain allowed\n{allowed}"
+    );
+}
+
+/// A *proven* Bash dialect must never reinterpret Windows escape syntax in
+/// the middle of a word: a backtick there is ordinary POSIX syntax, so
+/// `` g`it … `` is not git.
+///
+/// A caret in the COMMAND WORD is the exception: since `f5f6b49` it widens
+/// even a Bash-labelled payload to the deny-wins union
+/// (`segment_command_word_is_cmd_assembled`), because `doc^ker system prune`
+/// otherwise reached an allow while `docker system prune` denied, and nothing
+/// but cmd.exe assembly puts a caret in an executable name. So `g^it branch
+/// ^-d` is judged under the cmd.exe reading too and denies for every label.
+///
+/// The unknown dialect is a different question. Since #294 it is a deny-wins
+/// *union* rather than a synonym for POSIX: a generic terminal adapter has not
+/// proven which shell will run the command, so a payload that reconstructs a
+/// protected executable under cmd.exe or PowerShell must be blocked. The
+/// assertion below therefore flipped when #294's decoded-view keyword gate
+/// landed — the same flip already recorded for `g^it branch ^-d` in
+/// `src/cli.rs`'s batch test. The escape here is unquoted and so sits in an
+/// executable position; a caret inside quoted data does *not* reach the replay
+/// (see `tests/repro_294_unknown_dialect_pack_fanout.rs`).
+#[test]
+fn bash_does_not_guess_windows_escape_syntax_but_unknown_is_a_union() {
+    for (command, caret_command_word) in [
+        ("g`it branch -`d feature", false),
+        ("g^it branch ^-d feature", true),
+    ] {
+        let bash_payload = serde_json::json!({
+            "turn_id": "turn-bash-dialect",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": command },
+        })
+        .to_string();
+        let bash_outcome = run_hook_raw(
+            bash_payload.as_bytes(),
+            &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
+        );
+        // `turn_id` makes this a Codex payload. Codex labels its shell `Bash`
+        // on every platform, but on a Windows host that shell is PowerShell by
+        // default, so the label is down-trusted there (#379,
+        // `codex_host_shell_dialect`) and the escape IS reconstructed.
+        if cfg!(windows) || caret_command_word {
+            assert!(
+                bash_outcome.is_codex_block_shape(),
+                "a Codex Bash payload must adopt the PowerShell/cmd reading of \
+                 {command:?} on a Windows host or when a caret assembles the \
+                 command word\n{bash_outcome}"
+            );
+        } else {
+            assert!(
+                bash_outcome.is_allow_shape(),
+                "Bash must not reinterpret Windows shell escapes in {command:?}\n{bash_outcome}"
+            );
+        }
+
+        // Claude Code's Bash tool is Git Bash on every host, so its label is
+        // never down-trusted for escape syntax alone — only a caret-assembled
+        // command word widens it.
+        let claude_payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": { "command": command },
+        })
+        .to_string();
+        let claude_outcome = run_hook_raw(
+            claude_payload.as_bytes(),
+            &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
+        );
+        if caret_command_word {
+            assert!(
+                claude_outcome.is_claude_block_shape(),
+                "a caret-assembled command word widens Claude's Bash too in \
+                 {command:?}\n{claude_outcome}"
+            );
+        } else {
+            assert!(
+                claude_outcome.is_allow_shape(),
+                "Claude's Bash must not reinterpret Windows shell escapes in {command:?}\n{claude_outcome}"
+            );
+        }
+
+        let unknown_payload = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "tool_name": "runTerminalCommand",
+            "tool_input": { "command": command },
+        })
+        .to_string();
+        let unknown_outcome = run_hook_raw(
+            unknown_payload.as_bytes(),
+            &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
+        );
+        assert!(
+            unknown_outcome.is_claude_block_shape(),
+            "#294: an unproven dialect must adopt the cmd/PowerShell reading that \
+             reconstructs `git branch -d` in {command:?}\n{unknown_outcome}"
+        );
+    }
 }
 
 #[test]
@@ -679,6 +966,7 @@ fn codex_allow_safe_commands_produce_no_output() {
         "git log --oneline -5",
         "git diff HEAD",
         "git checkout -b new-feature",
+        r#"git commit -m "Fix git push --force detection""#,
         "ls -la",
         "echo hello",
         "cat README.md",
@@ -788,6 +1076,7 @@ fn codex_warn_path_exits_zero_with_stderr_warning() {
         .env("TEMP", home.path().join("tmp"))
         .env("TMP", home.path().join("tmp"))
         .env("NO_COLOR", "1")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -872,7 +1161,12 @@ fn claude_deny_matrix_multiple_destructive_commands() {
     ];
 
     for (cmd, expected_pack_fragment) in commands {
-        let outcome = run_claude_hook(cmd);
+        let workdir = tempfile::tempdir().expect("tempdir");
+        let payload = with_payload_cwd(&build_claude_payload(cmd), workdir.path());
+        let outcome = run_hook_raw(
+            payload.as_bytes(),
+            &[("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)],
+        );
         assert_eq!(
             outcome.exit_code, 0,
             "Claude deny must exit 0 for '{cmd}'\n{outcome}"
@@ -970,23 +1264,19 @@ fn claude_deny_git_checkout_file_restore() {
 }
 
 #[test]
-fn claude_deny_or_warn_git_stash_drop() {
+fn claude_default_warn_git_stash_drop_is_nonblocking() {
     let outcome = run_claude_hook("git stash drop");
     assert_eq!(
         outcome.exit_code, 0,
         "git stash drop must exit 0 via Claude\n{outcome}"
     );
     assert!(
-        !outcome.stdout.is_empty(),
-        "git stash drop must produce stdout JSON via Claude\n{outcome}"
+        outcome.stdout.is_empty(),
+        "default warn must allow without requesting Claude review\n{outcome}"
     );
-    let json = outcome.stdout_json();
-    let decision = json["hookSpecificOutput"]["permissionDecision"]
-        .as_str()
-        .unwrap_or("");
     assert!(
-        decision == "deny" || decision == "ask",
-        "git stash drop must be denied or warned (ask), got '{decision}'\n{outcome}"
+        outcome.stderr_contains("dcg WARNING"),
+        "default warn must remain human-visible\n{outcome}"
     );
 }
 
@@ -1001,6 +1291,7 @@ fn claude_allow_safe_commands_produce_no_output() {
         "git log --oneline -5",
         "git diff HEAD",
         "git checkout -b new-feature",
+        r#"git commit -m "Fix git push --force detection""#,
         "ls -la",
         "echo hello",
         "cat README.md",
@@ -1029,17 +1320,17 @@ fn claude_allow_git_clean_dry_run_not_blocked() {
 }
 
 // ---------------------------------------------------------------------------
-// P2.9.3 — Claude warn path: exit=0, stdout JSON with permissionDecision="ask"
+// P2.9.3 — Explicit review policy: native ask on capable hook clients
 // ---------------------------------------------------------------------------
 
 #[test]
-fn claude_warn_path_exits_zero_with_ask_json() {
+fn claude_ask_path_exits_zero_with_native_review_json() {
     let home = tempfile::tempdir().expect("tempdir");
     let config_dir = home.path().join(".config/dcg");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(
         config_dir.join("config.toml"),
-        b"[policy.rules]\n\"core.git:reset-hard\" = \"warn\"\n",
+        b"[policy]\ndefault_mode = \"ask\"\n",
     )
     .unwrap();
 
@@ -1055,6 +1346,7 @@ fn claude_warn_path_exits_zero_with_ask_json() {
         .env("TEMP", home.path().join("tmp"))
         .env("TMP", home.path().join("tmp"))
         .env("NO_COLOR", "1")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1073,39 +1365,39 @@ fn claude_warn_path_exits_zero_with_ask_json() {
         home_dir: home.path().to_path_buf(),
     };
 
-    assert_eq!(outcome.exit_code, 0, "Claude warn must exit 0\n{outcome}");
+    assert_eq!(outcome.exit_code, 0, "Claude ask must exit 0\n{outcome}");
     assert!(
         !outcome.stdout.is_empty(),
-        "Claude warn must produce stdout JSON (unlike Codex warn which has empty stdout)\n{outcome}"
+        "Claude ask must produce stdout JSON\n{outcome}"
     );
 
     let json = outcome.stdout_json();
     let hso = &json["hookSpecificOutput"];
     assert_eq!(
         hso["permissionDecision"], "ask",
-        "Claude warn must have permissionDecision='ask'\n{outcome}"
+        "Claude ask must have permissionDecision='ask'\n{outcome}"
     );
     assert!(
         hso["permissionDecisionReason"]
             .as_str()
             .unwrap_or("")
-            .contains("warn"),
-        "Claude warn reason must mention 'warn'\n{outcome}"
+            .contains("APPROVAL REQUIRED"),
+        "Claude ask reason must explain that approval is required\n{outcome}"
     );
 
-    // stderr should have a human-visible warning
+    // stderr should have a human-visible blocked/pending-review warning
     assert!(
         !outcome.stderr.is_empty(),
-        "Claude warn stderr must be non-empty\n{outcome}"
+        "Claude ask stderr must be non-empty\n{outcome}"
     );
     assert!(
-        outcome.stderr_contains("WARNING") || outcome.stderr_contains("warn"),
-        "stderr must contain warning text\n{outcome}"
+        outcome.stderr_contains("BLOCKED"),
+        "stderr must contain the blocked-command review context\n{outcome}"
     );
 }
 
 #[test]
-fn copilot_warn_path_exits_zero_with_minimal_ask_json() {
+fn copilot_ask_path_exits_zero_with_minimal_review_json() {
     let payload = serde_json::json!({
         "event": "pre-tool-use",
         "toolName": "bash",
@@ -1117,22 +1409,22 @@ fn copilot_warn_path_exits_zero_with_minimal_ask_json() {
 
     let outcome = run_hook_raw_with_config(
         payload.as_bytes(),
-        r#"[policy.rules]
-"core.git:reset-hard" = "warn"
+        r#"[policy]
+default_mode = "ask"
 "#,
         &[],
     );
 
-    assert_eq!(outcome.exit_code, 0, "Copilot warn must exit 0\n{outcome}");
+    assert_eq!(outcome.exit_code, 0, "Copilot ask must exit 0\n{outcome}");
     assert!(
         !outcome.stdout.is_empty(),
-        "Copilot warn must produce stdout JSON\n{outcome}"
+        "Copilot ask must produce stdout JSON\n{outcome}"
     );
 
     let json = outcome.stdout_json();
     assert_eq!(
         json["permissionDecision"], "ask",
-        "Copilot warn must have permissionDecision='ask'\n{outcome}"
+        "Copilot ask must have permissionDecision='ask'\n{outcome}"
     );
     assert_eq!(json.as_object().map(serde_json::Map::len), Some(2));
     assert!(
@@ -1143,9 +1435,42 @@ fn copilot_warn_path_exits_zero_with_minimal_ask_json() {
         json["permissionDecisionReason"]
             .as_str()
             .unwrap_or("")
-            .contains("warn"),
-        "Copilot warn reason must mention 'warn'\n{outcome}"
+            .contains("APPROVAL REQUIRED"),
+        "Copilot ask reason must explain that approval is required\n{outcome}"
     );
+}
+
+#[test]
+fn warn_policy_remains_non_blocking_on_review_capable_clients() {
+    let claude = run_hook_raw_with_config(
+        build_claude_payload("git reset --hard HEAD~1").as_bytes(),
+        "[policy.rules]\n\"core.git:reset-hard\" = \"warn\"\n",
+        &[],
+    );
+    assert_eq!(claude.exit_code, 0, "Claude warn must exit 0\n{claude}");
+    assert!(
+        claude.stdout.is_empty(),
+        "Claude warn must not be confused with ask\n{claude}"
+    );
+    assert!(!claude.stderr.is_empty(), "Claude warn must be visible");
+
+    let copilot_payload = serde_json::json!({
+        "event": "pre-tool-use",
+        "toolName": "bash",
+        "toolArgs": {"command": "git reset --hard HEAD~1"},
+    })
+    .to_string();
+    let copilot = run_hook_raw_with_config(
+        copilot_payload.as_bytes(),
+        "[policy.rules]\n\"core.git:reset-hard\" = \"warn\"\n",
+        &[],
+    );
+    assert_eq!(copilot.exit_code, 0, "Copilot warn must exit 0\n{copilot}");
+    assert!(
+        copilot.stdout.is_empty(),
+        "Copilot warn must not be confused with ask\n{copilot}"
+    );
+    assert!(!copilot.stderr.is_empty(), "Copilot warn must be visible");
 }
 
 // ---------------------------------------------------------------------------
@@ -1219,6 +1544,7 @@ fn claude_deny_writes_history_entry() {
         .env("TEMP", home.path().join("tmp"))
         .env("TMP", home.path().join("tmp"))
         .env("NO_COLOR", "1")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .env("DCG_HISTORY_DB", &db_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1270,7 +1596,8 @@ fn claude_allow_once_round_trip() {
     let home_path = home.path().to_path_buf();
     let system_path = std::env::var("PATH").unwrap_or_default();
 
-    let deny_payload = build_claude_payload("git reset --hard HEAD~1");
+    let deny_payload =
+        with_payload_cwd(&build_claude_payload("git reset --hard HEAD~1"), &home_path);
     let mut cmd = Command::new(dcg_binary());
     cmd.env_clear()
         .env("PATH", &system_path)
@@ -1280,6 +1607,7 @@ fn claude_allow_once_round_trip() {
         .env("TEMP", home_path.join("tmp"))
         .env("TMP", home_path.join("tmp"))
         .env("NO_COLOR", "1")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1336,7 +1664,8 @@ fn claude_allow_once_round_trip() {
     );
 
     // Step 3: Retry the same command — should now be allowed
-    let retry_payload = build_claude_payload("git reset --hard HEAD~1");
+    let retry_payload =
+        with_payload_cwd(&build_claude_payload("git reset --hard HEAD~1"), &home_path);
     let mut cmd = Command::new(dcg_binary());
     cmd.env_clear()
         .env("PATH", &system_path)
@@ -1346,6 +1675,7 @@ fn claude_allow_once_round_trip() {
         .env("TEMP", home_path.join("tmp"))
         .env("TMP", home_path.join("tmp"))
         .env("NO_COLOR", "1")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1437,8 +1767,8 @@ fn cross_protocol_allow_structural_parity() {
     // Both exit 0 with empty stdout
     assert_eq!(codex.exit_code, 0);
     assert_eq!(claude.exit_code, 0);
-    assert!(codex.stdout.is_empty());
-    assert!(claude.stdout.is_empty());
+    assert_eq!(codex.stdout, [] as [u8; 0]);
+    assert_eq!(claude.stdout, [] as [u8; 0]);
 }
 
 // ===========================================================================
@@ -1592,7 +1922,8 @@ fn failopen_empty_stdin() {
 
 #[test]
 fn failopen_truncated_json() {
-    let payload = br#"{ "tool_name": "Bash", "tool_input": { "command": "git reset --ha"#;
+    // Truncated JSON whose visible command is benign still fails open.
+    let payload = br#"{ "tool_name": "Bash", "tool_input": { "command": "echo hel"#;
     let outcome = run_hook_raw(payload, &[]);
     assert_eq!(
         outcome.exit_code, 0,
@@ -1601,6 +1932,20 @@ fn failopen_truncated_json() {
     assert!(
         outcome.stdout.is_empty(),
         "no stdout on fail-open\n{outcome}"
+    );
+}
+
+/// An unparseable payload gets the same best-effort scan as an oversized one,
+/// so a destructive command visible in it is judged rather than allowed blind.
+/// `--ha` is Git's unambiguous abbreviation of `--hard`.
+#[test]
+fn truncated_json_with_a_visible_destructive_command_is_denied() {
+    let payload = br#"{ "tool_name": "Bash", "tool_input": { "command": "git reset --ha"#;
+    let outcome = run_hook_raw(payload, &[]);
+    assert_eq!(outcome.exit_code, 0, "{outcome}");
+    assert!(
+        String::from_utf8_lossy(&outcome.stdout).contains("\"deny\""),
+        "the visible destructive command must be denied\n{outcome}"
     );
 }
 
@@ -1634,22 +1979,69 @@ fn failopen_oversize_stdin() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn failopen_oversize_command() {
+fn oversize_command_is_explicitly_indeterminate() {
     // Default command limit is 64 KiB. Send a 70 KiB command inside a small payload.
     let big_cmd = "echo ".to_string() + &"A".repeat(70 * 1024);
     let payload = build_claude_payload(&big_cmd);
     let outcome = run_hook_raw(payload.as_bytes(), &[]);
     assert_eq!(
         outcome.exit_code, 0,
-        "oversize command must fail-open\n{outcome}"
+        "oversize command must return a normal hook response\n{outcome}"
     );
     assert!(
-        outcome.stdout.is_empty(),
-        "no stdout on fail-open\n{outcome}"
+        !outcome.stdout.is_empty(),
+        "oversize command must never become an empty-stdout allow\n{outcome}"
+    );
+    let json = outcome.stdout_json();
+    assert_eq!(
+        json["hookSpecificOutput"]["permissionDecision"], "ask",
+        "Claude should request operator review for an unevaluated command\n{outcome}"
     );
     assert!(
         outcome.stderr_contains("exceeds limit"),
         "stderr must mention 'exceeds limit' for oversize command\n{outcome}"
+    );
+}
+
+#[test]
+fn raised_outer_limit_cannot_bypass_snowflake_inner_analysis_budget() {
+    // The hook's outer command limit is configurable. Keep the input below that
+    // reviewed limit while exceeding the Snowflake CLI parser's independent
+    // 64 KiB analysis budget. This must fail closed through the real config,
+    // protocol, and subprocess path rather than becoming a silent allow.
+    let mut command = String::from("snow sql -q 'SELECT 1' # ");
+    command.push_str(&"x".repeat(70 * 1024));
+    let payload = build_claude_payload(&command);
+    let outcome = run_hook_raw_with_config(
+        payload.as_bytes(),
+        r#"
+[general]
+max_command_bytes = 131072
+
+[packs]
+enabled = ["database.snowflake"]
+"#,
+        &[],
+    );
+
+    assert_eq!(
+        outcome.exit_code, 0,
+        "bounded-analysis denial must use the normal hook response path\n{outcome}"
+    );
+    assert!(
+        !outcome.stdout.is_empty(),
+        "an over-budget Snowflake command must never become an empty-stdout allow\n{outcome}"
+    );
+    let json = outcome.stdout_json();
+    assert_eq!(
+        json["hookSpecificOutput"]["permissionDecision"], "deny",
+        "the enabled Snowflake pack must fail closed above its inner parser budget\n{outcome}"
+    );
+    assert!(
+        json["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("bounded Snowflake CLI analysis budget")),
+        "the denial must identify the bounded-analysis failure\n{outcome}"
     );
 }
 
@@ -1750,8 +2142,8 @@ fn failopen_same_behavior_both_protocols() {
         claude_outcome.exit_code, 0,
         "Claude-style missing command must fail-open\n{claude_outcome}"
     );
-    assert!(codex_outcome.stdout.is_empty());
-    assert!(claude_outcome.stdout.is_empty());
+    assert_eq!(codex_outcome.stdout, [] as [u8; 0]);
+    assert_eq!(claude_outcome.stdout, [] as [u8; 0]);
 }
 
 // ===========================================================================
@@ -1881,15 +2273,41 @@ fn disable_core_filesystem_still_blocks_git_claude() {
 // ===========================================================================
 // P2.11 — Allow-once round-trip under Codex
 //
-// Under Codex, the model-visible stderr denial must not expose allow-once
-// tokens. The pending store still records the generated code so a human or
-// harness can redeem it explicitly, then retry — the command must pass.
+// Codex's strict parser accepts only three hookSpecificOutput fields. The
+// review identifier must therefore be usable from permissionDecisionReason,
+// without consulting the private pending store or adding JSON fields (#537).
+// The terse model-facing stderr warning continues to omit review identifiers.
+// The user redeems it explicitly; only the exact command may then pass once.
 // ===========================================================================
 
-/// Extract the allow-once short_code from the pending_exceptions.jsonl
-/// in the hermetic HOME directory.
+/// Where these tests pin the pending-exception store.
+///
+/// `src/pending_exceptions.rs` prefers `$HOME/.config/dcg/` only when that
+/// directory ALREADY exists, and otherwise falls back to `dirs::config_dir()`
+/// — `~/.config` on Linux but `~/Library/Application Support` on macOS. These
+/// tests use a fresh tempdir HOME where `.config/dcg` does not pre-exist, so
+/// without pinning the store lands where the assertions do not look: the tests
+/// passed on CI (ubuntu) and failed on macOS. Pin the path explicitly rather
+/// than teaching the helper to search both locations, which would let a real
+/// misconfiguration pass unnoticed.
+fn pending_exceptions_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".config/dcg/pending_exceptions.jsonl")
+}
+
+/// Companion store for redeemed allow-once entries; same rationale.
+fn allow_once_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(".config/dcg/allow_once.jsonl")
+}
+
+/// Apply both store overrides to a spawned dcg invocation.
+fn pin_exception_stores(cmd: &mut Command, home: &std::path::Path) {
+    cmd.env("DCG_PENDING_EXCEPTIONS_PATH", pending_exceptions_path(home))
+        .env("DCG_ALLOW_ONCE_PATH", allow_once_path(home))
+        .env("DCG_SELF_HEAL_HOOK", "0");
+}
+
 fn extract_allow_once_code_from_pending_store(home: &std::path::Path) -> Option<String> {
-    let pending_path = home.join(".config/dcg/pending_exceptions.jsonl");
+    let pending_path = pending_exceptions_path(home);
     let content = std::fs::read_to_string(&pending_path).ok()?;
     for line in content.lines() {
         let line = line.trim();
@@ -1907,115 +2325,126 @@ fn extract_allow_once_code_from_pending_store(home: &std::path::Path) -> Option<
     None
 }
 
-#[test]
-fn codex_deny_creates_pending_exception_with_code() {
-    // Use a persistent HOME (not run_codex_hook, which cleans up its tempdir)
-    let home = tempfile::tempdir().expect("tempdir");
-    let home_path = home.path().to_path_buf();
-    let system_path = std::env::var("PATH").unwrap_or_default();
+/// Keep the hook and the human's CLI review in the same isolated directory.
+fn codex_review_test_command(home: &std::path::Path) -> Command {
+    let tmp = home.join("tmp");
+    std::fs::create_dir_all(&tmp).expect("create isolated temp directory");
+    let config_path = home.join("config.toml");
+    std::fs::write(&config_path, "").expect("write isolated config");
 
-    let payload = build_codex_payload("git reset --hard HEAD~1");
     let mut cmd = Command::new(dcg_binary());
     cmd.env_clear()
-        .env("PATH", &system_path)
-        .env("HOME", &home_path)
-        .env("USERPROFILE", &home_path)
-        .env("TMPDIR", home_path.join("tmp"))
-        .env("TEMP", home_path.join("tmp"))
-        .env("TMP", home_path.join("tmp"))
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env("TMPDIR", &tmp)
+        .env("TEMP", &tmp)
+        .env("TMP", &tmp)
         .env("NO_COLOR", "1")
+        .env("DCG_CONFIG", &config_path)
+        .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .env("DCG_SELF_HEAL_HOOK", "0")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
+        .env("DCG_HEREDOC_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
+        .env("DCG_AST_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
+        .current_dir(home);
+    pin_exception_stores(&mut cmd, home);
+    cmd
+}
+
+/// Feed a Codex payload to dcg; never execute its command text.
+fn run_codex_in_home(command: &str, home: &std::path::Path, hook_args: &[&str]) -> HookOutcome {
+    run_codex_tool_in_home("Bash", command, home, hook_args)
+}
+
+fn run_codex_tool_in_home(
+    tool_name: &str,
+    command: &str,
+    home: &std::path::Path,
+    hook_args: &[&str],
+) -> HookOutcome {
+    let mut payload: serde_json::Value =
+        serde_json::from_str(&build_codex_payload(command)).expect("Codex payload");
+    payload["cwd"] = serde_json::json!(home);
+    payload["tool_name"] = serde_json::json!(tool_name);
+    let payload = payload.to_string();
+
+    let mut child = codex_review_test_command(home)
+        .args(hook_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let mut child = cmd.spawn().expect("spawn");
-    {
-        let stdin = child.stdin.as_mut().unwrap();
-        stdin.write_all(payload.as_bytes()).unwrap();
-    }
-    let output = child.wait_with_output().unwrap();
-    let outcome = HookOutcome {
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn Codex hook");
+    child
+        .stdin
+        .as_mut()
+        .expect("hook stdin")
+        .write_all(payload.as_bytes())
+        .expect("write Codex payload");
+    let output = child.wait_with_output().expect("wait for Codex hook");
+    HookOutcome {
         stdout: output.stdout,
         stderr: output.stderr,
         exit_code: output.status.code().unwrap_or(-1),
         stdin_sent: payload.into_bytes(),
-        home_dir: home_path.clone(),
-    };
+        home_dir: home.to_path_buf(),
+    }
+}
 
-    assert!(outcome.is_codex_block_shape(), "block expected\n{outcome}");
-
-    let code = extract_allow_once_code_from_pending_store(&home_path);
-    assert!(
-        code.is_some(),
-        "Codex deny must create a pending exception with short_code\n{outcome}"
-    );
-    assert!(
-        code.as_ref().unwrap().len() >= 5,
-        "short_code must be >= 5 chars, got {:?}\n{outcome}",
-        code
-    );
+/// Read the supported review instruction, not dcg's private store or stderr.
+fn codex_reason_allow_once_code(outcome: &HookOutcome) -> Option<String> {
+    let json = outcome.stdout_json();
+    let reason = json["hookSpecificOutput"]["permissionDecisionReason"].as_str()?;
+    let (_, instruction) = reason.split_once("the user can approve it with: dcg allow-once ")?;
+    let code = instruction.split_whitespace().next()?;
+    (code.len() >= 5 && code.bytes().all(|byte| byte.is_ascii_digit())).then(|| code.to_string())
 }
 
 #[test]
-fn codex_allow_once_round_trip() {
+fn codex_deny_creates_pending_exception_with_code() {
     let home = tempfile::tempdir().expect("tempdir");
-    let home_path = home.path().to_path_buf();
-    let system_path = std::env::var("PATH").unwrap_or_default();
+    let outcome = run_codex_in_home("git reset --hard HEAD~1", home.path(), &[]);
 
-    // Step 1: Codex deny — creates pending exception in hermetic HOME
-    let deny_payload = build_codex_payload("git reset --hard HEAD~1");
-    let mut cmd = Command::new(dcg_binary());
-    cmd.env_clear()
-        .env("PATH", &system_path)
-        .env("HOME", &home_path)
-        .env("USERPROFILE", &home_path)
-        .env("TMPDIR", home_path.join("tmp"))
-        .env("TEMP", home_path.join("tmp"))
-        .env("TMP", home_path.join("tmp"))
-        .env("NO_COLOR", "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    assert!(outcome.is_codex_block_shape(), "block expected\n{outcome}");
 
-    let mut child = cmd.spawn().expect("spawn deny");
-    {
-        let stdin = child.stdin.as_mut().unwrap();
-        stdin.write_all(deny_payload.as_bytes()).unwrap();
-    }
-    let output = child.wait_with_output().unwrap();
-    let deny_outcome = HookOutcome {
-        stdout: output.stdout,
-        stderr: output.stderr,
-        exit_code: output.status.code().unwrap_or(-1),
-        stdin_sent: deny_payload.into_bytes(),
-        home_dir: home_path.clone(),
-    };
+    let code = codex_reason_allow_once_code(&outcome)
+        .unwrap_or_else(|| panic!("Codex reason must expose the review code\n{outcome}"));
+    assert_eq!(
+        extract_allow_once_code_from_pending_store(home.path()).as_deref(),
+        Some(code.as_str()),
+        "Codex reason must expose the persisted identifier\n{outcome}"
+    );
+}
+
+fn assert_codex_allow_once_round_trip(
+    tool_name: &str,
+    command: &str,
+    changed_commands: &[&str],
+    hook_args: &[&str],
+    redeem_args: &[&str],
+) {
+    let home = tempfile::tempdir().expect("tempdir");
+    let deny_outcome = run_codex_tool_in_home(tool_name, command, home.path(), hook_args);
 
     assert!(
         deny_outcome.is_codex_block_shape(),
         "initial Codex deny expected\n{deny_outcome}"
     );
+    let allow_code = codex_reason_allow_once_code(&deny_outcome)
+        .unwrap_or_else(|| panic!("Codex reason must expose the review code\n{deny_outcome}"));
+    assert_eq!(
+        extract_allow_once_code_from_pending_store(home.path()).as_deref(),
+        Some(allow_code.as_str()),
+        "surfaced identifier must refer to the persisted exact-command denial\n{deny_outcome}"
+    );
 
-    // Extract the allow-once code from the pending store
-    let allow_code = extract_allow_once_code_from_pending_store(&home_path)
-        .unwrap_or_else(|| panic!("pending store must contain short_code\n{deny_outcome}"));
-
-    // Step 2: Redeem the allow-once code
-    let redeem_output = Command::new(dcg_binary())
-        .arg("allow-once")
-        .arg(&allow_code)
-        .arg("--yes")
-        .env_clear()
-        .env("PATH", &system_path)
-        .env("HOME", &home_path)
-        .env("USERPROFILE", &home_path)
-        .env("TMPDIR", home_path.join("tmp"))
-        .env("TEMP", home_path.join("tmp"))
-        .env("TMP", home_path.join("tmp"))
-        .env("NO_COLOR", "1")
+    // --yes stands in for the user's interactive confirmation in this test.
+    let redeem_output = codex_review_test_command(home.path())
+        .args(["allow-once", &allow_code, "--yes"])
+        .args(redeem_args)
         .output()
         .expect("failed to run allow-once redeem");
-
     assert!(
         redeem_output.status.success(),
         "allow-once redeem must succeed (exit 0), got exit {}\nstdout: {}\nstderr: {}",
@@ -2024,38 +2453,180 @@ fn codex_allow_once_round_trip() {
         String::from_utf8_lossy(&redeem_output.stderr),
     );
 
-    // Step 3: Retry under Codex — must now be allowed (exit 0)
-    let retry_payload = build_codex_payload("git reset --hard HEAD~1");
-    let mut cmd = Command::new(dcg_binary());
-    cmd.env_clear()
-        .env("PATH", &system_path)
-        .env("HOME", &home_path)
-        .env("USERPROFILE", &home_path)
-        .env("TMPDIR", home_path.join("tmp"))
-        .env("TEMP", home_path.join("tmp"))
-        .env("TMP", home_path.join("tmp"))
-        .env("NO_COLOR", "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let mut child = cmd.spawn().expect("spawn retry");
+    // Altered targets and wrappers, even ones containing the original command,
+    // must not borrow or consume its grant. Trailing whitespace also differs
+    // in raw bytes despite being semantically equivalent.
+    let whitespace_variant = format!("{command} ");
+    for changed in changed_commands
+        .iter()
+        .copied()
+        .chain(std::iter::once(whitespace_variant.as_str()))
     {
-        let stdin = child.stdin.as_mut().unwrap();
-        stdin.write_all(retry_payload.as_bytes()).unwrap();
+        let outcome = run_codex_tool_in_home(tool_name, changed, home.path(), hook_args);
+        assert!(
+            outcome.is_codex_block_shape(),
+            "an altered command must remain denied after redemption\n{outcome}"
+        );
     }
-    let output = child.wait_with_output().unwrap();
-    let retry_outcome = HookOutcome {
-        stdout: output.stdout,
-        stderr: output.stderr,
-        exit_code: output.status.code().unwrap_or(-1),
-        stdin_sent: retry_payload.into_bytes(),
-        home_dir: home_path.clone(),
-    };
 
+    let retry_outcome = run_codex_tool_in_home(tool_name, command, home.path(), hook_args);
     assert!(
         retry_outcome.is_allow_shape(),
-        "after allow-once redeem, Codex retry must be allowed (exit 0)\n{retry_outcome}"
+        "after redemption, the exact Codex command must be allowed once\n{retry_outcome}"
+    );
+
+    let consumed_outcome = run_codex_tool_in_home(tool_name, command, home.path(), hook_args);
+    assert!(
+        consumed_outcome.is_codex_block_shape(),
+        "the exact command must be denied again after consuming its single use\n{consumed_outcome}"
+    );
+}
+
+#[test]
+fn codex_allow_once_round_trip() {
+    assert_codex_allow_once_round_trip(
+        "Bash",
+        "git reset --hard HEAD~1",
+        &[
+            "git reset --hard HEAD~2",
+            "bash -c 'git reset --hard HEAD~1'",
+            "echo \"$(git reset --hard HEAD~1)\"",
+        ],
+        &[],
+        &["--single-use"],
+    );
+}
+
+#[test]
+fn codex_allow_once_powershell_wrapped_round_trip() {
+    // Windows Codex command text is data: the test needs no PowerShell
+    // executable and never runs either destructive operation.
+    assert_codex_allow_once_round_trip(
+        "Bash",
+        r#""C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe" -Command 'git reset --hard HEAD~1'"#,
+        &[
+            r#""C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe" -Command 'git reset --hard HEAD~2'"#,
+            "git reset --hard HEAD~1",
+        ],
+        &["hook"],
+        // The documented command is also single-use when the flag is omitted.
+        &[],
+    );
+}
+
+#[test]
+fn codex_allow_once_unknown_dialect_round_trip() {
+    // launch-process leaves the dialect Unknown on every host, while turn_id
+    // still identifies Codex. The PowerShell replay sees the executable sink;
+    // it must not lose a grant consumed by the primary dialect's evaluation.
+    assert_codex_allow_once_round_trip(
+        "launch-process",
+        "'git reset --hard HEAD~1' | iex",
+        &["'git reset --hard HEAD~2' | iex"],
+        &[],
+        &["--single-use"],
+    );
+}
+
+#[test]
+fn codex_allow_once_preserves_raw_diagnostic_prefix() {
+    // Diagnostic text is masked during rule matching. The grant still binds
+    // to the entire raw input, including the inert diagnostic arguments.
+    assert_codex_allow_once_round_trip(
+        "Bash",
+        "dcg test 'git reset --hard HEAD~2' && git reset --hard HEAD~1",
+        &[
+            "dcg test 'git reset --hard HEAD~3' && git reset --hard HEAD~1",
+            "git reset --hard HEAD~1",
+        ],
+        &[],
+        &["--single-use"],
+    );
+}
+
+#[test]
+fn codex_allow_once_tar_helper_binds_to_the_complete_invocation() {
+    assert_codex_allow_once_round_trip(
+        "Bash",
+        "tar -cf backup.tar --checkpoint-action='exec=git reset --hard HEAD~1' payload",
+        &[
+            "git reset --hard HEAD~1",
+            "tar -cf other.tar --checkpoint-action='exec=git reset --hard HEAD~1' payload",
+            "tar -cf backup.tar --checkpoint-action='exec=git reset --hard HEAD~2' payload",
+        ],
+        &[],
+        &["--single-use"],
+    );
+}
+
+#[test]
+fn codex_allow_once_unverified_tar_helper_round_trip() {
+    assert_codex_allow_once_round_trip(
+        "Bash",
+        r#"tar -xf archive.tar --to-command="$HELPER""#,
+        &[
+            r#"tar -xf other.tar --to-command="$HELPER""#,
+            r#"tar -xf archive.tar --to-command="$OTHER_HELPER""#,
+        ],
+        &[],
+        &["--single-use"],
+    );
+}
+
+fn assert_codex_denial_without_review_code(outcome: &HookOutcome) {
+    assert!(
+        outcome.is_codex_block_shape(),
+        "failure to issue a review code must preserve the minimal Codex denial\n{outcome}"
+    );
+    let json = outcome.stdout_json();
+    let reason = json["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .expect("denial reason");
+    assert!(
+        !reason.contains("dcg allow-once"),
+        "a code-less denial must not advertise a redeemable instruction\n{outcome}"
+    );
+}
+
+#[test]
+fn codex_contended_pending_store_denies_without_review_code() {
+    let home = make_hermetic_home();
+    let pending = pending_exceptions_path(home.path());
+    std::fs::create_dir_all(pending.parent().unwrap()).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&pending)
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&lock).unwrap();
+    let outcome = run_codex_in_home("git reset --hard HEAD~1", home.path(), &[]);
+    fs2::FileExt::unlock(&lock).unwrap();
+    assert!(
+        outcome.is_codex_block_shape(),
+        "fallback must deny\n{outcome}"
+    );
+    assert!(
+        !outcome.stdout_str().contains("dcg allow-once"),
+        "failed persistence must not advertise redemption\n{outcome}"
+    );
+    assert!(std::fs::read_to_string(pending).unwrap().trim().is_empty());
+}
+
+#[test]
+fn codex_pending_store_error_preserves_codeless_denial() {
+    let home = tempfile::tempdir().expect("tempdir");
+    // A directory at the store's file path fails even with elevated test
+    // privileges, unlike a platform-dependent read-only permissions fixture.
+    std::fs::create_dir_all(pending_exceptions_path(home.path()))
+        .expect("create unusable store path");
+
+    let outcome = run_codex_in_home("git reset --hard HEAD~1", home.path(), &["hook"]);
+    assert_codex_denial_without_review_code(&outcome);
+    assert!(
+        outcome.stderr_contains("could not record an allow-once code"),
+        "store failure must leave a diagnostic while the command stays blocked\n{outcome}"
     );
 }
 
@@ -2092,6 +2663,7 @@ fn run_with_user_allowlist(allowlist_toml: &str, command: &str, use_codex: bool)
         .env("TMP", home.path().join("tmp"))
         .env("NO_COLOR", "1")
         .env("DCG_ALLOWLIST_SYSTEM_PATH", "")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -2251,6 +2823,7 @@ fn codex_deny_writes_history_entry_on_normal_exit() {
         .env("TEMP", home.path().join("tmp"))
         .env("TMP", home.path().join("tmp"))
         .env("NO_COLOR", "1")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .env("DCG_HISTORY_DB", &db_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2276,7 +2849,7 @@ fn codex_deny_writes_history_entry_on_normal_exit() {
     );
 
     // Normal return runs Drop-based history flushing, so the DB exists with data.
-    // fsqlite/sqlite page size is 4096; a newly-created DB with schema + one row
+    // SQLite's page size is 4096; a newly-created DB with schema + one row
     // may be exactly 4096 bytes (one page).
     assert!(
         db_path.exists(),
@@ -2313,6 +2886,7 @@ fn codex_deny_with_history_disabled_still_emits_json() {
         .env("TEMP", home.path().join("tmp"))
         .env("TMP", home.path().join("tmp"))
         .env("NO_COLOR", "1")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -2331,8 +2905,7 @@ fn codex_deny_with_history_disabled_still_emits_json() {
     );
     assert!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout)
-            .ok()
-            .is_some_and(|json| json["hookSpecificOutput"]["permissionDecision"] == "deny"),
+            .is_ok_and(|json| json["hookSpecificOutput"]["permissionDecision"] == "deny"),
         "Codex deny must produce minimal JSON with history disabled"
     );
     assert!(
@@ -2340,12 +2913,18 @@ fn codex_deny_with_history_disabled_still_emits_json() {
         "Codex deny must still produce stderr with history disabled"
     );
 
-    // No history DB should be created
-    let default_db = home.path().join(".config/dcg/history.db");
-    assert!(
-        !default_db.exists(),
-        "no history DB should be created when history is disabled"
-    );
+    // No history DB should be created, neither at the current default
+    // state-directory location nor at the pre-0.15 config-directory one.
+    for default_db in [
+        home.path().join(".local/state/dcg/history.db"),
+        home.path().join(".config/dcg/history.db"),
+    ] {
+        assert!(
+            !default_db.exists(),
+            "no history DB should be created when history is disabled: {}",
+            default_db.display()
+        );
+    }
 }
 
 #[test]
@@ -2383,6 +2962,7 @@ fn codex_rapid_fire_denies_all_persist_to_history() {
             .env("TEMP", home.path().join("tmp"))
             .env("TMP", home.path().join("tmp"))
             .env("NO_COLOR", "1")
+            .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
             .env("DCG_HISTORY_DB", &db_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -2402,8 +2982,7 @@ fn codex_rapid_fire_denies_all_persist_to_history() {
         );
         assert!(
             serde_json::from_slice::<serde_json::Value>(&output.stdout)
-                .ok()
-                .is_some_and(|json| { json["hookSpecificOutput"]["permissionDecision"] == "deny" }),
+                .is_ok_and(|json| { json["hookSpecificOutput"]["permissionDecision"] == "deny" }),
             "Codex deny must emit minimal JSON for '{cmd}'"
         );
     }
@@ -2461,6 +3040,7 @@ fn codex_deny_history_write_protected_dir_no_panic() {
         .env("TEMP", home.path().join("tmp"))
         .env("TMP", home.path().join("tmp"))
         .env("NO_COLOR", "1")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
         .env("DCG_HISTORY_DB", &db_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2481,8 +3061,7 @@ fn codex_deny_history_write_protected_dir_no_panic() {
     );
     assert!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout)
-            .ok()
-            .is_some_and(|json| json["hookSpecificOutput"]["permissionDecision"] == "deny"),
+            .is_ok_and(|json| json["hookSpecificOutput"]["permissionDecision"] == "deny"),
         "Codex deny JSON must survive history DB failure"
     );
     assert!(
@@ -2622,31 +3201,86 @@ fn sequential_vs_parallel_codex_denies_exit_normally() {
 // P2.14.3 — Real HOME not touched by hermetic tests
 // ---------------------------------------------------------------------------
 
+/// Redirecting the home directory must relocate every file dcg writes.
+///
+/// Asserted positively — the writes land inside the redirected home — because
+/// the earlier form (real-home mtime unchanged) returned early wherever `HOME`
+/// is unset, i.e. on every Windows host, which is the one platform where the
+/// redirection did not work: dcg resolved the profile through the known-folder
+/// API and ignored `USERPROFILE`, so a sandboxed run rewrote the operator's real
+/// `~\.claude\settings.json` and minted allow-once grants in the real store
+/// (bd-b2b1). Only `HOME`/`USERPROFILE` are set, no `APPDATA`: the profile
+/// variable alone has to be enough, as `HOME` is on POSIX.
 #[test]
-fn hermetic_tests_do_not_touch_real_home() {
-    let real_home = match std::env::var("HOME") {
-        Ok(h) => PathBuf::from(h),
-        Err(_) => return, // skip if no real HOME
-    };
-    let real_pending = real_home.join(".config/dcg/pending");
+fn redirected_home_receives_every_hook_write() {
+    let home = make_hermetic_home();
+    let claude_dir = home.path().join(".claude");
+    std::fs::create_dir_all(&claude_dir).unwrap();
+    let settings = claude_dir.join("settings.json");
+    std::fs::write(&settings, "{}").unwrap();
 
-    // Record mtime before (if dir exists)
-    let mtime_before = std::fs::metadata(&real_pending)
-        .ok()
-        .and_then(|m| m.modified().ok());
+    let mut cmd = Command::new(dcg_binary());
+    cmd.env_clear()
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("NO_COLOR", "1")
+        .env("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("failed to spawn dcg process");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(
+            with_payload_cwd(
+                &build_claude_payload("git reset --hard HEAD~1"),
+                home.path(),
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("\"permissionDecision\":\"deny\""),
+        "expected a deny; stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-    // Run a deny that writes to pending store
-    let outcome = run_codex_hook("git reset --hard HEAD~1");
-    assert!(outcome.is_codex_block_shape());
-    assert_ne!(outcome.home_dir, real_home);
+    // Self-heal repaired the settings file in the redirected profile.
+    let healed = std::fs::read_to_string(&settings).unwrap();
+    assert!(
+        healed.contains("PreToolUse") && healed.contains("dcg"),
+        "self-heal must write the redirected profile's settings.json, got: {healed}"
+    );
 
-    // Verify mtime unchanged
-    let mtime_after = std::fs::metadata(&real_pending)
-        .ok()
-        .and_then(|m| m.modified().ok());
-    assert_eq!(
-        mtime_before, mtime_after,
-        "real HOME pending dir mtime must not change during hermetic test"
+    // The deny's pending record was written somewhere under the redirected home.
+    let mut stack = vec![home.path().to_path_buf()];
+    let mut pending = None;
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path
+                .file_name()
+                .is_some_and(|n| n == "pending_exceptions.jsonl")
+            {
+                pending = Some(path);
+            }
+        }
+    }
+    let pending =
+        pending.expect("pending_exceptions.jsonl must be written under the redirected home");
+    assert!(
+        std::fs::read_to_string(&pending)
+            .unwrap()
+            .contains("git reset --hard HEAD~1"),
+        "pending record at {} must hold the denied command",
+        pending.display()
     );
 }
 
@@ -2748,8 +3382,8 @@ fn run_codex_heredoc(command: &str) -> HookOutcome {
     run_hook_raw(
         payload.as_bytes(),
         &[
-            ("DCG_HEREDOC_TIMEOUT_MS", "5000"),
-            ("DCG_HOOK_TIMEOUT_MS", "5000"),
+            ("DCG_HEREDOC_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS),
+            ("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS),
         ],
     )
 }
@@ -2760,15 +3394,18 @@ fn run_claude_heredoc(command: &str) -> HookOutcome {
     run_hook_raw(
         payload.as_bytes(),
         &[
-            ("DCG_HEREDOC_TIMEOUT_MS", "5000"),
-            ("DCG_HOOK_TIMEOUT_MS", "5000"),
+            ("DCG_HEREDOC_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS),
+            ("DCG_HOOK_TIMEOUT_MS", SEMANTIC_TEST_TIMEOUT_MS),
         ],
     )
 }
 
 #[test]
 fn heredoc_python_shutil_rmtree_codex_deny() {
-    let cmd = r#"python3 -c "import shutil; shutil.rmtree('/tmp/data')""#;
+    // Non-temp target: #455 gave the recursive-delete rule the same temp
+    // carve-out `rm -rf /tmp/data` has always had, and these tests are about
+    // the hook protocol shape rather than which paths the rule covers.
+    let cmd = r#"python3 -c "import shutil; shutil.rmtree('/home/example/project')""#;
     let o = run_codex_hook(cmd);
     assert!(
         o.is_codex_block_shape(),
@@ -2786,7 +3423,10 @@ fn heredoc_python_shutil_rmtree_codex_deny() {
 
 #[test]
 fn heredoc_python_shutil_rmtree_claude_deny() {
-    let cmd = r#"python3 -c "import shutil; shutil.rmtree('/tmp/data')""#;
+    // Non-temp target: #455 gave the recursive-delete rule the same temp
+    // carve-out `rm -rf /tmp/data` has always had, and these tests are about
+    // the hook protocol shape rather than which paths the rule covers.
+    let cmd = r#"python3 -c "import shutil; shutil.rmtree('/home/example/project')""#;
     let o = run_claude_hook(cmd);
     assert!(
         o.is_claude_block_shape(),
@@ -2851,7 +3491,10 @@ fn heredoc_javascript_fs_rmsync_claude_deny() {
 
 #[test]
 fn heredoc_python_cross_protocol_parity() {
-    let cmd = r#"python3 -c "import shutil; shutil.rmtree('/tmp/data')""#;
+    // Non-temp target: #455 gave the recursive-delete rule the same temp
+    // carve-out `rm -rf /tmp/data` has always had, and these tests are about
+    // the hook protocol shape rather than which paths the rule covers.
+    let cmd = r#"python3 -c "import shutil; shutil.rmtree('/home/example/project')""#;
     let codex = run_codex_hook(cmd);
     let claude = run_claude_hook(cmd);
 
@@ -2914,8 +3557,8 @@ fn heredoc_node_inline_exec_codex_deny() {
         "node -e with child_process execSync should be blocked under Codex\n{o}"
     );
     assert!(
-        o.stderr_contains("heredoc."),
-        "stderr should mention a heredoc pack\n{o}"
+        o.stderr_contains("heredoc.") || o.stderr_contains("core.filesystem"),
+        "stderr should identify either the inline-script detector or the authoritative filesystem rule\n{o}"
     );
 }
 

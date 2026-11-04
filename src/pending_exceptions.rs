@@ -3,7 +3,7 @@
 //! This module provides a small JSONL-backed record store that is:
 //! - Append-friendly for concurrent hooks
 //! - Deterministic in serialization
-//! - Fail-open on parse errors (corrupt lines are skipped)
+//! - Fail-closed for invalid grants (corrupt or out-of-policy lines are skipped)
 
 use chrono::{DateTime, Duration, Utc};
 use fs2::FileExt;
@@ -17,7 +17,9 @@ use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::config::resolve_config_path_value;
-use crate::logging::{RedactionConfig, redact_command};
+use crate::logging::{
+    RedactionConfig, RedactionMode, redact_command, redact_metadata, redact_reason,
+};
 
 /// Environment override for pending exceptions file path.
 pub const ENV_PENDING_EXCEPTIONS_PATH: &str = "DCG_PENDING_EXCEPTIONS_PATH";
@@ -71,7 +73,6 @@ pub struct AllowOnceEntry {
     pub command_raw: String,
     pub command_redacted: String,
     pub reason: String,
-    #[serde(default)]
     pub single_use: bool,
     pub consumed_at: Option<String>,
     #[serde(default)]
@@ -116,11 +117,59 @@ impl AllowOnceEntry {
 
     #[must_use]
     pub fn matches_scope(&self, cwd: &Path) -> bool {
-        let scope_path = Path::new(&self.scope_path);
+        let (Some(scope_path), Some(cwd)) = (self.valid_scope_path(), canonical_directory(cwd))
+        else {
+            return false;
+        };
         match self.scope_kind {
             AllowOnceScopeKind::Cwd => cwd == scope_path,
-            AllowOnceScopeKind::Project => cwd.starts_with(scope_path),
+            // Comparing nearest repository roots also excludes nested repos
+            // and submodules. A lexical prefix alone includes `..` and
+            // symlink escapes, and accepts a forged scope of `/` (#610).
+            AllowOnceScopeKind::Project => {
+                cwd.starts_with(&scope_path)
+                    && crate::config::find_repo_root(&cwd, crate::config::REPO_ROOT_SEARCH_MAX_HOPS)
+                        .as_ref()
+                        == Some(&scope_path)
+            }
         }
+    }
+
+    fn valid_scope_path(&self) -> Option<PathBuf> {
+        let scope = canonical_directory(Path::new(&self.scope_path))?;
+        if self.scope_kind == AllowOnceScopeKind::Project
+            && (scope.parent().is_none() || !is_project_root(&scope))
+        {
+            return None;
+        }
+        Some(scope)
+    }
+}
+
+fn canonical_directory(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() || !path.is_dir() {
+        return None;
+    }
+    path.canonicalize().ok()
+}
+
+fn is_project_root(path: &Path) -> bool {
+    // Git worktrees and submodules use a .git file instead of a directory.
+    let marker = path.join(".git");
+    marker.is_dir() || marker.is_file()
+}
+
+/// Derive the scope from the blocked command's directory, never the directory
+/// where an approval happens to be redeemed. Unresolvable directories cannot
+/// safely authorize a command.
+pub(crate) fn resolve_allow_once_scope(cwd: &Path) -> Option<(AllowOnceScopeKind, PathBuf)> {
+    let cwd = canonical_directory(cwd)?;
+    match crate::config::find_repo_root(&cwd, crate::config::REPO_ROOT_SEARCH_MAX_HOPS) {
+        Some(root) if root.parent().is_some() && is_project_root(&root) => {
+            Some((AllowOnceScopeKind::Project, root))
+        }
+        Some(_) => None,
+        None => Some((AllowOnceScopeKind::Cwd, cwd)),
     }
 }
 
@@ -163,18 +212,89 @@ impl PendingExceptionRecord {
     }
 }
 
+/// Persistence budget for the hook deny path (issue #291).
+///
+/// Recording a block used to acquire the store's exclusive lock with an
+/// unbounded blocking wait BEFORE the protocol denial was emitted, so a
+/// contended or wedged store could delay the denial past the agent's hook
+/// window (cf. #183). Callers on the deny path pass this budget instead:
+/// lock acquisition is bounded by `lock_wait`, and store maintenance
+/// (prune rewrites / archive rotation) is skipped when `allow_maintenance`
+/// is false because the evaluation deadline is nearly exhausted.
+#[derive(Debug, Clone, Copy)]
+pub struct PersistBudget {
+    /// Maximum time to wait for the exclusive store lock.
+    pub lock_wait: std::time::Duration,
+    /// Whether prune/rotate rewrites may run this invocation.
+    ///
+    /// This is the caller's estimate taken BEFORE the (up to `lock_wait`)
+    /// lock acquisition. Supply `maintenance_recheck` so the decision is
+    /// re-derived from the live deadline once the lock is actually held —
+    /// otherwise a budget measured before a 150ms wait can authorize a
+    /// full-store rewrite with nothing left to pay for it.
+    pub allow_maintenance: bool,
+    /// Re-evaluation of `allow_maintenance` against the caller's deadline,
+    /// applied after the store lock is acquired.
+    pub maintenance_recheck: Option<MaintenanceRecheck>,
+}
+
+/// Deadline-driven re-evaluation of [`PersistBudget::allow_maintenance`].
+///
+/// Maintenance is permitted only while the deadline still has at least
+/// `min_budget` left at the moment the store lock is held.
+#[derive(Debug, Clone, Copy)]
+pub struct MaintenanceRecheck {
+    /// The caller's evaluation deadline.
+    pub deadline: crate::perf::Deadline,
+    /// Remaining budget required for maintenance to be worth starting.
+    pub min_budget: std::time::Duration,
+}
+
+impl MaintenanceRecheck {
+    /// Whether maintenance still fits in the remaining budget.
+    #[must_use]
+    pub fn allows_maintenance(&self) -> bool {
+        self.deadline
+            .remaining()
+            .is_some_and(|remaining| remaining > self.min_budget)
+    }
+}
+
+/// Soft watermark above which store maintenance runs regardless of the
+/// caller's deadline budget.
+///
+/// Rotation/pruning only ever runs from a `record_block*` call, and the hook
+/// deny path — the only production caller — routinely arrives with too little
+/// budget to authorize it (issue #291). Left alone, a store under sustained
+/// deny pressure would never rotate, grow to `MAX_PENDING_BYTES`, and then
+/// silently stop issuing allow-once codes forever (the hard cap refuses every
+/// new entry). Above this watermark maintenance is therefore forced: paying
+/// one bounded rewrite occasionally is strictly better than losing allow-once
+/// issuance permanently.
+pub(crate) const PENDING_MAINTENANCE_WATERMARK_BYTES: u64 = MAX_PENDING_BYTES / 2;
+
 /// Maintenance stats produced while loading/pruning.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct PendingMaintenance {
     pub pruned_expired: usize,
     pub pruned_consumed: usize,
+    /// Malformed JSON or records that violate the authorization invariants.
     pub parse_errors: usize,
+    /// A read failure prevents granting from or rewriting a partial snapshot.
+    pub read_errors: usize,
 }
 
 impl PendingMaintenance {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.pruned_expired == 0 && self.pruned_consumed == 0 && self.parse_errors == 0
+        self.pruned_expired == 0
+            && self.pruned_consumed == 0
+            && self.parse_errors == 0
+            && self.read_errors == 0
+    }
+
+    const fn should_rewrite(&self) -> bool {
+        self.read_errors == 0 && !self.is_empty()
     }
 }
 
@@ -206,7 +326,7 @@ impl PendingExceptionStore {
         }
 
         // Check XDG-style path first (~/.config/dcg/), then platform-native
-        let xdg_base = dirs::home_dir().map(|h| h.join(".config"));
+        let xdg_base = crate::config::home_dir().map(|h| h.join(".config"));
         let xdg_path = xdg_base
             .as_ref()
             .map(|b| b.join("dcg").join(PENDING_EXCEPTIONS_FILE));
@@ -222,8 +342,11 @@ impl PendingExceptionStore {
         }
 
         // Fall back to platform-native
-        let base = dirs::config_dir()
-            .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".config"));
+        let base = crate::config::user_config_dir().unwrap_or_else(|| {
+            crate::config::home_dir()
+                .unwrap_or_default()
+                .join(".config")
+        });
         base.join("dcg").join(PENDING_EXCEPTIONS_FILE)
     }
 
@@ -245,28 +368,131 @@ impl PendingExceptionStore {
         source: Option<String>,
         allow_once_audit: Option<&AllowOnceAuditConfig<'_>>,
     ) -> io::Result<(PendingExceptionRecord, PendingMaintenance)> {
+        let file = open_locked(&self.path)?;
+        Self::record_block_locked(
+            file,
+            &self.path,
+            command,
+            cwd,
+            reason,
+            redaction,
+            single_use,
+            source,
+            allow_once_audit,
+            true,
+        )
+    }
+
+    /// Bounded-latency variant of [`Self::record_block`] for the hook deny
+    /// path (issue #291).
+    ///
+    /// The exclusive store lock is acquired with a bounded wait
+    /// (`budget.lock_wait`) instead of blocking indefinitely, and maintenance
+    /// rewrites are skipped when `budget.allow_maintenance` is false. Returns
+    /// `Ok(None)` when the lock stayed contended past the bound — the caller
+    /// emits its denial WITHOUT an allow-once code rather than delaying it.
+    ///
+    /// # Errors
+    ///
+    /// Returns any I/O errors encountered while opening or writing the store
+    /// file (lock contention is `Ok(None)`, not an error).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_block_bounded(
+        &self,
+        command: &str,
+        cwd: &str,
+        reason: &str,
+        redaction: &RedactionConfig,
+        single_use: bool,
+        source: Option<String>,
+        allow_once_audit: Option<&AllowOnceAuditConfig<'_>>,
+        budget: PersistBudget,
+    ) -> io::Result<Option<(PendingExceptionRecord, PendingMaintenance)>> {
+        let Some(file) = open_locked_bounded(&self.path, budget.lock_wait)? else {
+            return Ok(None);
+        };
+        // Re-derive the maintenance decision now that the lock is held: the
+        // caller's estimate was taken before a wait of up to `lock_wait`.
+        let allow_maintenance = match budget.maintenance_recheck {
+            Some(recheck) => budget.allow_maintenance && recheck.allows_maintenance(),
+            None => budget.allow_maintenance,
+        };
+        Self::record_block_locked(
+            file,
+            &self.path,
+            command,
+            cwd,
+            reason,
+            redaction,
+            single_use,
+            source,
+            allow_once_audit,
+            allow_maintenance,
+        )
+        .map(Some)
+    }
+
+    /// Shared body of [`Self::record_block`] / [`Self::record_block_bounded`]:
+    /// caller has already opened AND locked the store file.
+    #[allow(clippy::too_many_arguments)]
+    fn record_block_locked(
+        mut file: File,
+        path: &Path,
+        command: &str,
+        cwd: &str,
+        reason: &str,
+        redaction: &RedactionConfig,
+        single_use: bool,
+        source: Option<String>,
+        allow_once_audit: Option<&AllowOnceAuditConfig<'_>>,
+        allow_maintenance: bool,
+    ) -> io::Result<(PendingExceptionRecord, PendingMaintenance)> {
         let now = Utc::now();
         let record =
             PendingExceptionRecord::new(now, cwd, command, reason, redaction, single_use, source);
 
-        let mut file = open_locked(&self.path)?;
-        let (active, maintenance) = load_active_from_file(&mut file, now, allow_once_audit);
-
-        // Rotate before deciding how to write. If the active set is over the
-        // cap, archive the oldest portion to `pending.jsonl.1` and only
-        // retain the newest half in the live file. This keeps every future
-        // record_block call O(MAX_PENDING_LINES / 2) instead of unbounded.
-        let did_prune = maintenance.pruned_expired > 0 || maintenance.pruned_consumed > 0;
-        let pre_rotate_len = active.len();
-        let active_after_rotate = if active.len() > MAX_PENDING_LINES {
-            rotate_overflow(&active, &self.path)?
-        } else {
-            active
-        };
-        let did_rotate = active_after_rotate.len() != pre_rotate_len;
-        if did_prune || did_rotate {
-            rewrite_records(&mut file, &active_after_rotate)?;
+        // Maintenance (full-store scan, prune rewrite, archive rotation) runs
+        // only when the caller's deadline budget allows it. When
+        // `allow_maintenance` is false (issue #291: hook deny path with the
+        // budget nearly exhausted) the store is not even scanned — pruning is
+        // deferred to the next uncontended invocation and the append below
+        // stays O(1).
+        //
+        // Anti-starvation override: once the live file is past the soft
+        // watermark, maintenance runs regardless of budget. Deferring forever
+        // is not a valid outcome — it ends at the hard cap below, where every
+        // future allow-once code issuance fails silently.
+        let over_watermark = file.metadata()?.len() > PENDING_MAINTENANCE_WATERMARK_BYTES;
+        if over_watermark && !allow_maintenance {
+            crate::emit_stderr!(
+                "[dcg] Warning: pending-exceptions store is above the {PENDING_MAINTENANCE_WATERMARK_BYTES}-byte \
+                 maintenance watermark; running a prune/rotate pass despite the low deadline budget."
+            );
         }
+        let allow_maintenance = allow_maintenance || over_watermark;
+        let maintenance = if allow_maintenance {
+            let (active, maintenance) = load_active_from_file(&mut file, now, allow_once_audit);
+
+            // Rotate before deciding how to write. If the active set is over
+            // the cap, archive the oldest portion to `pending.jsonl.1` and
+            // only retain the newest half in the live file. This keeps every
+            // future record_block call O(MAX_PENDING_LINES / 2) instead of
+            // unbounded.
+            let did_prune = maintenance.should_rewrite();
+            let pre_rotate_len = active.len();
+            let active_after_rotate = if active.len() > MAX_PENDING_LINES {
+                rotate_overflow(&active, path)?
+            } else {
+                active
+            };
+            let did_rotate = active_after_rotate.len() != pre_rotate_len;
+            if did_prune || did_rotate {
+                rewrite_records(&mut file, &active_after_rotate)?;
+            }
+            maintenance
+        } else {
+            PendingMaintenance::default()
+        };
 
         // Final hard cap: if the live file is somehow still over the byte
         // cap (e.g. a single record is enormous), refuse the new entry
@@ -299,7 +525,7 @@ impl PendingExceptionStore {
         let mut file = open_locked(&self.path)?;
         let (active, maintenance) = load_active_from_file(&mut file, now, None);
 
-        if maintenance.pruned_expired > 0 || maintenance.pruned_consumed > 0 {
+        if maintenance.should_rewrite() {
             rewrite_records(&mut file, &active)?;
         }
 
@@ -352,7 +578,7 @@ impl PendingExceptionStore {
         active.retain(|record| record.full_hash != full_hash);
         let removed = before - active.len();
 
-        if removed > 0 || maintenance.pruned_expired > 0 || maintenance.pruned_consumed > 0 {
+        if removed > 0 || maintenance.should_rewrite() {
             rewrite_records(&mut file, &active)?;
         }
 
@@ -406,7 +632,7 @@ impl AllowOnceStore {
         }
 
         // Check XDG-style path first (~/.config/dcg/), then platform-native
-        let xdg_base = dirs::home_dir().map(|h| h.join(".config"));
+        let xdg_base = crate::config::home_dir().map(|h| h.join(".config"));
         let xdg_path = xdg_base
             .as_ref()
             .map(|b| b.join("dcg").join(ALLOW_ONCE_FILE));
@@ -422,8 +648,11 @@ impl AllowOnceStore {
         }
 
         // Fall back to platform-native
-        let base = dirs::config_dir()
-            .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".config"));
+        let base = crate::config::user_config_dir().unwrap_or_else(|| {
+            crate::config::home_dir()
+                .unwrap_or_default()
+                .join(".config")
+        });
         base.join("dcg").join(ALLOW_ONCE_FILE)
     }
 
@@ -437,10 +666,20 @@ impl AllowOnceStore {
         entry: &AllowOnceEntry,
         now: DateTime<Utc>,
     ) -> io::Result<PendingMaintenance> {
+        if entry.schema_version != SCHEMA_VERSION
+            || entry.is_consumed()
+            || !valid_lifetime(&entry.created_at, &entry.expires_at, now)
+            || entry.valid_scope_path().is_none()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid allow-once grant: expected an active lifetime of at most 24 hours and a valid directory scope",
+            ));
+        }
         let mut file = open_locked(&self.path)?;
         let (active, maintenance) = load_allow_once_from_file(&mut file, now, None);
 
-        if maintenance.pruned_expired > 0 || maintenance.pruned_consumed > 0 {
+        if maintenance.should_rewrite() {
             rewrite_allow_once_records(&mut file, &active)?;
         }
 
@@ -464,7 +703,7 @@ impl AllowOnceStore {
         let mut file = open_locked(&self.path)?;
         let (active, maintenance) = load_allow_once_from_file(&mut file, now, None);
 
-        if maintenance.pruned_expired > 0 || maintenance.pruned_consumed > 0 {
+        if maintenance.should_rewrite() {
             rewrite_allow_once_records(&mut file, &active)?;
         }
 
@@ -526,7 +765,7 @@ impl AllowOnceStore {
         active.retain(|entry| entry.source_full_hash != full_hash);
         let removed = before - active.len();
 
-        if removed > 0 || maintenance.pruned_expired > 0 || maintenance.pruned_consumed > 0 {
+        if removed > 0 || maintenance.should_rewrite() {
             rewrite_allow_once_records(&mut file, &active)?;
         }
 
@@ -547,14 +786,15 @@ impl AllowOnceStore {
         now: DateTime<Utc>,
         allow_once_audit: Option<&AllowOnceAuditConfig<'_>>,
     ) -> io::Result<Option<AllowOnceEntry>> {
-        if !self.path.exists() {
+        // With --no-policy-files no allow-once grant on disk applies.
+        if crate::config::policy_files_disabled() || !self.path.exists() {
             return Ok(None);
         }
 
         let mut file = open_locked(&self.path)?;
         let (mut active, maintenance) = load_allow_once_from_file(&mut file, now, allow_once_audit);
 
-        if maintenance.pruned_expired > 0 || maintenance.pruned_consumed > 0 {
+        if maintenance.should_rewrite() {
             rewrite_allow_once_records(&mut file, &active)?;
         }
 
@@ -597,7 +837,7 @@ impl AllowOnceStore {
         Ok(Some(selected))
     }
 
-    /// Match a command against allow-once entries, but only grant if `force_allow_config` is set.
+    /// Match a command against the first scoped allow-once entry with `force_allow_config` set.
     ///
     /// This prevents single-use entries from being consumed when a config blocklist would still
     /// deny the command (unless explicitly forced).
@@ -614,28 +854,25 @@ impl AllowOnceStore {
         now: DateTime<Utc>,
         allow_once_audit: Option<&AllowOnceAuditConfig<'_>>,
     ) -> io::Result<Option<AllowOnceEntry>> {
-        if !self.path.exists() {
+        // With --no-policy-files no allow-once grant on disk applies.
+        if crate::config::policy_files_disabled() || !self.path.exists() {
             return Ok(None);
         }
 
         let mut file = open_locked(&self.path)?;
         let (mut active, maintenance) = load_allow_once_from_file(&mut file, now, allow_once_audit);
 
-        if maintenance.pruned_expired > 0 || maintenance.pruned_consumed > 0 {
+        if maintenance.should_rewrite() {
             rewrite_allow_once_records(&mut file, &active)?;
         }
 
-        let idx = active
-            .iter()
-            .position(|entry| entry.command_raw == command && entry.matches_scope(cwd));
+        let idx = active.iter().position(|entry| {
+            entry.command_raw == command && entry.matches_scope(cwd) && entry.force_allow_config
+        });
 
         let Some(idx) = idx else {
             return Ok(None);
         };
-
-        if !active[idx].force_allow_config {
-            return Ok(None);
-        }
 
         let mut selected = active[idx].clone();
         if active[idx].single_use {
@@ -693,8 +930,11 @@ pub fn log_maintenance(
     let timestamp = format_timestamp(Utc::now());
     writeln!(
         file,
-        "[{timestamp}] [pending-exceptions] {context}: pruned_expired={}, pruned_consumed={}, parse_errors={}",
-        maintenance.pruned_expired, maintenance.pruned_consumed, maintenance.parse_errors
+        "[{timestamp}] [pending-exceptions] {context}: pruned_expired={}, pruned_consumed={}, parse_errors={}, read_errors={}",
+        maintenance.pruned_expired,
+        maintenance.pruned_consumed,
+        maintenance.parse_errors,
+        maintenance.read_errors
     )?;
     Ok(())
 }
@@ -702,11 +942,18 @@ pub fn log_maintenance(
 /// Log an allow-once management action (best-effort).
 ///
 /// This uses the same log file path expansion rules as [`log_maintenance`].
+/// Full redaction keeps known action labels but removes free-form details,
+/// including the command-derived hashes and codes recorded by revocation.
 ///
 /// # Errors
 ///
 /// Returns any I/O errors encountered while opening or appending to the log file.
-pub fn log_allow_once_action(log_file: &str, action: &str, details: &str) -> io::Result<()> {
+pub fn log_allow_once_action(
+    log_file: &str,
+    action: &str,
+    details: &str,
+    redaction: &RedactionConfig,
+) -> io::Result<()> {
     let path = expand_log_path(log_file);
 
     if let Some(parent) = path.parent() {
@@ -715,6 +962,12 @@ pub fn log_allow_once_action(log_file: &str, action: &str, details: &str) -> io:
 
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
     let timestamp = format_timestamp(Utc::now());
+    let action = if matches!(action, "clear" | "revoke") {
+        action.to_string()
+    } else {
+        redact_metadata(action, redaction)
+    };
+    let details = redact_metadata(details, redaction);
     writeln!(file, "[{timestamp}] [allow-once] {action}: {details}")?;
     Ok(())
 }
@@ -767,7 +1020,10 @@ impl AllowOnceEventKind {
 /// A structured log entry for allow-once events.
 ///
 /// This provides machine-readable, stable log entries for audit trails.
-/// All command data respects the redaction configuration.
+/// Full redaction removes free text from commands, diagnostics, and paths.
+/// Command-derived hashes and short codes are also redacted: an unkeyed digest
+/// can disclose low-entropy commands through candidate testing. Event names,
+/// timestamps, and known source/scope labels remain useful for auditing.
 #[derive(Debug, Clone, Serialize)]
 pub struct AllowOnceLogEntry {
     /// ISO 8601 timestamp of the event.
@@ -812,17 +1068,28 @@ impl AllowOnceLogEntry {
         Self {
             timestamp: format_timestamp(Utc::now()),
             event: AllowOnceEventKind::CodeIssued.label().to_string(),
-            short_code: record.short_code.clone(),
-            full_hash: record.full_hash.clone(),
-            cwd: record.cwd.clone(),
+            short_code: redact_metadata(&record.short_code, redaction),
+            full_hash: redact_metadata(&record.full_hash, redaction),
+            cwd: redact_metadata(&record.cwd, redaction),
             command: redact_for_log(&record.command_raw, redaction),
             expires_at: Some(record.expires_at.clone()),
-            reason: Some(record.reason.clone()),
+            reason: Some(redact_reason(&record.reason, redaction)),
             allowlist_layer: None,
             scope_kind: None,
             single_use: Some(record.single_use),
             force_allow_config: None,
-            source: record.source.clone(),
+            source: record.source.as_deref().map(|source| {
+                // Production sources are MatchSource enum labels. Records
+                // loaded from disk can contain arbitrary strings instead.
+                if matches!(
+                    source,
+                    "ConfigOverride" | "LegacyPattern" | "Pack" | "HeredocAst"
+                ) {
+                    source.to_string()
+                } else {
+                    redact_metadata(source, redaction)
+                }
+            }),
         }
     }
 
@@ -832,12 +1099,12 @@ impl AllowOnceLogEntry {
         Self {
             timestamp: format_timestamp(Utc::now()),
             event: AllowOnceEventKind::CodeResolved.label().to_string(),
-            short_code: entry.source_short_code.clone(),
-            full_hash: entry.source_full_hash.clone(),
-            cwd: entry.scope_path.clone(),
+            short_code: redact_metadata(&entry.source_short_code, redaction),
+            full_hash: redact_metadata(&entry.source_full_hash, redaction),
+            cwd: redact_metadata(&entry.scope_path, redaction),
             command: redact_for_log(&entry.command_raw, redaction),
             expires_at: Some(entry.expires_at.clone()),
-            reason: Some(entry.reason.clone()),
+            reason: Some(redact_reason(&entry.reason, redaction)),
             allowlist_layer: None,
             scope_kind: Some(format!("{:?}", entry.scope_kind).to_lowercase()),
             single_use: Some(entry.single_use),
@@ -857,13 +1124,17 @@ impl AllowOnceLogEntry {
         Self {
             timestamp: format_timestamp(Utc::now()),
             event: AllowOnceEventKind::AllowGranted.label().to_string(),
-            short_code: entry.source_short_code.clone(),
-            full_hash: entry.source_full_hash.clone(),
-            cwd: cwd.to_string(),
+            short_code: redact_metadata(&entry.source_short_code, redaction),
+            full_hash: redact_metadata(&entry.source_full_hash, redaction),
+            cwd: redact_metadata(cwd, redaction),
             command: redact_for_log(&entry.command_raw, redaction),
             expires_at: Some(entry.expires_at.clone()),
             reason: None,
-            allowlist_layer: Some(layer.to_string()),
+            allowlist_layer: Some(if layer == "allow_once" {
+                layer.to_string()
+            } else {
+                redact_metadata(layer, redaction)
+            }),
             scope_kind: Some(format!("{:?}", entry.scope_kind).to_lowercase()),
             single_use: Some(entry.single_use),
             force_allow_config: Some(entry.force_allow_config),
@@ -877,9 +1148,9 @@ impl AllowOnceLogEntry {
         Self {
             timestamp: format_timestamp(Utc::now()),
             event: AllowOnceEventKind::EntryConsumed.label().to_string(),
-            short_code: entry.source_short_code.clone(),
-            full_hash: entry.source_full_hash.clone(),
-            cwd: cwd.to_string(),
+            short_code: redact_metadata(&entry.source_short_code, redaction),
+            full_hash: redact_metadata(&entry.source_full_hash, redaction),
+            cwd: redact_metadata(cwd, redaction),
             command: redact_for_log(&entry.command_raw, redaction),
             expires_at: Some(entry.expires_at.clone()),
             reason: None,
@@ -904,9 +1175,9 @@ impl AllowOnceLogEntry {
         Self {
             timestamp: format_timestamp(Utc::now()),
             event: AllowOnceEventKind::EntryExpired.label().to_string(),
-            short_code: short_code.to_string(),
-            full_hash: full_hash.to_string(),
-            cwd: cwd.to_string(),
+            short_code: redact_metadata(short_code, redaction),
+            full_hash: redact_metadata(full_hash, redaction),
+            cwd: redact_metadata(cwd, redaction),
             command: redact_for_log(command, redaction),
             expires_at: Some(expires_at.to_string()),
             reason: None,
@@ -1075,7 +1346,7 @@ fn expand_log_path(log_file: &str) -> PathBuf {
     if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
         return PathBuf::from(home).join(rest);
     }
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = crate::config::home_dir() {
         return home.join(rest);
     }
     PathBuf::from(log_file)
@@ -1102,6 +1373,39 @@ fn open_locked(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// Bounded-wait variant of [`open_locked`] (issue #291): poll
+/// `try_lock_exclusive` with short sleeps instead of blocking indefinitely,
+/// so a contended or wedged store cannot stall the hook deny path. Returns
+/// `Ok(None)` when the lock stayed contended past `max_wait`.
+fn open_locked_bounded(path: &Path, max_wait: std::time::Duration) -> io::Result<Option<File>> {
+    const RETRY_SLEEP: std::time::Duration = std::time::Duration::from_millis(5);
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+
+    let started = std::time::Instant::now();
+    loop {
+        // Treat any lock failure (WouldBlock or otherwise) as contention: the
+        // caller degrades to a code-less denial rather than surfacing an
+        // error, mirroring the self-heal lock idiom in cli.rs.
+        if file.try_lock_exclusive().is_ok() {
+            return Ok(Some(file));
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= max_wait {
+            return Ok(None);
+        }
+        std::thread::sleep(RETRY_SLEEP.min(max_wait.saturating_sub(elapsed)));
+    }
+}
+
 fn load_active_from_file(
     file: &mut File,
     now: DateTime<Utc>,
@@ -1111,14 +1415,14 @@ fn load_active_from_file(
     let mut active: Vec<PendingExceptionRecord> = Vec::new();
 
     if file.seek(SeekFrom::Start(0)).is_err() {
-        maintenance.parse_errors += 1;
+        maintenance.read_errors += 1;
         return (active, maintenance);
     }
     let reader = BufReader::new(file);
 
     for line in reader.lines() {
         let Ok(line) = line else {
-            maintenance.parse_errors += 1;
+            maintenance.read_errors += 1;
             continue;
         };
         let trimmed = line.trim();
@@ -1152,9 +1456,21 @@ fn load_active_from_file(
             continue;
         }
 
+        // Pending codes are also persisted input: redeeming a future-dated or
+        // long-lived record must not mint a fresh grant (#610).
+        if record.schema_version != SCHEMA_VERSION
+            || !valid_lifetime(&record.created_at, &record.expires_at, now)
+        {
+            maintenance.parse_errors += 1;
+            continue;
+        }
+
         active.push(record);
     }
 
+    if maintenance.read_errors > 0 {
+        active.clear();
+    }
     (active, maintenance)
 }
 
@@ -1167,14 +1483,14 @@ fn load_allow_once_from_file(
     let mut active: Vec<AllowOnceEntry> = Vec::new();
 
     if file.seek(SeekFrom::Start(0)).is_err() {
-        maintenance.parse_errors += 1;
+        maintenance.read_errors += 1;
         return (active, maintenance);
     }
     let reader = BufReader::new(file);
 
     for line in reader.lines() {
         let Ok(line) = line else {
-            maintenance.parse_errors += 1;
+            maintenance.read_errors += 1;
             continue;
         };
         let trimmed = line.trim();
@@ -1208,9 +1524,22 @@ fn load_allow_once_from_file(
             continue;
         }
 
+        // Do not trust that entries were written by `dcg allow-once`. Apply
+        // the same limits at every read, including reusable and forced grants.
+        if record.schema_version != SCHEMA_VERSION
+            || !valid_lifetime(&record.created_at, &record.expires_at, now)
+            || record.valid_scope_path().is_none()
+        {
+            maintenance.parse_errors += 1;
+            continue;
+        }
+
         active.push(record);
     }
 
+    if maintenance.read_errors > 0 {
+        active.clear();
+    }
     (active, maintenance)
 }
 
@@ -1308,11 +1637,25 @@ fn append_allow_once_record(file: &mut File, record: &AllowOnceEntry) -> io::Res
 
 fn is_expired(expires_at: &str, now: DateTime<Utc>) -> bool {
     if let Ok(dt) = DateTime::parse_from_rfc3339(expires_at) {
-        return dt.with_timezone(&Utc) < now;
+        return dt.with_timezone(&Utc) <= now;
     }
     // Fail-closed: treat unparseable timestamps as expired for security.
     // This prevents entries with corrupted/invalid timestamps from persisting indefinitely.
     true
+}
+
+fn valid_lifetime(created_at: &str, expires_at: &str, now: DateTime<Utc>) -> bool {
+    let (Ok(created), Ok(expires)) = (
+        DateTime::parse_from_rfc3339(created_at),
+        DateTime::parse_from_rfc3339(expires_at),
+    ) else {
+        return false;
+    };
+    let lifetime = expires.signed_duration_since(created);
+    created <= now
+        && now < expires
+        && lifetime > Duration::zero()
+        && lifetime <= Duration::hours(EXPIRY_HOURS)
 }
 
 fn format_timestamp(timestamp: DateTime<Utc>) -> String {
@@ -1400,6 +1743,17 @@ fn redact_for_pending(command: &str, redaction: &RedactionConfig) -> String {
     if !effective.enabled {
         effective.enabled = true;
     }
+    // The pending store is persisted and later displayed by `allow-once`, so
+    // recognised secret shapes are replaced regardless of the configured mode
+    // (issue #386). `Full` already discards everything, so only the modes that
+    // keep command text need it.
+    if matches!(
+        effective.mode,
+        RedactionMode::None | RedactionMode::Arguments
+    ) {
+        let secrets_redacted = crate::redaction::redact_secrets(command);
+        return redact_command(&secrets_redacted, &effective);
+    }
     redact_command(command, &effective)
 }
 
@@ -1423,7 +1777,7 @@ mod tests {
         let home = std::env::var_os("HOME")
             .filter(|h| !h.is_empty())
             .map(PathBuf::from)
-            .or_else(dirs::home_dir);
+            .or_else(crate::config::home_dir);
 
         if let Some(home) = home {
             assert_eq!(expand_log_path("~/logs/dcg.log"), home.join("logs/dcg.log"));
@@ -1584,6 +1938,7 @@ mod tests {
     #[test]
     fn test_allow_once_consumes_single_use() {
         let dir = TempDir::new().expect("tempdir");
+        let scope = dir.path().to_str().unwrap();
         let allow_path = dir.path().join("allow_once.jsonl");
         let store = AllowOnceStore::new(allow_path);
         let now = DateTime::parse_from_rfc3339("2026-01-10T06:30:00Z")
@@ -1598,7 +1953,7 @@ mod tests {
             &pending,
             now,
             AllowOnceScopeKind::Cwd,
-            "/repo",
+            scope,
             true,
             false,
             &redaction,
@@ -1606,7 +1961,7 @@ mod tests {
 
         store.add_entry(&entry, now).unwrap();
 
-        let cwd = Path::new("/repo");
+        let cwd = dir.path();
         let first = store.match_command("git status", cwd, now, None).unwrap();
         assert!(first.is_some());
 
@@ -1615,8 +1970,90 @@ mod tests {
     }
 
     #[test]
+    fn test_forced_allow_once_skips_ordinary_and_mismatched_entries_issue_599() {
+        let dir = TempDir::new().expect("tempdir");
+        let cwd_dir = TempDir::new().expect("cwd tempdir");
+        let other_dir = TempDir::new().expect("other cwd tempdir");
+        let cwd = cwd_dir.path();
+        let scope = cwd.to_str().unwrap();
+        let store = AllowOnceStore::new(dir.path().join("allow_once.jsonl"));
+        let now = DateTime::parse_from_rfc3339("2026-01-10T06:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let command = "'/usr/bin/python3' -c 'print(1)'";
+        let redaction = redaction_config();
+        let pending =
+            PendingExceptionRecord::new(now, scope, command, "blocked", &redaction, true, None);
+        let ordinary = AllowOnceEntry::from_pending(
+            &pending,
+            now,
+            AllowOnceScopeKind::Cwd,
+            scope,
+            true,
+            false,
+            &redaction,
+        );
+        let mut forced = ordinary.clone();
+        forced.force_allow_config = true;
+        let mut wrong_command = forced.clone();
+        wrong_command.command_raw.push(' ');
+        let mut wrong_cwd = forced.clone();
+        wrong_cwd.scope_path = other_dir.path().to_str().unwrap().to_string();
+        let preserved = [ordinary.clone(), wrong_command, wrong_cwd];
+        for entry in &preserved {
+            store.add_entry(entry, now).unwrap();
+        }
+
+        assert!(
+            store
+                .match_command_force_config(command, cwd, now, None)
+                .unwrap()
+                .is_none(),
+            "ordinary, altered-command, and other-cwd entries cannot override policy"
+        );
+        assert_eq!(store.load_active(now).unwrap().0, preserved);
+
+        // A later explicit forced authorization must not be hidden by the
+        // retained ordinary entry for the same command and cwd.
+        store.add_entry(&forced, now).unwrap();
+        let selected = store
+            .match_command_force_config(command, cwd, now, None)
+            .unwrap()
+            .expect("later matching forced entry");
+        forced.consumed_at = Some(format_timestamp(now));
+        assert_eq!(selected, forced);
+        assert_eq!(store.load_active(now).unwrap().0, preserved);
+        assert!(
+            store
+                .match_command_force_config(command, cwd, now, None)
+                .unwrap()
+                .is_none(),
+            "a forced single-use entry cannot be reused"
+        );
+        assert_eq!(store.load_active(now).unwrap().0, preserved);
+
+        // Removing the policy later still leaves the ordinary authorization
+        // usable once; the failed policy attempts never consumed it.
+        let selected = store.match_command(command, cwd, now, None).unwrap();
+        let mut consumed_ordinary = ordinary;
+        consumed_ordinary.consumed_at = Some(format_timestamp(now));
+        assert_eq!(selected, Some(consumed_ordinary));
+        assert_eq!(store.load_active(now).unwrap().0, preserved[1..]);
+        assert!(
+            store
+                .match_command(command, cwd, now, None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn test_allow_once_project_scope_matches_subdir() {
         let dir = TempDir::new().expect("tempdir");
+        let scope = dir.path().to_str().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let subdir = dir.path().join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
         let allow_path = dir.path().join("allow_once.jsonl");
         let store = AllowOnceStore::new(allow_path);
         let now = DateTime::parse_from_rfc3339("2026-01-10T06:30:00Z")
@@ -1631,7 +2068,7 @@ mod tests {
             &pending,
             now,
             AllowOnceScopeKind::Project,
-            "/repo",
+            scope,
             false,
             false,
             &redaction,
@@ -1639,7 +2076,7 @@ mod tests {
 
         store.add_entry(&entry, now).unwrap();
 
-        let cwd = Path::new("/repo/subdir");
+        let cwd = subdir.as_path();
         let matched = store.match_command("git status", cwd, now, None).unwrap();
         assert!(matched.is_some());
     }
@@ -1663,6 +2100,7 @@ mod tests {
     #[test]
     fn test_allow_once_reusable_until_expiry() {
         let dir = TempDir::new().expect("tempdir");
+        let scope = dir.path().to_str().unwrap();
         let allow_path = dir.path().join("allow_once.jsonl");
         let store = AllowOnceStore::new(allow_path.clone());
         let now = DateTime::parse_from_rfc3339("2026-01-10T06:30:00Z")
@@ -1676,14 +2114,14 @@ mod tests {
             &pending,
             now,
             AllowOnceScopeKind::Cwd,
-            "/repo",
+            scope,
             false,
             false,
             &redaction,
         );
         store.add_entry(&entry, now).unwrap();
 
-        let cwd = Path::new("/repo");
+        let cwd = dir.path();
         assert!(
             store
                 .match_command("git status", cwd, now, None)
@@ -1699,11 +2137,20 @@ mod tests {
 
         let contents = std::fs::read_to_string(&allow_path).unwrap();
         assert_eq!(contents.lines().count(), 1);
+        assert!(
+            store
+                .match_command("git status", cwd, now + Duration::hours(EXPIRY_HOURS), None)
+                .unwrap()
+                .is_none(),
+            "a reusable grant expires at the boundary, not after it"
+        );
     }
 
     #[test]
     fn test_allow_once_scope_mismatch_does_not_allow() {
         let dir = TempDir::new().expect("tempdir");
+        let scope = dir.path().to_str().unwrap();
+        let other = TempDir::new().expect("other tempdir");
         let allow_path = dir.path().join("allow_once.jsonl");
         let store = AllowOnceStore::new(allow_path);
         let now = DateTime::parse_from_rfc3339("2026-01-10T06:30:00Z")
@@ -1717,14 +2164,14 @@ mod tests {
             &pending,
             now,
             AllowOnceScopeKind::Cwd,
-            "/repo",
+            scope,
             false,
             false,
             &redaction,
         );
         store.add_entry(&entry, now).unwrap();
 
-        let cwd = Path::new("/different");
+        let cwd = other.path();
         assert!(
             store
                 .match_command("git status", cwd, now, None)
@@ -1736,6 +2183,7 @@ mod tests {
     #[test]
     fn test_allow_once_load_active_prunes_expired_and_consumed() {
         let dir = TempDir::new().expect("tempdir");
+        let scope = dir.path().to_str().unwrap();
         let allow_path = dir.path().join("allow_once.jsonl");
         let store = AllowOnceStore::new(allow_path.clone());
         let now = DateTime::parse_from_rfc3339("2026-01-10T06:30:00Z")
@@ -1750,7 +2198,7 @@ mod tests {
             &pending,
             now,
             AllowOnceScopeKind::Cwd,
-            "/repo",
+            scope,
             false,
             false,
             &redaction,
@@ -1760,7 +2208,7 @@ mod tests {
             &pending,
             now,
             AllowOnceScopeKind::Cwd,
-            "/repo",
+            scope,
             false,
             false,
             &redaction,
@@ -1771,7 +2219,7 @@ mod tests {
             &pending,
             now,
             AllowOnceScopeKind::Cwd,
-            "/repo",
+            scope,
             true,
             false,
             &redaction,
@@ -1793,6 +2241,403 @@ mod tests {
 
         let rewritten = std::fs::read_to_string(&allow_path).unwrap();
         assert_eq!(rewritten.lines().count(), 1);
+    }
+
+    #[test]
+    fn stored_grants_enforce_lifetime_schema_and_scope_issue_610() {
+        let dir = TempDir::new().unwrap();
+        let store = AllowOnceStore::new(dir.path().join("allow_once.jsonl"));
+        let now = DateTime::parse_from_rfc3339("2026-10-29T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let scope = dir.path().to_str().unwrap();
+        let pending = PendingExceptionRecord::new(
+            now,
+            scope,
+            "git reset --hard HEAD",
+            "blocked",
+            &redaction_config(),
+            true,
+            None,
+        );
+        let entry = AllowOnceEntry::from_pending(
+            &pending,
+            now,
+            AllowOnceScopeKind::Cwd,
+            scope,
+            false,
+            true,
+            &redaction_config(),
+        );
+        let valid = serde_json::to_value(&entry).unwrap();
+        let file_scope = dir.path().join("ordinary-file");
+        std::fs::write(&file_scope, "not a directory").unwrap();
+        let root = dir.path().ancestors().last().unwrap();
+        let cases = [
+            ("schema_version", serde_json::json!(0)),
+            ("schema_version", serde_json::json!(SCHEMA_VERSION + 1)),
+            ("created_at", serde_json::json!("not-a-timestamp")),
+            ("created_at", serde_json::json!("2026-10-29T12:00:01Z")),
+            ("created_at", serde_json::json!("2026-10-31T12:00:00Z")),
+            ("expires_at", serde_json::json!("not-a-timestamp")),
+            ("expires_at", serde_json::json!("2099-01-01T00:00:00Z")),
+            ("expires_at", serde_json::json!("2026-10-30T12:00:00.001Z")),
+            ("expires_at", serde_json::json!("2026-10-29T12:00:00Z")),
+            ("expires_at", serde_json::json!("2026-10-29T11:59:59Z")),
+            ("scope_path", serde_json::json!("")),
+            ("scope_path", serde_json::json!(".")),
+            ("scope_path", serde_json::json!(file_scope)),
+            ("scope_path", serde_json::json!(dir.path().join("missing"))),
+            // A project grant may not turn an arbitrary ancestor into a
+            // repository-wide exception. This directory has no .git marker.
+            ("scope_kind", serde_json::json!("project")),
+            ("scope_kind", serde_json::json!("global")),
+            ("single_use", serde_json::Value::Null),
+        ];
+        for (field, value) in cases {
+            let mut forged = valid.clone();
+            forged[field] = value;
+            for forced in [false, true] {
+                std::fs::write(store.path(), format!("{forged}\n")).unwrap();
+                let matched = if forced {
+                    store.match_command_force_config(&entry.command_raw, dir.path(), now, None)
+                } else {
+                    store.match_command(&entry.command_raw, dir.path(), now, None)
+                };
+                assert!(matched.unwrap().is_none(), "forced={forced}: {forged}");
+                assert!(
+                    std::fs::read_to_string(store.path()).unwrap().is_empty(),
+                    "invalid records must not remain to become active later"
+                );
+            }
+        }
+
+        // The reported forged global, reusable grant must never be honored.
+        let mut forged = valid.clone();
+        forged["scope_kind"] = serde_json::json!("project");
+        forged["scope_path"] = serde_json::json!(root);
+        std::fs::write(store.path(), format!("{forged}\n")).unwrap();
+        assert!(
+            store
+                .match_command(&entry.command_raw, dir.path(), now, None)
+                .unwrap()
+                .is_none()
+        );
+
+        // Missing single_use must not silently become a reusable exception.
+        let mut incomplete = valid;
+        incomplete.as_object_mut().unwrap().remove("single_use");
+        std::fs::write(store.path(), format!("{incomplete}\n")).unwrap();
+        assert!(
+            store
+                .match_command(&entry.command_raw, dir.path(), now, None)
+                .unwrap()
+                .is_none()
+        );
+
+        // The same paths still accept a valid, explicitly reusable forced
+        // grant; validation must not disable legitimate approvals.
+        store.add_entry(&entry, now).unwrap();
+        for _ in 0..2 {
+            assert!(
+                store
+                    .match_command_force_config(&entry.command_raw, dir.path(), now, None)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_records_do_not_discard_valid_grants_issue_610() {
+        let dir = TempDir::new().unwrap();
+        let store = AllowOnceStore::new(dir.path().join("allow_once.jsonl"));
+        let now = Utc::now();
+        let scope = dir.path().to_str().unwrap();
+        let pending = PendingExceptionRecord::new(
+            now,
+            scope,
+            "git reset --hard HEAD",
+            "blocked",
+            &redaction_config(),
+            true,
+            None,
+        );
+        let entry = AllowOnceEntry::from_pending(
+            &pending,
+            now,
+            AllowOnceScopeKind::Cwd,
+            scope,
+            true,
+            false,
+            &redaction_config(),
+        );
+        let mut forged = entry.clone();
+        forged.created_at = format_timestamp(now + Duration::hours(1));
+        forged.expires_at = format_timestamp(now + Duration::hours(2));
+        assert_eq!(
+            store.add_entry(&forged, now).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        std::fs::write(
+            store.path(),
+            format!(
+                "not-json\n{}\n{}\n",
+                serde_json::to_string(&forged).unwrap(),
+                serde_json::to_string(&entry).unwrap()
+            ),
+        )
+        .unwrap();
+        let (entries, maintenance) = store.preview_active(now).unwrap();
+        assert_eq!(entries, vec![entry.clone()]);
+        assert_eq!(maintenance.parse_errors, 2);
+        assert_eq!(
+            std::fs::read_to_string(store.path())
+                .unwrap()
+                .lines()
+                .count(),
+            3
+        );
+        assert!(
+            store
+                .match_command("git reset --hard  HEAD", dir.path(), now, None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .match_command(&entry.command_raw, dir.path(), now, None)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .match_command(&entry.command_raw, dir.path(), now, None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unreadable_store_snapshot_cannot_grant_or_discard_records_issue_610() {
+        let dir = TempDir::new().unwrap();
+        let allow_store = AllowOnceStore::new(dir.path().join("allow_once.jsonl"));
+        let pending_store = PendingExceptionStore::new(dir.path().join("pending.jsonl"));
+        let now = Utc::now();
+        let scope = dir.path().to_str().unwrap();
+        let pending = PendingExceptionRecord::new(
+            now,
+            scope,
+            "git reset --hard HEAD",
+            "blocked",
+            &redaction_config(),
+            true,
+            None,
+        );
+        let entry = AllowOnceEntry::from_pending(
+            &pending,
+            now,
+            AllowOnceScopeKind::Cwd,
+            scope,
+            true,
+            false,
+            &redaction_config(),
+        );
+        for (path, record) in [
+            (allow_store.path(), serde_json::to_vec(&entry).unwrap()),
+            (pending_store.path(), serde_json::to_vec(&pending).unwrap()),
+        ] {
+            // BufRead::lines cannot decode the first line. Never rewrite the
+            // partial snapshot and silently discard a still-valid record.
+            let mut bytes = vec![0xff, b'\n'];
+            bytes.extend(record);
+            bytes.push(b'\n');
+            std::fs::write(path, &bytes).unwrap();
+            let maintenance = if path == allow_store.path() {
+                let (entries, maintenance) = allow_store.load_active(now).unwrap();
+                assert!(entries.is_empty());
+                maintenance
+            } else {
+                let (records, maintenance) = pending_store.load_active(now).unwrap();
+                assert!(records.is_empty());
+                maintenance
+            };
+            assert_eq!(maintenance.read_errors, 1);
+            assert!(!maintenance.should_rewrite());
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn project_scopes_follow_repository_boundaries_issue_610() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().join("repo");
+        let child = repo.join("child");
+        let sibling = dir.path().join("repo-other");
+        let nested = repo.join("nested");
+        for path in [
+            repo.join(".git"),
+            child.clone(),
+            sibling.clone(),
+            nested.join(".git"),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        let now = Utc::now();
+        let pending = PendingExceptionRecord::new(
+            now,
+            child.to_str().unwrap(),
+            "git reset --hard HEAD",
+            "blocked",
+            &redaction_config(),
+            true,
+            None,
+        );
+        let (kind, scope) = resolve_allow_once_scope(&child).unwrap();
+        assert_eq!(kind, AllowOnceScopeKind::Project);
+        assert_eq!(scope, repo.canonicalize().unwrap());
+        let mut entry = AllowOnceEntry::from_pending(
+            &pending,
+            now,
+            kind,
+            scope.to_str().unwrap(),
+            false,
+            false,
+            &redaction_config(),
+        );
+        for cwd in [&repo, &child, &child.join(".."), &child.join(".")] {
+            assert!(
+                entry.matches_scope(cwd),
+                "valid project cwd: {}",
+                cwd.display()
+            );
+        }
+        for cwd in [
+            &sibling,
+            &nested,
+            &repo.join("../repo-other"),
+            &dir.path().to_path_buf(),
+            &PathBuf::from("."),
+        ] {
+            assert!(
+                !entry.matches_scope(cwd),
+                "escaped project cwd: {}",
+                cwd.display()
+            );
+        }
+        entry.scope_path = child.to_str().unwrap().to_string();
+        assert!(
+            !entry.matches_scope(&child),
+            "a project subdirectory is not a project root"
+        );
+
+        entry.scope_path = repo.to_str().unwrap().to_string();
+        entry.scope_kind = AllowOnceScopeKind::Cwd;
+        assert!(entry.matches_scope(&repo));
+        assert!(
+            !entry.matches_scope(&child),
+            "cwd scope cannot cover descendants"
+        );
+
+        // .git files are used for worktrees and submodules, which must keep
+        // their own scope instead of borrowing the enclosing repository.
+        let worktree = repo.join("worktree");
+        std::fs::create_dir(&worktree).unwrap();
+        std::fs::write(worktree.join(".git"), "gitdir: ../.git/worktrees/example\n").unwrap();
+        let (kind, scope) = resolve_allow_once_scope(&worktree).unwrap();
+        assert_eq!(kind, AllowOnceScopeKind::Project);
+        assert_eq!(scope, worktree.canonicalize().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_scope_canonicalizes_symlinks_before_matching_issue_610() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().join("repo");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let alias = dir.path().join("repo-alias");
+        let escape = repo.join("escape");
+        std::os::unix::fs::symlink(&repo, &alias).unwrap();
+        std::os::unix::fs::symlink(&outside, &escape).unwrap();
+        let now = Utc::now();
+        let pending = PendingExceptionRecord::new(
+            now,
+            alias.to_str().unwrap(),
+            "git reset --hard HEAD",
+            "blocked",
+            &redaction_config(),
+            true,
+            None,
+        );
+        let (kind, scope) = resolve_allow_once_scope(&alias).unwrap();
+        assert_eq!(scope, repo.canonicalize().unwrap());
+        let entry = AllowOnceEntry::from_pending(
+            &pending,
+            now,
+            kind,
+            scope.to_str().unwrap(),
+            false,
+            false,
+            &redaction_config(),
+        );
+        assert!(entry.matches_scope(&alias));
+        assert!(!entry.matches_scope(&escape));
+        assert!(!entry.matches_scope(&escape.join("..")));
+    }
+
+    #[test]
+    fn pending_codes_also_enforce_lifetime_and_schema_issue_610() {
+        let (store, dir) = make_store();
+        let now = DateTime::parse_from_rfc3339("2026-10-29T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let valid = PendingExceptionRecord::new(
+            now,
+            dir.path().to_str().unwrap(),
+            "git reset --hard HEAD",
+            "blocked",
+            &redaction_config(),
+            true,
+            None,
+        );
+        for (created, expires, schema) in [
+            (
+                "2026-10-29T12:00:00Z",
+                "2099-01-01T00:00:00Z",
+                SCHEMA_VERSION,
+            ),
+            (
+                "2026-10-29T12:00:01Z",
+                "2026-10-30T12:00:00Z",
+                SCHEMA_VERSION,
+            ),
+            ("invalid", "2026-10-30T12:00:00Z", SCHEMA_VERSION),
+            (
+                "2026-10-29T12:00:00Z",
+                "2026-10-30T12:00:00Z",
+                SCHEMA_VERSION + 1,
+            ),
+        ] {
+            let mut record = valid.clone();
+            record.created_at = created.to_string();
+            record.expires_at = expires.to_string();
+            record.schema_version = schema;
+            std::fs::write(store.path(), serde_json::to_string(&record).unwrap()).unwrap();
+            let (matches, maintenance) = store.lookup_by_code(&record.short_code, now).unwrap();
+            assert!(matches.is_empty(), "{record:?}");
+            assert_eq!(maintenance.parse_errors, 1);
+        }
+        assert!(valid_lifetime(
+            "2026-10-29T13:00:00+01:00",
+            "2026-10-30T13:00:00+01:00",
+            now
+        ));
+        assert!(is_expired(
+            &valid.expires_at,
+            now + Duration::hours(EXPIRY_HOURS)
+        ));
     }
 
     #[test]
@@ -2030,11 +2875,12 @@ mod tests {
             mode: crate::logging::RedactionMode::Full,
             max_argument_len: 8,
         };
+        let marker = "DCG_SYNTHETIC_PRIVATE_ARGUMENT_9b4e";
         let record = PendingExceptionRecord::new(
             now,
-            "/repo",
-            "git reset --hard HEAD",
-            "blocked",
+            marker,
+            &format!("git reset --hard {marker}"),
+            &format!("producer {}", marker.to_lowercase()),
             &redaction,
             false,
             None,
@@ -2042,6 +2888,38 @@ mod tests {
 
         let entry = AllowOnceLogEntry::code_issued(&record, &redaction);
         assert_eq!(entry.command, "[REDACTED]");
+        let grant = AllowOnceEntry::from_pending(
+            &record,
+            now,
+            AllowOnceScopeKind::Cwd,
+            marker,
+            true,
+            false,
+            &redaction,
+        );
+        for entry in [
+            entry,
+            AllowOnceLogEntry::code_resolved(&grant, &redaction),
+            AllowOnceLogEntry::allow_granted(&grant, &redaction, "allow_once", marker),
+            AllowOnceLogEntry::entry_consumed(&grant, &redaction, marker),
+            AllowOnceLogEntry::entry_expired(
+                &record.short_code,
+                &record.full_hash,
+                marker,
+                marker,
+                &record.expires_at,
+                &redaction,
+            ),
+        ] {
+            for serialized in [entry.format_json(), entry.format_text()] {
+                assert!(
+                    !serialized.to_lowercase().contains(&marker.to_lowercase()),
+                    "{serialized}"
+                );
+                assert!(!serialized.contains(&record.short_code));
+                assert!(!serialized.contains(&record.full_hash));
+            }
+        }
     }
 
     #[test]
@@ -2066,6 +2944,255 @@ mod tests {
 
         let entry = AllowOnceLogEntry::code_issued(&record, &redaction);
         assert_eq!(entry.command, "git reset --hard HEAD");
+    }
+
+    #[test]
+    fn test_allow_once_log_redaction_covers_entire_records_issue_585() {
+        const MARKER: &str = "DCG_SYNTHETIC_PRIVATE_ARGUMENT_9b4e";
+        let marker_lower = MARKER.to_ascii_lowercase();
+        let now = DateTime::parse_from_rfc3339("2026-01-10T06:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let dir = TempDir::new().expect("tempdir");
+        let cwd = dir.path().join(MARKER).to_str().unwrap().to_string();
+        std::fs::create_dir_all(Path::new(&cwd).join(".git")).unwrap();
+        let command = format!("git reset --hard {MARKER}");
+        let reason = format!("Command uses {marker_lower}");
+        let pending = PendingExceptionRecord::new(
+            now,
+            &cwd,
+            &command,
+            &reason,
+            &RedactionConfig::default(),
+            true,
+            Some(MARKER.to_string()),
+        );
+        let allow_entry = AllowOnceEntry::from_pending(
+            &pending,
+            now,
+            AllowOnceScopeKind::Project,
+            &cwd,
+            true,
+            false,
+            &RedactionConfig::default(),
+        );
+        let original_pending = pending.clone();
+        let original_allow_entry = allow_entry.clone();
+
+        // A record may predate the current logging configuration. Redact its
+        // raw diagnostic and metadata at the audit boundary, regardless of
+        // the command_redacted stored beside it.
+        for (enabled, mode, full) in [
+            (true, RedactionMode::Full, true),
+            (false, RedactionMode::Full, false),
+            (true, RedactionMode::None, false),
+            (true, RedactionMode::Arguments, false),
+        ] {
+            let redaction = RedactionConfig {
+                enabled,
+                mode,
+                max_argument_len: 8,
+            };
+            let entries = [
+                (
+                    "code_issued",
+                    AllowOnceLogEntry::code_issued(&pending, &redaction),
+                ),
+                (
+                    "code_resolved",
+                    AllowOnceLogEntry::code_resolved(&allow_entry, &redaction),
+                ),
+                (
+                    "allow_granted",
+                    AllowOnceLogEntry::allow_granted(&allow_entry, &redaction, MARKER, &cwd),
+                ),
+                (
+                    "entry_consumed",
+                    AllowOnceLogEntry::entry_consumed(&allow_entry, &redaction, &cwd),
+                ),
+                (
+                    "entry_expired",
+                    AllowOnceLogEntry::entry_expired(
+                        &pending.short_code,
+                        &pending.full_hash,
+                        &cwd,
+                        &command,
+                        &pending.expires_at,
+                        &redaction,
+                    ),
+                ),
+            ];
+
+            for (event, entry) in &entries {
+                assert_eq!(entry.event, *event);
+                assert_eq!(
+                    entry.short_code,
+                    if full {
+                        "[REDACTED]"
+                    } else {
+                        &pending.short_code
+                    }
+                );
+                assert_eq!(
+                    entry.full_hash,
+                    if full {
+                        "[REDACTED]"
+                    } else {
+                        &pending.full_hash
+                    }
+                );
+                assert_eq!(
+                    entry.expires_at.as_deref(),
+                    Some(pending.expires_at.as_str())
+                );
+                assert_eq!(entry.cwd, if full { "[REDACTED]" } else { &cwd });
+                assert_eq!(entry.command, if full { "[REDACTED]" } else { &command });
+                if matches!(*event, "code_issued" | "code_resolved") {
+                    assert_eq!(
+                        entry.reason.as_deref(),
+                        Some(if full {
+                            "Diagnostic details redacted."
+                        } else {
+                            &reason
+                        })
+                    );
+                }
+                if matches!(*event, "code_resolved" | "allow_granted" | "entry_consumed") {
+                    assert_eq!(entry.scope_kind.as_deref(), Some("project"));
+                    assert_eq!(entry.single_use, Some(true));
+                }
+                for serialized in [entry.format_json(), entry.format_text()] {
+                    assert_eq!(
+                        serialized.to_ascii_lowercase().contains(&marker_lower),
+                        !full,
+                        "whole {event} record with enabled={enabled}, mode={mode:?}: {serialized}"
+                    );
+                    if full {
+                        assert!(
+                            !serialized.contains(&pending.full_hash),
+                            "command digest must not permit candidate testing: {serialized}"
+                        );
+                        assert!(
+                            !serialized.contains(&pending.short_code),
+                            "short codes also derive from the command digest: {serialized}"
+                        );
+                    }
+                }
+            }
+
+            for format in [AllowOnceLogFormat::Json, AllowOnceLogFormat::Text] {
+                let path = dir
+                    .path()
+                    .join(format!("{enabled}-{mode:?}-{format:?}.log"));
+                for (_, entry) in &entries {
+                    log_allow_once_event(path.to_str().unwrap(), entry, format).unwrap();
+                }
+                let contents = std::fs::read_to_string(&path).unwrap();
+                assert_eq!(contents.lines().count(), entries.len());
+                assert_eq!(
+                    contents.to_ascii_lowercase().contains(&marker_lower),
+                    !full,
+                    "persisted {format:?} records with enabled={enabled}, mode={mode:?}"
+                );
+                if full {
+                    assert!(!contents.contains(&pending.full_hash));
+                    assert!(!contents.contains(&pending.short_code));
+                }
+            }
+        }
+
+        // Redaction of audit copies must not change authorization state.
+        assert_eq!(pending, original_pending);
+        assert_eq!(allow_entry, original_allow_entry);
+        assert!(allow_entry.matches_scope(Path::new(&cwd)));
+        assert_eq!(allow_entry.command_raw, command);
+    }
+
+    #[test]
+    fn test_allow_once_log_full_redaction_preserves_known_labels_issue_585() {
+        let redaction = RedactionConfig {
+            enabled: true,
+            mode: RedactionMode::Full,
+            max_argument_len: 8,
+        };
+        let now = DateTime::parse_from_rfc3339("2026-01-10T06:30:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for source in ["ConfigOverride", "LegacyPattern", "Pack", "HeredocAst"] {
+            let pending = PendingExceptionRecord::new(
+                now,
+                "/repo",
+                "git reset --hard",
+                "blocked",
+                &redaction,
+                true,
+                Some(source.to_string()),
+            );
+            let entry = AllowOnceLogEntry::code_issued(&pending, &redaction);
+            assert_eq!(entry.source.as_deref(), Some(source));
+
+            let allow_entry = AllowOnceEntry::from_pending(
+                &pending,
+                now,
+                AllowOnceScopeKind::Cwd,
+                "/repo",
+                true,
+                false,
+                &redaction,
+            );
+            let granted =
+                AllowOnceLogEntry::allow_granted(&allow_entry, &redaction, "allow_once", "/repo");
+            assert_eq!(granted.allowlist_layer.as_deref(), Some("allow_once"));
+            assert_eq!(granted.scope_kind.as_deref(), Some("cwd"));
+        }
+    }
+
+    #[test]
+    fn test_allow_once_management_log_redaction_issue_585() {
+        const MARKER: &str = "DCG_SYNTHETIC_PRIVATE_ARGUMENT_9b4e";
+        let hash = compute_full_hash_with_secret("2026-01-10T06:30:00Z", "/repo", MARKER, None);
+        let code = short_code_from_hash(&hash);
+        let details = format!("target={code}, full_hash={hash}, reason={MARKER}");
+        let dir = TempDir::new().expect("tempdir");
+
+        for (enabled, mode, full) in [
+            (true, RedactionMode::Full, true),
+            (false, RedactionMode::Full, false),
+            (true, RedactionMode::None, false),
+            (true, RedactionMode::Arguments, false),
+        ] {
+            let redaction = RedactionConfig {
+                enabled,
+                mode,
+                max_argument_len: 8,
+            };
+            let path = dir
+                .path()
+                .join(format!("management-{enabled}-{mode:?}.log"));
+            for action in ["clear", "revoke", MARKER] {
+                log_allow_once_action(path.to_str().unwrap(), action, &details, &redaction)
+                    .unwrap();
+            }
+            let contents = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(contents.lines().count(), 3);
+            assert!(contents.contains("[allow-once] clear:"));
+            assert!(contents.contains("[allow-once] revoke:"));
+            assert_eq!(
+                contents
+                    .to_ascii_lowercase()
+                    .contains(&MARKER.to_ascii_lowercase()),
+                !full,
+                "management log with enabled={enabled}, mode={mode:?}: {contents}"
+            );
+            assert_eq!(contents.contains(&hash), !full);
+            assert_eq!(contents.contains(&code), !full);
+            if full {
+                assert!(contents.contains("[allow-once] [REDACTED]: [REDACTED]"));
+                assert!(contents.lines().all(|line| line.ends_with(": [REDACTED]")));
+            } else {
+                assert!(contents.lines().all(|line| line.ends_with(&details)));
+            }
+        }
     }
 
     #[test]
@@ -2332,7 +3459,7 @@ mod tests {
     fn synthetic_active_records(n: usize, base_now: DateTime<Utc>) -> Vec<PendingExceptionRecord> {
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
-            let mut record = PendingExceptionRecord::new(
+            let record = PendingExceptionRecord::new(
                 base_now,
                 "/repo",
                 &format!("git command-{i}"),
@@ -2341,9 +3468,6 @@ mod tests {
                 false,
                 None,
             );
-            // Push expiry well into the future so load_active_from_file
-            // doesn't prune them out from under us.
-            record.expires_at = format_timestamp(base_now + Duration::hours(48));
             out.push(record);
         }
         out
@@ -2427,6 +3551,260 @@ mod tests {
         assert!(
             !archive.exists(),
             "below-cap activity must not create pending.jsonl.1"
+        );
+    }
+
+    // =========================================================================
+    // Issue #291: bounded persistence for the hook deny path
+    // =========================================================================
+
+    fn small_budget() -> PersistBudget {
+        PersistBudget {
+            lock_wait: std::time::Duration::from_millis(40),
+            allow_maintenance: true,
+            maintenance_recheck: None,
+        }
+    }
+
+    #[test]
+    fn test_291_record_block_bounded_uncontended_issues_record() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("pending.jsonl");
+        let store = PendingExceptionStore::new(path.clone());
+
+        let result = store
+            .record_block_bounded(
+                "git reset --hard",
+                "/repo",
+                "blocked",
+                &redaction_config(),
+                false,
+                None,
+                None,
+                small_budget(),
+            )
+            .expect("record_block_bounded");
+
+        let (record, _maintenance) = result.expect("uncontended store must issue a record");
+        assert!(!record.short_code.is_empty());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains(&record.short_code));
+    }
+
+    #[test]
+    fn test_291_record_block_bounded_contended_returns_none_within_bound() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("pending.jsonl");
+        let store = PendingExceptionStore::new(path.clone());
+
+        // Hold the exclusive lock from a second handle (flock is per open
+        // file description, so this contends even within one process).
+        let holder = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .expect("open lock holder");
+        holder.lock_exclusive().expect("hold lock");
+
+        let started = std::time::Instant::now();
+        let result = store
+            .record_block_bounded(
+                "git reset --hard",
+                "/repo",
+                "blocked",
+                &redaction_config(),
+                false,
+                None,
+                None,
+                small_budget(),
+            )
+            .expect("contention is Ok(None), not an error");
+        let elapsed = started.elapsed();
+
+        assert!(result.is_none(), "contended store must not issue a code");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "bounded wait must give up promptly, took {elapsed:?}"
+        );
+        FileExt::unlock(&holder).expect("unlock");
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.is_empty(),
+            "no record may be appended on contention"
+        );
+    }
+
+    #[test]
+    fn test_291_record_block_bounded_skips_maintenance_when_budget_low() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("pending.jsonl");
+        let store = PendingExceptionStore::new(path.clone());
+
+        // Seed an EXPIRED record directly so maintenance would prune it.
+        let expired = PendingExceptionRecord::new(
+            Utc::now() - Duration::hours(EXPIRY_HOURS * 2),
+            "/repo",
+            "git push --force",
+            "blocked",
+            &redaction_config(),
+            false,
+            None,
+        );
+        let line = serde_json::to_string(&expired).unwrap();
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+
+        let no_maintenance = PersistBudget {
+            lock_wait: std::time::Duration::from_millis(40),
+            allow_maintenance: false,
+            maintenance_recheck: None,
+        };
+        let (_record, maintenance) = store
+            .record_block_bounded(
+                "git reset --hard",
+                "/repo",
+                "blocked",
+                &redaction_config(),
+                false,
+                None,
+                None,
+                no_maintenance,
+            )
+            .expect("record_block_bounded")
+            .expect("uncontended store must issue a record");
+
+        assert!(
+            maintenance.is_empty(),
+            "maintenance must be skipped when the budget is low"
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains(&expired.short_code),
+            "expired record must survive (pruning deferred), content: {content}"
+        );
+        assert_eq!(content.lines().count(), 2, "append still happened");
+    }
+
+    #[test]
+    fn test_292_maintenance_recheck_reflects_the_post_lock_deadline() {
+        // The caller's `allow_maintenance` is measured BEFORE a lock wait of
+        // up to 150ms. An already-exhausted deadline at lock time must veto
+        // the stale `true`.
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("pending.jsonl");
+        let store = PendingExceptionStore::new(path.clone());
+
+        let expired = PendingExceptionRecord::new(
+            Utc::now() - Duration::hours(EXPIRY_HOURS * 2),
+            "/repo",
+            "git push --force",
+            "blocked",
+            &redaction_config(),
+            false,
+            None,
+        );
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&expired).unwrap()),
+        )
+        .unwrap();
+
+        let stale_budget = PersistBudget {
+            lock_wait: std::time::Duration::from_millis(40),
+            // Stale pre-lock estimate.
+            allow_maintenance: true,
+            maintenance_recheck: Some(MaintenanceRecheck {
+                deadline: crate::perf::Deadline::new(std::time::Duration::ZERO),
+                min_budget: std::time::Duration::from_millis(250),
+            }),
+        };
+        let (_record, maintenance) = store
+            .record_block_bounded(
+                "git reset --hard",
+                "/repo",
+                "blocked",
+                &redaction_config(),
+                false,
+                None,
+                None,
+                stale_budget,
+            )
+            .expect("record_block_bounded")
+            .expect("uncontended store must issue a record");
+
+        assert!(
+            maintenance.is_empty(),
+            "exhausted deadline at lock time must veto the stale allow_maintenance"
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains(&expired.short_code),
+            "pruning must have been deferred"
+        );
+    }
+
+    #[test]
+    fn test_292_watermark_forces_maintenance_despite_low_budget() {
+        // Starvation guard: the hook deny path is the only production caller
+        // and routinely has too little budget for maintenance, so without a
+        // watermark override a busy store would grow to MAX_PENDING_BYTES and
+        // then refuse every future allow-once code, silently and forever.
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("pending.jsonl");
+        let store = PendingExceptionStore::new(path.clone());
+
+        let expired = PendingExceptionRecord::new(
+            Utc::now() - Duration::hours(EXPIRY_HOURS * 2),
+            "/repo",
+            "git push --force",
+            "blocked",
+            &redaction_config(),
+            false,
+            None,
+        );
+        let line = format!("{}\n", serde_json::to_string(&expired).unwrap());
+        let copies = (PENDING_MAINTENANCE_WATERMARK_BYTES as usize / line.len()) + 16;
+        std::fs::write(&path, line.repeat(copies)).unwrap();
+        assert!(
+            std::fs::metadata(&path).unwrap().len() > PENDING_MAINTENANCE_WATERMARK_BYTES,
+            "store must start above the watermark"
+        );
+
+        let no_maintenance = PersistBudget {
+            lock_wait: std::time::Duration::from_millis(200),
+            allow_maintenance: false,
+            maintenance_recheck: None,
+        };
+        let (record, maintenance) = store
+            .record_block_bounded(
+                "git reset --hard",
+                "/repo",
+                "blocked",
+                &redaction_config(),
+                false,
+                None,
+                None,
+                no_maintenance,
+            )
+            .expect("record_block_bounded must not hit the hard cap")
+            .expect("uncontended store must issue a record");
+
+        assert!(
+            maintenance.pruned_expired > 0,
+            "maintenance must run above the watermark even with no budget"
+        );
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            after < PENDING_MAINTENANCE_WATERMARK_BYTES,
+            "the forced pass must bring the store back under the watermark, got {after}"
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains(&record.short_code),
+            "the new record must still be appended"
         );
     }
 }

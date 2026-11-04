@@ -1,6 +1,6 @@
 [package]
 name = "destructive_command_guard"
-version = "0.6.8"
+version = "0.16.0"
 edition = "2024"
 resolver = "2"
 authors = [
@@ -26,6 +26,8 @@ exclude = [
     "*.webp",
     "agent_baseline/",
     "action/",
+    # Published separately as tree-sitter-bash-dcg / ast-grep-language-dcg.
+    "vendor/",
 ]
 
 # Primary binary with short alias
@@ -41,28 +43,41 @@ serde_yaml = "0.9"          # External pack YAML parsing
 toml = "1.0"
 toml_edit = "0.25"         # Preserves formatting when editing TOML files
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }  # RFC 3339 timestamps
-fancy-regex = "0.18"
+fancy-regex = "0.19"
 regex = "1.10"              # For RegexSet in heredoc detection
 memchr = "2.8"
 aho-corasick = "1.1"        # Multi-pattern string matching for keyword quick-reject
 smallvec = "1.15.1"
 colored = "3.1"
-dirs = "6.0"
+dirs = "7.0"
 glob = "0.3"                # Glob pattern expansion for custom pack paths
 shell-words = "1.1"         # Quote-aware tokenization for static stdin data-flow analysis
 libc = "0.2"                # Nonblocking, no-follow opens for inspected stdin files on Unix
 clap = { version = "4.5", features = ["derive", "env"] }
 clap_complete = "4.6"
 once_cell = "1.19"
-base64 = "0.22"              # For decision log format parsing in simulate
+# Keep the scalar engine: logs and encoded-command analysis do not justify the
+# default SIMD feature, which is base64's only unsafe-code surface.
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 async-trait = "0.1.89"
-rust-mcp-sdk = { version = "0.9.0", default-features = false, features = ["server", "stdio", "macros"] }
+rust-mcp-sdk = { version = "1.0.1", default-features = false, features = ["server", "stdio", "macros"] }
 tokio = { version = "1.52", features = ["rt-multi-thread"] }
 rayon = { version = "1.11", optional = true }
 
 # AST-based pattern matching for heredoc/inline-script content
-ast-grep-core = "0.44"
-ast-grep-language = { version = "0.44", default-features = false, features = [
+# SupportLang crosses this crate's Language/LanguageExt trait boundary. Keep
+# the core compatible with the vendored language adapter below; two semver
+# incompatible core versions produce distinct traits and cannot interoperate.
+# Dependabot ignores this crate for that reason (.github/dependabot.yml).
+ast-grep-core = "0.45.3"
+# The Bash grammar carries dcg's #442/#461 fixes (scanner memory safety on glibc;
+# explicit stdin descriptors and mixed file/here-string redirections). It used to
+# arrive through `[patch.crates-io]`, which `cargo publish` drops, so a crates.io
+# build silently compiled the unpatched grammar. The patched grammar is now
+# published as `tree-sitter-bash-dcg`, and `ast-grep-language-dcg` is
+# ast-grep-language 0.45.3 built against it. Both live under vendor/, and the
+# `path` keys are used for local builds while `version` is what gets published.
+ast-grep-language = { package = "ast-grep-language-dcg", version = "0.45.3", path = "vendor/ast-grep-language", default-features = false, features = [
     "tree-sitter-bash",
     "tree-sitter-python",
     "tree-sitter-javascript",
@@ -78,14 +93,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.11"
 hmac = "0.13"  # HMAC for optional short-code hardening (ksk.1.10)
 fs2 = "0.4"
-fsqlite = { version = "0.1.16", features = ["fts5"] }  # FrankenSQLite (atomic commit-marker recovery hardening in 0.1.16)
-fsqlite-types = "0.1.16"  # SqliteValue type
-fsqlite-error = "0.1.16"  # FrankenError type
+rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }  # Stable bundled SQLite for history telemetry
 ctrlc = "3.5.1"
 flate2 = "1.0"  # Gzip compression for history export
 
 # Update checking dependencies
-self_update = { version = "1.0.0-rc.5", default-features = false, features = ["reqwest", "rustls", "github"] }
+self_update = { version = "1.1.0", default-features = false, features = ["reqwest", "rustls", "github"] }
 semver = "1.0"  # Semantic version comparison for update checks
 
 # TUI/CLI visual polish dependencies (advk epic)
@@ -101,8 +114,27 @@ tru = "0.2.2"
 # stack and the regex renderer below already has a purpose-built highlighter.
 rich_rust = { version = "0.2.2", features = ["markdown"], optional = true }
 
+[target.'cfg(unix)'.dependencies]
+# Safe `gethostname()` for the history `hostname` column (#514), and safe
+# `getrusage()` so a deadline miss can report the CPU time the hook got (#571).
+# nix is already compiled in through ctrlc; this only turns on two of its
+# features, so no new crate enters the graph and `#![forbid(unsafe_code)]`
+# still holds here.
+nix ={ version = "0.31", default-features = false, features = ["hostname", "resource"] }
+# Safe descriptor-based ownership and Linux extended-attribute preservation
+# during atomic settings replacement. Already present in the dependency graph.
+rustix = { version = "1.1.5", features = ["fs"] }
+
 [build-dependencies]
 vergen-gix = { version = "10.0.0-beta.8", features = ["build", "cargo", "rustc"] }
+# Windows PE metadata (#303): a VERSIONINFO resource (product/company/
+# description/version) and an application manifest. An unsigned, stripped,
+# size-optimized binary with NO version resource is a textbook input to
+# Defender's ML heuristics; the metadata also makes `dcg.exe` identifiable in
+# Explorer / Task Manager. Unconditional because a `[target.'cfg(windows)']`
+# build-dependency is resolved against the HOST, which would drop it on the
+# Linux cross-build; build.rs only invokes it when the TARGET is Windows.
+winresource = { version = "0.1.31", default-features = false }
 
 [dev-dependencies]
 assert_cmd = "2.2"
@@ -138,6 +170,38 @@ codegen-units = 1   # Single codegen unit for better optimization
 panic = "abort"     # Smaller binary, no unwinding overhead
 strip = true        # Remove debug symbols
 
+# The hook is a one-shot process: every enabled pack whose keywords match the
+# command compiles its full pattern set from scratch on each invocation.
+# Profiling (#245/#248) showed >90% of the ~150-200ms full-evaluation cost was
+# regex COMPILATION inside these crates, which `opt-level = "z"` slows several
+# fold. Building only the regex family for speed recovers most of that latency
+# while keeping the rest of the binary size-optimized.
+[profile.release.package.regex-automata]
+opt-level = 3
+[profile.release.package.regex-syntax]
+opt-level = 3
+[profile.release.package.regex]
+opt-level = 3
+[profile.release.package.fancy-regex]
+opt-level = 3
+[profile.release.package.aho-corasick]
+opt-level = 3
+[profile.release.package.memchr]
+opt-level = 3
+[profile.release.package.bit-set]
+opt-level = 3
+[profile.release.package.bit-vec]
+opt-level = 3
+
+# Profilable build for `profiling-software-performance` / samply. Inherits the
+# shipping release optimizations but keeps frame pointers and line tables so
+# flamegraphs resolve symbols. Never ship this profile — it is measurement-only.
+[profile.release-perf]
+inherits = "release"
+opt-level = 3
+debug = "line-tables-only"
+strip = false
+
 [profile.dev]
 opt-level = 1       # Faster compile times during development
 
@@ -153,6 +217,11 @@ rich-output = ["dep:rich_rust"]  # Enable rich_rust for premium terminal output
 all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 nursery = { level = "warn", priority = -1 }
+# `assert!(x.is_empty())` is idiomatic and reads clearly; this lint only asks for
+# `assert_eq!(x, "")` to get a nicer failure message. It fires on hundreds of test
+# assertions here with no defect behind any of them, and the suggestion is
+# type-specific so `clippy --fix` cannot apply it. Allowed per the convention above.
+assert_is_empty = "allow"
 # The pinned release nightly promotes two purely stylistic lints across the
 # entire mature codebase. Keep `-D warnings` meaningful for correctness lints
 # without forcing a behavior-neutral rewrite of hundreds of control-flow sites.
@@ -176,6 +245,11 @@ must_use_candidate = "allow"
 single_match_else = "allow"
 unnested_or_patterns = "allow"
 match_same_arms = "allow"
+# nursery lint with a message near-identical to match_same_arms. Same reasoning: the
+# two sites are long shell-dialect predicates inside the guard that decides whether a
+# destructive command runs; hoisting their shared trailing expression would
+# restructure that control flow for a stylistic gain.
+branches_sharing_code = "allow"
 needless_pass_by_value = "allow"
 similar_names = "allow"
 match_wildcard_for_single_variants = "allow"

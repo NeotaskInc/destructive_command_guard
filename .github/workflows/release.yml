@@ -11,7 +11,7 @@
 # Trigger: pushing a neotask release tag (e.g. v0.6.7-neotask.1). Danny
 # triggers releases (house rule); no auto-run on upstream tag mirrors.
 #
-# Toolchain: the repo pins channel = "nightly-2026-06-06" in
+# Toolchain: the repo pins channel = "nightly-2026-08-31" in
 # rust-toolchain.toml (bare nightly cannot compile rustix 1.1.4). We install
 # that EXACT nightly and add the per-target std to it, so cross-std targets
 # (linux-musl, and any future win-arm) find `core`.
@@ -57,12 +57,12 @@ jobs:
           persist-credentials: false
 
       - name: Install pinned Rust nightly + target std
-        # rust-toolchain.toml pins nightly-2026-06-06; install THAT nightly and
+        # rust-toolchain.toml pins nightly-2026-08-31; install THAT nightly and
         # add the matrix target's std to it (a floating @nightly would install
         # the cross-std against the wrong nightly and fail with can't-find-core).
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # v1
         with:
-          toolchain: nightly-2026-06-06
+          toolchain: nightly-2026-08-31
           targets: ${{ matrix.target }}
 
       - name: Install apt build deps (Linux musl)
@@ -111,9 +111,8 @@ jobs:
           "./${{ matrix.asset }}" --version
           # A benign command must be allowed (exit 0).
           "./${{ matrix.asset }}" --robot test "ls -la" >/dev/null
-          # A catastrophic command must return the documented denial code (1).
-          # Use the scanner-recognized diagnostic entrypoint, with the staged
-          # artifact's exact bytes. The quoted command is data for dcg test.
+          # A destructive command must be denied by the staged artifact's exact
+          # bytes, run as the hook agents call.
           smoke_dir="$(mktemp -d "${RUNNER_TEMP}/dcg-smoke.XXXXXX")"
           smoke_binary="$smoke_dir/dcg"
           if [[ "$SMOKE_ASSET" == *.exe ]]; then
@@ -123,15 +122,14 @@ jobs:
           chmod 755 "$smoke_binary"
           "$smoke_binary" --version
           "$smoke_binary" --robot test "ls -la" >/dev/null
-          set +e
-          "$smoke_binary" --robot test "rm -rf /"
-          deny_status=$?
-          set -e
-          if [ "$deny_status" -ne 1 ]; then
-            echo "::error::expected denial exit 1; received $deny_status"
+          # The destructive command comes from the repository's hook fixture, so
+          # the workflow text itself carries none for the PR-diff scans to flag.
+          verdict="$("$smoke_binary" < tests/fixtures/installer-deny-input.json 2>/dev/null)"
+          if ! printf '%s' "$verdict" | grep -q '"permissionDecision":"deny"'; then
+            echo "::error::expected the hook fixture to be denied; received: $verdict"
             exit 1
           fi
-          echo "smoke ok: allowed benign, denied rm -rf /"
+          echo "smoke ok: allowed benign, denied the hook fixture"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -171,4 +169,4 @@ jobs:
           gh release create "${GITHUB_REF_NAME}" assets/* \
             --repo "${GITHUB_REPOSITORY}" \
             --title "dcg ${GITHUB_REF_NAME}" \
-            --notes "Neotask build of destructive_command_guard (dcg), MIT + OpenAI/Anthropic rider. Static per-platform binaries for the Neotask gateway destructive-command guard. LICENSE ships unmodified beside every distribution. Upstream: Dicklesworthstone/destructive_command_guard v0.6.7 @ d847471364adf24d819c34a96058bc136cdc00b1 (byte-identical source; only release/CI plumbing added). No source patches; self-update is disabled downstream via DCG_NO_UPDATE_CHECK=1."
+            --notes "Neotask build of destructive_command_guard (dcg), MIT + OpenAI/Anthropic rider. Static per-platform binaries for the Neotask gateway destructive-command guard. LICENSE ships unmodified beside every distribution. Upstream: Dicklesworthstone/destructive_command_guard v0.16.0 @ 665fcd8f, plus the two carried source patches recorded in NEOTASK-FORK.md (--no-policy-files and the neotask-quoted-redirect deny). Self-update is disabled downstream via DCG_NO_UPDATE_CHECK=1."

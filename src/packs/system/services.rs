@@ -4,9 +4,29 @@
 //! - systemctl stop/disable on critical services
 //! - service stop on critical services
 //! - init system modifications
+//! - unloading kernel modules (`modprobe -r`, `rmmod`), locally or over ssh
 
+use crate::packs::regex_engine::LazyCompiledRegex;
 use crate::packs::{DestructivePattern, Pack, SafePattern};
 use crate::{destructive_pattern, safe_pattern};
+
+/// Anchor a read-only exemption to the command the segment actually runs.
+///
+/// Same shape as `system::disk`'s macro, and the sudo group admits only `-n` for
+/// the same reason: `sudo -u journalctl systemctl stop sshd` supplies the tool
+/// name as `-u`'s value, and a prefix skipping `-\S+` would treat that as
+/// evidence the segment is a journal read (#448).
+macro_rules! services_safe_pattern {
+    ($name:literal, $body:expr) => {
+        SafePattern {
+            name: $name,
+            regex: LazyCompiledRegex::new(concat!(
+                r"^[ \t]*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|<>()\x22'\\$`*?\[\]{}~]*[ \t]+)*(?:sudo[ \t]+(?:-n[ \t]+)?)?(?:[^\s;&|<>()\x22'\\$`*?\[\]{}~=]+/)?",
+                $body
+            )),
+        }
+    };
+}
 
 /// Create the Services pack.
 #[must_use]
@@ -23,6 +43,8 @@ pub fn create_pack() -> Pack {
             "upstart",
             "shutdown",
             "reboot",
+            "modprobe",
+            "rmmod",
         ],
         safe_patterns: create_safe_patterns(),
         destructive_patterns: create_destructive_patterns(),
@@ -47,7 +69,25 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "systemctl-status",
             r"systemctl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+status(?=\s|$)"
         ),
-        safe_pattern!("service-status", r"service\s+\S+\s+status(?=\s|$)"),
+        // There is deliberately no `service <unit> status` exemption.
+        //
+        // One used to sit here as `service\s+\S+\s+status(?=\s|$)`, anchored only
+        // at the end, so three trailing tokens satisfied it and short-circuited
+        // every destructive rule in the pack (#448). `systemctl stop` accepts
+        // several unit names, so the real unit still stops while the junk ones
+        // merely error — unlike the shapes where the tool rejects a stray
+        // operand outright, these execute:
+        //
+        //   systemctl stop nginx service foo status      was allowed
+        //   systemctl disable nginx service foo status   was allowed
+        //   systemctl mask sshd service foo status       was allowed
+        //
+        // Dropped rather than anchored because it was redundant: the only
+        // destructive rule here naming `service` is
+        // `service\s+(?:ssh|sshd|network|networking|docker)\s+stop`, which a
+        // `status` invocation cannot match. `systemctl-status` above needs no
+        // change — its optional group only consumes `-`-prefixed tokens, so
+        // `systemctl stop nginx status` does not satisfy it.
         // list commands are safe
         safe_pattern!(
             "systemctl-list",
@@ -73,8 +113,12 @@ fn create_safe_patterns() -> Vec<SafePattern> {
             "systemctl-cat",
             r"systemctl\b(?:\s+--?\S+(?:\s+\S+)?)*\s+cat(?=\s|$)"
         ),
-        // journalctl is safe (logs)
-        safe_pattern!("journalctl", r"\bjournalctl\b"),
+        // journalctl is safe (logs), but only when journalctl is what runs. As
+        // a bare word it matched anywhere in the segment, and a safe match
+        // short-circuits the pack, so `systemctl stop sshd --output=journalctl`
+        // and `shutdown -h now -- journalctl` were both allowed while the same
+        // commands without the word were denied (#448).
+        services_safe_pattern!("journalctl", r"journalctl\b"),
     ]
 }
 
@@ -196,6 +240,52 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
              Check current runlevel:\n  \
              runlevel"
         ),
+        // modprobe -r / --remove (also clustered short flags such as -rf)
+        destructive_pattern!(
+            "modprobe-remove",
+            r#"modprobe\b(?:[ \t]+[^;&|\n'"]*?)?[ \t]-(?:-remove\b|[a-zA-Z]*r[a-zA-Z]*\b)"#,
+            "Unloading a kernel module on a running host can crash or wedge the kernel.",
+            High,
+            "Removing a driver from a live kernel is not a safe reset. Unloading a GPU/DRM \
+             driver (nvidia, amdgpu, i915, ...) tears down the framebuffer console; on some \
+             kernels that teardown Oopses while holding the console lock, after which every \
+             new terminal, every tty close and `ps aux` hang in uninterruptible sleep until \
+             the machine is rebooted. Storage and network drivers can take their devices \
+             down with them.\n\n\
+             An nvidia-smi \"driver/library version mismatch\" means userspace was upgraded \
+             under a loaded module: schedule a reboot instead.\n\n\
+             Inspect without changing anything:\n  \
+             lsmod\n  \
+             modinfo <module>\n  \
+             modprobe -n -v -r <module>   (dry run)",
+            executables = ["modprobe"]
+        ),
+        // rmmod
+        destructive_pattern!(
+            "rmmod",
+            r"rmmod\b[ \t]+[^\s;&|]",
+            "Unloading a kernel module on a running host can crash or wedge the kernel.",
+            High,
+            "rmmod removes a driver from the running kernel. Unloading GPU/DRM, storage or \
+             network drivers can Oops the kernel or leave the console and tty layer wedged \
+             until reboot.\n\n\
+             Inspect without changing anything:\n  \
+             lsmod\n  \
+             modinfo <module>",
+            executables = ["rmmod"]
+        ),
+        // `ssh host sudo modprobe -r x`: an unquoted remote command is part of the ssh
+        // segment, so the two executable-scoped rules above never see it.
+        destructive_pattern!(
+            "ssh-remote-module-unload",
+            r#"ssh\b[^;&|\n]*?[ \t](?:sudo[ \t]+(?:-[a-zA-Z]+[ \t]+)*)?(?:modprobe\b[^;&|\n'"]*?[ \t]-(?:-remove\b|[a-zA-Z]*r[a-zA-Z]*\b)|rmmod[ \t]+[^\s;&|])"#,
+            "Unloading a kernel module on a remote host can crash or wedge its kernel.",
+            High,
+            "The remote command unloads a kernel module (modprobe -r / rmmod). Unloading \
+             GPU/DRM, storage or network drivers on a running host can Oops the kernel or \
+             leave the console and tty layer wedged until reboot.",
+            executables = ["ssh"]
+        ),
     ]
 }
 
@@ -204,6 +294,91 @@ mod tests {
     use super::*;
     use crate::packs::Severity;
     use crate::packs::test_helpers::*;
+
+    #[test]
+    fn journalctl_in_argument_data_does_not_disarm_the_pack_issue_448() {
+        // `\bjournalctl\b` matched the word anywhere in the segment, and a safe
+        // match short-circuits the pack. Measured against v0.14.4: both of
+        // these were allowed, while the same commands without the word denied.
+        let pack = create_pack();
+        for command in [
+            "systemctl stop sshd --output=journalctl",
+            "shutdown -h now -- journalctl",
+        ] {
+            assert!(
+                !pack.matches_safe(command),
+                "{command:?} must not match a safe pattern: `journalctl` is \
+                 argument data, not the command being run"
+            );
+            assert!(
+                pack.check(command).is_some(),
+                "{command:?} must still be blocked"
+            );
+        }
+    }
+
+    /// The same class as the test above, in an exemption anchored only at the end.
+    ///
+    /// `service-status` was `service\s+\S+\s+status(?=\s|$)`, so three trailing
+    /// tokens satisfied it. These execute: `systemctl` accepts several unit
+    /// names, so the real unit stops while `service`, `foo` and `status` merely
+    /// fail to resolve.
+    #[test]
+    fn a_trailing_service_status_does_not_disarm_the_pack_issue_448() {
+        let pack = create_pack();
+        for command in [
+            "systemctl stop nginx service foo status",
+            "systemctl disable nginx service foo status",
+            "systemctl mask sshd service foo status",
+        ] {
+            assert!(
+                !pack.matches_safe(command),
+                "{command:?} must not match a safe pattern: `service foo status` \
+                 is trailing argument data, not the command being run"
+            );
+            assert!(
+                pack.check(command).is_some(),
+                "{command:?} must still be blocked"
+            );
+        }
+    }
+
+    /// Dropping `service-status` must not block the read-only invocations it
+    /// existed for. It was redundant: the only destructive rule here naming
+    /// `service` requires a critical unit *and* `stop`.
+    #[test]
+    fn reading_service_state_stays_allowed_without_its_exemption_issue_448() {
+        let pack = create_pack();
+        for command in [
+            "service nginx status",
+            "service sshd status",
+            "sudo service docker status",
+            "systemctl status nginx",
+            "systemctl is-active nginx",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command:?} is read-only and must not be blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn reading_the_journal_stays_allowed_issue_448() {
+        let pack = create_pack();
+        for command in [
+            "journalctl",
+            "journalctl -u sshd -n 50",
+            "sudo journalctl --since today",
+            "/usr/bin/journalctl -f",
+            "LC_ALL=C journalctl -xe",
+        ] {
+            assert!(
+                pack.matches_safe(command) || pack.check(command).is_none(),
+                "{command:?} is read-only and must not be blocked"
+            );
+        }
+    }
 
     #[test]
     fn shutdown_is_reachable_via_keywords() {
@@ -301,5 +476,61 @@ mod tests {
         let pack = create_pack();
         assert_no_match(&pack, "git status");
         assert_no_match(&pack, "echo hello");
+    }
+
+    #[test]
+    fn kernel_module_unloads_are_blocked() {
+        let pack = create_pack();
+        for (command, rule) in [
+            (
+                "sudo modprobe -r nvidia_uvm nvidia_drm nvidia_modeset nvidia",
+                "modprobe-remove",
+            ),
+            ("modprobe --remove nvidia", "modprobe-remove"),
+            ("sudo modprobe -rf amdgpu", "modprobe-remove"),
+            ("modprobe -v -r i915", "modprobe-remove"),
+            ("/usr/sbin/modprobe -r snd_hda_intel", "modprobe-remove"),
+            ("rmmod nvidia_drm", "rmmod"),
+            ("sudo rmmod -f i915", "rmmod"),
+            (
+                "ssh gpu-host sudo modprobe -r nvidia",
+                "ssh-remote-module-unload",
+            ),
+            (
+                "ssh -i key gpu-host sudo -n rmmod nvidia",
+                "ssh-remote-module-unload",
+            ),
+        ] {
+            assert!(
+                pack.might_match(command),
+                "{command:?} must pass the keyword gate"
+            );
+            assert_blocks_with_pattern(&pack, command, rule);
+            assert_blocks_with_severity(&pack, command, Severity::High);
+        }
+    }
+
+    #[test]
+    fn kernel_module_inspection_and_loading_stay_allowed() {
+        let pack = create_pack();
+        for command in [
+            "sudo modprobe nvidia",
+            "modprobe -a snd_seq snd_rawmidi",
+            "modprobe -c",
+            "lsmod",
+            "modinfo nvidia",
+            "cat /etc/modprobe.d/blacklist.conf",
+            "ls /etc/modprobe.d",
+            // The words as argument data, not as the program being run.
+            "grep -rn \"modprobe -r\" /etc",
+            "pgrep -f \"modprobe -r nvidia\"",
+            "echo use rmmod carefully",
+            "ssh gpu-host lsmod",
+        ] {
+            assert!(
+                pack.check(command).is_none(),
+                "{command:?} must not be blocked"
+            );
+        }
     }
 }

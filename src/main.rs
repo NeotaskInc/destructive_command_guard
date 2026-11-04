@@ -19,29 +19,41 @@
 
 use clap::Parser;
 use colored::Colorize;
-use destructive_command_guard::agent::{Agent, detect_agent};
+use destructive_command_guard::agent::{Agent, DetectionMethod, detect_agent_with_details};
 use destructive_command_guard::allowlist::LayeredAllowlist;
 use destructive_command_guard::cli::{self, Cli};
 // Exit codes are used by cli.rs for robot mode; main.rs uses them for hook mode errors
-use destructive_command_guard::config::Config;
+use destructive_command_guard::config::{CompiledOverrides, Config, HeredocSettings};
+#[cfg(test)]
+use destructive_command_guard::evaluator::evaluate_command_with_pack_order_deadline_at_path;
 use destructive_command_guard::evaluator::{
-    EvaluationDecision, MatchSource, evaluate_command_with_pack_order_deadline_at_path,
+    AllowOnceCwdScope, EvaluationDecision, EvaluationResult,
+    evaluate_command_with_pack_order_deadline_at_path_in_dialect,
 };
 #[allow(unused_imports)]
-use destructive_command_guard::exit_codes::{EXIT_DENIED, EXIT_PARSE_ERROR, EXIT_SUCCESS};
+use destructive_command_guard::exit_codes::{
+    EXIT_BROKEN_PIPE, EXIT_DENIED, EXIT_PARSE_ERROR, EXIT_REASONIX_WARNING, EXIT_SUCCESS,
+};
 use destructive_command_guard::history::{
-    CommandEntry, ENV_HISTORY_DB_PATH, HistoryWriter, Outcome as HistoryOutcome,
+    CommandEntry, HistoryWriter, Outcome as HistoryOutcome, ResolvedHistoryPath,
 };
 use destructive_command_guard::hook;
 use destructive_command_guard::load_default_allowlists;
+use destructive_command_guard::normalize::ShellDialect;
+#[cfg(test)]
 use destructive_command_guard::normalize::normalize_command;
 use destructive_command_guard::packs::load_external_packs;
 #[cfg(test)]
 use destructive_command_guard::packs::pack_aware_quick_reject;
-use destructive_command_guard::packs::{DecisionMode, REGISTRY};
-use destructive_command_guard::pending_exceptions::{PendingExceptionStore, log_maintenance};
-use destructive_command_guard::perf::{Deadline, HOOK_EVALUATION_BUDGET};
-use destructive_command_guard::sanitize_for_pattern_matching;
+use destructive_command_guard::packs::{DecisionMode, EnabledKeywordIndex, REGISTRY};
+use destructive_command_guard::pending_exceptions::{
+    MaintenanceRecheck, PendingExceptionStore, PersistBudget, log_maintenance,
+};
+use destructive_command_guard::perf::{
+    self, Deadline, HOOK_EVALUATION_BUDGET, HookProfile, ProfilePhase, phase,
+};
+use destructive_command_guard::update::{GIT_DESCRIBE, GIT_SHA};
+use destructive_command_guard::{emit_stderr, emit_stdout};
 // Import HookInput for parsing stdin JSON in hook mode
 #[cfg(test)]
 use destructive_command_guard::hook::HookInput;
@@ -49,13 +61,16 @@ use destructive_command_guard::hook::HookInput;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::io::{self, IsTerminal};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 // Build metadata from vergen (set by build.rs)
 const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TIMESTAMP: Option<&str> = option_env!("VERGEN_BUILD_TIMESTAMP");
 const RUSTC_SEMVER: Option<&str> = option_env!("VERGEN_RUSTC_SEMVER");
+const RUSTC_COMMIT_HASH: Option<&str> = option_env!("VERGEN_RUSTC_COMMIT_HASH");
+const RUSTC_COMMIT_DATE: Option<&str> = option_env!("VERGEN_RUSTC_COMMIT_DATE");
+const RUSTC_HOST_TRIPLE: Option<&str> = option_env!("VERGEN_RUSTC_HOST_TRIPLE");
 const CARGO_TARGET: Option<&str> = option_env!("VERGEN_CARGO_TARGET_TRIPLE");
 
 // NOTE: HookInput, ToolInput, HookOutput, HookSpecificOutput types are now defined
@@ -98,11 +113,29 @@ fn enable_windows_ansi() {
     }
 }
 
-fn history_db_path(config: &destructive_command_guard::config::HistoryConfig) -> Option<PathBuf> {
-    if let Ok(path) = std::env::var(ENV_HISTORY_DB_PATH) {
-        return Some(PathBuf::from(path));
+/// The one history database every writer and reader agrees on
+/// (`DCG_HISTORY_DB` > `[history] database_path` > legacy > state dir).
+fn history_db_path(config: &destructive_command_guard::config::HistoryConfig) -> PathBuf {
+    ResolvedHistoryPath::resolve(config).path
+}
+
+fn create_history_writer(
+    config: &destructive_command_guard::config::HistoryConfig,
+) -> HistoryWriter {
+    let _phase = phase(ProfilePhase::HistoryInit);
+    HistoryWriter::new(Some(history_db_path(config)), config)
+}
+
+fn record_history(writer: &HistoryWriter, entry: CommandEntry) {
+    let _phase = phase(ProfilePhase::HistoryRecord);
+    writer.log(entry);
+}
+
+fn drop_history_writer(writer: Option<HistoryWriter>) {
+    if let Some(writer) = writer {
+        let _phase = phase(ProfilePhase::HistoryFlush);
+        drop(writer);
     }
-    config.expanded_database_path()
 }
 
 fn build_history_entry(
@@ -115,6 +148,7 @@ fn build_history_entry(
     pattern_name: Option<&str>,
     allowlist_layer: Option<&str>,
 ) -> CommandEntry {
+    let _phase = phase(ProfilePhase::HistoryRecord);
     let eval_duration_us = u64::try_from(eval_duration.as_micros()).unwrap_or(u64::MAX);
 
     CommandEntry {
@@ -132,29 +166,270 @@ fn build_history_entry(
 
 fn history_agent_type_for_protocol(protocol: hook::HookProtocol, detected_agent: &Agent) -> &str {
     match protocol {
+        hook::HookProtocol::Codex if *detected_agent == Agent::Muse => detected_agent.config_key(),
         hook::HookProtocol::Codex => Agent::CodexCli.config_key(),
         hook::HookProtocol::Gemini => Agent::GeminiCli.config_key(),
         hook::HookProtocol::Copilot => Agent::CopilotCli.config_key(),
         hook::HookProtocol::Hermes => Agent::Hermes.config_key(),
         hook::HookProtocol::Grok => Agent::Grok.config_key(),
         hook::HookProtocol::Antigravity => Agent::Antigravity.config_key(),
+        hook::HookProtocol::Crush => Agent::Crush.config_key(),
+        hook::HookProtocol::Reasonix => Agent::Reasonix.config_key(),
         hook::HookProtocol::ClaudeCompatible => detected_agent.config_key(),
     }
 }
 
+/// The agent whose `[agents.<key>]` profile, history label and self-heal
+/// target apply to a request answered in `protocol`.
+///
+/// The wire protocol normally names the host, whatever the environment
+/// suggests. Muse Code (#572) is the exception: it sends Codex's payload shape
+/// (a `turn_id`) and reads Codex's minimal answer, so the protocol alone said
+/// "Codex" and an `[agents.muse]` profile never applied. Muse runs hooks in a
+/// cleared environment, so the identity comes only from the installer-written
+/// `--agent muse`; it is never inferred from the payload, so a payload cannot
+/// claim to be Muse.
 fn effective_agent_for_hook_protocol(
     protocol: hook::HookProtocol,
     detected_agent: &Agent,
 ) -> Agent {
     match protocol {
+        hook::HookProtocol::Codex if *detected_agent == Agent::Muse => Agent::Muse,
         hook::HookProtocol::Codex => Agent::CodexCli,
         hook::HookProtocol::Gemini => Agent::GeminiCli,
         hook::HookProtocol::Copilot => Agent::CopilotCli,
         hook::HookProtocol::Hermes => Agent::Hermes,
         hook::HookProtocol::Grok => Agent::Grok,
         hook::HookProtocol::Antigravity => Agent::Antigravity,
+        hook::HookProtocol::Crush => Agent::Crush,
+        hook::HookProtocol::Reasonix => Agent::Reasonix,
         hook::HookProtocol::ClaudeCompatible => detected_agent.clone(),
     }
+}
+
+/// The protocol dcg answers in once the payload has named its own.
+///
+/// Muse Code reads only `hookSpecificOutput.permissionDecision` and rejects
+/// shapes it does not know (a bare `allow`, a legacy `decision`), so it is
+/// answered in the minimal Codex shape it is known to enforce, including for a
+/// payload that happens to lack `turn_id` and would otherwise get Claude's
+/// extended document. Every other host keeps the protocol its payload selects.
+fn host_hook_protocol(protocol: hook::HookProtocol, detected_agent: &Agent) -> hook::HookProtocol {
+    if *detected_agent == Agent::Muse && protocol == hook::HookProtocol::ClaudeCompatible {
+        hook::HookProtocol::Codex
+    } else {
+        protocol
+    }
+}
+
+/// Hosts whose behavior when a hook cannot answer is undocumented, so dcg
+/// blocks every request it cannot read instead of failing open (#572). Muse
+/// Code documents an `onFailure` fallback for a hook that exits non-zero,
+/// times out or prints invalid output, but not what happens without one; an
+/// unreadable payload therefore blocks here rather than relying on it.
+fn host_requires_fail_closed(detected_agent: &Agent) -> bool {
+    *detected_agent == Agent::Muse
+}
+
+/// Maximum time the deny path may wait for the pending-exceptions store lock
+/// before emitting its denial without an allow-once code (issue #291).
+///
+/// Wide enough that a short burst of concurrent hook denials (each holding
+/// the lock for a scan + append + fsync) still gets codes, while a wedged or
+/// long-held lock degrades to a code-less denial well inside the 1000ms
+/// evaluation budget instead of stalling the protocol response indefinitely.
+const ALLOW_ONCE_LOCK_WAIT: Duration = Duration::from_millis(150);
+
+/// Minimum remaining deadline budget required before the deny path lets the
+/// pending-exceptions store run maintenance (full scan + prune/archive
+/// rewrite) while recording a block (issue #291).
+const ALLOW_ONCE_MAINTENANCE_MIN_BUDGET: Duration = Duration::from_millis(250);
+
+/// Minimum remaining deadline budget required before hook mode runs the
+/// settings.json self-heal check (issue #293).
+///
+/// Sized just above the self-heal advisory lock's own bounded wait (5 attempts
+/// × 10ms) plus the read/parse/rename it guards, so a deliberately tight
+/// `general.hook_timeout_ms` spends its budget on evaluation rather than on
+/// housekeeping. Self-heal is idempotent and reruns on the next invocation.
+const SELF_HEAL_MIN_BUDGET: Duration = Duration::from_millis(60);
+
+const INDETERMINATE_HISTORY_PACK: &str = "dcg.internal";
+const INDETERMINATE_HISTORY_PATTERN: &str = "evaluation-deadline";
+
+/// The indeterminate reason published when a command exceeds
+/// `general.max_command_bytes`.
+///
+/// Shared by the pre-writer primary-command refusal and the per-entry batch
+/// refusal so the two sites cannot drift: both must emit identical bytes.
+fn format_oversized_command_reason(command_len: usize, max_command_bytes: usize) -> String {
+    format!(
+        "Command is {command_len} bytes and exceeds limit {max_command_bytes} bytes; \
+         DCG did not evaluate it. Reduce the command size or raise \
+         general.max_command_bytes after review."
+    )
+}
+
+/// What a deadline miss reports beyond its stage (#571): the phase the budget
+/// ran out in, the bounded analysis that stopped short (if one did before the
+/// deadline), the wall time spent, and the CPU time the process actually got.
+/// Wall time close to the budget with little CPU means the host did not
+/// schedule dcg; CPU close to the wall time means the input was slow.
+#[derive(Debug, Clone, Copy)]
+struct IndeterminateDetail {
+    exhaustion: perf::BudgetExhaustion,
+    elapsed: Duration,
+    cpu: Option<Duration>,
+}
+
+impl IndeterminateDetail {
+    fn now(exhaustion: perf::BudgetExhaustion, deadline: &Deadline) -> Self {
+        Self {
+            exhaustion,
+            elapsed: deadline.elapsed(),
+            cpu: perf::process_cpu_time(),
+        }
+    }
+}
+
+fn format_indeterminate_reason(
+    stage: &str,
+    budget: Duration,
+    detail: &IndeterminateDetail,
+) -> String {
+    use std::fmt::Write as _;
+    let mut context = format!("stage: {stage}");
+    let exhaustion = detail.exhaustion;
+    // A bounded step that gave up while hook budget remained is the cause;
+    // otherwise name where the deadline itself was noticed.
+    let incomplete = exhaustion
+        .incomplete
+        .filter(|_| detail.elapsed < budget || exhaustion.deadline.is_none());
+    if let Some((step, step_phase)) = incomplete {
+        if let Some(step_phase) = step_phase {
+            let _ = write!(context, ", phase: {}", perf::phase_name(step_phase));
+        }
+        let _ = write!(context, ", incomplete: {step}");
+    } else if let Some(Some(deadline_phase)) = exhaustion.deadline {
+        let _ = write!(context, ", phase: {}", perf::phase_name(deadline_phase));
+    }
+    let _ = write!(context, "; elapsed {}ms", detail.elapsed.as_millis());
+    if let Some(cpu) = detail.cpu {
+        let _ = write!(context, ", process CPU {}ms", cpu.as_millis());
+    }
+    format!(
+        "DCG could not complete safety evaluation within {}ms ({context}); \
+         command was not verified. Review manually or increase hook_timeout_ms.",
+        budget.as_millis()
+    )
+}
+
+/// Exit status for a blocking verdict (deny, ask, or indeterminate) after
+/// its publication attempt.
+///
+/// `Ok` means the JSON reached stdout and the protocol's exit-0 contract
+/// applies. `Err` means the host stopped reading before the verdict was
+/// written — with `SIGPIPE` ignored that is an `EPIPE` on the write — and
+/// exit 0 with nothing on stdout reads as "proceed" on every host, so the
+/// protocol's blocking exit status has to carry the verdict instead
+/// (`HookProtocol::undeliverable_block_exit_code`). The stderr line is
+/// best-effort: Claude Code feeds it back to the model on exit 2, and a host
+/// that closed stderr too simply gets the status.
+fn blocking_verdict_exit_code(protocol: hook::HookProtocol, delivery: io::Result<()>) -> i32 {
+    match delivery {
+        // Reasonix reads only the exit status (#358): exit 0 would let the
+        // command run whatever was written.
+        Ok(()) if protocol.blocks_by_exit_status() => protocol.undeliverable_block_exit_code(),
+        Ok(()) => EXIT_SUCCESS,
+        Err(error) => {
+            let exit_code = protocol.undeliverable_block_exit_code();
+            emit_stderr!(
+                "[dcg] BLOCKED: the verdict could not be written to stdout ({error}); exiting {exit_code} so the host fails closed."
+            );
+            exit_code
+        }
+    }
+}
+
+/// The protocol for a verdict published WITHOUT a parsed payload: a
+/// fail-closed parse failure, or a proven deny salvaged from an oversized or
+/// non-UTF-8 payload.
+///
+/// Normally that is the env/process-detected agent's protocol
+/// ([`hook_protocol_for_agent`]). When no agent was identified, that falls
+/// back to the Claude shape, which answers with exit 0, and a host that reads
+/// only the exit status takes exit 0 as a pass. That is the ordinary case for
+/// Reasonix (#358): it sets no env marker, and process-ancestry detection is
+/// Unix-only. Antigravity also needs its native JSON response when its env
+/// marker is absent. So when the agent is unknown, the envelope markers still
+/// readable in the raw `prefix` decide instead
+/// ([`hook::protocol_from_truncated_json`]). They never override an
+/// identified agent: a planted marker must not be able to switch, say,
+/// Codex's JSON deny into an exit status Codex treats as a pass.
+fn payloadless_hook_protocol(detected_agent: &Agent, prefix: Option<&str>) -> hook::HookProtocol {
+    if !detected_agent.is_known() {
+        if let Some(protocol) = prefix.and_then(hook::protocol_from_truncated_json) {
+            return protocol;
+        }
+    }
+    hook_protocol_for_agent(detected_agent)
+}
+
+/// Leave hook mode with `exit_code`.
+///
+/// Exit 0 is the ordinary return from `main`. A non-zero status goes through
+/// `process::exit`, which skips `Drop`, so callers must have dropped (and
+/// thereby flushed) the history writer first.
+fn finish_hook_mode(exit_code: i32) {
+    perf::finish_hook_profile();
+    if exit_code != EXIT_SUCCESS {
+        std::process::exit(exit_code);
+    }
+}
+
+/// Publish one conservative protocol decision for every deadline exit path
+/// and return the process exit status (see `blocking_verdict_exit_code`).
+///
+/// Deadline exhaustion is not an allow: Claude/Copilot can ask the operator,
+/// while protocols without an `ask` decision receive their documented block
+/// response. The protocol response is flushed before best-effort history is
+/// queued, and the history worker is detached before return: once the
+/// evaluation budget is exhausted, no audit sink may delay hook-process exit.
+/// History records deadline decisions as denied because no supported protocol
+/// lets the command execute without a subsequent human approval.
+fn handle_indeterminate_evaluation(
+    protocol: hook::HookProtocol,
+    history_writer: Option<&mut HistoryWriter>,
+    history_agent_type: &str,
+    command: &str,
+    working_dir: &str,
+    stage: &str,
+    exhaustion: perf::BudgetExhaustion,
+    deadline: &Deadline,
+    deny_unverified: bool,
+) -> i32 {
+    let detail = IndeterminateDetail::now(exhaustion, deadline);
+    let elapsed = detail.elapsed;
+    let budget = deadline.max_duration();
+
+    let reason = format_indeterminate_reason(stage, budget, &detail);
+    let delivery = hook::output_indeterminate_for_protocol(protocol, &reason, deny_unverified);
+
+    if let Some(writer) = history_writer {
+        let entry = build_history_entry(
+            history_agent_type,
+            command,
+            working_dir,
+            HistoryOutcome::Deny,
+            elapsed,
+            Some(INDETERMINATE_HISTORY_PACK),
+            Some(INDETERMINATE_HISTORY_PATTERN),
+            None,
+        );
+        record_history(writer, entry);
+        writer.detach_worker_on_drop();
+    }
+    blocking_verdict_exit_code(protocol, delivery)
 }
 
 /// Handle hook input that could not be parsed (issue #160).
@@ -181,6 +456,12 @@ fn hook_protocol_for_agent(agent: &Agent) -> hook::HookProtocol {
         Agent::Hermes => hook::HookProtocol::Hermes,
         Agent::Grok => hook::HookProtocol::Grok,
         Agent::Antigravity => hook::HookProtocol::Antigravity,
+        Agent::Crush => hook::HookProtocol::Crush,
+        // Reasonix reads only the exit status: the Claude-shaped fallback
+        // below would exit 0 and let the command run.
+        Agent::Reasonix => hook::HookProtocol::Reasonix,
+        // Muse Code enforces the minimal Codex deny (#572).
+        Agent::Muse => hook::HookProtocol::Codex,
         _ => hook::HookProtocol::ClaudeCompatible,
     }
 }
@@ -190,7 +471,7 @@ fn handle_unparseable_hook_input(
     detected_agent: &Agent,
     read_err: &hook::HookReadError,
     max_input_bytes: usize,
-) {
+) -> i32 {
     // Block when fail-closed AND the failure is an attacker-influenceable
     // payload problem: a JSON parse error OR an oversized input (padding a
     // command past the size limit must not skip evaluation under fail-closed —
@@ -198,9 +479,15 @@ fn handle_unparseable_hook_input(
     // malformed payloads.
     let blockable = matches!(
         read_err,
-        hook::HookReadError::Json(_) | hook::HookReadError::InputTooLarge(_)
+        hook::HookReadError::Json { .. }
+            | hook::HookReadError::InputTooLarge { .. }
+            | hook::HookReadError::InvalidUtf8 { .. }
     );
-    let block = blockable && config.is_fail_closed();
+    // A host that does not document what it does when a hook cannot answer
+    // gets a block for every request dcg could not read, transient IO
+    // included: the command was not verified either way (#572).
+    let host_fail_closed = host_requires_fail_closed(detected_agent);
+    let block = (blockable && config.is_fail_closed()) || host_fail_closed;
 
     // Audit trail: record the event to history (best-effort, never fatal).
     if config.history.enabled {
@@ -213,7 +500,8 @@ fn handle_unparseable_hook_input(
         } else {
             HistoryOutcome::Allow
         };
-        let writer = HistoryWriter::new(history_db_path(&config.history), &config.history);
+        let mut writer = create_history_writer(&config.history);
+        writer.limit_drop_wait_to(HOOK_EVALUATION_BUDGET);
         let entry = build_history_entry(
             detected_agent.config_key(),
             "<unparseable hook input>",
@@ -224,44 +512,78 @@ fn handle_unparseable_hook_input(
             None,
             Some("parse-error"),
         );
-        writer.log(entry);
+        record_history(&writer, entry);
         // Flush synchronously because this parse-error path returns
         // immediately after publishing its fail-open/fail-closed decision.
-        writer.flush_sync();
+        {
+            let _phase = phase(ProfilePhase::HistoryFlush);
+            writer.flush_sync();
+        }
+        drop_history_writer(Some(writer));
     }
 
     if !block {
-        // Fail-open (default). Keep the historic oversized-input warning so an
-        // operator can see why a large command was allowed; other errors warn
-        // only under verbose.
+        // Fail-open (default), but never silently: a hook whose input it cannot
+        // read is providing no protection at all, and the operator has to be
+        // able to see that from the terminal. The audit row above needs
+        // `[history] enabled = true`, so with history off a silent exit left no
+        // trace anywhere — dcg looked installed and working while allowing
+        // every command (issue #410). Both arms therefore warn unconditionally,
+        // matching what README's bounded-failure table already promises
+        // ("Allow with an audit warning").
         match read_err {
-            hook::HookReadError::InputTooLarge(len) => {
-                eprintln!(
+            hook::HookReadError::InputTooLarge { len, .. } => {
+                emit_stderr!(
                     "[dcg] Warning: stdin input ({len} bytes) exceeds limit ({max_input_bytes} bytes); allowing command (fail-open)"
                 );
             }
-            _ if config.general.verbose => {
-                eprintln!(
-                    "[dcg] Warning: could not parse hook input; allowing command (fail-open)"
+            hook::HookReadError::Json { error: err, .. } => {
+                emit_stderr!(
+                    "[dcg] Warning: could not parse hook input ({err}); allowing command (fail-open). Set DCG_FAIL_CLOSED=1 to block instead."
                 );
             }
-            _ => {}
+            // The payload bytes are attacker-controlled, so this is a malformed
+            // envelope and blocks under fail-closed alongside `Json`.
+            hook::HookReadError::InvalidUtf8 { error, .. } => {
+                emit_stderr!(
+                    "[dcg] Warning: hook input is not valid UTF-8 ({error}); allowing command (fail-open). Set DCG_FAIL_CLOSED=1 to block instead."
+                );
+            }
+            // A transient stdin read error is not an attacker-controlled
+            // payload and always fails open; say so rather than implying the
+            // envelope was malformed.
+            hook::HookReadError::Io(err) => {
+                emit_stderr!(
+                    "[dcg] Warning: could not read hook input ({err}); allowing command (fail-open)"
+                );
+            }
         }
-        return;
+        return EXIT_SUCCESS;
     }
 
     // Fail-closed: emit an agent-appropriate denial. Without a parsed payload we
     // cannot run protocol detection, so derive the protocol from the
-    // env/process-detected agent.
-    let protocol = hook_protocol_for_agent(detected_agent);
-    let reason = if matches!(read_err, hook::HookReadError::InputTooLarge(_)) {
+    // env/process-detected agent, or from whatever envelope markers the raw
+    // bytes still show when no agent was identified.
+    let raw_prefix = match read_err {
+        hook::HookReadError::InputTooLarge { prefix, .. } => Some(prefix.as_str()),
+        hook::HookReadError::InvalidUtf8 { lossy, .. } => Some(lossy.as_str()),
+        hook::HookReadError::Json { raw, .. } => Some(raw.as_str()),
+        hook::HookReadError::Io(_) => None,
+    };
+    let protocol = payloadless_hook_protocol(detected_agent, raw_prefix);
+    let reason = if host_fail_closed && !(blockable && config.is_fail_closed()) {
+        "BLOCKED by dcg: the hook input was unreadable, malformed or over the size limit, \
+         so the command was not verified. dcg always fails closed for this host. Check \
+         that dcg and the agent are up to date."
+    } else if matches!(read_err, hook::HookReadError::InputTooLarge { .. }) {
         "BLOCKED by dcg: the hook input exceeds the size limit and cannot be evaluated; \
          DCG_FAIL_CLOSED is set (fail-closed mode)."
     } else {
         "BLOCKED by dcg: the hook input could not be parsed; DCG_FAIL_CLOSED is set \
          (fail-closed mode). Fix the malformed hook payload or unset DCG_FAIL_CLOSED."
     };
-    hook::output_denial_for_protocol(
+    let delivery = hook::output_denial_for_protocol(
         protocol,
         "<unparseable hook input>",
         reason,
@@ -275,6 +597,286 @@ fn handle_unparseable_hook_input(
         &[],
         None,
     );
+    blocking_verdict_exit_code(protocol, delivery)
+}
+
+/// Overlap between consecutive scan windows of an over-limit command, so a
+/// destructive command that straddles a window boundary is still wholly
+/// contained in the next window. 4 KiB comfortably exceeds any realistic
+/// single shell command.
+const OVERSIZED_SCAN_WINDOW_OVERLAP: usize = 4 * 1024;
+
+/// Hard cap on the number of scan windows produced from one extracted
+/// command. With the 4 MiB scan buffer and the 64 KiB default command limit
+/// this is never reached; it exists so an exotic configuration cannot turn
+/// the fail-open path into an unbounded loop.
+const OVERSIZED_SCAN_MAX_WINDOWS: usize = 128;
+
+/// Slice `command` into evaluable, overlapping windows and append them to
+/// `out`.
+///
+/// A command within the limit contributes itself unchanged. Empty windows are
+/// dropped. Windows always start and end on char boundaries.
+fn push_oversized_scan_windows(out: &mut Vec<String>, command: &str, max_command_bytes: usize) {
+    if command.is_empty() || max_command_bytes == 0 {
+        return;
+    }
+    if command.len() <= max_command_bytes {
+        out.push(command.to_string());
+        return;
+    }
+
+    let stride = max_command_bytes
+        .saturating_sub(OVERSIZED_SCAN_WINDOW_OVERLAP)
+        .max(1);
+    let mut start = 0usize;
+    for _ in 0..OVERSIZED_SCAN_MAX_WINDOWS {
+        if start >= command.len() {
+            break;
+        }
+        let mut begin = start;
+        while begin < command.len() && !command.is_char_boundary(begin) {
+            begin += 1;
+        }
+        let mut end = (begin + max_command_bytes).min(command.len());
+        while end > begin && !command.is_char_boundary(end) {
+            end -= 1;
+        }
+        if begin < end {
+            out.push(command[begin..end].to_string());
+        }
+        if end >= command.len() {
+            break;
+        }
+        start += stride;
+    }
+}
+
+/// Best-effort evaluation of an oversized hook payload's truncated prefix
+/// (issue #290).
+///
+/// Padding a destructive command past `max_hook_input_bytes` used to skip
+/// every pack: the oversized input failed open (by default) without any
+/// evaluation. The JSON prefix that WAS read usually still contains
+/// `tool_input.command` or native Antigravity `toolCall.args.CommandLine`,
+/// so extract commands leniently and run them through the normal evaluation
+/// pipeline. A proven Deny/Ask publishes the ordinary blocking response;
+/// deadline exhaustion, or a window whose evaluation could not complete,
+/// publishes an indeterminate response. Both return the protocol's exit
+/// status. Nothing extractable, a benign command, or a warn/log match returns
+/// `None` to keep the historic fail-open warning path.
+///
+/// Two attribution rules keep this from over-denying and from under-scanning:
+/// - The prefix must name a recognized SHELL tool (`tool_name`/`toolName` or
+///   native `toolCall.name`). Antigravity's nameless-with-args form is also
+///   accepted, as on the parsed path.
+///   An oversized `Write`/`Read` envelope that happens to carry a
+///   command-shaped field is not a shell request and must fail open; so does
+///   an unattributable prefix — dcg never denies what it cannot attribute to
+///   a shell.
+/// - EVERY recovered command is evaluated independently. Legacy envelopes
+///   retain the all-occurrences `"command"` scan. Native envelopes recover
+///   their accepted command aliases only from command-bearing envelope
+///   fields, keeping unrelated metadata inert. Neither a duplicate key nor
+///   a benign alias may suppress another command.
+///
+/// Only called under fail-open; fail-closed unparseable input still denies
+/// unconditionally in `handle_unparseable_hook_input` (issue #160).
+///
+/// Serves every unparseable-payload kind that still carries bytes: oversized
+/// input hands over its truncated prefix, and invalid UTF-8 hands over its
+/// lossy decoding. The two differ only in how the bytes became unusable, and an
+/// attacker picks whichever is cheaper — appending one `0xFF` is a great deal
+/// cheaper than padding past the size limit.
+fn try_deny_unparseable_payload(
+    config: &Config,
+    detected_agent: &Agent,
+    prefix: &str,
+    deadline: &Deadline,
+    compiled_overrides: &CompiledOverrides,
+    heredoc_settings: &HeredocSettings,
+    external_store: &destructive_command_guard::packs::ExternalPackStore,
+) -> Option<i32> {
+    // Attribute the payload to a shell tool before evaluating anything. The
+    // dialect comes from the same mapping the normal parsed path uses.
+    let (_tool_name, shell_dialect) = hook::shell_tool_from_truncated_json(prefix)?;
+
+    // The padding may live INSIDE the command string (the issue's repro
+    // shape), either before or after the destructive part. Evaluating an
+    // over-limit command outright would be refused as oversized, so slice it
+    // into overlapping evaluable windows instead of keeping only the leading
+    // prefix: padding-then-destructive is exactly as easy to write as
+    // destructive-then-padding.
+    let max_command_bytes = config.general.max_command_bytes();
+    let mut commands: Vec<String> = Vec::new();
+    for command in hook::extract_commands_from_truncated_json(prefix) {
+        push_oversized_scan_windows(&mut commands, &command, max_command_bytes);
+    }
+    if commands.is_empty() {
+        return None;
+    }
+
+    // No parsed payload exists, so protocol detection falls back to the
+    // env/process-detected agent, or to the prefix's envelope markers when no
+    // agent was identified (same rule as the fail-closed deny path).
+    let hook_protocol = payloadless_hook_protocol(detected_agent, Some(prefix));
+    let effective_agent = effective_agent_for_hook_protocol(hook_protocol, detected_agent);
+    let history_agent_type = history_agent_type_for_protocol(hook_protocol, detected_agent);
+
+    let allowlists = load_effective_allowlists_for_agent(config, &effective_agent);
+    let mut enabled_packs: HashSet<String> = config.enabled_pack_ids_for_agent(&effective_agent);
+    enabled_packs.extend(config.enabled_external_pack_ids(external_store, Some(&effective_agent)));
+
+    let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
+    let mut ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
+    let has_external_packs =
+        external_store.extend_evaluation(&enabled_packs, &mut enabled_keywords, &mut ordered_packs);
+    let keyword_index = if has_external_packs {
+        None
+    } else {
+        REGISTRY.build_enabled_keyword_index(&ordered_packs)
+    };
+
+    let cwd_path = std::env::current_dir().ok();
+    let working_dir = cwd_path.as_ref().map_or_else(
+        || "<unknown>".to_string(),
+        |path| path.to_string_lossy().to_string(),
+    );
+    let decision_logger = destructive_command_guard::logging::DecisionLogger::new(&config.logging);
+
+    let eval_context = HookEvalContext {
+        config,
+        enabled_keywords: &enabled_keywords,
+        ordered_packs: &ordered_packs,
+        keyword_index: keyword_index.as_ref(),
+        compiled_overrides,
+        allowlists: &allowlists,
+        heredoc_settings,
+        cwd_path: cwd_path.as_deref(),
+        // Only the truncated prefix of an oversized payload is available
+        // here; its envelope fields were never parsed.
+        hook_cwd: None,
+        // With the envelope unparsed the harness-reported cwd is unknown, and
+        // the hook process's own cwd is not a substitute for it, so
+        // directory-scoped allowlist entries fail closed here (#387).
+        scope_base: None,
+        working_dir: &working_dir,
+        deadline,
+        hook_protocol,
+        history_agent_type,
+        max_command_bytes,
+        decision_logger: decision_logger.as_ref(),
+    };
+
+    // History is deliberately not passed to resolve: the fail-open fallback
+    // records its own audit row in `handle_unparseable_hook_input`, and a
+    // refused payload must not provoke history-writer construction (worker
+    // thread + database) unless a denial is actually published.
+    // Deny if ANY extracted occurrence (or scan window) resolves decisively;
+    // a benign decoy ahead of the real command must not be able to end the
+    // scan.
+    //
+    // An exhausted deadline leaves windows unscanned, so "nothing found" is not
+    // something this run established — and this loop used to `break` into the
+    // fail-open branch, which ALLOWS. That contradicted the invariant stated
+    // twice in AGENTS.md ("exhaustion is indeterminate, never a silent allow"),
+    // and the normal-size path already honours it: measured at
+    // `DCG_HOOK_TIMEOUT_MS=1`, `git reset --hard` answered ask-or-deny 12/12
+    // while the same command padded past the size limit answered ALLOW 12/12
+    // (#475). Publishing the same Indeterminate the normal path publishes is
+    // what closes that, and it is also why
+    // `issue_290_padding_inside_command_before_destructive_part_is_denied`
+    // flaked: it was green only while the host was fast enough to finish.
+    //
+    // Completing the scan with no hit still returns None. That is a real
+    // "nothing found", not an unknown, so a benign oversized payload keeps
+    // failing open exactly as `issue_290_padded_benign_command_still_fails_open`
+    // requires.
+    //
+    // A window whose own evaluation could not finish is the same unknown as an
+    // exhausted deadline: the evaluator answered Indeterminate (an incomplete
+    // regex search, a bounded analysis that stopped short — #569 turned the
+    // Windows filesystem statement bound into one — or a nested deadline). It
+    // used to fall through this loop into the fail-open `None`, including on
+    // the LAST window, where the next iteration's deadline check never ran.
+    // Keep it until the scan ends, so a later window's proven Deny still
+    // outranks it, and then publish it instead of allowing.
+    let mut pending_indeterminate: Option<ResolvedCommandOutcome> = None;
+    for command in &commands {
+        if deadline.is_exceeded() {
+            let mut history_writer = if config.history.enabled {
+                let mut writer = create_history_writer(&config.history);
+                writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
+                Some(writer)
+            } else {
+                None
+            };
+            let exit_code = publish_decisive_response(
+                &eval_context,
+                ResolvedCommandOutcome::DeadlineExhausted {
+                    command: command.clone(),
+                    stage: "oversized_payload_window_scan",
+                    exhaustion: perf::take_budget_exhaustion(),
+                },
+                &mut history_writer,
+            );
+            // Dropped before the caller can `process::exit`, for the same
+            // reason the deny arm below drops its writer here.
+            drop_history_writer(history_writer);
+            return Some(exit_code);
+        }
+        // Windows made of pure padding carry no enabled keyword; skipping
+        // them keeps the multi-window scan a substring search per megabyte
+        // rather than a full evaluation per window.
+        if destructive_command_guard::packs::pack_aware_quick_reject(command, &enabled_keywords) {
+            continue;
+        }
+        // Down-trust a `Bash`-labeled dialect when this window is unmistakably
+        // PowerShell/cmd, exactly as the normal parsed path does (#322). Without
+        // this, padding a mislabeled PowerShell payload past `max_command_bytes`
+        // routed it here with an unrefined Posix dialect, where a cmdlet is an
+        // inert unknown binary — reopening the #322 hole on the oversized path.
+        let refined_dialect = hook::refine_shell_dialect(command, shell_dialect);
+        let outcome = resolve_hook_command(&eval_context, command, refined_dialect, None);
+        match outcome {
+            ResolvedCommandOutcome::DenyFamily(resolved)
+                if matches!(resolved.mode, DecisionMode::Deny | DecisionMode::Ask) =>
+            {
+                let mut history_writer = if config.history.enabled {
+                    let mut writer = create_history_writer(&config.history);
+                    writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
+                    Some(writer)
+                } else {
+                    None
+                };
+                let exit_code = publish_decisive_response(
+                    &eval_context,
+                    ResolvedCommandOutcome::DenyFamily(resolved),
+                    &mut history_writer,
+                );
+                // Dropped here, before the caller can `process::exit`: the
+                // audit row must be flushed first.
+                drop_history_writer(history_writer);
+                return Some(exit_code);
+            }
+            indeterminate @ (ResolvedCommandOutcome::DeadlineExhausted { .. }
+            | ResolvedCommandOutcome::OversizedCommand { .. }) => {
+                pending_indeterminate.get_or_insert(indeterminate);
+            }
+            ResolvedCommandOutcome::DenyFamily(_) | ResolvedCommandOutcome::Allow(_) => {}
+        }
+    }
+    let indeterminate = pending_indeterminate?;
+    let mut history_writer = if config.history.enabled {
+        let mut writer = create_history_writer(&config.history);
+        writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
+        Some(writer)
+    } else {
+        None
+    };
+    let exit_code = publish_decisive_response(&eval_context, indeterminate, &mut history_writer);
+    drop_history_writer(history_writer);
+    Some(exit_code)
 }
 
 /// Process-wide registry of shutdown actions.
@@ -326,10 +928,146 @@ fn install_signal_shutdown_handler() {
     // (in registration order), then exits 130. Code 130 is the canonical
     // "interrupted by SIGINT" status (128 + SIGINT(2)).
     let _ = ctrlc::set_handler(|| {
-        eprintln!("[dcg] Flushing on signal...");
+        emit_stderr!("[dcg] Flushing on signal...");
         run_shutdown_actions();
         std::process::exit(130);
     });
+}
+
+/// Convert the standard library's `EPIPE` print panic into a clean exit.
+///
+/// `SIGPIPE` is deliberately left ignored (see `output::emit` for why a hook
+/// binary must not die on a stderr write while its stdout verdict may still
+/// have a reader), so a `println!`/`eprintln!` to a pipe whose reader has
+/// gone away panics instead. Under the release profile's `panic = "abort"`
+/// that panic used to become `SIGABRT` plus a core dump, and in hook mode it
+/// dropped the verdict on the floor (issue #389). The hook path itself now
+/// writes through the non-panicking `emit_*` helpers; this backstop covers the
+/// CLI surface (`dcg packs | head -1`, …) and any diagnostic that slips
+/// through, and exits with `EXIT_BROKEN_PIPE` — the status of a C tool killed
+/// by `SIGPIPE`, reached without a signal death.
+///
+/// Every other panic still goes to the default hook and keeps its existing
+/// behaviour; only the exact standard-library broken-pipe message is claimed.
+fn install_broken_pipe_backstop() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let is_broken_pipe = info
+            .payload_as_str()
+            .is_some_and(destructive_command_guard::output::emit::is_broken_pipe_print_panic);
+        if is_broken_pipe {
+            // Deliberately no `run_shutdown_actions()` here, unlike the SIGINT
+            // handler: a panic hook can run on a thread that already holds
+            // the shutdown registry (a flush action that itself hit EPIPE),
+            // and a deadlocked panic hook is strictly worse than an unflushed
+            // history row for a process whose reader has already left.
+            std::process::exit(EXIT_BROKEN_PIPE);
+        }
+        default_hook(info);
+        fail_closed_on_hook_panic();
+    }));
+}
+
+/// How hook mode answers if the process panics before it has published a
+/// verdict. Armed by the hook path once it knows the protocol, and cleared once
+/// the command is known to be allowed.
+#[derive(Clone, Copy)]
+struct HookPanicPolicy {
+    protocol: hook::HookProtocol,
+    deny_unverified: bool,
+}
+
+static HOOK_PANIC_POLICY: std::sync::Mutex<Option<HookPanicPolicy>> = std::sync::Mutex::new(None);
+
+fn set_hook_panic_policy(policy: Option<HookPanicPolicy>) {
+    let mut guard = match HOOK_PANIC_POLICY.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = policy;
+}
+
+const HOOK_PANIC_REASON: &str = "DCG hit an internal error while evaluating this command, \
+     so the command was not verified. Review it manually; the error is on stderr.";
+
+/// Turn a panic in hook mode into a blocking verdict instead of a crash.
+///
+/// The release profile aborts on panic, and a hook killed by `SIGABRT` (or,
+/// in an unwinding build, one that exits 101) is a non-blocking hook error to
+/// every supported host: the tool call proceeds. A panic anywhere in the
+/// evaluation (the main thread, or an analysis worker thread, which under
+/// `panic = "abort"` takes the whole process with it) was therefore an allow.
+///
+/// Armed, this publishes the indeterminate verdict for the request's protocol
+/// (ask, or deny under `unverified_decision = deny`) and exits with the status
+/// that verdict needs. If a verdict was already being written when the panic
+/// struck, the document on stdout may be incomplete, so the protocol's blocking
+/// exit status carries the decision instead.
+fn fail_closed_on_hook_panic() {
+    let policy = match HOOK_PANIC_POLICY.try_lock() {
+        Ok(guard) => *guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => *poisoned.into_inner(),
+        // Only `set_hook_panic_policy` takes this lock, and it holds it for an
+        // assignment, so contention means a panic inside that assignment.
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    };
+    let Some(policy) = policy else {
+        return;
+    };
+    let exit_code = match hook::output_indeterminate_from_panic(
+        policy.protocol,
+        HOOK_PANIC_REASON,
+        policy.deny_unverified,
+    ) {
+        Some(delivery) => blocking_verdict_exit_code(policy.protocol, delivery),
+        None => policy.protocol.undeliverable_block_exit_code(),
+    };
+    std::process::exit(exit_code);
+}
+
+/// Fault injection for the panic backstop's end-to-end tests.
+///
+/// Debug builds only (the integration tests run the debug binary); release
+/// builds compile this to nothing. `DCG_TEST_HOOK_PANIC=main` panics on the
+/// hook thread, `=worker` on a spawned analysis-style thread, both at the
+/// point a command is about to be evaluated.
+#[cfg(debug_assertions)]
+fn inject_test_hook_panic() {
+    match std::env::var("DCG_TEST_HOOK_PANIC").as_deref() {
+        Ok("main") => panic!("injected hook panic (DCG_TEST_HOOK_PANIC=main)"),
+        Ok("worker") => {
+            let _ = std::thread::spawn(|| {
+                panic!("injected hook panic (DCG_TEST_HOOK_PANIC=worker)");
+            })
+            .join();
+        }
+        _ => {}
+    }
+}
+
+#[cfg(not(debug_assertions))]
+const fn inject_test_hook_panic() {}
+
+/// Opt-in diagnostics for hook mode: `DCG_LOG=<filter>` (for example
+/// `DCG_LOG=debug`, or `DCG_LOG=destructive_command_guard::heredoc=trace`)
+/// sends the evaluator's tracing events to stderr. Unset, nothing is installed
+/// and the hot path pays nothing.
+fn init_hook_tracing() {
+    if destructive_command_guard::output::is_robot_mode() {
+        return;
+    }
+    let Some(filter) = std::env::var_os("DCG_LOG") else {
+        return;
+    };
+    let Ok(filter) = tracing_subscriber::EnvFilter::try_new(filter.to_string_lossy().trim()) else {
+        emit_stderr!("[dcg] Warning: ignoring DCG_LOG: not a valid tracing filter");
+        return;
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(io::stderr)
+        .with_ansi(false)
+        .try_init();
 }
 
 fn install_history_shutdown_handler(
@@ -379,65 +1117,859 @@ fn top_level_flag_requested(args: &[String], long: &str, short: &str) -> bool {
     false
 }
 
-fn remove_disabled_packs_for_agent(
-    enabled_packs: &mut HashSet<String>,
-    config: &Config,
-    agent: &Agent,
-) {
-    let profile = config.agents.profile_for_agent(agent);
-    for disabled in &profile.disabled_packs {
-        enabled_packs.remove(disabled);
-        enabled_packs.retain(|pack| !pack.starts_with(&format!("{disabled}.")));
-    }
-}
-
-fn apply_agent_allowlist_profile(
-    config: &Config,
-    agent: &Agent,
-    mut allowlists: LayeredAllowlist,
-) -> LayeredAllowlist {
-    if config.allowlist_disabled_for_agent(agent) {
-        return LayeredAllowlist::default();
-    }
-
-    allowlists.prepend_agent_exact_commands(
-        agent.config_key(),
-        config.additional_allowlist_for_agent(agent),
-    );
-    allowlists
-}
-
 fn load_effective_allowlists_for_agent(config: &Config, agent: &Agent) -> LayeredAllowlist {
-    apply_agent_allowlist_profile(config, agent, load_default_allowlists())
+    config.apply_agent_allowlist_profile(agent, load_default_allowlists())
+}
+
+/// A hook command whose evaluation resolved to the deny family
+/// (deny / ask / warn), carrying everything needed to publish the protocol
+/// response later — after every batch entry has been resolved.
+struct ResolvedDenyFamily {
+    command: String,
+    allow_once_cwd: Option<PathBuf>,
+    result: destructive_command_guard::evaluator::EvaluationResult,
+    mode: DecisionMode,
+    eval_duration: Duration,
+}
+
+/// Outcome of resolving (evaluating, mode-resolving, and rebase-recovery
+/// checking) one hook command, WITHOUT publishing any protocol response.
+///
+/// Responses are deferred because hook protocols are one-JSON-document
+/// streams and a `toolCalls[]` batch may contain several non-allow entries:
+/// answering mid-batch would both risk emitting two decision documents and —
+/// the confirmed fail-open — end the request on a Warn entry with later
+/// destructive entries UNEVALUATED. All entries are resolved first, then
+/// exactly one response is chosen by [`outcome_rank`] precedence.
+enum ResolvedCommandOutcome {
+    /// Entry may run; stdout untouched. Covers plain allows, allowlist
+    /// overrides, rebase-recovery conversions, and `Log`-mode matches (the
+    /// latter two log their own history rows at resolve time, as before).
+    /// Carries the would-be history Allow row (built only when history is
+    /// enabled and only for plain allows) so an all-allow request can record
+    /// exactly one Allow row for the primary command.
+    Allow(Option<Box<CommandEntry>>),
+    /// Command exceeds `max_command_bytes` and cannot be evaluated. Publishes
+    /// the size-limit indeterminate message (no history row, as before).
+    OversizedCommand { command_len: usize },
+    /// The shared wall-clock deadline was exhausted before or while
+    /// evaluating this entry. Publishes the conservative indeterminate
+    /// response — never a silent allow of unscanned entries.
+    DeadlineExhausted {
+        command: String,
+        stage: &'static str,
+        /// Where the budget ran out, taken right after the evaluation (#571).
+        exhaustion: perf::BudgetExhaustion,
+    },
+    /// Deny / Ask / Warn candidate awaiting decisive selection.
+    DenyFamily(Box<ResolvedDenyFamily>),
+}
+
+/// Precedence ranks for decisive-response selection across a batch.
+/// Higher wins; ties keep the earliest entry (scan order).
+const RANK_ALLOW: u8 = 0;
+const RANK_WARN: u8 = 1;
+const RANK_ASK: u8 = 2;
+const RANK_INDETERMINATE: u8 = 3;
+const RANK_DENY: u8 = 4;
+
+/// Rank a deny-family decision mode: Deny > Ask > Warn.
+///
+/// Indeterminate outcomes rank between Deny and Ask (see [`outcome_rank`]): a
+/// proven destructive entry must deny even if another entry could not be
+/// evaluated, while an unevaluated entry must escalate over ask/warn/allow.
+const fn deny_family_rank(mode: DecisionMode) -> u8 {
+    match mode {
+        DecisionMode::Deny => RANK_DENY,
+        DecisionMode::Ask => RANK_ASK,
+        DecisionMode::Warn => RANK_WARN,
+        // Log-mode entries are fully handled at resolve time and never enter
+        // the deny-family candidate set; ranked as allow for exhaustiveness.
+        DecisionMode::Log => RANK_ALLOW,
+    }
+}
+
+/// Precedence of a resolved outcome: Deny > Indeterminate > Ask > Warn >
+/// Log/Allow.
+fn outcome_rank(outcome: &ResolvedCommandOutcome) -> u8 {
+    match outcome {
+        ResolvedCommandOutcome::Allow(_) => RANK_ALLOW,
+        ResolvedCommandOutcome::OversizedCommand { .. }
+        | ResolvedCommandOutcome::DeadlineExhausted { .. } => RANK_INDETERMINATE,
+        ResolvedCommandOutcome::DenyFamily(resolved) => deny_family_rank(resolved.mode),
+    }
+}
+
+/// Shared per-request state for evaluating hook commands.
+///
+/// The VS Code Agent Host batches several shell commands into one hook
+/// request (issue #252). Each entry is evaluated independently against this
+/// shared context — same config, allowlists, packs, and wall-clock
+/// [`Deadline`] — so a batch cannot buy itself extra evaluation budget.
+struct HookEvalContext<'a> {
+    config: &'a Config,
+    enabled_keywords: &'a [&'static str],
+    ordered_packs: &'a [String],
+    keyword_index: Option<&'a EnabledKeywordIndex>,
+    compiled_overrides: &'a CompiledOverrides,
+    allowlists: &'a LayeredAllowlist,
+    heredoc_settings: &'a HeredocSettings,
+    cwd_path: Option<&'a Path>,
+    /// Working directory reported by the harness in the hook payload (`cwd`),
+    /// when present. This is where the command will run, which can differ
+    /// from the hook process's own cwd; rebase-recovery resolution prefers
+    /// it (#331). Allow-once uses its validated form in `scope_base`; history
+    /// retains the hook process's `cwd_path`.
+    hook_cwd: Option<&'a Path>,
+    /// Base directory for allow-once grants and directory-scoped (`paths = [...]`)
+    /// allowlist entries: the directory the harness says the command runs in,
+    /// before any `cd` on the command line itself is applied (#387). `None`
+    /// means dcg could not determine it, which makes every path-scoped grant
+    /// inapplicable — a grant that cannot be located does not apply.
+    scope_base: Option<&'a Path>,
+    working_dir: &'a str,
+    deadline: &'a Deadline,
+    hook_protocol: hook::HookProtocol,
+    history_agent_type: &'a str,
+    max_command_bytes: usize,
+    /// `[logging]` decision log; `None` unless `enabled = true` (the default
+    /// is off, so the common path pays nothing).
+    decision_logger: Option<&'a destructive_command_guard::logging::DecisionLogger>,
+}
+
+impl HookEvalContext<'_> {
+    /// Record one command's final outcome in the `[logging]` decision log.
+    fn log_decision(
+        &self,
+        result: &EvaluationResult,
+        command: &str,
+        mode: DecisionMode,
+        elapsed: Duration,
+    ) {
+        if let Some(logger) = self.decision_logger {
+            logger.log(
+                result,
+                command,
+                None,
+                mode,
+                u64::try_from(elapsed.as_micros()).ok(),
+            );
+        }
+    }
+}
+
+/// Outcome of checking a denied command against the rebase-recovery window.
+enum RecoveryAttempt {
+    /// Not a recovery rule, no signal, or the probe location could not be
+    /// attributed. The original deny stands.
+    NotApplicable,
+    /// The signal is active and nothing else on the line denies: allow. The
+    /// permit, if that was the signal, has been consumed.
+    Granted {
+        reason: destructive_command_guard::rebase_recovery::RecoveryReason,
+        pattern: Option<String>,
+    },
+    /// The signal is active, but re-evaluating the rest of the line found
+    /// another verdict that stands on its own. Nothing was consumed.
+    Residual(Box<destructive_command_guard::evaluator::EvaluationResult>),
+    /// The deadline ran out during re-evaluation.
+    Indeterminate,
+}
+
+/// Decide whether the rebase-recovery window applies to a denied command.
+///
+/// The signal is probed in the repository the command will actually run in
+/// (#331): the harness-reported `cwd` when present (else the hook process
+/// cwd), moved by any leading `cd <literal> &&` / `pushd` and a
+/// `git -C <literal>` on the matched segment. Anything dcg cannot attribute
+/// statically keeps the deny.
+///
+/// A live signal unlocks only the recovery rules, never the line. The command
+/// is re-evaluated with exactly those rules granted; a second destructive
+/// operation on the same line (`git restore -- f; git reset --hard`, or a
+/// `git restore` in another repository after a further `cd`) keeps its own
+/// verdict and the permit stays unconsumed because the command will not run.
+fn attempt_rebase_recovery(
+    ctx: &HookEvalContext<'_>,
+    command: &str,
+    shell_dialect: ShellDialect,
+    result: &destructive_command_guard::evaluator::EvaluationResult,
+) -> RecoveryAttempt {
+    use destructive_command_guard::rebase_recovery;
+
+    // A recovery exemption cannot authorize other rules whose evaluation
+    // failed. Keep the already-proven denial instead of weakening it.
+    if result.regex_evaluation_incomplete {
+        return RecoveryAttempt::NotApplicable;
+    }
+
+    let Some(info) = result.pattern_info.as_ref() else {
+        return RecoveryAttempt::NotApplicable;
+    };
+    let pack = info.pack_id.as_deref();
+    let pattern = info.pattern_name.as_deref();
+    if !rebase_recovery::is_recovery_rule(pack, pattern) {
+        return RecoveryAttempt::NotApplicable;
+    }
+
+    let recovery_base = ctx
+        .hook_cwd
+        .filter(|path| path.is_absolute() && path.is_dir())
+        .or(ctx.cwd_path);
+    let Some(recovery_cwd) = recovery_base.and_then(|base| {
+        rebase_recovery::resolve_recovery_cwd(
+            base,
+            command,
+            info.matched_span.as_ref().map(|span| span.start),
+            shell_dialect,
+        )
+    }) else {
+        return RecoveryAttempt::NotApplicable;
+    };
+    let Some(reason) = rebase_recovery::should_allow_recovery(&recovery_cwd, pack, pattern) else {
+        return RecoveryAttempt::NotApplicable;
+    };
+
+    if ctx.deadline.is_exceeded() {
+        return RecoveryAttempt::Indeterminate;
+    }
+    let relaxed = rebase_recovery::relaxed_allowlist(ctx.allowlists);
+    let residual = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+        command,
+        ctx.enabled_keywords,
+        ctx.ordered_packs,
+        ctx.keyword_index,
+        ctx.compiled_overrides,
+        &relaxed,
+        ctx.heredoc_settings,
+        None,
+        // The residual scan re-runs the same line, so it must scope
+        // path-aware allowlist entries to the same directory the recovery
+        // probe used — the one the command actually reaches (#387).
+        Some(recovery_cwd.as_path()),
+        Some(ctx.deadline),
+        shell_dialect,
+    );
+    // The residual's own first match may be one policy lets run; a deny
+    // behind it must still be found (#498).
+    let residual = destructive_command_guard::evaluator::escalate_masked_findings(
+        ctx.config,
+        command,
+        &relaxed,
+        residual,
+        |command, grants| {
+            evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                command,
+                ctx.enabled_keywords,
+                ctx.ordered_packs,
+                ctx.keyword_index,
+                ctx.compiled_overrides,
+                grants,
+                ctx.heredoc_settings,
+                None,
+                Some(recovery_cwd.as_path()),
+                Some(ctx.deadline),
+                shell_dialect,
+            )
+        },
+    );
+    if residual.decision == EvaluationDecision::Indeterminate || residual.skipped_due_to_budget {
+        return RecoveryAttempt::Indeterminate;
+    }
+    if residual.decision == EvaluationDecision::Deny {
+        // A residual finding whose policy mode lets the line run (warn/log)
+        // still spends the permit: the recovery command executes, and a
+        // single-shot permit must not survive its own use.
+        let residual_mode = destructive_command_guard::evaluator::resolve_effective_mode(
+            ctx.config, command, &residual,
+        )
+        .unwrap_or(DecisionMode::Deny);
+        if !matches!(residual_mode, DecisionMode::Deny | DecisionMode::Ask)
+            && matches!(reason, rebase_recovery::RecoveryReason::ActivePermit(_))
+        {
+            rebase_recovery::consume_permit(&recovery_cwd);
+        }
+        return RecoveryAttempt::Residual(Box::new(residual));
+    }
+
+    // Consume the permit if that's why we allowed (single-shot).
+    if matches!(reason, rebase_recovery::RecoveryReason::ActivePermit(_)) {
+        rebase_recovery::consume_permit(&recovery_cwd);
+    }
+    RecoveryAttempt::Granted {
+        reason,
+        pattern: pattern.map(str::to_string),
+    }
+}
+
+/// Resolve one hook command end-to-end WITHOUT publishing a protocol
+/// response.
+///
+/// This is the single evaluate-and-resolve path for both the primary command
+/// and every additional `toolCalls[]` batch entry: evaluation, per-entry mode
+/// resolution, and the per-entry rebase-recovery conversion all happen here,
+/// so the decisive selection afterwards compares RESOLVED outcomes. Resolve-
+/// time side effects deliberately kept from the old flow: rebase-recovery
+/// conversions log their history row (and stderr note) immediately, and
+/// `Log`-mode matches log their history row and optional file log
+/// immediately — both are stdout-silent and never mask later entries.
+#[allow(clippy::too_many_lines)]
+fn resolve_hook_command(
+    ctx: &HookEvalContext<'_>,
+    command: &str,
+    shell_dialect: ShellDialect,
+    history_writer: Option<&HistoryWriter>,
+) -> ResolvedCommandOutcome {
+    // Refuse oversized commands conservatively. The limit bounds every later
+    // parser and scanner, so truncating or treating the command as clean would
+    // let an attacker hide a destructive tail beyond the inspected prefix.
+    if command.len() > ctx.max_command_bytes {
+        return ResolvedCommandOutcome::OversizedCommand {
+            command_len: command.len(),
+        };
+    }
+
+    // Budget notes belong to this command's evaluation alone.
+    let _ = perf::take_budget_exhaustion();
+    if ctx.deadline.is_exceeded() {
+        return ResolvedCommandOutcome::DeadlineExhausted {
+            command: command.to_string(),
+            stage: "pre_evaluation",
+            exhaustion: perf::take_budget_exhaustion(),
+        };
+    }
+
+    // The directory THIS command runs in: what the harness reported, moved by
+    // any static `cd` on the line (#387). `None` — unknowable — leaves every
+    // `paths = [...]` allowlist entry inapplicable rather than applying it
+    // against a directory that has nothing to do with the command.
+    let scope_cwd = ctx.scope_base.and_then(|base| {
+        destructive_command_guard::rebase_recovery::resolve_effective_cwd(
+            base,
+            command,
+            shell_dialect,
+        )
+    });
+    // An exact-command grant approves the whole request envelope from its
+    // reported starting directory. Its command bytes already include any cd
+    // or nested shell; unlike rule-level path allowlists above, it must not
+    // switch to a derived inner-command directory or become unusable when a
+    // nested cd cannot be resolved. An unknown request directory still fails
+    // closed. Keep this identity installed through policy replays.
+    let _allow_once_cwd = AllowOnceCwdScope::install(ctx.scope_base);
+
+    // Use the shared evaluator for hook mode parity with `dcg test`.
+    let eval_start = Instant::now();
+    let allow_once_audit = ctx.config.allow_once_audit();
+    let mut result = evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+        command,
+        ctx.enabled_keywords,
+        ctx.ordered_packs,
+        ctx.keyword_index,
+        ctx.compiled_overrides,
+        ctx.allowlists,
+        ctx.heredoc_settings,
+        allow_once_audit.as_ref(),
+        scope_cwd.as_deref(), // project_path: scopes path-aware allowlist entries (#186, #387)
+        Some(ctx.deadline),
+        shell_dialect,
+    );
+    // A first match that policy lets run (warn/log/ask) must not hide a later
+    // deny on the same line (#498).
+    result = destructive_command_guard::evaluator::escalate_masked_findings(
+        ctx.config,
+        command,
+        ctx.allowlists,
+        result,
+        |command, relaxed| {
+            evaluate_command_with_pack_order_deadline_at_path_in_dialect(
+                command,
+                ctx.enabled_keywords,
+                ctx.ordered_packs,
+                ctx.keyword_index,
+                ctx.compiled_overrides,
+                relaxed,
+                ctx.heredoc_settings,
+                None,
+                scope_cwd.as_deref(),
+                Some(ctx.deadline),
+                shell_dialect,
+            )
+        },
+    );
+
+    // NOTE: External packs from custom_paths are now checked in evaluate_command()
+    // alongside built-in packs, so no separate fallback check is needed here.
+
+    let eval_duration = eval_start.elapsed();
+
+    if result.decision == EvaluationDecision::Indeterminate || result.skipped_due_to_budget {
+        ctx.log_decision(&result, command, DecisionMode::Deny, eval_duration);
+        return ResolvedCommandOutcome::DeadlineExhausted {
+            command: command.to_string(),
+            stage: "evaluation",
+            exhaustion: perf::take_budget_exhaustion(),
+        };
+    }
+
+    if result.decision != EvaluationDecision::Deny {
+        ctx.log_decision(&result, command, DecisionMode::Log, eval_duration);
+        // Build the would-be Allow history row only when history is enabled;
+        // the caller logs it only when this entry is the primary and the
+        // whole request resolves all-allow.
+        let allow_row = history_writer.map(|_| {
+            let mut pack_id = None;
+            let mut pattern_name = None;
+            let mut allowlist_layer = None;
+
+            if let Some(override_) = result.allowlist_override.as_ref() {
+                allowlist_layer = Some(override_.layer.label());
+                pack_id = override_.matched.pack_id.as_deref();
+                pattern_name = override_.matched.pattern_name.as_deref();
+            }
+
+            Box::new(build_history_entry(
+                ctx.history_agent_type,
+                command,
+                ctx.working_dir,
+                HistoryOutcome::Allow,
+                eval_duration,
+                pack_id,
+                pattern_name,
+                allowlist_layer,
+            ))
+        });
+        return ResolvedCommandOutcome::Allow(allow_row);
+    }
+
+    if result.pattern_info.is_none() {
+        // Fail open: structurally unexpected, but hook safety wins.
+        let allow_row = history_writer.map(|_| {
+            Box::new(build_history_entry(
+                ctx.history_agent_type,
+                command,
+                ctx.working_dir,
+                HistoryOutcome::Allow,
+                eval_duration,
+                None,
+                None,
+                None,
+            ))
+        });
+        return ResolvedCommandOutcome::Allow(allow_row);
+    }
+
+    let mut mode =
+        destructive_command_guard::evaluator::resolve_effective_mode(ctx.config, command, &result)
+            .unwrap_or(DecisionMode::Deny);
+
+    // Rebase-recovery unblock (issue #104), applied per command.
+    //
+    // Before emitting a hard deny, check whether this is one of the narrow
+    // "recovery" patterns (`checkout-discard`, `restore-worktree`, etc.)
+    // AND a recovery signal is active: either a rebase is in progress
+    // (`.git/rebase-merge/` or `.git/rebase-apply/`) or a short-lived
+    // `dcg rebase-recover` permit was issued. If yes, convert the deny
+    // into an allow with a stderr note and (for the permit case) consume
+    // the cookie so subsequent unrelated commands stay blocked.
+    //
+    // Safety: only fires when (a) the matched pattern is on the small
+    // recovery allowlist, (b) a recovery signal is active in the repository
+    // the command reaches, AND (c) nothing else on the command line denies
+    // on its own merits. Outside this narrow window the original deny path
+    // is unchanged. The conversion leaves stdout untouched, so later batch
+    // entries are still evaluated.
+    if matches!(mode, DecisionMode::Deny) {
+        match attempt_rebase_recovery(ctx, command, shell_dialect, &result) {
+            RecoveryAttempt::NotApplicable => {}
+            RecoveryAttempt::Granted { reason, pattern } => {
+                // Inform on stderr (visible to the agent and to humans).
+                // Stays silent when stderr isn't a TTY and robot mode is on,
+                // but the message itself is always safe to emit.
+                emit_stderr!(
+                    "[dcg] Allowing `{}` → rebase-recovery mode ({})",
+                    pattern.as_deref().unwrap_or("<unknown>"),
+                    reason.label()
+                );
+                if let Some(writer) = history_writer {
+                    let entry = build_history_entry(
+                        ctx.history_agent_type,
+                        command,
+                        ctx.working_dir,
+                        HistoryOutcome::Allow,
+                        eval_duration,
+                        Some("core.git"),
+                        pattern.as_deref(),
+                        Some("rebase-recovery"),
+                    );
+                    record_history(writer, entry);
+                }
+                return ResolvedCommandOutcome::Allow(None);
+            }
+            RecoveryAttempt::Indeterminate => {
+                return ResolvedCommandOutcome::DeadlineExhausted {
+                    command: command.to_string(),
+                    stage: "rebase_recovery_reevaluation",
+                    exhaustion: perf::take_budget_exhaustion(),
+                };
+            }
+            RecoveryAttempt::Residual(residual) => {
+                // The recovery rule itself was unlockable, but another
+                // finding on the same line stands on its own. Report THAT
+                // finding: telling the user to mint a permit for a rule that
+                // is not what blocks them sends them in circles.
+                result = *residual;
+                mode = destructive_command_guard::evaluator::resolve_effective_mode(
+                    ctx.config, command, &result,
+                )
+                .unwrap_or(DecisionMode::Deny);
+            }
+        }
+    }
+
+    // The resolved outcome — deny, ask, warn or log — after policy,
+    // confidence, and any rebase-recovery residual.
+    ctx.log_decision(&result, command, mode, eval_duration);
+
+    let Some(ref info) = result.pattern_info else {
+        // Only reachable through a residual result, which by construction
+        // carries pattern info for its deny. Keep the conservative answer.
+        return ResolvedCommandOutcome::DenyFamily(Box::new(ResolvedDenyFamily {
+            command: command.to_string(),
+            allow_once_cwd: ctx.scope_base.map(Path::to_path_buf),
+            result,
+            mode: DecisionMode::Deny,
+            eval_duration,
+        }));
+    };
+    let pack = info.pack_id.as_deref();
+    let pattern = info.pattern_name.as_deref();
+
+    if mode == DecisionMode::Log {
+        // Silent allow with its own audit row; never a response candidate, so
+        // it can never mask later batch entries.
+        if let Some(writer) = history_writer {
+            let entry = build_history_entry(
+                ctx.history_agent_type,
+                command,
+                ctx.working_dir,
+                HistoryOutcome::Allow,
+                eval_duration,
+                pack,
+                pattern,
+                None,
+            );
+            record_history(writer, entry);
+        }
+        if let Some(log_file) = &ctx.config.general.log_file {
+            let _ = hook::log_blocked_command(
+                log_file,
+                command,
+                &info.reason,
+                pack,
+                &ctx.config.logging.redaction,
+            );
+        }
+        return ResolvedCommandOutcome::Allow(None);
+    }
+
+    ResolvedCommandOutcome::DenyFamily(Box::new(ResolvedDenyFamily {
+        command: command.to_string(),
+        allow_once_cwd: ctx.scope_base.map(Path::to_path_buf),
+        result,
+        mode,
+        eval_duration,
+    }))
+}
+
+/// Publish the single protocol response for the decisive resolved outcome,
+/// with its history row — the decisive entry's row, exactly as the
+/// single-command flow records it.
+///
+/// Returns the process exit status: `EXIT_SUCCESS` whenever the verdict
+/// reached stdout (or needed no stdout), the protocol's blocking status when
+/// a deny, ask, or indeterminate verdict could not be written (see
+/// `blocking_verdict_exit_code`). Reasonix reads only the status, so there a
+/// blocking verdict always exits 2 and a warning exits
+/// `EXIT_REASONIX_WARNING` (#358).
+#[allow(clippy::too_many_lines)]
+fn publish_decisive_response(
+    ctx: &HookEvalContext<'_>,
+    outcome: ResolvedCommandOutcome,
+    history_writer: &mut Option<HistoryWriter>,
+) -> i32 {
+    let resolved = match outcome {
+        // Never selected as decisive; the caller only publishes non-allow
+        // outcomes.
+        ResolvedCommandOutcome::Allow(_) => return EXIT_SUCCESS,
+        ResolvedCommandOutcome::OversizedCommand { command_len } => {
+            let reason = format_oversized_command_reason(command_len, ctx.max_command_bytes);
+            let delivery = hook::output_indeterminate_for_protocol(
+                ctx.hook_protocol,
+                &reason,
+                ctx.config.unverified_denies(),
+            );
+            return blocking_verdict_exit_code(ctx.hook_protocol, delivery);
+        }
+        ResolvedCommandOutcome::DeadlineExhausted {
+            command,
+            stage,
+            exhaustion,
+        } => {
+            return handle_indeterminate_evaluation(
+                ctx.hook_protocol,
+                history_writer.as_mut(),
+                ctx.history_agent_type,
+                &command,
+                ctx.working_dir,
+                stage,
+                exhaustion,
+                ctx.deadline,
+                ctx.config.unverified_denies(),
+            );
+        }
+        ResolvedCommandOutcome::DenyFamily(resolved) => resolved,
+    };
+
+    let ResolvedDenyFamily {
+        command,
+        allow_once_cwd,
+        result,
+        mode,
+        eval_duration,
+    } = *resolved;
+    let Some(ref info) = result.pattern_info else {
+        // Unreachable by construction: resolve_hook_command only builds a
+        // DenyFamily when pattern_info is present.
+        return EXIT_SUCCESS;
+    };
+    let pack = info.pack_id.as_deref();
+    let pattern = info.pattern_name.as_deref();
+    let explanation = info.explanation.as_deref();
+
+    if let Some(writer) = history_writer.as_ref() {
+        let outcome = match mode {
+            DecisionMode::Deny | DecisionMode::Ask => HistoryOutcome::Deny,
+            DecisionMode::Warn => HistoryOutcome::Warn,
+            DecisionMode::Log => HistoryOutcome::Allow,
+        };
+        let entry = build_history_entry(
+            ctx.history_agent_type,
+            &command,
+            ctx.working_dir,
+            outcome,
+            eval_duration,
+            pack,
+            pattern,
+            None,
+        );
+        record_history(writer, entry);
+    }
+
+    match mode {
+        DecisionMode::Deny | DecisionMode::Ask => {
+            let reason = match (pack, pattern) {
+                (Some(pack_id), Some(pattern_name)) => {
+                    format!("{pack_id}:{pattern_name} - {}", info.reason)
+                }
+                _ => info.reason.clone(),
+            };
+
+            // Allow-once code issuance is best-effort and must never delay the
+            // protocol denial (issue #291): the store lock is acquired with a
+            // small bounded wait, maintenance rewrites are skipped when the
+            // deadline budget is low, and persistence is skipped entirely once
+            // the deadline is exhausted. On contention/failure the denial is
+            // emitted WITHOUT a code — the block always stands.
+            let mut allow_once_info: Option<hook::AllowOnceInfo> = None;
+            let remaining = ctx.deadline.remaining().unwrap_or(Duration::ZERO);
+            if let Some(allow_once_cwd) = allow_once_cwd.as_deref().filter(|_| !remaining.is_zero())
+            {
+                let store_path = PendingExceptionStore::default_path(Some(allow_once_cwd));
+                let store = PendingExceptionStore::new(store_path);
+                let budget = PersistBudget {
+                    lock_wait: remaining.min(ALLOW_ONCE_LOCK_WAIT),
+                    allow_maintenance: remaining > ALLOW_ONCE_MAINTENANCE_MIN_BUDGET,
+                    // `remaining` was measured BEFORE a lock wait of up to
+                    // ALLOW_ONCE_LOCK_WAIT; re-derive the decision from the
+                    // live deadline once the lock is actually held.
+                    maintenance_recheck: Some(MaintenanceRecheck {
+                        deadline: *ctx.deadline,
+                        min_budget: ALLOW_ONCE_MAINTENANCE_MIN_BUDGET,
+                    }),
+                };
+                match store.record_block_bounded(
+                    &command,
+                    allow_once_cwd.to_string_lossy().as_ref(),
+                    &reason,
+                    &ctx.config.logging.redaction,
+                    false,
+                    Some(format!("{:?}", info.source)),
+                    ctx.config.allow_once_audit().as_ref(),
+                    budget,
+                ) {
+                    Ok(Some((record, maintenance))) => {
+                        allow_once_info = Some(hook::AllowOnceInfo {
+                            code: record.short_code,
+                            full_hash: record.full_hash,
+                        });
+                        if let Some(log_file) = ctx.config.general.log_file.as_deref() {
+                            let _ = log_maintenance(log_file, maintenance, "record_block");
+                        }
+                    }
+                    // Lock stayed contended: denial is emitted without a code.
+                    Ok(None) => {}
+                    // A store error (notably the MAX_PENDING_BYTES hard cap)
+                    // used to be swallowed, so allow-once issuance could stop
+                    // silently and permanently. The block still stands; say so.
+                    Err(e) => {
+                        emit_stderr!(
+                            "[dcg] Warning: could not record an allow-once code for this block ({e}); the block still stands."
+                        );
+                    }
+                }
+            }
+
+            let branch_ctx = if ctx.config.git_awareness.should_show_branch_in_output() {
+                result.branch_context.as_ref()
+            } else {
+                None
+            };
+            // The documented `confidence` field (#471): the scorer's view of
+            // the matched span, the same score the `[confidence]` downgrade
+            // reads. Absent when the match has no span to score, or a span
+            // measured on another string (an unwrapped inner command), which
+            // would score unrelated text.
+            let addresses_command =
+                destructive_command_guard::evaluator::span_addresses_command(&command, info);
+            let confidence = info
+                .matched_span
+                .as_ref()
+                .filter(|_| addresses_command)
+                .map(|span| {
+                    let sanitized =
+                        destructive_command_guard::context::sanitize_for_pattern_matching(&command);
+                    let score = destructive_command_guard::confidence::compute_match_confidence(
+                        &destructive_command_guard::confidence::ConfidenceContext {
+                            command: &command,
+                            sanitized_command: Some(sanitized.as_ref()),
+                            match_start: span.start,
+                            match_end: span.end,
+                        },
+                    );
+                    (f64::from(score.value) * 100.0).round() / 100.0
+                });
+            let delivery = if mode == DecisionMode::Ask {
+                hook::output_review_request_for_protocol(
+                    ctx.hook_protocol,
+                    &command,
+                    &info.reason,
+                    pack,
+                    pattern,
+                    explanation,
+                    allow_once_info.as_ref(),
+                    info.matched_span.as_ref(),
+                    info.severity,
+                    confidence,
+                    info.suggestions,
+                    branch_ctx,
+                )
+            } else {
+                hook::output_denial_for_protocol(
+                    ctx.hook_protocol,
+                    &command,
+                    &info.reason,
+                    pack,
+                    pattern,
+                    explanation,
+                    allow_once_info.as_ref(),
+                    info.matched_span.as_ref(),
+                    info.severity,
+                    confidence,
+                    info.suggestions,
+                    branch_ctx,
+                )
+            };
+
+            // Log if configured
+            if let Some(log_file) = &ctx.config.general.log_file {
+                let _ = hook::log_blocked_command(
+                    log_file,
+                    &command,
+                    &info.reason,
+                    pack,
+                    &ctx.config.logging.redaction,
+                );
+            }
+
+            // Review-capable clients receive ask; all others receive their
+            // ordinary blocking response. Returning normally lets
+            // `HistoryWriter::Drop` flush the buffered audit entry before the
+            // caller acts on a fail-closed exit status.
+            blocking_verdict_exit_code(ctx.hook_protocol, delivery)
+        }
+        DecisionMode::Warn => {
+            // A warning that never reaches the host is harmless: the command
+            // was going to proceed either way, so this stays exit 0.
+            let _ = hook::output_warning_for_protocol(
+                ctx.hook_protocol,
+                &command,
+                &info.reason,
+                pack,
+                pattern,
+                explanation,
+            );
+            // Reasonix shows a hook's output only when it does not pass, and
+            // treats any status other than 0 or 2 as a non-blocking warning.
+            if ctx.hook_protocol.blocks_by_exit_status() {
+                EXIT_REASONIX_WARNING
+            } else {
+                EXIT_SUCCESS
+            }
+        }
+        // Unreachable: Log-mode entries are handled at resolve time.
+        DecisionMode::Log => EXIT_SUCCESS,
+    }
 }
 
 // NOTE: Denial output functions (format_denial_message, print_colorful_warning, deny)
 // are now in the hook module. Use hook::output_denial() for all denial responses.
 
 /// Print version information and exit.
+///
+/// Output contract: the bare semver is the ONLY line on stdout (installers
+/// and `dcg update` read it with `--version 2>/dev/null | head -1`), and it is
+/// written first. The banner and the build-provenance lines (`Built:`,
+/// `Commit:`, `Git SHA:`, `Rustc …:`) go to stderr, where
+/// `scripts/perf_baseline.py` and the README's troubleshooting guidance
+/// expect them; they are kept for that reason rather than trimmed to a
+/// one-liner. Every write is best-effort: with `SIGPIPE` ignored, a reader
+/// that stops early (`dcg --version 2>&1 | head -1`) makes the remaining
+/// writes fail with `EPIPE`, and that must end in a normal exit 0 — not the
+/// SIGABRT core dump of issue #389.
 fn print_version() {
     // Machine-readable version on stdout (for scripts, installers, etc.)
-    println!("{PKG_VERSION}");
+    emit_stdout!("{PKG_VERSION}");
 
     // ASCII art logo - compact shield design
-    eprintln!();
-    eprintln!(
+    emit_stderr!();
+    emit_stderr!(
         "  {}",
         "╭─────────────────────────────────────────╮".bright_black()
     );
-    eprintln!(
+    emit_stderr!(
         "  {}  🛡  {}               {}",
         "│".bright_black(),
         "Destructive Command Guard".white().bold(),
         "│".bright_black()
     );
-    eprintln!(
+    emit_stderr!(
         "  {}     {}                           {}",
         "│".bright_black(),
         format!("dcg v{PKG_VERSION}").cyan().bold(),
         "│".bright_black()
     );
-    eprintln!(
+    emit_stderr!(
         "  {}                                         {}",
         "│".bright_black(),
         "│".bright_black()
@@ -447,7 +1979,7 @@ fn print_version() {
     if let Some(ts) = BUILD_TIMESTAMP {
         // Extract just the date part for cleaner display
         let date = ts.split('T').next().unwrap_or(ts);
-        eprintln!(
+        emit_stderr!(
             "  {}  {} {}                   {}",
             "│".bright_black(),
             "Built:".bright_black(),
@@ -456,7 +1988,7 @@ fn print_version() {
         );
     }
     if let Some(rustc) = RUSTC_SEMVER {
-        eprintln!(
+        emit_stderr!(
             "  {}  {} {}                      {}",
             "│".bright_black(),
             "Rustc:".bright_black(),
@@ -464,8 +1996,23 @@ fn print_version() {
             "│".bright_black()
         );
     }
+    // Stable compiler identity lines bind reproducibility tooling to the
+    // compiler that built this binary, rather than whichever rustc happens to
+    // be installed when the binary is later measured.
+    for (label, value) in [
+        ("Rustc release", RUSTC_SEMVER),
+        ("Rustc commit", RUSTC_COMMIT_HASH),
+        ("Rustc date", RUSTC_COMMIT_DATE),
+        ("Rustc host", RUSTC_HOST_TRIPLE),
+    ] {
+        if let Some(value) = value {
+            if !value.is_empty() && value != "VERGEN_IDEMPOTENT_OUTPUT" {
+                emit_stderr!("{label}: {value}");
+            }
+        }
+    }
     if let Some(target) = CARGO_TARGET {
-        eprintln!(
+        emit_stderr!(
             "  {}  {} {}         {}",
             "│".bright_black(),
             "Target:".bright_black(),
@@ -473,27 +2020,53 @@ fn print_version() {
             "│".bright_black()
         );
     }
+    // Provenance (#320): distinguishes a release-tag build from a local build
+    // ahead of the tag (`v0.11.0-7-gabc1234` / `-dirty`).
+    if let Some(describe) = GIT_DESCRIBE {
+        if !describe.is_empty() && describe != "VERGEN_IDEMPOTENT_OUTPUT" {
+            emit_stderr!(
+                "  {}  {} {}                {}",
+                "│".bright_black(),
+                "Commit:".bright_black(),
+                describe.white(),
+                "│".bright_black()
+            );
+        }
+    }
+    // Keep the human-friendly description above, but expose the full object id
+    // on its own stable line for provenance-sensitive tooling. This stays on
+    // stderr so stdout remains the single machine-readable semver line.
+    if let Some(sha) = GIT_SHA {
+        if !sha.is_empty() && sha != "VERGEN_IDEMPOTENT_OUTPUT" {
+            emit_stderr!("Git SHA: {sha}");
+        }
+    }
 
-    eprintln!(
+    emit_stderr!(
         "  {}                                         {}",
         "│".bright_black(),
         "│".bright_black()
     );
-    eprintln!(
+    emit_stderr!(
         "  {}  {}  {}",
         "│".bright_black(),
         "Protecting your code from destructive ops".green(),
         "│".bright_black()
     );
-    eprintln!(
+    emit_stderr!(
         "  {}",
         "╰─────────────────────────────────────────╯".bright_black()
     );
-    eprintln!();
+    emit_stderr!();
 }
 
 #[allow(clippy::too_many_lines)]
 fn main() {
+    // Must run before the first write of any kind: every later `println!` in
+    // the CLI surface relies on it to turn a closed pipe into a clean exit
+    // instead of a SIGABRT core dump (issue #389).
+    install_broken_pipe_backstop();
+
     // Configure colors based on TTY detection
     configure_colors();
 
@@ -513,11 +2086,11 @@ fn main() {
     // Parse CLI arguments (subcommands). If parsing fails (e.g., unknown flags),
     // print the clap error and exit instead of falling into hook mode and
     // blocking on stdin.
-    let cli = match Cli::try_parse() {
+    let mut cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => {
             let exit_code = e.exit_code();
-            eprintln!("{e}");
+            emit_stderr!("{e}");
             std::process::exit(exit_code);
         }
     };
@@ -528,9 +2101,11 @@ fn main() {
 
     // Initialize output system based on CLI flags.
     // --legacy-output, --no-color, or --robot forces plain output mode.
-    // Robot mode also suppresses all stderr output.
+    // Robot mode also suppresses human diagnostics. A hook protocol that
+    // carries its verdict on stderr still retains that required wire channel.
     let robot_mode = destructive_command_guard::output::robot_mode_enabled(cli.robot);
     let force_plain_output = cli.legacy_output || cli.no_color || robot_mode;
+    destructive_command_guard::output::init_robot_mode(robot_mode);
     destructive_command_guard::output::init(force_plain_output);
     destructive_command_guard::output::init_console(force_plain_output);
     destructive_command_guard::output::init_suggestions(!cli.no_suggestions && !robot_mode);
@@ -540,29 +2115,160 @@ fn main() {
         colored::control::set_override(false);
     }
 
-    // If there's a subcommand, handle it and exit.
+    // Plain `dcg hook` is the documented explicit spelling of bare hook
+    // mode. Route it into this exact path instead of the JSONL batch reader so
+    // both entry points share the bounded byte reader, invalid-UTF-8
+    // classification, oversized-prefix salvage scan, and fail-open/fail-closed
+    // policy (#430). Any batch-specific option keeps the dedicated JSONL
+    // implementation, preserving its output/exit-code contract.
+    let plain_hook_alias = matches!(
+        cli.command.as_ref(),
+        Some(cli::Command::Hook(cmd))
+            if !cmd.batch
+                && !cmd.parallel
+                && cmd.workers == 0
+                && !cmd.continue_on_error
+                && cmd.with_packs.is_none()
+    );
+    if plain_hook_alias {
+        cli.command = None;
+    }
+
+    // If there's another subcommand (or an explicitly configured batch hook),
+    // handle it and exit.
     if cli.command.is_some() {
         if let Err(e) = cli::run_command(cli) {
-            eprintln!("Error: {e}");
+            emit_stderr!("Error: {e}");
             std::process::exit(1);
         }
         return;
     }
 
-    // Load configuration
-    let config = Config::load();
-    let detected_agent = detect_agent();
+    // Opt-in diagnostics run through the real hook path, including early
+    // exits and history shutdown. They only write to stderr; robot mode
+    // retains its explicit stderr-silent contract.
+    let _hook_profile = HookProfile::from_env(!robot_mode);
 
-    // Check if bypass is requested (escape hatch)
+    // Check if bypass is requested (escape hatch). It is an environment check
+    // only, so it runs before config loading and agent detection: the escape
+    // hatch must not pay for work whose result it discards.
     if Config::is_bypassed() {
         return;
     }
 
+    let request_setup_phase = phase(ProfilePhase::RequestSetup);
+    init_hook_tracing();
+    let _hook_phase = destructive_command_guard::perf::PhaseTimer::start("hook_total");
+
+    // Load configuration
+    let config_phase = phase(ProfilePhase::ConfigLoad);
+    let config = Config::load();
+    destructive_command_guard::output::install_theme_config(&config);
+    let agent_detection = detect_agent_with_details();
+    let detected_agent = agent_detection.agent;
+    // Armed with the detected agent's protocol until the payload names its own
+    // (below); a panic before then still fails closed.
+    set_hook_panic_policy(Some(HookPanicPolicy {
+        protocol: payloadless_hook_protocol(&detected_agent, None),
+        deny_unverified: config.unverified_denies(),
+    }));
+    drop(config_phase);
+
+    // Read hook input FIRST, before the deadline starts: how long the client
+    // takes to write stdin is outside dcg's control and must not eat the
+    // evaluation budget (a client that spawns the hook and writes the payload
+    // late would otherwise start every evaluation near-exhausted).
+    let max_input_bytes = config.general.max_hook_input_bytes();
+    let hook_read = hook::read_hook_input(max_input_bytes);
+
+    // Factory's Execute envelope is a stronger signal than an inherited
+    // environment marker (for example Droid started from a Claude terminal).
+    // Pin its profile and history label before any hook work. An explicit
+    // --agent override remains authoritative, and other hosts keep their
+    // existing identity/protocol selection.
+    let detected_agent = if agent_detection.method != DetectionMethod::Explicit
+        && hook_read
+            .as_ref()
+            .is_ok_and(hook::HookInput::is_droid_execute)
+    {
+        Agent::Droid
+    } else {
+        detected_agent
+    };
+
+    // A config error is not a command-policy match and cannot be allowlisted.
+    // Read the envelope only to select the correct blocking wire protocol.
+    // Do this before self-heal, pack loading, history, and evaluation budgets.
+    if let Some(reason) = config.configuration_error() {
+        let protocol = match &hook_read {
+            Ok(input) => {
+                let Some(extracted) = hook::extract_command_with_context(input) else {
+                    set_hook_panic_policy(None);
+                    if input.requests_explicit_verdict() {
+                        let _ = hook::output_explicit_allow();
+                    }
+                    return;
+                };
+                host_hook_protocol(extracted.protocol, &detected_agent)
+            }
+            Err(error) => {
+                let prefix = match error {
+                    hook::HookReadError::InputTooLarge { prefix, .. } => Some(prefix.as_str()),
+                    hook::HookReadError::InvalidUtf8 { lossy, .. } => Some(lossy.as_str()),
+                    hook::HookReadError::Json { raw, .. } => Some(raw.as_str()),
+                    hook::HookReadError::Io(_) => None,
+                };
+                payloadless_hook_protocol(&detected_agent, prefix)
+            }
+        };
+        emit_stderr!("Error: {reason}");
+        let delivery = hook::output_indeterminate_for_protocol(protocol, reason, true);
+        finish_hook_mode(blocking_verdict_exit_code(protocol, delivery));
+        return;
+    }
+
+    // Start the evaluation deadline immediately after the input read so that
+    // EVERYTHING dcg does on its own clock — self-heal, external pack
+    // loading, and evaluation — is bounded by `hook_timeout_ms` (issue #293;
+    // both stages previously ran before `Deadline::new` and were unbounded).
+    // Enforce a minimum timeout so a zero-valued override cannot force every
+    // hook request immediately into the conservative indeterminate path.
+    let deadline = Deadline::new(Duration::from_millis(config.effective_hook_timeout_ms()));
+
     // Self-heal: verify the DCG hook is still registered in settings.json.
     // Claude Code can silently overwrite settings.json mid-session, removing the hook.
     // This re-registers it automatically (fail-open: errors are logged, never fatal).
-    if config.general.self_heal_hook {
-        cli::ensure_hook_registered();
+    //
+    // Skipped when the whole budget is smaller than self-heal's own worst case
+    // (SELF_HEAL_MIN_BUDGET): a repair can spend up to the advisory lock's
+    // bounded wait before it even writes, so running it under a tighter
+    // deadline would spend the entire evaluation window on housekeeping. The
+    // deadline is never already *exhausted* here — it starts a few statements
+    // above and MIN_HOOK_TIMEOUT_MS clamps it above zero — so the guard is a
+    // budget floor, not an exhaustion check. Skipping is safe: the check
+    // reruns on the next invocation.
+    let self_heal_budget_ok = deadline
+        .remaining()
+        .is_none_or(|remaining| remaining >= SELF_HEAL_MIN_BUDGET);
+    if config.general.self_heal_hook && self_heal_budget_ok {
+        let _phase = phase(ProfilePhase::SelfHeal);
+        // Grok, Reasonix, and other hosts can identify themselves only in the
+        // already-parsed payload. Their compatibility settings must not move
+        // with an inherited Claude-only configuration override.
+        let self_heal_agent = hook_read.as_ref().map_or_else(
+            |_| detected_agent.clone(),
+            |input| {
+                let protocol = hook::detect_protocol(input);
+                if protocol == hook::HookProtocol::ClaudeCompatible {
+                    input
+                        .claude_compatible_host_for_self_heal()
+                        .unwrap_or_else(|| detected_agent.clone())
+                } else {
+                    effective_agent_for_hook_protocol(protocol, &detected_agent)
+                }
+            },
+        );
+        cli::ensure_hook_registered_for_agent(&self_heal_agent);
     }
 
     // Compile overrides once (precompiled regexes, no per-command compilation)
@@ -576,16 +2282,15 @@ fn main() {
     let external_paths = config.packs.expand_custom_paths();
     let external_store = load_external_packs(&external_paths);
 
-    // Log warnings from external pack loading (fail-open: don't block on warnings).
-    if config.general.verbose {
-        for warning in external_store.warnings() {
-            eprintln!("[dcg] Warning: {warning}");
-        }
+    // Surface external pack load FAILURES unconditionally (issue #293): a
+    // broken custom pack file silently dropped its coverage when this was
+    // verbose-only. The store only records warnings on failures, so success
+    // stays silent — one stderr line per broken file.
+    for warning in external_store.warnings() {
+        emit_stderr!("[dcg] Warning: {warning}");
     }
 
-    // Read and parse input
-    let max_input_bytes = config.general.max_hook_input_bytes();
-    let hook_input = match hook::read_hook_input(max_input_bytes) {
+    let hook_input = match hook_read {
         Ok(input) => input,
         Err(read_err) => {
             // Malformed, oversized, or unreadable hook input. The default is
@@ -594,37 +2299,137 @@ fn main() {
             // when fail-closed mode is enabled — including oversized input,
             // which is attacker-controllable (issue #160). Routing oversized
             // input through the same handler is what closes the size-bypass.
-            handle_unparseable_hook_input(&config, &detected_agent, &read_err, max_input_bytes);
+            //
+            // Oversized input under fail-open first gets a best-effort
+            // evaluation of the truncated prefix that WAS read (issue #290):
+            // padding a destructive command past the size limit must not skip
+            // every pack. A proven deny/ask on the embedded command emits the
+            // normal protocol response; anything else keeps fail-open.
+            if !config.is_fail_closed() {
+                // Every unparseable-payload kind that still carries bytes gets
+                // the same best-effort scan. Invalid UTF-8 needs it as much as
+                // oversized input does: one stray byte appended to an ordinary
+                // envelope is far cheaper to write than megabytes of padding.
+                // A JSON parse error needs it too: each specific parse hole
+                // found so far (a numeric Copilot `timestamp`, a wrong-typed
+                // field, a lone surrogate escape) failed open with the command
+                // in plain view, and this judges the next unforeseen one.
+                let salvageable = match &read_err {
+                    hook::HookReadError::InputTooLarge { prefix, .. } => Some(prefix.as_str()),
+                    hook::HookReadError::InvalidUtf8 { lossy, .. } => Some(lossy.as_str()),
+                    hook::HookReadError::Json { raw, .. } => Some(raw.as_str()),
+                    hook::HookReadError::Io(_) => None,
+                };
+                if let Some(prefix) = salvageable {
+                    if let Some(exit_code) = try_deny_unparseable_payload(
+                        &config,
+                        &detected_agent,
+                        prefix,
+                        &deadline,
+                        &compiled_overrides,
+                        &heredoc_settings,
+                        external_store,
+                    ) {
+                        finish_hook_mode(exit_code);
+                        return;
+                    }
+                }
+            }
+            let exit_code =
+                handle_unparseable_hook_input(&config, &detected_agent, &read_err, max_input_bytes);
+            finish_hook_mode(exit_code);
             return;
         }
     };
 
-    // Start evaluation deadline after input size checks (includes evaluation).
-    // Enforce a minimum timeout to prevent bypass via `hook_timeout_ms = 0`
-    // which would cause deadline_exceeded() to immediately allow all commands.
-    let deadline = Deadline::new(
-        config
-            .general
-            .hook_timeout_ms
-            .map_or(HOOK_EVALUATION_BUDGET, |ms| {
-                Duration::from_millis(ms.max(destructive_command_guard::perf::MIN_HOOK_TIMEOUT_MS))
-            }),
-    );
+    // A payload declaring bypassPermissions/dontAsk has no human guaranteed to
+    // answer an `ask`, so unverified commands are denied instead (the
+    // `unverified_decision = "deny"` posture). An explicit
+    // DCG_UNVERIFIED_DECISION still wins; see `Config::unverified_denies`.
+    let mut config = config;
+    if hook_input.declares_unattended_permission_mode() {
+        config.general.unverified_decision =
+            destructive_command_guard::config::UnverifiedDecision::Deny;
+    }
 
-    let Some((command, hook_protocol)) = hook::extract_command_with_protocol(&hook_input) else {
+    // dcg's OpenCode plugin asks for an explicit allow so that silence can
+    // mean "dcg died" there instead of "allowed".
+    let explicit_verdict = hook_input.requests_explicit_verdict();
+
+    let Some(extracted_command) = hook::extract_command_with_context(&hook_input) else {
+        // A shell tool call whose command dcg cannot find is a payload shape
+        // dcg does not understand, not a harmless call. Hosts that require
+        // fail-closed get a block; elsewhere this keeps the historic answer.
+        if host_requires_fail_closed(&detected_agent) && hook_input.is_shell_tool_call() {
+            let protocol = payloadless_hook_protocol(&detected_agent, None);
+            let reason = format!(
+                "BLOCKED by dcg: this {} call carries no command dcg can read (expected \
+                 tool_input.command or tool_input.cmd), so it was not verified. dcg always \
+                 fails closed for this host. Check that dcg and the agent are up to date.",
+                hook_input.tool_name.as_deref().unwrap_or("shell")
+            );
+            let delivery = hook::output_denial_for_protocol(
+                protocol,
+                "<no command in shell tool call>",
+                &reason,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                None,
+            );
+            finish_hook_mode(blocking_verdict_exit_code(protocol, delivery));
+            return;
+        }
+        // Not a shell tool call: dcg has no opinion, and that is the answer.
+        set_hook_panic_policy(None);
+        if explicit_verdict {
+            let _ = hook::output_explicit_allow();
+        }
         return;
     };
+    let hook::ExtractedHookCommand {
+        command,
+        protocol: hook_protocol,
+        dialect: shell_dialect,
+        additional_commands,
+    } = extracted_command;
+    let hook_protocol = host_hook_protocol(hook_protocol, &detected_agent);
+    // From here until the request is known to be allowed, a panic publishes
+    // a blocking verdict instead of crashing open.
+    set_hook_panic_policy(Some(HookPanicPolicy {
+        protocol: hook_protocol,
+        deny_unverified: config.unverified_denies(),
+    }));
     let history_agent_type = history_agent_type_for_protocol(hook_protocol, &detected_agent);
     let effective_agent = effective_agent_for_hook_protocol(hook_protocol, &detected_agent);
-
-    // Check command size limit (fail-open: allow and warn)
     let max_command_bytes = config.general.max_command_bytes();
-    if command.len() > max_command_bytes {
-        eprintln!(
-            "[dcg] Warning: command ({} bytes) exceeds limit ({} bytes); allowing command (fail-open)",
-            command.len(),
-            max_command_bytes
+
+    // Refuse an oversized single-command request before ANY per-request
+    // machinery exists — allowlist loading, pack expansion, and especially the
+    // history writer, whose construction creates the database, spawns a worker
+    // thread, and installs a shutdown handler. A payload dcg refuses to
+    // evaluate must not be able to provoke that work (it did not before the
+    // batch refactor moved the check behind the writer).
+    //
+    // Requests that carry additional batch entries deliberately fall through
+    // to the per-entry check inside `resolve_hook_command`: the other entries
+    // are still evaluable, and a proven Deny there must outrank this
+    // indeterminate answer rather than be pre-empted by it. Both sites format
+    // the reason through `format_oversized_command_reason`, so the emitted
+    // bytes are identical either way.
+    if additional_commands.is_empty() && command.len() > max_command_bytes {
+        let reason = format_oversized_command_reason(command.len(), max_command_bytes);
+        let delivery = hook::output_indeterminate_for_protocol(
+            hook_protocol,
+            &reason,
+            config.unverified_denies(),
         );
+        finish_hook_mode(blocking_verdict_exit_code(hook_protocol, delivery));
         return;
     }
 
@@ -635,32 +2440,46 @@ fn main() {
     // environment variables.
     let allowlists = load_effective_allowlists_for_agent(&config, &effective_agent);
 
-    let mut enabled_packs: HashSet<String> = config.enabled_pack_ids_for_agent(&effective_agent);
+    // A PowerShell or Cmd payload gets the windows.* packs on any host (#451).
+    //
+    // The dialect alone is not sufficient evidence. A Windows payload that
+    // arrives mislabeled as `Bash` — the #322/#252 case, which is the one
+    // #451 exists for — is refined to `Unknown`, not to PowerShell or Cmd, so
+    // matching on the dialect alone never activated the packs for it. The
+    // command's own shape is the signal that survives a wrong label, and
+    // `Unknown` by itself is not it: an unrecognised tool name produces
+    // `Unknown` too and proves nothing about the payload.
+    let windows_payload = std::iter::once((command.as_str(), shell_dialect))
+        .chain(
+            additional_commands
+                .iter()
+                .map(|(entry, dialect)| (entry.as_str(), *dialect)),
+        )
+        .any(|(entry, dialect)| match dialect {
+            ShellDialect::PowerShell | ShellDialect::Cmd => true,
+            ShellDialect::Unknown => hook::command_is_windows_shell_payload(entry),
+            ShellDialect::Posix => false,
+        });
+    let mut enabled_packs: HashSet<String> =
+        config.enabled_pack_ids_for_agent_and_payload(&effective_agent, windows_payload);
 
     // Auto-enable external packs: packs loaded via custom_paths are implicitly enabled.
     // This avoids requiring users to both add a path AND explicitly enable the pack ID.
-    for id in external_store.pack_ids() {
-        enabled_packs.insert(id.clone());
-    }
-    remove_disabled_packs_for_agent(&mut enabled_packs, &config, &effective_agent);
+    // `packs.disabled` and the agent profile still turn them off (#588).
+    enabled_packs.extend(config.enabled_external_pack_ids(external_store, Some(&effective_agent)));
 
     let mut enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
-    // Merge external pack keywords into enabled keywords for quick rejection.
-    // This ensures commands with external pack keywords are not prematurely rejected.
-    enabled_keywords.extend(external_store.keywords().iter().copied());
 
     // Build ordered pack list and keyword index AFTER external packs are loaded,
-    // so external pack IDs are included in the evaluation iteration list.
+    // so external pack IDs are included in the evaluation iteration list. Their
+    // keywords join the quick-reject list, so commands with external pack
+    // keywords are not prematurely rejected.
     let mut ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
-    // Append external pack IDs (not in the registry, so expand_enabled_ordered won't include them).
-    for id in external_store.pack_ids() {
-        if !ordered_packs.contains(id) {
-            ordered_packs.push(id.clone());
-        }
-    }
+    let has_external_packs =
+        external_store.extend_evaluation(&enabled_packs, &mut enabled_keywords, &mut ordered_packs);
     // Keyword index only covers built-in packs; disable when external packs are present
     // to ensure the non-indexed path (which handles both built-in and external) is used.
-    let keyword_index = if external_store.pack_ids().next().is_some() {
+    let keyword_index = if has_external_packs {
         None
     } else {
         REGISTRY.build_enabled_keyword_index(&ordered_packs)
@@ -672,11 +2491,10 @@ fn main() {
         |path| path.to_string_lossy().to_string(),
     );
 
-    let history_writer = if config.history.enabled {
-        Some(HistoryWriter::new(
-            history_db_path(&config.history),
-            &config.history,
-        ))
+    let mut history_writer = if config.history.enabled {
+        let mut writer = create_history_writer(&config.history);
+        writer.limit_drop_wait_to(deadline.remaining().unwrap_or_default());
+        Some(writer)
     } else {
         None
     };
@@ -687,549 +2505,644 @@ fn main() {
         }
     }
 
-    if deadline.is_exceeded() {
-        if let Some(log_file) = config.general.log_file.as_deref() {
-            let _ = hook::log_budget_skip(
-                log_file,
-                &command,
-                "pre_evaluation",
-                deadline.elapsed(),
-                HOOK_EVALUATION_BUDGET,
-            );
+    let hook_cwd = hook_input.cwd.as_deref().map(Path::new);
+
+    // Directory-scoped allowlist entries are judged against the directory the
+    // harness says the command will run in, never the hook process's own
+    // `getcwd()` — the two agree only when dcg is run by hand from a prompt
+    // (#387). When the payload reports a cwd dcg cannot use (relative, or not
+    // a directory) the process cwd is not a substitute, so scoping fails
+    // closed. Only when the payload carries no `cwd` at all — protocols that
+    // omit it, and JSON piped in by hand — is the process cwd the sole
+    // available signal.
+    let scope_base = match hook_cwd {
+        Some(path) => Some(path).filter(|path| path.is_absolute() && path.is_dir()),
+        None => cwd_path.as_deref(),
+    };
+    let decision_logger = destructive_command_guard::logging::DecisionLogger::new(&config.logging);
+
+    let eval_context = HookEvalContext {
+        config: &config,
+        enabled_keywords: &enabled_keywords,
+        ordered_packs: &ordered_packs,
+        keyword_index: keyword_index.as_ref(),
+        compiled_overrides: &compiled_overrides,
+        allowlists: &allowlists,
+        heredoc_settings: &heredoc_settings,
+        cwd_path: cwd_path.as_deref(),
+        hook_cwd,
+        scope_base,
+        working_dir: &working_dir,
+        deadline: &deadline,
+        hook_protocol,
+        history_agent_type,
+        max_command_bytes,
+        decision_logger: decision_logger.as_ref(),
+    };
+    drop(request_setup_phase);
+
+    // Resolve EVERY command in the request before publishing anything (issue
+    // #252 batches): each entry is evaluated independently, with its own
+    // dialect, against the same shared wall-clock deadline. Responding
+    // mid-batch was a confirmed fail-open — a Warn-mode entry ended the
+    // request with later destructive entries unevaluated — and also risked
+    // emitting two decision documents on one-JSON-document protocols.
+    // Exactly one response is chosen afterwards by precedence:
+    // Deny > Indeterminate > Ask > Warn > Log/Allow (ties keep scan order).
+    let mut decisive: Option<ResolvedCommandOutcome> = None;
+    let mut primary_allow_row: Option<Box<CommandEntry>> = None;
+
+    for (index, (entry_command, entry_dialect)) in std::iter::once((command, shell_dialect))
+        .chain(additional_commands)
+        .enumerate()
+    {
+        inject_test_hook_panic();
+        let outcome = resolve_hook_command(
+            &eval_context,
+            &entry_command,
+            entry_dialect,
+            history_writer.as_ref(),
+        );
+        match outcome {
+            ResolvedCommandOutcome::Allow(row) => {
+                if index == 0 {
+                    primary_allow_row = row;
+                }
+            }
+            other => {
+                // Nothing outranks a Deny, and once the shared deadline is
+                // exhausted every later entry would resolve DeadlineExhausted
+                // too — stop scanning for both. Oversized entries keep the
+                // scan going: later entries remain evaluable and a proven
+                // Deny outranks the indeterminate answer.
+                let stop = outcome_rank(&other) == RANK_DENY
+                    || matches!(other, ResolvedCommandOutcome::DeadlineExhausted { .. });
+                if decisive.as_ref().map_or(RANK_ALLOW, outcome_rank) < outcome_rank(&other) {
+                    decisive = Some(other);
+                }
+                if stop {
+                    break;
+                }
+            }
         }
-        return;
     }
 
-    // Use the shared evaluator for hook mode parity with `dcg test`.
-    let eval_start = Instant::now();
-    let result = evaluate_command_with_pack_order_deadline_at_path(
-        &command,
-        &enabled_keywords,
-        &ordered_packs,
-        keyword_index.as_ref(),
-        &compiled_overrides,
-        &allowlists,
-        &heredoc_settings,
-        None,                // allow_once_audit
-        cwd_path.as_deref(), // project_path: scopes path-aware allowlist entries (#186)
-        Some(&deadline),
+    tracing::debug!(
+        decisive_rank = decisive.as_ref().map_or(RANK_ALLOW, outcome_rank),
+        "hook request resolved"
     );
-
-    // NOTE: External packs from custom_paths are now checked in evaluate_command()
-    // alongside built-in packs, so no separate fallback check is needed here.
-
-    let eval_duration = eval_start.elapsed();
-
-    if result.skipped_due_to_budget {
-        if let Some(writer) = history_writer.as_ref() {
-            let entry = build_history_entry(
-                history_agent_type,
-                &command,
-                &working_dir,
-                HistoryOutcome::Allow,
-                eval_duration,
-                None,
-                None,
-                None,
-            );
-            writer.log(entry);
-        }
-        if let Some(log_file) = config.general.log_file.as_deref() {
-            let _ = hook::log_budget_skip(
-                log_file,
-                &command,
-                "evaluation",
-                deadline.elapsed(),
-                HOOK_EVALUATION_BUDGET,
-            );
-        }
-        return;
-    }
-
-    if result.decision != EvaluationDecision::Deny {
-        if let Some(writer) = history_writer.as_ref() {
-            let mut pack_id = None;
-            let mut pattern_name = None;
-            let mut allowlist_layer = None;
-
-            if let Some(override_) = result.allowlist_override.as_ref() {
-                allowlist_layer = Some(override_.layer.label());
-                pack_id = override_.matched.pack_id.as_deref();
-                pattern_name = override_.matched.pattern_name.as_deref();
+    let exit_code = if let Some(outcome) = decisive {
+        publish_decisive_response(&eval_context, outcome, &mut history_writer)
+    } else {
+        // Every entry was evaluated and allowed: a later panic (history
+        // flush) must not turn that into a block.
+        set_hook_panic_policy(None);
+        // All-allow request: record exactly one history Allow row, for the
+        // primary command, matching the single-command flow.
+        if let Some(entry) = primary_allow_row {
+            if let Some(writer) = history_writer.as_ref() {
+                record_history(writer, *entry);
             }
-
-            let entry = build_history_entry(
-                history_agent_type,
-                &command,
-                &working_dir,
-                HistoryOutcome::Allow,
-                eval_duration,
-                pack_id,
-                pattern_name,
-                allowlist_layer,
-            );
-            writer.log(entry);
         }
-        return;
-    }
-
-    let Some(ref info) = result.pattern_info else {
-        // Fail open: structurally unexpected, but hook safety wins.
-        if let Some(writer) = history_writer.as_ref() {
-            let entry = build_history_entry(
-                history_agent_type,
-                &command,
-                &working_dir,
-                HistoryOutcome::Allow,
-                eval_duration,
-                None,
-                None,
-                None,
-            );
-            writer.log(entry);
-        }
-        return;
+        EXIT_SUCCESS
     };
 
-    let pack = info.pack_id.as_deref();
-    let mut mode = match info.source {
-        MatchSource::Pack | MatchSource::HeredocAst => {
-            config
-                .policy()
-                .resolve_mode(pack, info.pattern_name.as_deref(), info.severity)
-        }
-        // Never downgrade explicit blocks.
-        MatchSource::ConfigOverride | MatchSource::LegacyPattern => DecisionMode::Deny,
-    };
-
-    // Apply confidence scoring (if enabled) to potentially downgrade Deny to Warn.
-    // Only applies to pack/heredoc matches, not config overrides.
-    if matches!(info.source, MatchSource::Pack | MatchSource::HeredocAst) {
-        let sanitized = sanitize_for_pattern_matching(&command);
-        let normalized_command = normalize_command(&command);
-        let normalized_sanitized = normalize_command(sanitized.as_ref());
-
-        let mut confidence_command = command.as_str();
-        let mut confidence_sanitized: Option<&str> = None;
-
-        if normalized_command.len() == normalized_sanitized.len() {
-            confidence_command = normalized_command.as_ref();
-            if sanitized.as_ref() != command {
-                confidence_sanitized = Some(normalized_sanitized.as_ref());
-            }
-        }
-
-        let confidence_result = destructive_command_guard::apply_confidence_scoring(
-            confidence_command,
-            confidence_sanitized,
-            &result,
-            mode,
-            &config.confidence,
-        );
-        mode = confidence_result.mode;
+    // The command proceeds (allowed, warned, or logged). A caller that asked
+    // for an explicit verdict gets one; when a document was already written
+    // (a deny or ask answered with exit 0) the stdout claim makes this a no-op.
+    if explicit_verdict && exit_code == EXIT_SUCCESS {
+        let _ = hook::output_explicit_allow();
     }
 
-    let pattern = info.pattern_name.as_deref();
-    let explanation = info.explanation.as_deref();
-
-    // Rebase-recovery unblock (issue #104).
-    //
-    // Before emitting a hard deny, check whether this is one of the narrow
-    // "recovery" patterns (`checkout-discard`, `restore-worktree`, etc.)
-    // AND a recovery signal is active: either a rebase is in progress
-    // (`.git/rebase-merge/` or `.git/rebase-apply/`) or a short-lived
-    // `dcg rebase-recover` permit was issued. If yes, convert the deny
-    // into an allow with a stderr note and (for the permit case) consume
-    // the cookie so subsequent unrelated commands stay blocked.
-    //
-    // Safety: only fires when BOTH (a) the matched pattern is on the
-    // small recovery allowlist, AND (b) a recovery signal is active.
-    // Outside this narrow window the original deny path is unchanged.
-    if matches!(mode, DecisionMode::Deny) {
-        if let Some(cwd_ref) = cwd_path.as_deref() {
-            if let Some(reason) = destructive_command_guard::rebase_recovery::should_allow_recovery(
-                cwd_ref, pack, pattern,
-            ) {
-                // Consume the permit if that's why we allowed (single-shot).
-                if matches!(
-                    reason,
-                    destructive_command_guard::rebase_recovery::RecoveryReason::ActivePermit(_)
-                ) {
-                    destructive_command_guard::rebase_recovery::consume_permit(cwd_ref);
-                }
-                // Inform on stderr (visible to the agent and to humans).
-                // Stays silent when stderr isn't a TTY and robot mode is on,
-                // but the message itself is always safe to emit.
-                eprintln!(
-                    "[dcg] Allowing `{}` → rebase-recovery mode ({})",
-                    pattern.unwrap_or("<unknown>"),
-                    reason.label()
-                );
-                if let Some(writer) = history_writer.as_ref() {
-                    let entry = build_history_entry(
-                        history_agent_type,
-                        &command,
-                        &working_dir,
-                        HistoryOutcome::Allow,
-                        eval_duration,
-                        pack,
-                        pattern,
-                        Some("rebase-recovery"),
-                    );
-                    writer.log(entry);
-                }
-                return;
-            }
-        }
-    }
-
-    if let Some(writer) = history_writer.as_ref() {
-        let outcome = match mode {
-            DecisionMode::Deny => HistoryOutcome::Deny,
-            DecisionMode::Warn => HistoryOutcome::Warn,
-            DecisionMode::Log => HistoryOutcome::Allow,
-        };
-        let entry = build_history_entry(
-            history_agent_type,
-            &command,
-            &working_dir,
-            outcome,
-            eval_duration,
-            pack,
-            pattern,
-            None,
-        );
-        writer.log(entry);
-    }
-
-    match mode {
-        DecisionMode::Deny => {
-            let store_path = PendingExceptionStore::default_path(cwd_path.as_deref());
-            let store = PendingExceptionStore::new(store_path);
-            let reason = match (pack, pattern) {
-                (Some(pack_id), Some(pattern_name)) => {
-                    format!("{pack_id}:{pattern_name} - {}", info.reason)
-                }
-                _ => info.reason.clone(),
-            };
-
-            let mut allow_once_info: Option<hook::AllowOnceInfo> = None;
-            if let Ok((record, maintenance)) = store.record_block(
-                &command,
-                &working_dir,
-                &reason,
-                &config.logging.redaction,
-                false,
-                Some(format!("{:?}", info.source)),
-                None,
-            ) {
-                allow_once_info = Some(hook::AllowOnceInfo {
-                    code: record.short_code,
-                    full_hash: record.full_hash,
-                });
-                if let Some(log_file) = config.general.log_file.as_deref() {
-                    let _ = log_maintenance(log_file, maintenance, "record_block");
-                }
-            }
-
-            let branch_ctx = if config.git_awareness.should_show_branch_in_output() {
-                result.branch_context.as_ref()
-            } else {
-                None
-            };
-            hook::output_denial_for_protocol(
-                hook_protocol,
-                &command,
-                &info.reason,
-                pack,
-                pattern,
-                explanation,
-                allow_once_info.as_ref(),
-                info.matched_span.as_ref(),
-                info.severity,
-                None, // confidence not yet available in PatternMatch
-                info.suggestions,
-                branch_ctx,
-            );
-
-            // Log if configured
-            if let Some(log_file) = &config.general.log_file {
-                let _ = hook::log_blocked_command(log_file, &command, &info.reason, pack);
-            }
-
-            // All deny protocols, including current Codex, return normally so
-            // buffered history is flushed by `HistoryWriter::Drop`. Codex gets
-            // a minimal stdout JSON denial from `output_denial_for_protocol`.
-        }
-        DecisionMode::Warn => {
-            hook::output_warning_for_protocol(
-                hook_protocol,
-                &command,
-                &info.reason,
-                pack,
-                pattern,
-                explanation,
-            );
-        }
-        DecisionMode::Log => {
-            // Silent allow; optionally log to file for history.
-            if let Some(log_file) = &config.general.log_file {
-                let _ = hook::log_blocked_command(log_file, &command, &info.reason, pack);
-            }
-        }
-    }
+    // A fail-closed exit goes through `process::exit`, which skips `Drop`:
+    // flush the audit row first.
+    drop_history_writer(history_writer);
+    finish_hook_mode(exit_code);
 }
 
 /// Print help information.
 #[allow(clippy::too_many_lines)]
 fn print_help() {
-    eprintln!();
-    eprintln!("  🛡  {} {}", "dcg".green().bold(), PKG_VERSION.cyan());
-    eprintln!(
+    emit_stderr!();
+    emit_stderr!("  🛡  {} {}", "dcg".green().bold(), PKG_VERSION.cyan());
+    emit_stderr!(
         "     {}",
         "Destructive Command Guard - multi-agent safety hook".bright_black()
     );
-    eprintln!();
+    emit_stderr!();
 
     // Usage section
-    eprintln!("  {}", "USAGE".yellow().bold());
-    eprintln!("  {}", "─".repeat(50).bright_black());
-    eprintln!("    Runs as a pre-execution shell hook for Claude Code, Codex CLI,");
-    eprintln!("    Gemini CLI, GitHub Copilot CLI, Cursor IDE, and Hermes Agent.");
-    eprintln!("    Compatible agents, including Codex, receive protocol-specific stdout JSON.");
-    eprintln!();
+    emit_stderr!("  {}", "USAGE".yellow().bold());
+    emit_stderr!("  {}", "─".repeat(50).bright_black());
+    emit_stderr!("    Runs as a pre-execution shell hook for Claude Code, Codex CLI,");
+    emit_stderr!("    Gemini CLI, GitHub Copilot CLI, Cursor IDE, Hermes Agent,");
+    emit_stderr!("    OpenCode, Oh My Pi (omp), and Factory Droid.");
+    emit_stderr!("    Compatible agents, including Codex, receive protocol-specific stdout JSON.");
+    emit_stderr!();
 
     // Configuration section
-    eprintln!("  {}", "CONFIGURATION".yellow().bold());
-    eprintln!("  {}", "─".repeat(50).bright_black());
-    eprintln!("    Installers configure supported agent hooks automatically.");
-    eprintln!(
-        "    Common Claude Code config in {}:",
+    emit_stderr!("  {}", "CONFIGURATION".yellow().bold());
+    emit_stderr!("  {}", "─".repeat(50).bright_black());
+    emit_stderr!("    Installers configure supported agent hooks automatically.");
+    emit_stderr!(
+        "    Claude Code user config: {} (default {}).",
+        "$CLAUDE_CONFIG_DIR/settings.json".cyan(),
         "~/.claude/settings.json".cyan()
     );
-    eprintln!();
-    eprintln!(
+    emit_stderr!();
+    emit_stderr!(
         "    {}",
-        "╭──────────────────────────────────────────────────────────────╮".bright_black()
+        "Hook commands must use the resolved absolute dcg executable path.".white()
     );
-    eprintln!(
-        "    {} {} {}",
-        "│".bright_black(),
-        r#"{"hooks": {"PreToolUse": [{"matcher": "Bash","#.white(),
-        "│".bright_black()
+    emit_stderr!(
+        "    Run {} to install or repair it safely.",
+        "dcg install".green()
     );
-    eprintln!(
-        "    {}   {} {}",
-        "│".bright_black(),
-        r#""hooks": [{"type": "command", "command": "dcg"}]}]}}"#.white(),
-        "│".bright_black()
-    );
-    eprintln!(
-        "    {}",
-        "╰──────────────────────────────────────────────────────────────╯".bright_black()
-    );
-    eprintln!();
+    emit_stderr!();
 
     // Options section
-    eprintln!("  {}", "OPTIONS".yellow().bold());
-    eprintln!("  {}", "─".repeat(50).bright_black());
-    eprintln!(
+    emit_stderr!("  {}", "OPTIONS".yellow().bold());
+    emit_stderr!("  {}", "─".repeat(50).bright_black());
+    emit_stderr!(
         "    {}     Print version information",
         "--version, -V".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}        Print this help message",
         "--help, -h".green()
     );
-    eprintln!();
+    emit_stderr!();
 
     // Commands section
-    eprintln!("  {}", "COMMANDS".yellow().bold());
-    eprintln!("  {}", "─".repeat(50).bright_black());
-    eprintln!(
+    emit_stderr!("  {}", "COMMANDS".yellow().bold());
+    emit_stderr!("  {}", "─".repeat(50).bright_black());
+    emit_stderr!(
         "    {}         Test a command against enabled packs",
         "test".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}      Explain why a command would be blocked/allowed",
         "explain".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}       Check installation and hook registration",
         "doctor".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}        List all available packs and their status",
         "packs".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}         Pack management commands (info, validate)",
         "pack".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}    Manage allowlist entries (add, list, remove)",
         "allowlist".green()
     );
-    eprintln!("    {}        Add a rule to the allowlist", "allow".green());
-    eprintln!(
+    emit_stderr!("    {}        Add a rule to the allowlist", "allow".green());
+    emit_stderr!(
         "    {}      Remove a rule from the allowlist",
         "unallow".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}   Allow a blocked command once via short code",
         "allow-once".green()
     );
-    eprintln!(
+    emit_stderr!(
+        "    {}    Create a new file from stdin without overwriting",
+        "create-new".green()
+    );
+    emit_stderr!(
         "    {}         Scan files for destructive commands",
         "scan".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}     Simulate policy evaluation on command logs",
         "simulate".green()
     );
-    eprintln!("    {}       Show current configuration", "config".green());
-    eprintln!(
+    emit_stderr!("    {}       Show current configuration", "config".green());
+    emit_stderr!(
         "    {}         Generate a sample configuration file",
         "init".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}      Install the hook into Claude Code settings",
         "install".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}    Remove the hook from Claude Code settings",
         "uninstall".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}       Update dcg to the latest release",
         "update".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}        Show local statistics from the log file",
         "stats".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}      Query command history database",
         "history".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}  Suggest allowlist patterns from history",
         "suggest-allowlist".green()
     );
-    eprintln!("    {}       Run regression corpus tests", "corpus".green());
-    eprintln!(
+    emit_stderr!("    {}       Run regression corpus tests", "corpus".green());
+    emit_stderr!(
         "    {}         Run in explicit hook mode (batch support)",
         "hook".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}  Generate shell completion scripts",
         "completions".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}          Developer tools for pack development",
         "dev".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}   Start MCP server for agent integration",
         "mcp-server".green()
     );
-    eprintln!();
-    eprintln!(
+    emit_stderr!();
+    emit_stderr!(
         "    Run {} for detailed help on a command.",
         "dcg <command> --help".cyan()
     );
-    eprintln!();
+    emit_stderr!();
 
     // Environment section
-    eprintln!("  {}", "ENVIRONMENT".yellow().bold());
-    eprintln!("  {}", "─".repeat(50).bright_black());
-    eprintln!(
+    emit_stderr!("  {}", "ENVIRONMENT".yellow().bold());
+    emit_stderr!("  {}", "─".repeat(50).bright_black());
+    emit_stderr!(
         "    {}=0-3     Verbosity level (0 = quiet, 3 = trace)",
         "DCG_VERBOSE".green()
     );
-    eprintln!(
+    emit_stderr!(
+        "    {}=<filter>    Hook-mode tracing to stderr (e.g. debug)",
+        "DCG_LOG".green()
+    );
+    emit_stderr!(
         "    {}=1       Suppress non-error output",
         "DCG_QUIET".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}=1    Disable colored output (same as NO_COLOR)",
         "DCG_NO_COLOR".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}=text|json|sarif  Default output format (command-specific).",
         "DCG_FORMAT".green()
     );
-    eprintln!("                          `sarif` is real SARIF only for `dcg scan`; on every");
-    eprintln!("                          other command `sarif`/`structured` is an alias for");
-    eprintln!("                          JSON, and `text` an alias for pretty. Per-command");
-    eprintln!("                          accepted values: see `dcg <command> --help`.");
-    eprintln!(
+    emit_stderr!("                          `sarif` is real SARIF only for `dcg scan`; on every");
+    emit_stderr!("                          other command `sarif`/`structured` is an alias for");
+    emit_stderr!("                          JSON, and `text` an alias for pretty. Per-command");
+    emit_stderr!("                          accepted values: see `dcg <command> --help`.");
+    emit_stderr!(
         "    {}=/path  Use explicit config file",
         "DCG_CONFIG".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}=ms  Hook evaluation timeout budget",
         "DCG_HOOK_TIMEOUT_MS".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}=1      Robot mode for AI agents (JSON output, no stderr)",
         "DCG_ROBOT".green()
     );
-    eprintln!(
+    emit_stderr!(
         "    {}=1  Block (deny) on unparseable hook input (default: fail-open)",
         "DCG_FAIL_CLOSED".green()
     );
-    eprintln!();
+    emit_stderr!();
 
     // Blocked commands section
-    eprintln!("  {}", "BLOCKED COMMANDS".yellow().bold());
-    eprintln!("  {}", "─".repeat(50).bright_black());
-    eprintln!();
-    eprintln!(
+    emit_stderr!("  {}", "BLOCKED COMMANDS".yellow().bold());
+    emit_stderr!("  {}", "─".repeat(50).bright_black());
+    emit_stderr!();
+    emit_stderr!(
         "    {} {}",
         "Git".red().bold(),
         "(core.git pack)".bright_black()
     );
-    eprintln!("      {} git reset --hard", "•".red());
-    eprintln!("      {} git checkout -- <path>", "•".red());
-    eprintln!("      {} git restore (without --staged)", "•".red());
-    eprintln!("      {} git clean -f", "•".red());
-    eprintln!("      {} git push --force", "•".red());
-    eprintln!("      {} git branch -D", "•".red());
-    eprintln!("      {} git stash drop/clear", "•".red());
-    eprintln!();
-    eprintln!(
+    emit_stderr!("      {} git reset --hard", "•".red());
+    emit_stderr!("      {} git checkout -- <path>", "•".red());
+    emit_stderr!("      {} git restore (without --staged)", "•".red());
+    emit_stderr!("      {} git clean -f", "•".red());
+    emit_stderr!("      {} git push --force", "•".red());
+    emit_stderr!("      {} git branch -D", "•".red());
+    emit_stderr!("      {} git stash drop/clear", "•".red());
+    emit_stderr!();
+    emit_stderr!(
         "    {} {}",
         "Filesystem".red().bold(),
         "(core.filesystem pack)".bright_black()
     );
-    eprintln!(
+    emit_stderr!(
         "      {} rm -rf outside literal /tmp and /var/tmp subtrees",
         "•".red()
     );
-    eprintln!();
+    emit_stderr!();
 
     // Additional packs note. These IDs must be real pack IDs that resolve via
     // `dcg pack info <id>` — listing non-existent IDs here misleads users into
     // trying to enable packs that don't exist (see issue #152).
-    eprintln!("    📦 Additional packs: containers.docker, kubernetes.kubectl,");
-    eprintln!("       database.postgresql, infrastructure.terraform, and more.");
-    eprintln!();
+    emit_stderr!("    📦 Additional packs: containers.docker, kubernetes.kubectl,");
+    emit_stderr!("       database.postgresql, infrastructure.terraform, and more.");
+    emit_stderr!();
 
     // Links section
-    eprintln!("  {}", "─".repeat(50).bright_black());
-    eprintln!(
+    emit_stderr!("  {}", "─".repeat(50).bright_black());
+    emit_stderr!(
         "    📖 {}",
         "https://github.com/Dicklesworthstone/destructive_command_guard"
             .blue()
             .underline()
     );
-    eprintln!();
+    emit_stderr!();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #358: Reasonix reads only the exit status, so every delivered blocking
+    /// verdict must exit 2 there, while stdout-JSON protocols keep exit 0. A
+    /// fail-closed parse failure attributed to Reasonix must use its protocol
+    /// too; the Claude-shaped fallback would exit 0 and let the command run.
+    #[test]
+    fn reasonix_blocks_by_exit_status_on_every_path() {
+        use destructive_command_guard::exit_codes::EXIT_HOOK_BLOCK;
+        assert_eq!(
+            blocking_verdict_exit_code(hook::HookProtocol::Reasonix, Ok(())),
+            EXIT_HOOK_BLOCK
+        );
+        assert_eq!(
+            blocking_verdict_exit_code(
+                hook::HookProtocol::Reasonix,
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            ),
+            EXIT_HOOK_BLOCK
+        );
+        for json_protocol in [
+            hook::HookProtocol::ClaudeCompatible,
+            hook::HookProtocol::Copilot,
+            hook::HookProtocol::Crush,
+        ] {
+            assert_eq!(
+                blocking_verdict_exit_code(json_protocol, Ok(())),
+                EXIT_SUCCESS
+            );
+        }
+        assert_eq!(
+            hook_protocol_for_agent(&Agent::Reasonix),
+            hook::HookProtocol::Reasonix
+        );
+        assert_ne!(EXIT_REASONIX_WARNING, EXIT_SUCCESS);
+        assert_ne!(EXIT_REASONIX_WARNING, EXIT_HOOK_BLOCK);
+
+        // Without a parsed payload, the raw envelope markers decide only
+        // when no agent was identified.
+        let reasonix_prefix =
+            r#"{"event":"PreToolUse","toolName":"bash","toolArgs":{"command":"git reset --hard"#;
+        let claude_prefix = r#"{"tool_name":"Bash","tool_input":{"command":"git reset --hard"#;
+        assert_eq!(
+            payloadless_hook_protocol(&Agent::Unknown, Some(reasonix_prefix)),
+            hook::HookProtocol::Reasonix
+        );
+        assert_eq!(
+            payloadless_hook_protocol(&Agent::Custom("x".into()), Some(reasonix_prefix)),
+            hook::HookProtocol::Reasonix
+        );
+        assert_eq!(
+            payloadless_hook_protocol(&Agent::Unknown, Some(claude_prefix)),
+            hook::HookProtocol::ClaudeCompatible
+        );
+        assert_eq!(
+            payloadless_hook_protocol(&Agent::Unknown, None),
+            hook::HookProtocol::ClaudeCompatible
+        );
+        for (agent, protocol) in [
+            (Agent::CodexCli, hook::HookProtocol::Codex),
+            (Agent::ClaudeCode, hook::HookProtocol::ClaudeCompatible),
+            (Agent::Crush, hook::HookProtocol::Crush),
+        ] {
+            assert_eq!(
+                payloadless_hook_protocol(&agent, Some(reasonix_prefix)),
+                protocol,
+                "{agent:?}: planted markers must not override an identified agent"
+            );
+        }
+    }
+
+    /// #572: Muse Code sends Codex-shaped payloads but is not Codex. With
+    /// `--agent muse`, the `[agents.muse]` profile and history label apply,
+    /// the answer keeps the minimal Codex shape Muse enforces (even for a
+    /// payload without `turn_id`), and unreadable input blocks. Without the
+    /// flag, nothing about Codex or Claude changes.
+    #[test]
+    fn muse_identity_selects_its_profile_and_the_codex_answer_shape() {
+        let muse = Agent::Muse;
+        assert_eq!(
+            effective_agent_for_hook_protocol(hook::HookProtocol::Codex, &muse),
+            Agent::Muse
+        );
+        assert_eq!(
+            history_agent_type_for_protocol(hook::HookProtocol::Codex, &muse),
+            "muse"
+        );
+        assert_eq!(
+            host_hook_protocol(hook::HookProtocol::ClaudeCompatible, &muse),
+            hook::HookProtocol::Codex
+        );
+        assert_eq!(
+            host_hook_protocol(hook::HookProtocol::Codex, &muse),
+            hook::HookProtocol::Codex
+        );
+        assert_eq!(hook_protocol_for_agent(&muse), hook::HookProtocol::Codex);
+        assert_eq!(
+            payloadless_hook_protocol(&muse, Some(r#"{"event":"PreToolUse","toolArgs":{"#)),
+            hook::HookProtocol::Codex,
+            "an identified Muse keeps its protocol against planted markers"
+        );
+        assert!(host_requires_fail_closed(&muse));
+
+        for other in [Agent::CodexCli, Agent::ClaudeCode, Agent::Unknown] {
+            assert_eq!(
+                effective_agent_for_hook_protocol(hook::HookProtocol::Codex, &other),
+                Agent::CodexCli,
+                "{other:?}"
+            );
+            assert_eq!(
+                host_hook_protocol(hook::HookProtocol::ClaudeCompatible, &other),
+                hook::HookProtocol::ClaudeCompatible,
+                "{other:?}"
+            );
+            assert!(!host_requires_fail_closed(&other), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn droid_keeps_claude_compatible_denial_and_payloadless_fallback() {
+        let protocol = hook_protocol_for_agent(&Agent::Droid);
+        assert_eq!(protocol, hook::HookProtocol::ClaudeCompatible);
+        assert_eq!(host_hook_protocol(protocol, &Agent::Droid), protocol);
+        assert_eq!(
+            effective_agent_for_hook_protocol(protocol, &Agent::Droid),
+            Agent::Droid
+        );
+        assert_eq!(
+            history_agent_type_for_protocol(protocol, &Agent::Droid),
+            "droid"
+        );
+        assert_eq!(blocking_verdict_exit_code(protocol, Ok(())), EXIT_SUCCESS);
+        assert_eq!(
+            blocking_verdict_exit_code(protocol, Err(io::Error::from(io::ErrorKind::BrokenPipe))),
+            destructive_command_guard::exit_codes::EXIT_HOOK_BLOCK,
+        );
+        assert_eq!(
+            payloadless_hook_protocol(&Agent::Droid, Some(r#"{"event":"PreToolUse","toolArgs":{"#)),
+            protocol,
+            "an installed Droid hook must not be rerouted by a malformed payload",
+        );
+        assert!(
+            !host_requires_fail_closed(&Agent::Droid),
+            "retain existing configured malformed-input policy"
+        );
+    }
+
+    #[test]
+    fn antigravity_recovery_protocol_never_overrides_an_identified_agent() {
+        let prefix = r#"{"toolCall":{"name":"run_command","args":{"CommandLine":"git reset --hard"#;
+        assert_eq!(
+            payloadless_hook_protocol(&Agent::Unknown, Some(prefix)),
+            hook::HookProtocol::Antigravity
+        );
+        assert_eq!(
+            payloadless_hook_protocol(&Agent::Custom("unknown-host".into()), Some(prefix)),
+            hook::HookProtocol::Antigravity
+        );
+        for agent in [
+            Agent::Antigravity,
+            Agent::CodexCli,
+            Agent::ClaudeCode,
+            Agent::GeminiCli,
+            Agent::Reasonix,
+        ] {
+            assert_eq!(
+                payloadless_hook_protocol(&agent, Some(prefix)),
+                hook_protocol_for_agent(&agent),
+                "native markers must preserve explicit agent {agent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn indeterminate_reason_uses_configured_budget_and_stage() {
+        let detail = IndeterminateDetail {
+            exhaustion: perf::BudgetExhaustion::default(),
+            elapsed: Duration::from_millis(1_502),
+            cpu: None,
+        };
+        let reason =
+            format_indeterminate_reason("pre_evaluation", Duration::from_millis(1_500), &detail);
+        assert!(reason.contains("within 1500ms"), "reason: {reason}");
+        assert!(reason.contains("stage: pre_evaluation"), "reason: {reason}");
+        assert!(reason.contains("elapsed 1502ms"), "reason: {reason}");
+        assert!(!reason.contains("process CPU"), "reason: {reason}");
+        assert!(
+            reason.contains("command was not verified"),
+            "reason: {reason}"
+        );
+        assert!(reason.contains("hook_timeout_ms"), "reason: {reason}");
+    }
+
+    #[test]
+    fn indeterminate_reason_names_the_phase_and_cpu_issue_571() {
+        // A starved process: the deadline passed while compiling a regex,
+        // after only a tenth of the wall time on a CPU.
+        let starved = IndeterminateDetail {
+            exhaustion: perf::BudgetExhaustion {
+                deadline: Some(Some(ProfilePhase::RegexCompile)),
+                incomplete: None,
+            },
+            elapsed: Duration::from_millis(1_152),
+            cpu: Some(Duration::from_millis(91)),
+        };
+        let reason = format_indeterminate_reason("evaluation", Duration::from_secs(1), &starved);
+        assert!(
+            reason.contains(
+                "within 1000ms (stage: evaluation, phase: regex_compile; elapsed 1152ms, process CPU 91ms)"
+            ),
+            "reason: {reason}"
+        );
+
+        // A bounded analysis step that gave up while hook budget remained is
+        // named instead of the deadline, which it did not reach.
+        let incomplete = IndeterminateDetail {
+            exhaustion: perf::BudgetExhaustion {
+                deadline: None,
+                incomplete: Some(("interpreter_literal_recovery", Some(ProfilePhase::AstMatch))),
+            },
+            elapsed: Duration::from_millis(425),
+            cpu: Some(Duration::from_millis(410)),
+        };
+        let reason = format_indeterminate_reason("evaluation", Duration::from_secs(1), &incomplete);
+        assert!(
+            reason.contains(
+                "(stage: evaluation, phase: ast_match, incomplete: interpreter_literal_recovery; \
+                 elapsed 425ms, process CPU 410ms)"
+            ),
+            "reason: {reason}"
+        );
+
+        // Past the deadline, the deadline is the cause even if an optional
+        // step also stopped short earlier.
+        let both = IndeterminateDetail {
+            exhaustion: perf::BudgetExhaustion {
+                deadline: Some(Some(ProfilePhase::PatternRules)),
+                incomplete: Some(("interpreter_literal_recovery", Some(ProfilePhase::AstMatch))),
+            },
+            elapsed: Duration::from_millis(1_003),
+            cpu: None,
+        };
+        let reason = format_indeterminate_reason("evaluation", Duration::from_secs(1), &both);
+        assert!(
+            reason.contains("(stage: evaluation, phase: pattern_rules; elapsed 1003ms)"),
+            "reason: {reason}"
+        );
+    }
+
+    #[test]
+    fn decisive_precedence_is_deny_indeterminate_ask_warn_allow() {
+        // The batch-response selection must escalate in exactly this order;
+        // anything weaker lets a low-severity entry mask a stronger one
+        // (the confirmed fail-open was a Warn entry ending the request
+        // before a destructive sibling was evaluated).
+        assert!(deny_family_rank(DecisionMode::Deny) > RANK_INDETERMINATE);
+        assert!(RANK_INDETERMINATE > deny_family_rank(DecisionMode::Ask));
+        assert!(deny_family_rank(DecisionMode::Ask) > deny_family_rank(DecisionMode::Warn));
+        assert!(deny_family_rank(DecisionMode::Warn) > RANK_ALLOW);
+        // Log-mode entries never become response candidates.
+        assert_eq!(deny_family_rank(DecisionMode::Log), RANK_ALLOW);
+
+        // Both indeterminate flavors share the tier between Deny and Ask.
+        let oversized = ResolvedCommandOutcome::OversizedCommand { command_len: 99 };
+        let exhausted = ResolvedCommandOutcome::DeadlineExhausted {
+            command: "echo hi".to_string(),
+            stage: "evaluation",
+            exhaustion: perf::BudgetExhaustion::default(),
+        };
+        assert_eq!(outcome_rank(&oversized), RANK_INDETERMINATE);
+        assert_eq!(outcome_rank(&exhausted), RANK_INDETERMINATE);
+        assert_eq!(
+            outcome_rank(&ResolvedCommandOutcome::Allow(None)),
+            RANK_ALLOW
+        );
+    }
 
     mod top_level_dispatch_tests {
         use super::*;
@@ -1742,14 +3655,13 @@ mod tests {
         }
 
         fn evaluate_with_agent(config: &Config, agent: &Agent, command: &str) -> EvaluationResult {
-            let mut enabled_packs = config.enabled_pack_ids_for_agent(agent);
-            remove_disabled_packs_for_agent(&mut enabled_packs, config, agent);
+            let enabled_packs = config.enabled_pack_ids_for_agent(agent);
             let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
             let ordered_packs = REGISTRY.expand_enabled_ordered(&enabled_packs);
             let keyword_index = REGISTRY.build_enabled_keyword_index(&ordered_packs);
             let compiled_overrides = config.overrides.compile();
             let allowlists =
-                apply_agent_allowlist_profile(config, agent, LayeredAllowlist::default());
+                config.apply_agent_allowlist_profile(agent, LayeredAllowlist::default());
 
             evaluate_command_with_pack_order_deadline_at_path(
                 command,
@@ -1777,8 +3689,7 @@ mod tests {
                 },
             );
 
-            let allowlists = apply_agent_allowlist_profile(
-                &config,
+            let allowlists = config.apply_agent_allowlist_profile(
                 &Agent::Unknown,
                 project_allowlist_for_rule("core.git:reset-hard"),
             );
@@ -1812,11 +3723,8 @@ mod tests {
                 },
             );
 
-            let allowlists = apply_agent_allowlist_profile(
-                &config,
-                &Agent::ClaudeCode,
-                LayeredAllowlist::default(),
-            );
+            let allowlists = config
+                .apply_agent_allowlist_profile(&Agent::ClaudeCode, LayeredAllowlist::default());
             let compiled_overrides = config.overrides.compile();
             let result = destructive_command_guard::evaluate_command(
                 "git reset --hard",
@@ -1869,6 +3777,29 @@ mod tests {
 
             assert_eq!(result.decision, EvaluationDecision::Allow);
             assert!(result.pattern_info.is_none());
+        }
+
+        #[test]
+        fn hook_agent_cannot_disable_mandatory_core_packs() {
+            let mut config = Config::default();
+            config.agents.profiles.insert(
+                "unknown".to_string(),
+                AgentProfile {
+                    disabled_packs: vec!["core".to_string(), "core.git".to_string()],
+                    ..Default::default()
+                },
+            );
+
+            let result = evaluate_with_agent(&config, &Agent::Unknown, "git reset --hard HEAD~1");
+
+            assert_eq!(result.decision, EvaluationDecision::Deny);
+            assert_eq!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pack_id.as_deref()),
+                Some("core.git")
+            );
         }
     }
 

@@ -239,6 +239,13 @@ Commands containing these keywords are checked against this pack:
 - `cosmosdb`
 - `monitor`
 - `purge`
+- `account`
+- `management-group`
+- `subscription`
+- `lock`
+- `cancel`
+- `remove`
+- `clear`
 
 ### Safe Patterns (Allowed)
 
@@ -246,13 +253,10 @@ These patterns match safe commands that are always allowed:
 
 | Pattern Name | Pattern |
 |--------------|----------|
-| `az-show` | `az\b(?:\s+--?\S+(?:\s+\S+)?)*\s+\S+\s+show(?=\s\|$)` |
-| `az-list` | `az\b(?:\s+--?\S+(?:\s+\S+)?)*\s+\S+\s+list(?=\s\|$)` |
-| `az-account` | `az\b(?:\s+--?\S+(?:\s+\S+)?)*\s+account(?=\s\|$)` |
-| `az-configure` | `az\b(?:\s+--?\S+(?:\s+\S+)?)*\s+configure(?=\s\|$)` |
-| `az-login` | `az\b(?:\s+--?\S+(?:\s+\S+)?)*\s+login(?=\s\|$)` |
-| `az-version` | `az\b(?:\s+--?\S+(?:\s+\S+)?)*\s+version(?=\s\|$)` |
-| `az-help` | `az\b.*--help` |
+| `az-show` | `az\b(?:\s+--?\S+(?:\s+\S+)?)*\s+[^-\s]\S*\s+show(?=\s\|$)` |
+| `az-list` | `az\b(?:\s+--?\S+(?:\s+\S+)?)*\s+[^-\s]\S*\s+list(?=\s\|$)` |
+| `az-help` | `(?<![\w-])az(?:\s+(?:\x22[^\x22]*\x22\|'[^']*'\|(?!--(?:\s\|$))[^\s;&\|<>\x22']+))*\s+--help(?:\s\|$)` |
+| `az-help-short` | `(?<![\w-])az(?:\s+(?:\x22[^\x22]*\x22\|'[^']*'\|(?!--(?:\s\|$))[^\s;&\|<>\x22']+))*\s+-h(?:\s\|$)` |
 | `az-deployment-what-if` | `az\b(?:\s+--?\S+(?:\s+\S+)?)*\s+deployment\s+(?:group\|sub\|mg\|tenant)\s+what-if(?:\s\|$)` |
 | `az-deployment-create-what-if` | `az\b(?:\s+--?\S+(?:\s+\S+)?)*\s+deployment\s+(?:group\|sub\|mg\|tenant)\s+create(?:\s\|$)[^\n;&\|]*\s--what-if(?:\s\|$)` |
 
@@ -272,6 +276,7 @@ These patterns match potentially destructive commands:
 | `functionapp-delete` | az functionapp delete removes the Azure Function App. | high |
 | `cosmosdb-delete` | az cosmosdb delete permanently destroys the Cosmos DB resource. | critical |
 | `keyvault-delete` | az keyvault delete removes the Key Vault. Secrets may be unrecoverable. | critical |
+| `keyvault-purge` | az keyvault purge permanently destroys a soft-deleted Key Vault and every secret, key and certificate in it. | critical |
 | `vnet-delete` | az network vnet delete removes the virtual network. | high |
 | `acr-delete` | az acr delete removes the container registry and all images. | critical |
 | `acr-repository-delete` | az acr repository delete permanently deletes the repository and its images. | high |
@@ -283,6 +288,13 @@ These patterns match potentially destructive commands:
 | `network-dns-zone-delete` | az network dns zone delete removes an Azure DNS zone — domains stop resolving. | critical |
 | `monitor-log-profiles-delete` | az monitor log-profiles delete removes a subscription activity-log export — compliance/forensics. | high |
 | `cosmosdb-sql-container-delete` | az cosmosdb <api> <db\|container\|keyspace> delete permanently destroys Cosmos DB data. | critical |
+| `account-management-group-delete` | az account management-group delete removes a management group from the tenant hierarchy. | critical |
+| `account-management-group-hierarchy-settings-delete` | az account management-group hierarchy-settings delete drops tenant-root hierarchy settings. | high |
+| `account-management-group-subscription-remove` | az account management-group subscription remove detaches a subscription from its management group. | high |
+| `account-subscription-cancel` | az account subscription cancel cancels an entire Azure subscription and everything in it. | critical |
+| `account-alias-delete` | az account alias delete removes the subscription alias used to manage a subscription declaratively. | high |
+| `account-lock-delete` | az account lock delete removes a subscription-level management lock — the guardrail against deletion. | high |
+| `account-clear` | az account clear wipes every cached subscription and credential from the local CLI profile. | medium |
 
 ### Allowlist Guidance
 

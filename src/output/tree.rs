@@ -696,17 +696,30 @@ pub fn explain_trace_tree(trace: &ExplainTrace) -> DcgTree {
 }
 
 fn decision_node(trace: &ExplainTrace) -> TreeNode {
-    let (decision, style) = match trace.decision {
-        EvaluationDecision::Allow => ("ALLOW", "[bold green]"),
-        EvaluationDecision::Deny => ("DENY", "[bold red]"),
+    // The resolved outcome, not the raw evaluator finding: a rule configured to
+    // `warn`/`ask`/`log` must not render as DENY here either (issue #417).
+    let decision = trace.outcome_label();
+    let style = match decision {
+        "ALLOW" => "[bold green]",
+        "DENY" => "[bold red]",
+        _ => "[bold yellow]",
     };
 
-    TreeNode::new(format!("Decision: {decision}"))
+    let mut node = TreeNode::new(format!("Decision: {decision}"))
         .styled(style)
         .child(TreeNode::new(format!(
             "Latency: {:.2}ms",
             trace.total_duration_us as f64 / 1000.0
-        )))
+        )));
+    if let Some(mode) = trace.effective_mode {
+        if trace.decision == EvaluationDecision::Deny && mode != crate::packs::DecisionMode::Deny {
+            node = node.child(TreeNode::new(format!(
+                "Policy: rule matched, [policy] mode {}",
+                mode.label()
+            )));
+        }
+    }
+    node
 }
 
 fn command_node(trace: &ExplainTrace) -> TreeNode {
@@ -950,14 +963,16 @@ fn trace_details_summary(details: &TraceDetails) -> String {
             decision,
             allowlisted,
         } => {
-            let decision = match decision {
+            let is_allow = *decision == EvaluationDecision::Allow;
+            let decision_label = match decision {
                 EvaluationDecision::Allow => "allow",
                 EvaluationDecision::Deny => "deny",
+                EvaluationDecision::Indeterminate => "indeterminate",
             };
-            if *allowlisted {
-                format!("{decision} via allowlist")
+            if *allowlisted && is_allow {
+                format!("{decision_label} via allowlist")
             } else {
-                decision.to_string()
+                decision_label.to_string()
             }
         }
     }
@@ -1548,6 +1563,7 @@ mod tests {
             normalized_command: Some("git reset --hard HEAD".to_string()),
             sanitized_command: None,
             decision: EvaluationDecision::Deny,
+            effective_mode: None,
             skipped_due_to_budget: false,
             total_duration_us: 1_250,
             steps: vec![TraceStep {
@@ -1601,6 +1617,41 @@ mod tests {
         assert!(output.contains("full_evaluation (1.00ms)"));
         assert!(output.contains("matched: core.git"));
         assert!(output.contains("Skipped (keyword gating): core.filesystem"));
+    }
+
+    #[test]
+    fn test_explain_trace_tree_renders_indeterminate_conservatively() {
+        let trace = ExplainTrace {
+            command: "complex command".to_string(),
+            normalized_command: None,
+            sanitized_command: None,
+            decision: EvaluationDecision::Indeterminate,
+            effective_mode: None,
+            skipped_due_to_budget: true,
+            total_duration_us: 200_000,
+            steps: vec![TraceStep {
+                name: "policy_decision",
+                duration_us: 0,
+                details: TraceDetails::PolicyDecision {
+                    decision: EvaluationDecision::Indeterminate,
+                    allowlisted: false,
+                },
+            }],
+            match_info: None,
+            allowlist_info: None,
+            pack_summary: None,
+        };
+
+        let output = explain_trace_tree(&trace)
+            .guides(DcgTreeGuides::Ascii)
+            .render_plain()
+            .join("\n");
+
+        assert!(output.contains("Decision: INDETERMINATE"));
+        assert!(output.contains("indeterminate"));
+        assert!(output.contains("Skipped deeper analysis after budget exhaustion"));
+        assert!(!output.contains("Decision: ALLOW"));
+        assert!(!output.contains("via allowlist"));
     }
 
     #[test]

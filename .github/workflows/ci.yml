@@ -278,7 +278,8 @@ jobs:
                  else { cargo build --bin dcg; 'target/debug/dcg.exe' }
           Write-Host "Using binary: $exe"
 
-          # Stage + zip in the dist.yml layout: dcg-<target>/dcg.exe
+          # Stage + zip in the layout install.ps1 accepts: one root-level dcg.exe
+          # (v0.16's installer refuses any other archive shape).
           $target = 'x86_64-pc-windows-msvc'
           $work = Join-Path $env:RUNNER_TEMP ('smoke_' + [Guid]::NewGuid().ToString('N'))
           $stageRoot = Join-Path $work 'stage'
@@ -287,7 +288,7 @@ jobs:
           Copy-Item $exe (Join-Path $stage 'dcg.exe') -Force
           $zip = Join-Path $work "dcg-$target.zip"
           Add-Type -AssemblyName System.IO.Compression.FileSystem
-          [System.IO.Compression.ZipFile]::CreateFromDirectory($stageRoot, $zip)
+          [System.IO.Compression.ZipFile]::CreateFromDirectory($stage, $zip)
           $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLower()
           $fileUri = ([System.Uri]("file://" + $zip)).AbsoluteUri
           Write-Host "zip=$zip"
@@ -348,12 +349,12 @@ jobs:
           ./scripts/e2e_test.ps1 -Verbose -Artifacts "$env:RUNNER_TEMP/e2e-artifacts"
           if ($LASTEXITCODE -ne 0) { throw "e2e_test.ps1 reported failures (exit $LASTEXITCODE)" }
 
-      - name: History DB concurrency / stale-lock stress (real-Windows fsqlite)
+      - name: History DB concurrency / stale-lock stress (real Windows SQLite)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          # Validates the fsqlite history DB on a REAL Windows runtime (the
-          # cfg(not(unix)) WAL/lock fallback path): N concurrent writer PROCESSES
+          # Validates the bundled SQLite history DB on a REAL Windows runtime:
+          # N concurrent writer PROCESSES
           # must not corrupt the DB and a killed writer must not wedge later runs.
           # (History itself is best-effort telemetry — a few records may drop under
           # extreme contention by design; the test asserts no-corruption + no-wedge
@@ -497,10 +498,10 @@ jobs:
           toolchain: nightly
           components: llvm-tools-preview
 
-      - name: Install cargo-llvm-cov
+      - name: Install cargo-llvm-cov and nextest
         uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
         with:
-          tool: cargo-llvm-cov
+          tool: cargo-llvm-cov,nextest
 
       - name: Cache cargo registry and target
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -513,9 +514,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-cov-
 
+      # Through nextest's ci profile, so coverage runs the same tests as `check`
+      # (the profile's default-filter is the fork's recorded upstream exclusions).
       - name: Run tests with coverage
         run: |
-          cargo llvm-cov --all-features --workspace \
+          cargo llvm-cov nextest --profile ci --no-fail-fast --all-features --workspace \
             --ignore-filename-regex='(tests/|benches/|\.cargo/)' \
             --no-report
 
@@ -808,7 +811,7 @@ jobs:
           # - Pattern match: 1ms panic
           # - Heredoc extract: 2ms panic
           # - Full heredoc pipeline: 20ms panic
-          # - Hook fail-open deadline: 200ms
+          # - Hook evaluation deadline: 1000ms (exhaustion is indeterminate, never a silent allow)
           echo "## Performance Budget Check" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
 
@@ -1216,7 +1219,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 2
+          # The absolute gate binds the binary's full Git object id to this
+          # checkout and retains `git describe` as supplemental diagnostics.
+          # Full history keeps that description reproducible.
+          fetch-depth: 0
           persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@d1031067263f94b142dd6c0ce24c5eb9d02d52a0 # v1 series 2026-09-03
@@ -1258,27 +1264,35 @@ jobs:
           fi
           echo "sha=$comparison_sha" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout comparison revision
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ steps.comparison.outputs.sha }}
-          path: perf-base
-          persist-credentials: false
-
+      # The comparison revision is built outside the checkout: the absolute
+      # gate below refuses to certify a binary from a worktree with untracked
+      # files, and actions/checkout can only write inside the workspace.
       - name: Build comparison binary
-        run: cargo build --manifest-path perf-base/Cargo.toml --target-dir perf-base-target --release --locked
+        env:
+          COMPARISON_SHA: ${{ steps.comparison.outputs.sha }}
+        run: |
+          git worktree add --detach "$RUNNER_TEMP/perf-base" "$COMPARISON_SHA"
+          cargo build --manifest-path "$RUNNER_TEMP/perf-base/Cargo.toml" \
+            --target-dir "$RUNNER_TEMP/perf-base-target" --release --locked
 
-      - name: Run base and candidate perf on this runner
+      # "Repo baseline" here is the comparison revision, measured on this
+      # runner: timings recorded on another CPU class cannot establish a
+      # regression after the runner migration.
+      - name: Run perf baseline + compare to repo baseline
         id: perf
         run: |
           set +e
 
-          BASELINE_JSON="perf-base.json"
-          CURRENT_JSON="perf-current.json"
-          REPORT_MD="perf-regression-report.md"
+          PERF_ARTIFACT_DIR="$RUNNER_TEMP/dcg-perf-relative"
+          mkdir -p "$PERF_ARTIFACT_DIR"
+          BASELINE_JSON="$PERF_ARTIFACT_DIR/perf-base.json"
+          CURRENT_JSON="$PERF_ARTIFACT_DIR/perf-current.json"
+          REPORT_MD="$PERF_ARTIFACT_DIR/perf-regression-report.md"
 
-          python3 scripts/perf_baseline.py \
-            --bin perf-base-target/release/dcg \
+          # Each revision is measured by its own harness: a newer harness can
+          # require probes an older binary does not answer.
+          python3 "$RUNNER_TEMP/perf-base/scripts/perf_baseline.py" \
+            --bin "$RUNNER_TEMP/perf-base-target/release/dcg" \
             --output "$BASELINE_JSON" \
             --warmup 10 \
             --runs 80 \
@@ -1292,10 +1306,10 @@ jobs:
 
           {
             echo "runner_class=blacksmith-4vcpu-ubuntu-2404"
-            echo "base_sha=$(git -C perf-base rev-parse HEAD)"
+            echo "base_sha=$(git -C "$RUNNER_TEMP/perf-base" rev-parse HEAD)"
             echo "candidate_sha=$(git rev-parse HEAD)"
             lscpu
-          } >> perf-runner.txt
+          } >> "$PERF_ARTIFACT_DIR/perf-runner.txt"
 
           python3 scripts/perf_baseline.py \
             --bin target/release/dcg \
@@ -1312,6 +1326,7 @@ jobs:
 
           python3 - "$BASELINE_JSON" "$CURRENT_JSON" "$REPORT_MD" <<'PY'
           import json
+          import math
           import sys
 
           baseline_path = sys.argv[1]
@@ -1322,16 +1337,69 @@ jobs:
           slack_ms = 5.0
           rss_slack_kb = 8192
 
-          with open(baseline_path, "r", encoding="utf-8") as handle:
-              baseline = json.load(handle)
-          with open(current_path, "r", encoding="utf-8") as handle:
-              current = json.load(handle)
+          def reject_non_finite_json_constant(value):
+              raise ValueError(f"non-standard JSON numeric constant: {value}")
 
-          baseline_cases = {c["id"]: c for c in baseline.get("cases", [])}
-          current_cases = {c["id"]: c for c in current.get("cases", [])}
+          with open(baseline_path, "r", encoding="utf-8") as handle:
+              baseline = json.load(
+                  handle, parse_constant=reject_non_finite_json_constant
+              )
+          with open(current_path, "r", encoding="utf-8") as handle:
+              current = json.load(
+                  handle, parse_constant=reject_non_finite_json_constant
+              )
 
           violations = []
           rows = []
+
+          def finite_nonnegative_number(value, label):
+              if isinstance(value, bool) or not isinstance(value, (int, float)):
+                  violations.append(f"{label} must be a JSON number")
+                  return None
+              numeric = float(value)
+              if not math.isfinite(numeric) or numeric < 0:
+                  violations.append(f"{label} must be finite and nonnegative")
+                  return None
+              return numeric
+
+          def optional_nonnegative_rss(value, label):
+              if value is None:
+                  return None
+              if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                  violations.append(f"{label} must be a nonnegative integer or null")
+                  return None
+              return value
+
+          baseline_case_list = baseline.get("cases", [])
+          current_case_list = current.get("cases", [])
+
+          def duplicate_ids(cases):
+              ids = [case["id"] for case in cases]
+              return sorted(case_id for case_id in set(ids) if ids.count(case_id) > 1)
+
+          for label, cases in (("baseline", baseline_case_list), ("current", current_case_list)):
+              duplicates = duplicate_ids(cases)
+              if duplicates:
+                  violations.append(f"duplicate case ids in {label}: {', '.join(duplicates)}")
+
+          baseline_cases = {c["id"]: c for c in baseline_case_list}
+          current_cases = {c["id"]: c for c in current_case_list}
+
+          required_baseline_case_ids = {
+              "quick_reject",
+              "safe_keyword",
+              "destructive_keyword",
+              "heredoc_inline",
+              "bypass",
+          }
+          missing_baseline_ids = sorted(
+              required_baseline_case_ids - set(baseline_cases)
+          )
+          if missing_baseline_ids:
+              violations.append(
+                  "committed baseline is missing required case ids: "
+                  + ", ".join(missing_baseline_ids)
+              )
 
           for case_id in sorted(baseline_cases.keys()):
               if case_id not in current_cases:
@@ -1341,31 +1409,51 @@ jobs:
               b = baseline_cases[case_id].get("metrics", {})
               c = current_cases[case_id].get("metrics", {})
 
-              b_p50 = float(b.get("p50_ms", 0.0))
-              c_p50 = float(c.get("p50_ms", 0.0))
+              b_p50 = finite_nonnegative_number(
+                  b.get("p50_ms"), f"baseline {case_id} p50_ms"
+              )
+              c_p50 = finite_nonnegative_number(
+                  c.get("p50_ms"), f"current {case_id} p50_ms"
+              )
+              if b_p50 is None or c_p50 is None:
+                  continue
 
               limit_p50 = b_p50 * mult + slack_ms
               status = "OK" if c_p50 <= limit_p50 else "REGRESSED"
               rows.append((case_id, b_p50, c_p50, limit_p50, status))
 
-              if c_p50 > limit_p50:
+              if status != "OK":
                   violations.append(
                       f"{case_id} p50_ms {c_p50:.2f} > {limit_p50:.2f} (baseline {b_p50:.2f}, mult {mult}x + {slack_ms}ms)"
                   )
 
-              b_rss = b.get("max_rss_kb")
-              c_rss = c.get("max_rss_kb")
-              if isinstance(b_rss, int) and isinstance(c_rss, int):
+              b_rss = optional_nonnegative_rss(
+                  b.get("max_rss_kb"), f"baseline {case_id} max_rss_kb"
+              )
+              c_rss = optional_nonnegative_rss(
+                  c.get("max_rss_kb"), f"current {case_id} max_rss_kb"
+              )
+              if b_rss is not None and c_rss is not None:
                   rss_limit = max(int(b_rss * 2.0), b_rss + rss_slack_kb)
                   if c_rss > rss_limit:
                       violations.append(
                           f"{case_id} max_rss_kb {c_rss} > {rss_limit} (baseline {b_rss})"
                       )
 
-          # Also fail if new unexpected cases are added (keeps the harness stable)
+          # Historical baselines are intentionally sparse. Current-only cases
+          # remain visible here and are enforced by the absolute evaluator-cost
+          # gate below; inventing retroactive limits would fabricate evidence.
           extra_cases = sorted(set(current_cases.keys()) - set(baseline_cases.keys()))
-          if extra_cases:
-              violations.append(f"unexpected new cases in current run: {', '.join(extra_cases)}")
+          for case_id in extra_cases:
+              c = current_cases[case_id].get("metrics", {})
+              c_p50 = finite_nonnegative_number(
+                  c.get("p50_ms"), f"current {case_id} p50_ms"
+              )
+              optional_nonnegative_rss(
+                  c.get("max_rss_kb"), f"current {case_id} max_rss_kb"
+              )
+              if c_p50 is not None:
+                  rows.append((case_id, None, c_p50, None, "UNBASELINED"))
 
           # Write report (Markdown for GHA summary + artifacts)
           lines = []
@@ -1374,11 +1462,15 @@ jobs:
           lines.append(f"- Baseline: `{baseline_path}`")
           lines.append(f"- Threshold: `current_p50_ms <= baseline_p50_ms * {mult} + {slack_ms}ms`")
           lines.append(f"- RSS slack: `max(baseline*2, baseline+{rss_slack_kb}KB)` (when available)")
+          lines.append("- Current-only cases: `UNBASELINED`; enforced by the absolute gate below")
           lines.append("")
           lines.append("| Case | Baseline p50 (ms) | Current p50 (ms) | Limit (ms) | Status |")
           lines.append("|------|-------------------|-----------------|-----------|--------|")
           for case_id, b_p50, c_p50, limit_p50, status in rows:
-              lines.append(f"| `{case_id}` | {b_p50:.2f} | {c_p50:.2f} | {limit_p50:.2f} | {status} |")
+              if status == "UNBASELINED":
+                  lines.append(f"| `{case_id}` | — | {c_p50:.2f} | — | {status} |")
+              else:
+                  lines.append(f"| `{case_id}` | {b_p50:.2f} | {c_p50:.2f} | {limit_p50:.2f} | {status} |")
           lines.append("")
 
           if violations:
@@ -1415,10 +1507,10 @@ jobs:
         with:
           name: perf-regression-artifacts
           path: |
-            perf-base.json
-            perf-current.json
-            perf-regression-report.md
-            perf-runner.txt
+            ${{ runner.temp }}/dcg-perf-relative/perf-base.json
+            ${{ runner.temp }}/dcg-perf-relative/perf-current.json
+            ${{ runner.temp }}/dcg-perf-relative/perf-regression-report.md
+            ${{ runner.temp }}/dcg-perf-relative/perf-runner.txt
           retention-days: 14
           if-no-files-found: ignore
 
@@ -1427,6 +1519,51 @@ jobs:
         run: |
           echo "::error::Perf regression gate failed (exit code ${{ steps.perf.outputs.exit_code }}). See 'perf-regression-artifacts' and the step summary."
           exit 1
+
+      # ABSOLUTE latency gate (#245). The comparison above is a RELATIVE
+      # ratchet against a recorded baseline: if a change makes every case
+      # uniformly slower, the baseline is simply re-recorded and the product's
+      # fixed hook deadline is never consulted. That is exactly how a ~215ms
+      # per-invocation cost shipped against a 200ms budget and turned ordinary
+      # commands into fail-closed review prompts for every user. This gate
+      # pairs each full hook invocation with DCG_BYPASS and asserts the p95 of
+      # the matched difference against the SHIPPED default budget. Process
+      # spawn sits outside that in-process deadline, so raw end-to-end p95 is
+      # retained as evidence but is not substituted for evaluator cost. The
+      # run uses a hermetic HOME and no ambient DCG_* overrides. One hundred
+      # samples also support the harness's 95/95 one-sided binomial tolerance
+      # rule (at most one over-limit sample per case).
+      - name: Absolute evaluator-cost gate vs shipped default budget
+        run: |
+          LATENCY_ARTIFACT_DIR="$RUNNER_TEMP/dcg-perf-latency"
+          mkdir -p "$LATENCY_ARTIFACT_DIR"
+          python3 -B scripts/perf_baseline.py --self-test
+          BUDGET_MS=$(grep -oP 'pub const HOOK_EVALUATION_BUDGET_MS: u64 = \K[0-9_]+' src/perf.rs | tr -d '_')
+          if ! [[ "$BUDGET_MS" =~ ^[0-9]+$ ]] || [ "$BUDGET_MS" -le 0 ]; then
+            echo "::error::HOOK_EVALUATION_BUDGET_MS must be one positive integer"
+            exit 1
+          fi
+          echo "Shipped default hook budget: ${BUDGET_MS}ms"
+          python3 scripts/perf_baseline.py \
+            --bin target/release/dcg \
+            --skip-trace --warmup 5 --runs 100 \
+            --assert-budget-ms "$BUDGET_MS" \
+            --assert-margin-pct 50 \
+            --output "$LATENCY_ARTIFACT_DIR/perf-latency-gate.json"
+
+      - name: Upload absolute latency gate certificate
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: perf-latency-gate-certificate
+          path: ${{ runner.temp }}/dcg-perf-latency/perf-latency-gate.json
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Harness protocol matrix (real binary, every agent wire format)
+        run: |
+          command -v jq >/dev/null 2>&1 || sudo apt-get install -y jq
+          bash scripts/e2e_harness_matrix.sh --binary target/release/dcg
 
   # Deep suite: fuzzing (manual only)
   fuzz:

@@ -15,11 +15,17 @@ trust to well-behaved agents while maintaining strict controls for unknown ones.
 | Codex CLI | Environment | `CODEX_CLI=1` |
 | Gemini CLI | Environment | `GEMINI_CLI=1` |
 | GitHub Copilot CLI | Environment | `COPILOT_CLI=1` or `COPILOT_AGENT_START_TIME_SEC` |
-| VS Code Copilot Chat | Hook payload | `tool_name` is `runTerminalCommand`, `run_in_terminal`, or `runInTerminal` |
+| VS Code Copilot Chat | Hook payload | `tool_name` is `runTerminalCommand`, `run_in_terminal`, or `runInTerminal`; the Agent Host's batched `toolCalls` envelope is also recognized, with every shell entry evaluated independently |
 | Cursor IDE | Environment | `CURSOR_IDE=1` (set by dcg's hook script) |
 | Hermes Agent | Environment | `HERMES_AGENT=1` or `HERMES_SESSION_ID` |
 | Grok (xAI) | Environment | `GROK_SESSION_ID`, `GROK_HOOK_EVENT`, or `GROK_WORKSPACE_ROOT` |
+| Oh My Pi (`omp`) | Explicit bridge / process | Generated extension passes `--agent omp`; exact `omp` and `oh-my-pi` process names are fallback matches |
+| Crush | Environment | `CRUSH=1` (set by Crush for hook subprocesses and `bash`-tool commands; the generic `AGENT`/`AI_AGENT` markers are not consulted). Hook payloads are recognized by their `event: "PreToolUse"` + `tool_input` envelope — see [crush-integration.md](crush-integration.md) |
+| Muse Code | Explicit flag only | The hook written by `dcg install --muse` passes `--agent muse` (Muse clears the hook environment). Its payload looks like Codex's (`turn_id`), so without the flag `[agents.codex-cli]` applies; the identity is never taken from the payload or a process name — see [muse-integration.md](muse-integration.md) |
+| Amp | Explicit bridge | The plugin written by `dcg install --amp` passes `--agent amp`; no environment marker or process name is consulted — see [amp-integration.md](amp-integration.md) |
+| Factory Droid | Explicit hook identity / hook payload / environment / process | `dcg install --droid` writes `--agent droid`; an `Execute` PreToolUse payload also identifies Droid. `FACTORY_PROJECT_DIR` and the exact `droid` process name are fallbacks. See [Factory Droid](#factory-droid) for configuration and the unverified Script boundary. |
 | Pi | Environment | `PI_CODING_AGENT=true` |
+| Posit Assistant | Environment | `PA_PROJECT_DIR` (set in hook subprocesses; checked last among environment markers so agents with their own markers win — environment detection still precedes parent-process detection) |
 
 ## Detection Priority
 
@@ -29,6 +35,263 @@ Agent detection follows this priority order:
 2. **Environment variables**: Most agents set identifying env vars
 3. **Parent process inspection**: Fallback check of process tree
 4. **Unknown**: Default when no agent is detected
+
+In hook mode, Droid's native `Execute` PreToolUse payload can supersede an
+inherited environment marker from another agent. An explicit `--agent` still
+wins, and other recognized native protocol markers remain authoritative.
+
+### Factory Droid
+
+Install the hook with the current DCG binary, then start a new Droid session:
+
+```bash
+dcg install --droid
+dcg doctor
+```
+
+`install.sh` and `install.ps1` also detect the `droid` executable or the user's
+`.factory` directory and delegate to this native installer. Add `--project` to
+install into the project's `.factory` directory instead: DCG uses the Git root
+when inside a repository, or the current directory in a non-Git project.
+Installation is idempotent; `--force` refreshes a stale DCG registration while preserving other
+hooks and settings. The hook command is an absolute DCG executable path followed
+by `--agent droid`, so `[agents.droid]` applies even if Droid clears environment
+variables or launches the hook through an intermediate shell.
+
+Factory documents two distinct JSON layouts:
+
+| File | Hook map | Selection |
+|------|----------|-----------|
+| `~/.factory/hooks.json` or `<project>/.factory/hooks.json` | Top-level `PreToolUse` | Takes precedence over settings hooks at the same scope |
+| `.factory/hooks/hooks.json` | Top-level `PreToolUse` | Legacy standalone location; check Droid's effective view when combined with newer files |
+| `.factory/settings.json` | `hooks.PreToolUse` | Documented fallback when `hooks.json` is absent; local/legacy interactions are described below |
+| `.factory/settings.local.json` | `hooks.PreToolUse` | Local settings override; keep its effective hooks in mind when diagnosing fallback settings |
+
+The installer selects an existing `hooks.json` first, then a
+`settings.local.json` containing `hooks.PreToolUse`, then a legacy
+`hooks/hooks.json`, and otherwise `settings.json`. This is DCG's installation
+selection order; Factory's public documentation does not fully specify merging
+when local settings and legacy files coexist. Confirm the chosen registration
+in Droid's effective view. For a fresh scope DCG uses `settings.json`. It does not alter
+organization-managed hooks, `hooksDisabled`, or organizational restrictions such
+as `allowManagedHooksOnly`. Those settings can prevent local hooks from running.
+Use Droid's `/hooks` effective view and `droid --debug` to check host loading.
+
+`dcg doctor` checks the selected user and project files, exact `Execute` matcher,
+unfiltered synchronous registration, and the absolute path of the DCG executable
+running doctor. A different executable path is treated as stale because it may
+refer to a version without Droid support. Reinstall using the desired executable
+to refresh that path. Malformed JSON, duplicate keys, invalid hook definitions,
+and visible disabled-hook controls are reported without discarding configuration.
+Factory does not document a per-hook Windows shell selector; DCG does not write
+Claude-specific PowerShell settings into Factory files. Verify the installed
+command's live dispatch on native Windows as well as the effective registration.
+
+For example, a **settings.json** registration has this shape (substitute the
+actual absolute executable path; quote the path inside the command when it
+contains spaces):
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Execute",
+        "hooks": [
+          {"type": "command", "command": "/absolute/path/to/dcg --agent droid"}
+        ]
+      }
+    ]
+  }
+}
+```
+
+In a standalone **hooks.json**, omit the outer `hooks` wrapper. Matchers are
+case-sensitive: `Bash`, `execute`, and `Execute` select different tools.
+
+The hook receives a snake_case payload such as:
+
+```json
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Execute",
+  "tool_input": {"command": "git status", "timeout": 60, "riskLevel": "low"}
+}
+```
+
+DCG evaluates `tool_input.command` using the shared command evaluator and agent
+profile. A denial is delivered as
+`hookSpecificOutput.permissionDecision: "deny"` with a reason, on exit 0.
+Allowed commands produce no stdout, preserving Droid's own permission checks.
+Factory also documents exit 2 as a blocking response; DCG uses it as a fallback
+if a blocking JSON verdict cannot be written. Other nonzero exit codes are
+hook errors, not documented blocks.
+
+Remove DCG's entries without removing unrelated configuration:
+
+```bash
+dcg uninstall --droid              # User scope, including inactive locations
+dcg uninstall --droid --project    # Current project scope
+```
+
+Both standalone and settings-wrapped files are checked so an inactive DCG
+registration does not reappear when a higher-priority file is later removed.
+Settings files remain in place, and organization-managed hooks are untouched.
+
+#### Loading regressions and Script-mode coverage
+
+Factory's published contract is the basis for this integration. A report against
+Droid **0.186.0** describes standalone hook files not loading, while project
+`settings.json` worked; the report remains separate from DCG's parser and
+installer tests. If an existing standalone file is not loaded by your Droid
+version, review its contents and move the complete hook map into settings using
+Factory's supported configuration flow. Merely adding DCG to settings while a
+standalone file shadows it is not proof of protection.
+
+**Nested `Execute` calls inside Droid's `Script` tool are unverified.** Factory
+describes Script as able to call other tools, but the public hook documentation
+does not establish whether each nested call dispatches `PreToolUse`. DCG's
+installed matcher covers `Execute` events that Droid actually delivers. It
+does not inspect the separate Script tool as if it were a shell command, and
+neither a valid registration nor a synthetic Execute test proves nested coverage.
+
+To investigate a specific Droid version safely, use a disposable project and a
+temporary audit hook that records `tool_name` and `tool_input.command`. First
+exercise harmless direct Execute commands, then have Script invoke the same
+commands. Require a separate **Execute** hook event for every nested invocation;
+an outer Script event is insufficient. To verify enforcement as well as event
+delivery, add a temporary high-severity [external pack](configuration.md#external-packs-yaml)
+that denies an otherwise harmless canary, such as printing a unique marker.
+Confirm the marker is never printed when the command is denied, for both direct
+and nested calls. Record the Droid version, model, effective hook configuration,
+captured events, and canary outcome. Until that succeeds, treat Script execution
+as outside verified protection and restrict it through Factory's controls where
+available.
+
+References: [Factory hooks](https://docs.factory.com/harness/hooks),
+[Droid settings](https://docs.factory.com/droid-cli/settings),
+[hook-loading report](https://github.com/Factory-AI/factory/issues/3),
+[Script announcement](https://factory.com/news/frontier-harness), and
+[SDK hook messages](https://docs.factory.com/sdk/typescript). SDK `hook` stream
+messages can help observe dispatch; their presence alone does not prove a deny
+prevented execution. `dcg doctor` inspects the local registration; it does not
+verify the live Factory dispatcher.
+
+### Oh My Pi (`omp`)
+
+Install dcg's native OMP ExtensionAPI module with:
+
+```bash
+dcg install --omp
+```
+
+The default user path is `~/.omp/agent/extensions/dcg-guard.ts`. OMP named
+profiles use `~/.omp/profiles/<name>/agent/extensions/dcg-guard.ts`; dcg follows
+OMP's `OMP_PROFILE`-before-`PI_PROFILE` precedence and honors
+`PI_CONFIG_DIR` for a config directory name relative to the user's home plus
+`PI_CODING_AGENT_DIR` for the default profile. Drive-qualified
+`PI_CONFIG_DIR` values are rejected on Windows because Rust would otherwise
+resolve them differently from OMP's home-relative `path.join` behavior. Use
+`dcg install --omp --project` to install `<cwd>/.omp/extensions/dcg-guard.ts`
+instead. OMP checks only the current working directory for native project
+extensions; it neither requires Git nor walks to an ancestor, so launch OMP
+from that same directory.
+
+The extension uses OMP's pre-execution `tool_call` event and sends each `bash`
+command to `dcg --robot test --stdin --agent omp --format json` with the dialect
+selected by OMP's execution route. Pinning the private bridge format prevents
+ambient `DCG_FORMAT` from redirecting or invalidating its compact protocol
+without removing that variable from supported environment-conditioned policy.
+The embedded install-time absolute dcg pathname is authoritative: ambient
+`DCG_BIN` cannot redirect the marker-owned guard. This binds a pathname, not a
+hash, inode/file ID, signature, or immutable executable object. Bun resolves
+that pathname again for each tool call, so moving or removing the file produces
+a visible infrastructure failure, while replacing bytes at the same pathname
+changes what a later callback executes. `dcg doctor` compares the marker-owned
+extension with source generated for the doctor process's pathname at inspection
+time; it does not attest binary contents or an extension already loaded by a
+running OMP session. To rebind deliberately, run
+`/desired/path/dcg install --omp --force` (add `--project` for project scope)
+and restart OMP. Protect the binary, extension, and their parent directories
+from writers not trusted to control OMP execution; a writer that can replace the
+extension can already run code inside OMP. Ordinary and managed-async calls use
+OMP's embedded Brush shell and pass `--dialect posix`, including on native
+Windows. An eligible local `pty: true` call instead maps OMP's configured
+external shell to `--dialect posix`, `cmd`, or `ps`; `PI_NO_PTY=1` disables that
+PTY route. A dcg deny, ask, or indeterminate result returns
+`{ block: true, reason }` to OMP.
+Because the bridge supplies `--agent omp` explicitly, OMP remains distinct from
+legacy Pi even when OMP exposes Pi-family compatibility variables. The
+canonical profile key is `agents.omp`; `oh-my-pi` is accepted as an alias.
+When `[history] enabled = true`, these robot-boundary evaluations are persisted
+with the canonical `agent_type = "omp"`; ordinary human `dcg test` diagnostics
+remain outside command history.
+
+The bridge spawns dcg directly, without a shell, and gives Bun a 30-second
+parent-side timeout with a hard kill signal. Immediately after a successful
+spawn it records one monotonic absolute deadline 30.5 seconds away and arms one
+observation watchdog. A direct child can exit while a descendant still holds
+its stdout or stderr descriptor, so exit settlement rearms that sole timer for
+the lesser of a 250-millisecond pipe-drain grace and the remaining absolute
+budget. If the remaining hard budget wins, expiry retains hard-deadline
+provenance. Exit-observation rejection attempts one direct-child `SIGKILL` and
+uses the same clamped drain; neither rearm kills again. Every active watchdog is
+cleared when observation finishes, and late exit settlement or rejection
+remains consumed. There is no retry, replacement process, or second
+concurrently active bridge watchdog.
+
+This is the finite child-observation lineage:
+
+| Current state + event | Process action | Pipe/clock action | Result invariant |
+|---|---|---|---|
+| `Bun.spawn` throws | No child exists | No watchdog is armed | One visible spawn diagnostic; fail open |
+| Spawn succeeds | Bun owns the 30-second direct-child timeout | Record and arm the monotonic 30.5-second absolute observation deadline; read both capped pipes and exit concurrently | No classification before the bounded observation settles |
+| Complete deny/ask/indeterminate frame or stdout overflow arrives | None | Retain the frame or capped overflow evidence while observation continues | Blocking evidence is absorbing |
+| Exit resolves before the hard deadline | None; the direct child is already gone | Rearm for `min(250 ms, remaining hard budget)` | Bytes already read remain eligible evidence; the absolute deadline cannot move |
+| Exit rejects before the hard deadline | Attempt one direct-child `SIGKILL` | Rearm for `min(250 ms, remaining hard budget)` without another kill | The exit fault and any kill fault remain visible; kill request alone does not prove a signal |
+| Drain grace expires | The direct child has exited or already received the rejection-path kill | Cancel both local readers | Retained block/overflow still blocks; missing evidence follows visible infrastructure fail-open |
+| Hard observation deadline expires | Attempt one direct-child `SIGKILL` | Cancel both readers and the local exit wrapper | Retained block/overflow still blocks; deadline remains visible |
+| All three observations settle first | None | Clear the active watchdog | Read signal provenance, classify once, and emit each owned diagnostic once |
+
+If a blocking frame and a deadline become runnable together, JavaScript's event
+loop imposes a total order: bytes delivered before reader cancellation are
+retained and absorbing; bytes delivered after cancellation are outside the
+observation boundary. The stdout and stderr caps bound retained memory, and the
+outer/deferred deadlines bound a standards-compliant asynchronous observation.
+If an underlying WHATWG cancellation algorithm rejects, the stream is still
+closed and pending reads settle; the bridge consumes the cancellation promise's
+rejection while retaining prior deny/ask/indeterminate and overflow evidence.
+The backstops sit above dcg's ordinary 1-second evaluator default and the broad
+Windows preset's 3-second default, not in place of those configurable budgets.
+An explicit evaluator budget above 30 seconds is nevertheless capped on this
+OMP bridge; direct hook and diagnostic invocations retain their configured
+budget.
+
+Two seams remain fundamentally outside this in-process boundary. A synchronous
+stall inside `Bun.spawn` (or any JavaScript/event-loop stall) prevents a timer
+from starting or firing. Bun's `proc.kill()` targets the direct child, not a
+process group, so it cannot prove that descendants were terminated or release
+their unrelated resources; local reader cancellation bounds the callback even
+when an inherited pipe holder survives. A non-standard stream whose synchronous
+cancel path throws without settling a pending read is likewise outside the Web
+Streams contract and cannot be bounded by another JavaScript promise. After
+observation, the bridge reads Bun's `signalCode` and reports an exact signal
+only when Bun actually exposes one; a successful `proc.kill("SIGKILL")` request
+does not itself forge SIGKILL provenance. This keeps an ordinary numeric exit
+137 distinct from an observed timeout or other observed `SIGKILL`.
+A complete deny, ask, or indeterminate verdict already written to stdout
+remains authoritative regardless of signal, cancellation, stream/exit fault,
+or deadline; stdout overflow and dcg's independent blocking exit 1 are likewise
+absorbing. Other abnormal statuses and infrastructure faults remain visible
+even when blocking evidence controls the action.
+
+OMP's public ExtensionAPI does not expose its ACP client-terminal capability or
+selected backend, and both ACP and JSON-RPC surface as `mode: "rpc"`. The bridge
+therefore does not infer a Windows dialect from mode: non-PTY RPC calls remain
+POSIX-scoped so ordinary JSON-RPC execution does not gain Cmd/PowerShell false
+positives. As a result, an ACP client-terminal call does not yet receive exact
+Cmd/PowerShell-specific coverage; closing that residual requires OMP to expose
+the actual BashTool route before the `tool_call` handler runs.
 
 ## Trust Levels
 
@@ -113,6 +376,14 @@ Configure agent profiles in your `config.toml`:
 trust_level = "high"
 additional_allowlist = ["npm run build", "cargo test"]
 
+[agents.omp]
+trust_level = "medium"
+extra_packs = ["strict_git"]
+
+[agents.droid]
+trust_level = "medium"
+extra_packs = ["strict_git"]
+
 # Restrict unknown agents
 [agents.unknown]
 trust_level = "low"
@@ -134,10 +405,10 @@ trust_level = "medium"
 | `additional_allowlist` | array | `[]` | Command patterns to allowlist for this agent (added on top of the base allowlist). |
 | `disabled_allowlist` | bool | `false` | If `true`, ignore all allowlist entries for this agent (more restrictive). |
 
-### Example: Restrictive Config for CI
+### Example: Agent Profiles for a Trusted Config
 
 ```toml
-# In .dcg.toml (project-level)
+# In ~/.config/dcg/config.toml, or in a reviewed file selected with DCG_CONFIG
 [agents.unknown]
 trust_level = "low"
 disabled_allowlist = true
@@ -147,6 +418,12 @@ extra_packs = ["strict_git", "database", "system"]
 trust_level = "medium"
 additional_allowlist = ["npm test", "npm run lint"]
 ```
+
+Automatically discovered repository `.dcg.toml` files cannot define agent
+profiles. Profiles can disable packs or add allowlist entries, so accepting
+them from a newly cloned repository would cross dcg's security boundary. To
+use a reviewed repository-owned profile deliberately, invoke dcg with
+`DCG_CONFIG=.dcg.toml` (or copy the profile into the user config).
 
 ## Custom Agents
 
@@ -254,6 +531,7 @@ In robot mode, dcg uses consistent exit codes across all commands:
 | 3 | `EXIT_CONFIG_ERROR` | Configuration error |
 | 4 | `EXIT_PARSE_ERROR` | Parse/input error |
 | 5 | `EXIT_IO_ERROR` | IO error |
+| 141 | `EXIT_BROKEN_PIPE` | stdout/stderr reader went away (`EPIPE`); a clean exit, never a signal death |
 
 ### Robot Mode JSON Output
 
@@ -283,6 +561,35 @@ All robot-mode responses are pure JSON on stdout:
 - Codex CLI uses strict hook parsing, so dcg emits a minimal
   `hookSpecificOutput` denial on stdout and exits 0.
 - Rich output always goes to stderr for human visibility.
+
+Hook mode carries the verdict in stdout JSON and exits 0 whether the command
+was allowed, warned about, sent for review, or denied. The exit status changes
+only when a blocking verdict could not be delivered:
+
+| Code | Constant | Meaning |
+|------|----------|---------|
+| 0 | `EXIT_SUCCESS` | Verdict delivered on stdout (an allow is empty stdout). Also an allow or a warning whose stdout reader went away: nothing was lost. |
+| 2 | `EXIT_HOOK_BLOCK` | A deny, ask, or indeterminate verdict could not be written to stdout (`EPIPE`: the host closed the pipe early). Exit 0 with nothing on stdout would read as "proceed", so the block travels in the exit status instead, with the reason on stderr. |
+
+How hosts read exit 2 with nothing on stdout:
+
+| Protocol | Effect |
+|----------|--------|
+| Claude Code and Claude-compatible hosts (Posit Assistant, Augment) | Blocks; stderr is fed back to the model as the reason |
+| Gemini CLI | Blocks (exit 2 is its blocking error) |
+| Copilot CLI | Blocks (`preToolUse` hooks that exit 2 deny the call) |
+| Crush | Blocks; stderr is the reason |
+| Factory Droid | Blocks; `PreToolUse` exit 2 is documented as a blocking error |
+| Grok | Blocks (exit 2 is a documented explicit deny) |
+| Codex CLI | Blocks in current releases (exit 2 with the reason on stderr is documented); some earlier builds logged it as a hook failure and failed open |
+| Hermes | Blocks in current releases (a `pre_tool_call` hook exiting 2 blocks even with no JSON on stdout); earlier builds only warned |
+| Reasonix | Blocks — exit 2 is its only blocking channel, so dcg always uses it there |
+| Muse Code | Not documented: a non-zero exit is a hook failure, which Muse hands to the handler's `onFailure` fallback when one is declared |
+| Antigravity (`agy`) | Logged as a hook failure, then fails open — the same outcome as exit 0 with no JSON, but visible |
+
+Hook mode never exits 2 for any other reason, and never exits 141: every
+hook-mode write tolerates a closed pipe. `EXIT_BROKEN_PIPE` belongs to the
+CLI surface below.
 
 **Robot mode** with subcommands uses standardized exit codes:
 - Exit 1 for denials (allows scripting with `$?`)
@@ -390,8 +697,9 @@ Available formats:
 2. **Grant trust incrementally**: Only increase trust for agents after
    observing their behavior.
 
-3. **Use project-level configs**: Put agent profiles in `.dcg.toml` so they're
-   version-controlled with your project.
+3. **Version reviewed profiles carefully**: A repository can keep a reviewed
+   profile in `.dcg.toml`, but it only takes effect when explicitly selected
+   with `DCG_CONFIG=.dcg.toml`; automatic discovery ignores agent profiles.
 
 4. **Restrict unknown agents**: Always configure `agents.unknown` with lower
    trust in production environments.

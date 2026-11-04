@@ -1,0 +1,28 @@
+# Neotask fork: `dcg scan` settings for this repository (read from the repo root by `dcg scan`).
+#
+# These nineteen upstream files are installers, uninstallers, install tests and end-to-end scripts that contain
+# destructive commands by design (they exercise a destructive-command guard). Neotask ships only the dcg binary and
+# LICENSE, never these files, so the PR-diff scans skip them (MON rulings, dev-igbgn, 2026-11-03). Each entry is an
+# exact path, not a glob: a new path in a future upstream intake is a new decision, recorded in NEOTASK-FORK.md.
+[scan.paths]
+exclude = [
+  "install.ps1",
+  "install.sh",
+  "uninstall.ps1",
+  "uninstall.sh",
+  "scripts/e2e_test.sh",
+  "scripts/e2e_test.ps1",
+  "scripts/e2e_fleet_install.sh",
+  "scripts/e2e_harness_matrix.sh",
+  "scripts/e2e_destructive_equivalents.sh",
+  "scripts/win_history_concurrency.ps1",
+  "scripts/scan_regression.sh",
+  "tests/install/test_helper.bash",
+  "tests/e2e/run_install_e2e.sh",
+  "tests/e2e/test_doctor_install_uninstall.sh",
+  "tests/installer/claude_hook_test.ps1",
+  "tests/installer/cursor_hook_test.ps1",
+  "tests/installer/profile_check_test.ps1",
+  "tests/installer/uninstall_test.ps1",
+  "tests/installer/checksum_test.ps1",
+]

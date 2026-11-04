@@ -11,7 +11,7 @@
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────────┐
 //! │                        Configuration                             │
-//! │  (env vars → project config → user config → system → defaults)  │
+//! │ (env → explicit → user → system → defaults; repo hardening only)│
 //! └─────────────────────────────────────────────────────────────────┘
 //!                                  │
 //!                                  ▼
@@ -78,12 +78,14 @@ pub mod hook;
 pub mod interactive;
 pub mod logging;
 pub mod mcp;
+mod neotask_quoted_redirect;
 pub mod normalize;
 pub mod output;
 pub mod packs;
 pub mod pending_exceptions;
 pub mod perf;
 pub mod rebase_recovery;
+pub mod redaction;
 pub mod sarif;
 pub mod scan;
 pub mod session;
@@ -93,6 +95,15 @@ pub mod suggest;
 pub mod suggestions;
 pub mod trace;
 pub mod update;
+
+// #442 regressions against the real ast-grep bash parser. The declaration belongs
+// here and not in vendor/patches/dcg-bash-scanner-wiring.patch: an undeclared file
+// under src/ is not part of the crate at all, so while it lived only in that patch
+// the tests were never compiled, never linted and never run — and
+// `cargo test --lib scanner_regression_tests` exits 0 on a filter that matches
+// nothing, so the CI step asserting them passed while testing zero tests.
+#[cfg(test)]
+mod scanner_regression_tests;
 
 // Re-export commonly used types
 pub use allowlist::{
@@ -193,10 +204,10 @@ pub use stats::{
 
 // Re-export performance budget types
 pub use perf::{
-    ABSOLUTE_MAX, Budget, BudgetStatus, Deadline, FAIL_OPEN_THRESHOLD_MS, FAST_PATH,
-    FAST_PATH_BUDGET_US, FULL_HEREDOC_PIPELINE, HEREDOC_EXTRACT, HEREDOC_TRIGGER,
+    ABSOLUTE_MAX, Budget, BudgetStatus, CAREFUL_COMPANY_HOOK_EVALUATION_BUDGET_MS, Deadline,
+    FAST_PATH, FAST_PATH_BUDGET_US, FULL_HEREDOC_PIPELINE, HEREDOC_EXTRACT, HEREDOC_TRIGGER,
     HOOK_EVALUATION_BUDGET, HOOK_EVALUATION_BUDGET_MS, LANGUAGE_DETECT, PATTERN_MATCH,
-    QUICK_REJECT, SLOW_PATH_BUDGET_MS, should_fail_open,
+    QUICK_REJECT, SLOW_PATH_BUDGET_MS, exceeds_absolute_budget,
 };
 
 // Re-export normalize types for wrapper stripping
@@ -212,8 +223,8 @@ pub use confidence::{
 pub use history::{
     AgentStat, BackupResult, CURRENT_SCHEMA_VERSION, CheckResult, CommandEntry,
     DEFAULT_DB_FILENAME, ENV_HISTORY_DB_PATH, ENV_HISTORY_DISABLED, HistoryDb, HistoryError,
-    HistoryStats, HistoryWriter, Outcome as HistoryOutcome, OutcomeStats, PatternStat,
-    PerformanceStats, ProjectStat, StatsTrends,
+    HistoryPathSource, HistoryStats, HistoryWriter, Outcome as HistoryOutcome, OutcomeStats,
+    PatternStat, PerformanceStats, ProjectStat, ResolvedHistoryPath, StatsTrends,
 };
 
 // Re-export interactive prompt types for human verification
@@ -250,3 +261,39 @@ pub use update::{
 
 // Re-export session occurrence tracking types for graduated response system
 pub use session::{OccurrenceSnapshot, hash_command as session_hash_command};
+
+/// One lock for every test in this crate that mutates the process environment.
+///
+/// There were three, one per module — `hook`, `agent` and `interactive` — and
+/// each serialised only against itself, so a writer in one module ran
+/// concurrently with a writer in another. In Rust 2024 `set_var` is `unsafe`
+/// precisely because glibc's `setenv` can realloc and free the `environ` array
+/// while another thread walks it, which faults inside libc with no Rust panic
+/// and no backtrace.
+///
+/// **This does not make the suite sound, and the guards that take it must not
+/// claim otherwise.** It closes writer-against-writer only. Readers take no
+/// lock — there are far more `env::var` call sites than `EnvVarGuard` uses, and
+/// native code such as bundled SQLite consulting `TMPDIR` cannot take a Rust
+/// lock at all. Closing that needs the tests to stop mutating the environment,
+/// or to run in a process of their own; see #445.
+///
+/// It lives at the end of this file because it is a test module, and
+/// `clippy::items_after_test_module` wants the crate's items above it.
+#[cfg(test)]
+pub(crate) mod test_env {
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Serialise against every other env-mutating test in the crate.
+    ///
+    /// A poisoned lock is taken anyway: the data is `()`, so there is no
+    /// invariant for a panicking test to have broken, and cascading every
+    /// later env test into a second failure hides the first one.
+    pub(crate) fn lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}

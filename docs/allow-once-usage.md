@@ -11,7 +11,8 @@ When dcg blocks a command, it prints a 6-digit numeric code that can be used to 
 **Key properties:**
 - Exceptions are scoped to the exact command + directory (project root in git repos, cwd otherwise)
 - Exceptions expire after 24 hours
-- By default, exceptions are reusable until expiry
+- By default an exception is single-use: it is consumed by the first command
+  it allows (`--reusable` keeps it valid until expiry instead)
 - All exceptions are logged for audit
 
 ---
@@ -55,17 +56,20 @@ This creates a temporary exception that:
 - Allows the exact command that was blocked
 - Is scoped to the project root (if in a git repo) or current directory (otherwise)
 - Expires after 24 hours
-- Can be used multiple times until expiry
+- Is consumed by the first matching command (unless created with `--reusable`)
 
-### Single-Use Exceptions
+### Single-Use (Default) and Reusable Exceptions
 
-For a one-time exception that's consumed after the first use:
+An allow-once grant is consumed by the first command it allows. To keep it valid
+for repeated runs of the same command until it expires:
 
 ```bash
-dcg allow-once 123456 --single-use
+dcg allow-once 123456 --reusable
 ```
 
-This is more restrictive and recommended when you only need to run the command once.
+A reusable grant is a bypass with a time window, so use it only when you really
+need to repeat the command. `--single-use` is still accepted and matches the
+default. Before #378 the default was reusable.
 
 ---
 
@@ -75,6 +79,13 @@ This is more restrictive and recommended when you only need to run the command o
 
 All allow-once exceptions expire after **24 hours** from creation. This cannot be changed.
 
+DCG checks this limit when reading stored grants and pending codes, as well as
+when creating them. Records with an unsupported schema, malformed timestamps,
+future creation time, non-positive lifetime, or lifetime longer than 24 hours
+are rejected. A grant is expired at its expiration timestamp. Invalid records
+are skipped without disabling valid neighboring grants and are removed during
+store maintenance.
+
 ### Directory Scope
 
 Exceptions are scoped based on whether the command was blocked inside a git repository:
@@ -83,6 +94,14 @@ Exceptions are scoped based on whether the command was blocked inside a git repo
 - **cwd scope** (outside git repos): If blocked outside a git repository, the exception only applies in the exact directory where the command was blocked.
 
 The scope is automatically determined—you cannot override it. This ensures exceptions are appropriately scoped: broad enough to be useful within a project, but not so broad that they leak across unrelated directories.
+
+Scope checks use the requested command's working directory, including a
+directory supplied by the agent hook. Paths are resolved before comparison so
+`..` components and symlinks cannot escape a scope. A project scope must name
+an existing repository root, cannot cover a filesystem root, and does not
+extend into a nested repository, submodule, or separate worktree. A missing,
+relative, or unknown directory cannot authorize a grant or be replaced with
+the directory where someone redeems the code.
 
 ### Exact Command Match
 
@@ -94,12 +113,16 @@ The exception only applies to the **exact command text** that was blocked. Even 
 
 ### Default Behavior
 
-By default, dcg redacts potentially sensitive information from commands when displaying them:
+By default, dcg redacts potentially sensitive information from commands when displaying them. Recognised credential shapes (provider API keys, forge tokens, JWTs, `Authorization:` headers, `scheme://user:password@host` URLs, private-key headers, and `password=`/`secret=` assignments) are replaced with a bracketed placeholder, and quoted arguments longer than `max_argument_len` are truncated:
 
 ```bash
 dcg allow-once list
-# Shows: git clone https://***@github.com/...
+# Shows: git clone https://[URL_CREDENTIALS]@github.com/...
 ```
+
+This is a mitigation over known shapes, not a guarantee: a credential in an
+unrecognised format still reaches the store. Use `redaction_mode = "full"` when
+the command text itself must never be persisted.
 
 ### Viewing Raw Commands
 
@@ -199,7 +222,7 @@ dcg allow-once clear --all
 
 ```bash
 dcg allow-once <CODE>              # Apply an allow-once code
-dcg allow-once <CODE> --single-use # Apply as one-time exception
+dcg allow-once <CODE> --reusable   # Keep the exception until it expires
 dcg allow-once <CODE> --force      # Override config blocklist
 dcg allow-once <CODE> --dry-run    # Preview without applying
 ```
@@ -233,7 +256,8 @@ Without disambiguation, the CLI will show a list of matching entries to choose f
 | `--json` | Output JSON for automation |
 | `--show-raw` | Show unredacted command text |
 | `--dry-run` | Preview without applying |
-| `--single-use` | Consumed after first allow |
+| `--single-use` | Consumed after first allow (the default) |
+| `--reusable` | Stay valid until expiry instead of being consumed |
 | `--force` | Override config blocklist |
 | `--pick <N>` | Select by index when codes collide |
 | `--hash <HASH>` | Select by full hash when codes collide |
@@ -270,25 +294,39 @@ These can be overridden with environment variables:
 - `DCG_PENDING_EXCEPTIONS_PATH`
 - `DCG_ALLOW_ONCE_PATH`
 
+With `careful_company_running_windows.guardrails` enabled, the
+`dcg-policy-self-weakening` rule also checks shell writes to the authorization
+stores, including redirects and common filesystem-writing commands. Reads and
+writes to unrelated files remain available.
+
+These files are local authorization state, not an independent security boundary
+against a process that can modify them. Record validation enforces the lifetime
+and scope limits; it does not authenticate who approved a grant. The optional
+short-code secret below does not sign stored grants, and a shell hook cannot
+intercept writes made through a separate file-editing tool.
+
 ---
 
 ## Optional HMAC Hardening
 
 Set `DCG_ALLOW_ONCE_SECRET` to harden short-code generation with HMAC-SHA256.
-This prevents attackers (or tooling) from forging valid short codes without the secret.
+Newly generated codes then depend on the secret as well as the request metadata.
+This does not authenticate records loaded from either authorization store.
 
 Trade-offs:
-- **Security**: stronger, tamper-resistant short codes.
-- **Recoverability**: if the secret changes or is lost, previously issued codes will no longer resolve.
-  Re-run the blocked command to generate a new code under the new secret.
+- **Generation**: a party without the secret cannot recompute newly issued codes
+  from the command, directory, and timestamp alone.
+- **Rotation**: changing the secret changes future codes. Already stored pending
+  codes and approved grants retain their own expiration and scope limits; secret
+  rotation does not revoke them. Use `revoke` or `clear` to remove them.
 
-Keep the secret stable within the environment where you expect to resolve codes.
+Keep the secret stable when you need consistent code generation across hooks.
 
 ---
 
 ## Best Practices
 
-1. **Use `--single-use` for one-off operations** - Prefer single-use exceptions when you only need to run a command once.
+1. **Reach for `--reusable` sparingly** - The default single-use grant covers a one-off operation; a reusable grant keeps the bypass open until it expires.
 
 2. **Review before applying** - Use `dcg explain "<command>"` to understand why the command was blocked before allowing it.
 

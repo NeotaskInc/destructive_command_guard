@@ -17,7 +17,9 @@
         "max_findings_per_command": null,
         "check_updates": true,
         "self_heal_hook": true,
-        "fail_closed": false
+        "fail_closed": false,
+        "unverified_decision": "ask",
+        "update_pin": false
       }
     },
     "output": {
@@ -57,9 +59,7 @@
       "$ref": "#/$defs/OverridesConfig",
       "default": {
         "allow": [],
-        "block": [],
-        "allowlist": null,
-        "allowlist_rules": null
+        "block": []
       }
     },
     "allowlist": {
@@ -109,7 +109,8 @@
           "deny": true,
           "warn": true,
           "allow": false
-        }
+        },
+        "caller_env": null
       }
     },
     "history": {
@@ -204,6 +205,14 @@
         "$ref": "#/$defs/ProjectConfig"
       },
       "default": {}
+    },
+    "rules": {
+      "description": "Per-rule settings keyed by `\"<pack_id>:<pattern_name>\"` (#284).\n\nCurrently carries `exempt_target_globs`, the rule-scoped target-path\nexemption. See [`RuleConfig`].",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/RuleConfig"
+      },
+      "default": {}
     }
   },
   "$defs": {
@@ -212,7 +221,7 @@
       "type": "object",
       "properties": {
         "color": {
-          "description": "Color output mode: \"auto\", \"always\", \"never\".",
+          "description": "Color output mode: \"auto\", \"always\", \"never\". \"never\" turns color off;\n\"auto\" and \"always\" both follow terminal detection (`NO_COLOR`, `CI`,\nand a non-TTY stdout still disable it).",
           "type": "string",
           "default": "auto"
         },
@@ -230,7 +239,7 @@
           "default": false
         },
         "hook_timeout_ms": {
-          "description": "Hook evaluation budget override in milliseconds.\nWhen set, overrides the default hook evaluation budget.",
+          "description": "Hook evaluation budget override in milliseconds.\nWhen set, overrides the default hook evaluation budget. Values below\n10 milliseconds are clamped to the minimum safe evaluation window.",
           "type": [
             "integer",
             "null"
@@ -240,7 +249,7 @@
           "default": null
         },
         "max_hook_input_bytes": {
-          "description": "Maximum bytes to read from stdin in hook mode.\nCommands exceeding this limit are allowed (fail-open) with a warning.\nDefault: 262144 (256 KiB).",
+          "description": "Maximum bytes to read from stdin in hook mode.\nOversized hook envelopes are allowed with an audit warning by default;\n`fail_closed` blocks them because their size is attacker-controlled.\nDefault: 262144 (256 KiB).",
           "type": [
             "integer",
             "null"
@@ -250,7 +259,7 @@
           "default": null
         },
         "max_command_bytes": {
-          "description": "Maximum bytes for command string after extraction from JSON.\nCommands exceeding this limit are allowed (fail-open) with a warning.\nDefault: 65536 (64 KiB).",
+          "description": "Maximum bytes for command string after extraction from JSON.\nCommands exceeding this limit produce an explicit indeterminate result;\nreview-capable protocols ask and other protocols block.\nDefault: 65536 (64 KiB).",
           "type": [
             "integer",
             "null"
@@ -275,7 +284,7 @@
           "default": true
         },
         "self_heal_hook": {
-          "description": "Whether to self-heal the hook registration in settings.json.\nWhen enabled, every hook invocation checks that the dcg entry is still\npresent in `~/.claude/settings.json` and re-registers it if missing.\nThis protects against Claude Code silently overwriting settings.json\nmid-session.\nDefault: true. Disable with `DCG_NO_SELF_HEAL` or `self_heal_hook = false`.",
+          "description": "Whether to self-heal the hook registration in settings.json.\nWhen enabled, each Claude hook invocation checks that the dcg entry is still\npresent in the active Claude settings (`CLAUDE_CONFIG_DIR/settings.json`,\ndefault `~/.claude/settings.json`) and re-registers it if missing.\nOther identified hosts keep their fixed Claude-compatible location.\nThis protects against Claude Code silently overwriting settings.json\nmid-session.\nDefault: true. Disable with `DCG_NO_SELF_HEAL` or `self_heal_hook = false`.",
           "type": "boolean",
           "default": true
         },
@@ -283,8 +292,33 @@
           "description": "Fail-closed mode for unparseable hook input.\n\nWhen `true`, hook input that cannot be parsed as JSON is BLOCKED\n(denied) instead of allowed. The default (`false`) is the documented\nfail-open behavior: malformed input is allowed so a transient encoding\nglitch never blocks legitimate work. Intended for high-security\nenvironments. Override at runtime with the `DCG_FAIL_CLOSED` env var\n(a truthy value forces fail-closed, a falsy value forces fail-open).",
           "type": "boolean",
           "default": false
+        },
+        "unverified_decision": {
+          "description": "Decision published when dcg cannot verify a command at all (#338):\nthe evaluation deadline expired, or the command exceeds\n`max_command_bytes`.\n\nThe default `ask` routes the command to an explicit operator decision\non review-capable protocols (Claude-compatible, Copilot); protocols\nwithout an `ask` decision always block. Set `deny` for unattended or\nautonomous sessions, where nobody is present to answer the prompt and\nan auto-approver would otherwise wave through exactly the commands dcg\ndeclined to inspect. Override at runtime with\n`DCG_UNVERIFIED_DECISION=deny|ask`.",
+          "$ref": "#/$defs/UnverifiedDecision",
+          "default": "ask"
+        },
+        "update_pin": {
+          "description": "Pin the installed binary against `dcg update` (#320).\n\nWhen `true`, `dcg update` refuses to replace the installed binary\n(before any network or installer work) unless `--replace-local-build`\nis passed, and the background \"update available\" nudge is suppressed.\nIntended for operators running a local build that is ahead of the\npublished release, where a routine update would silently downgrade\nguard coverage. Override at runtime with `DCG_UPDATE_PIN`.\nDefault: false.",
+          "type": "boolean",
+          "default": false
         }
       }
+    },
+    "UnverifiedDecision": {
+      "description": "Fallback decision for a command dcg could not verify (#338): evaluation\ndeadline exhausted, or command over `general.max_command_bytes`.\n\nThis is deliberately a two-value enum rather than `PolicyMode`: an\nunverified command has no matched rule to warn or log about, so the only\nmeaningful choices are routing it to an operator (`ask`) or refusing it\n(`deny`).",
+      "oneOf": [
+        {
+          "description": "Route the unverified command to an explicit operator decision on\nreview-capable protocols. Protocols without an `ask` decision block.",
+          "type": "string",
+          "const": "ask"
+        },
+        {
+          "description": "Refuse the unverified command on every protocol. The right posture for\nunattended sessions: the denial reason is actionable (shrink or split\nthe command), while an unanswered `ask` stalls or — worse — gets\nauto-approved without inspection.",
+          "type": "string",
+          "const": "deny"
+        }
+      ]
     },
     "OutputConfig": {
       "description": "Output display configuration.\n\nControls optional output enhancements like span highlighting and explanations.",
@@ -377,7 +411,7 @@
       }
     },
     "PolicyConfig": {
-      "description": "Decision mode policy configuration.\n\nControls how matched patterns are handled: deny (block), warn (allow with warning),\nor log (silent allow with optional logging).\n\nDefaults respect severity: Critical/High → deny, Medium → warn, Low → log.\nThis config allows overriding the default behavior per pack or per specific rule.",
+      "description": "Decision mode policy configuration.\n\nControls how matched patterns are handled: deny (block), ask (require\noperator review), warn (allow with warning), or log (silent allow with\noptional logging).\n\nDefaults respect severity: Critical/High → deny, Medium → warn, Low → log.\nThis config allows overriding the default behavior per pack or per specific rule.",
       "type": "object",
       "properties": {
         "default_mode": {
@@ -423,6 +457,11 @@
           "const": "deny"
         },
         {
+          "description": "Require explicit operator review; fail closed if the client cannot ask.",
+          "type": "string",
+          "const": "ask"
+        },
+        {
           "description": "Warn but allow (print warning to stderr, no JSON deny).",
           "type": "string",
           "const": "warn"
@@ -453,28 +492,6 @@
             "$ref": "#/$defs/BlockOverride"
           },
           "default": []
-        },
-        "allowlist": {
-          "description": "Simple allowlist format (backward compatible).\n\nExample in TOML:\n```toml\nallowlist = [\"npm run build\", \"cargo test\"]\n```",
-          "type": [
-            "array",
-            "null"
-          ],
-          "items": {
-            "type": "string"
-          },
-          "default": null
-        },
-        "allowlist_rules": {
-          "description": "Extended allowlist rules with path-specific conditions.\n\nExample in TOML:\n```toml\n[[allowlist_rules]]\npattern = \"rm -rf node_modules\"\npaths = [\"/home/*/projects/*\", \"/workspace/*\"]\ncomment = \"Allow node_modules cleanup in project directories\"\n```",
-          "type": [
-            "array",
-            "null"
-          ],
-          "items": {
-            "$ref": "#/$defs/AllowlistRule"
-          },
-          "default": null
         }
       }
     },
@@ -524,88 +541,6 @@
         "reason"
       ]
     },
-    "AllowlistRule": {
-      "description": "An extended allowlist rule with optional path conditions.\n\nThis supports context-aware allowlisting where rules can be scoped\nto specific directories or path patterns. Rules can also have expiration\nsettings (mutually exclusive: only one of `expires`, `ttl`, `ttl_seconds`,\nor `session` should be set).",
-      "type": "object",
-      "properties": {
-        "pattern": {
-          "description": "The pattern to allow (regex supported).",
-          "type": "string"
-        },
-        "paths": {
-          "description": "Optional path patterns where this rule applies.\n\nIf `None` or empty, the rule applies globally.\nSupports glob patterns like `/home/*/projects/*`.",
-          "type": [
-            "array",
-            "null"
-          ],
-          "items": {
-            "type": "string"
-          },
-          "default": null
-        },
-        "comment": {
-          "description": "Optional comment explaining the rule.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "expires": {
-          "description": "Optional expiration timestamp (ISO 8601 format).\n\nAfter this time, the rule is no longer active.\nExample: \"2024-06-01T00:00:00Z\"\n\nMutually exclusive with `ttl`, `ttl_seconds`, and `session`.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "ttl": {
-          "description": "Optional time-to-live duration as a human-readable string.\n\nSupported formats:\n- Minutes: \"30m\", \"30min\", \"30 minutes\"\n- Hours: \"4h\", \"4hr\", \"4 hours\"\n- Days: \"7d\", \"7 days\"\n- Weeks: \"1w\", \"1 week\"\n\nTTL is computed from `created_at` timestamp.\nMutually exclusive with `expires`, `ttl_seconds`, and `session`.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "ttl_seconds": {
-          "description": "Optional time-to-live duration in seconds.\n\nAlternative to `ttl` for programmatic use.\nTTL is computed from `created_at` timestamp.\nMutually exclusive with `expires`, `ttl`, and `session`.",
-          "type": [
-            "integer",
-            "null"
-          ],
-          "format": "uint64",
-          "minimum": 0,
-          "default": null
-        },
-        "session": {
-          "description": "Whether this is a session-only rule.\n\nSession rules are valid only within the shell session that created them.\nMutually exclusive with `expires`, `ttl`, and `ttl_seconds`.",
-          "type": [
-            "boolean",
-            "null"
-          ],
-          "default": null
-        },
-        "session_id": {
-          "description": "Session identifier this rule is bound to when `session = true`.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        },
-        "created_at": {
-          "description": "Timestamp when this rule was created (ISO 8601 format).\n\nRequired for TTL-based expiration. If not set when a TTL is specified,\nit will be automatically set to the current time when the rule is loaded.",
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null
-        }
-      },
-      "required": [
-        "pattern"
-      ]
-    },
     "AllowlistConfig": {
       "description": "Settings for layered allowlist files (`.dcg/allowlist.toml`,\n`~/.config/dcg/allowlist.toml`, and `/etc/dcg/allowlist.toml`).",
       "type": "object",
@@ -618,7 +553,7 @@
       }
     },
     "HeredocConfig": {
-      "description": "Heredoc and inline-script scanning configuration.\n\nThis configuration controls Tier 1/2/3 heredoc scanning behavior. Because the\nhook is performance- and UX-sensitive, defaults are conservative and fail-open\non extraction/parse errors.",
+      "description": "Heredoc and inline-script scanning configuration.\n\nThis configuration controls Tier 1/2/3 heredoc scanning behavior. Because the\nhook is performance- and UX-sensitive, extraction/parse errors use a bounded\nfallback scanner by default.",
       "type": "object",
       "properties": {
         "enabled": {
@@ -681,7 +616,7 @@
           "default": null
         },
         "fallback_on_parse_error": {
-          "description": "Fail-open when AST parsing fails for embedded code.",
+          "description": "Use bounded fallback scanning when AST parsing fails for embedded code.\nWhen false, block on the incomplete analysis instead.",
           "type": [
             "boolean",
             "null"
@@ -689,7 +624,7 @@
           "default": null
         },
         "fallback_on_timeout": {
-          "description": "Fail-open when extraction/parsing exceeds the timeout budget.",
+          "description": "Use bounded fallback scanning when extraction/parsing exceeds its timeout.\nWhen false, block on the incomplete analysis instead.",
           "type": [
             "boolean",
             "null"
@@ -830,7 +765,7 @@
           "default": false
         },
         "warn_threshold": {
-          "description": "Confidence threshold below which Deny is downgraded to Warn.\n\nValues range from 0.0 (always warn) to 1.0 (never warn).\nRecommended range: 0.3 - 0.7\n\nDefault: 0.5",
+          "description": "Confidence threshold below which Deny is downgraded to Warn.\n\nA match downgrades when its score is *below* this value, so 0.0 never\ndowngrades and 1.0 downgrades every match short of full confidence.\nA direct invocation (`rm -rf ./build`) scores 1.0 and never downgrades.\nRecommended range: 0.3 - 0.7\n\nDefault: 0.5",
           "type": "number",
           "format": "float",
           "default": 0.5
@@ -881,6 +816,14 @@
             "warn": true,
             "allow": false
           }
+        },
+        "caller_env": {
+          "description": "Name of an environment variable whose value identifies the caller,\nrecorded as `caller` on each entry (#378), e.g. `FLYWHEEL_AGENT_ID`.\nOpt-in. The value is a label only: it is sanitized, bounded, and never\nconsulted by any decision.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
         }
       }
     },
@@ -957,14 +900,15 @@
           "description": "Retention window in days.",
           "type": "integer",
           "format": "uint32",
-          "minimum": 0,
+          "minimum": 1,
+          "maximum": 3650,
           "default": 90
         },
         "max_size_mb": {
           "description": "Maximum database size in megabytes.",
           "type": "integer",
           "format": "uint32",
-          "minimum": 0,
+          "minimum": 1,
           "default": 500
         },
         "database_path": {
@@ -984,21 +928,21 @@
           "description": "Interval in hours between automatic prune checks.",
           "type": "integer",
           "format": "uint32",
-          "minimum": 0,
+          "minimum": 1,
           "default": 24
         },
         "batch_size": {
           "description": "Batch size for write operations (improves performance).",
           "type": "integer",
           "format": "uint32",
-          "minimum": 0,
+          "minimum": 1,
           "default": 50
         },
         "batch_flush_interval_ms": {
           "description": "Flush interval in milliseconds for batched writes.",
           "type": "integer",
           "format": "uint32",
-          "minimum": 0,
+          "minimum": 1,
           "default": 100
         }
       }
@@ -1100,7 +1044,7 @@
       ]
     },
     "GitAwarenessConfig": {
-      "description": "Git branch-aware strictness configuration.\n\nThis allows different strictness levels based on the current git branch,\nproviding more protection on important branches and more freedom on\nexperimental branches.\n\n# Example Configuration (TOML)\n\n```toml\n[git_awareness]\nenabled = true\n\n# Protected branches get extra scrutiny\nprotected_branches = [\"main\", \"production\", \"release/*\"]\nprotected_strictness = \"all\"  # Block everything including Low severity\n\n# Feature branches get more freedom\nrelaxed_branches = [\"feature/*\", \"experiment/*\", \"sandbox/*\"]\nrelaxed_strictness = \"critical\"  # Only block Critical severity\n\n# Packs to disable on relaxed branches\nrelaxed_disabled_packs = []\n\n# Default strictness when not matching any pattern\ndefault_strictness = \"high\"  # Block Critical and High (normal behavior)\n\n# Show branch context in output\nshow_branch_in_output = true\n```",
+      "description": "Git branch-aware strictness configuration.\n\n**`[git_awareness]` is not applied to hook decisions.** Its strictness can\nonly relax a denial, and the agent being guarded can choose its branch\nbefore the command it wants run, so honoring them would be a\nself-service downgrade. `dcg config` and `dcg doctor` warn when\n`enabled = true`.\n\nThis allows different strictness levels based on the current git branch,\nproviding more protection on important branches and more freedom on\nexperimental branches.\n\n# Example Configuration (TOML)\n\n```toml\n[git_awareness]\nenabled = true\n\n# Protected branches get extra scrutiny\nprotected_branches = [\"main\", \"production\", \"release/*\"]\nprotected_strictness = \"all\"  # Block everything including Low severity\n\n# Feature branches get more freedom\nrelaxed_branches = [\"feature/*\", \"experiment/*\", \"sandbox/*\"]\nrelaxed_strictness = \"critical\"  # Only block Critical severity\n\n# Packs to disable on relaxed branches\nrelaxed_disabled_packs = []\n\n# Default strictness when not matching any pattern\ndefault_strictness = \"high\"  # Block Critical and High (normal behavior)\n\n# Show branch context in output\nshow_branch_in_output = true\n```",
       "type": "object",
       "properties": {
         "enabled": {
@@ -1416,6 +1360,19 @@
             }
           ],
           "default": null
+        }
+      }
+    },
+    "RuleConfig": {
+      "description": "Per-rule settings, keyed by `\"<pack_id>:<pattern_name>\"` in a\n`[rules.\"core.filesystem:rm-rf-general\"]` table.\n\nThis is the rule-scoped sibling of `[policy.rules]`: `[policy.rules]` picks\nthe *mode* a rule decides with, `[rules]` narrows the *targets* the rule\ndecides about.",
+      "type": "object",
+      "properties": {
+        "exempt_target_globs": {
+          "description": "Glob patterns naming target paths this rule must not fire on.\n\nThe exemption is evaluated inside the rule's own target check, not as a\ncommand-level bypass: every other rule still sees the whole command, so\n`echo x > ~/.claude/jobs/a/tmp/log && git reset --hard` is still denied\nby `core.git:reset-hard`.\n\nOnly a **statically literal** target is ever eligible. A target built\nfrom a variable, command substitution, glob, or quote splice is never\nexempted — `core.filesystem:redirect-truncate-dynamic-path` exists for\nexactly those and deliberately supports no exemptions.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       }
     }

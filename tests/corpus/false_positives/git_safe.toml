@@ -33,6 +33,31 @@ command = "git branch feature-new"
 expected = "allow"
 
 [[case]]
+description = "git branch format value that looks like delete is data"
+command = "git branch --format -d"
+expected = "allow"
+
+[[case]]
+description = "git branch LASTARG_DEFAULT merged filter consumes dash value"
+command = "git branch --merged -d feature"
+expected = "allow"
+
+[[case]]
+description = "git branch delete cancelled by later negation is safe"
+command = "git branch -d --no-delete feature"
+expected = "allow"
+
+[[case]]
+description = "git branch end of options makes dash token an operand"
+command = "git branch --end-of-options -d"
+expected = "allow"
+
+[[case]]
+description = "git branch help exits before delete action"
+command = "git branch -dh feature"
+expected = "allow"
+
+[[case]]
 description = "git add is safe"
 command = "git add ."
 expected = "allow"
@@ -103,8 +128,8 @@ command = "git reset HEAD~1"
 expected = "allow"
 
 [[case]]
-description = "git branch delete lowercase is safe"
-command = "git branch -d merged-branch"
+description = "git merged branch listing is safe"
+command = "git branch --merged"
 expected = "allow"
 
 [[case]]
@@ -145,4 +170,67 @@ expected = "allow"
 [[case]]
 description = "git commit message containing rm -rf is safe"
 command = "git commit -m \"Fix rm -rf detection\""
+expected = "allow"
+
+[[case]]
+description = "quoted dynamic branch format data is not an option"
+command = "git branch --format \"$(format_producer)\""
+expected = "allow"
+
+[[case]]
+description = "literal command substitution output passed to echo is inert data"
+command = "echo \"$(printf 'git reset --hard')\""
+expected = "allow"
+
+[[case]]
+description = "a basename of pure glob metacharacters names no program (#360)"
+command = "/* *"
+expected = "allow"
+
+[[case]]
+description = "a C block comment reaching the shell is not a git branch command (#360)"
+command = "/** Default language for new articles */"
+expected = "allow"
+
+[[case]]
+description = "a second wildcard word cannot stand in for the branch subcommand (#360)"
+command = "/* b*"
+expected = "allow"
+
+# #597: an unquoted `-C` path followed by a read-only subcommand and a bare
+# dynamic operand. Reaching a branch deletion needs the path to split into
+# `branch` and the operand to be a flag: two unknowns.
+[[case]]
+description = "unquoted -C path, log with a dynamic revision (#597)"
+command = "git -C $r log main $b"
+expected = "allow"
+
+[[case]]
+description = "unquoted -C path, log with only a dynamic revision (#597)"
+command = "git -C $r log $b"
+expected = "allow"
+
+[[case]]
+description = "unquoted -C path, log with a quoted dynamic revision (#597)"
+command = "git -C $r log main \"$b\""
+expected = "allow"
+
+[[case]]
+description = "unquoted -C path, diff against a dynamic revision (#597)"
+command = "git -C $r diff main $b"
+expected = "allow"
+
+[[case]]
+description = "unquoted -C path, rev-list with a dynamic revision (#597)"
+command = "git -C $r rev-list main $b"
+expected = "allow"
+
+[[case]]
+description = "unquoted -C path, merge-base with a dynamic revision (#597)"
+command = "git -C $r merge-base main $b"
+expected = "allow"
+
+[[case]]
+description = "unquoted -C path, cherry with a dynamic revision (#597)"
+command = "git -C $r cherry main $b"
 expected = "allow"

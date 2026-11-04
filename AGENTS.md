@@ -10,6 +10,28 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ---
 
+## RULE 0.5 - SUITE-WIDE RULES LIVE IN /data/projects/AGENTS.md
+
+The suite-wide rules in **`/data/projects/AGENTS.md`** bind you here too. Read it. Two sections
+are load-bearing for perf work and are NOT duplicated below, so they cannot drift out of sync:
+
+- **`## Named Reward-Hacking Patterns (ALL FORBIDDEN)`** — 12 named patterns, several already
+  observed in this suite: gate self-weakening (and the exact price of a legitimate gate fix),
+  proof-class inflation, golden regeneration reflex, commit-stream pumping, tautological tests,
+  easy-lever cherry-picking, close-pump abuse, scope-splitting, spec-editing as progress,
+  conformance metastasis, dependency smuggling, bench-path hardcoding.
+- **`### Work-Graph Discipline`** — JSONL is truth and `beads.db` is disposable, `br sync
+  --import-only` after every pull, single-writer on graph structure, closure on cited evidence
+  with blocker beads gated on their named probe, `br dep cycles` stays empty.
+
+The three that most often decide whether a number here is real: a **self-speedup is
+MAINTENANCE, not a win** — a win needs the incumbent live in the SAME invocation; **never
+weaken a gate to land a change**, and if a gate is genuinely defective, meet the evidence
+standard and publish the win/lose split of what the fix admits; and **reporting a loss is a
+success** — one line, revert, next lever, no retraction narrative.
+
+---
+
 ## RULE NUMBER 1: NO FILE DELETION
 
 **YOU ARE NEVER ALLOWED TO DELETE A FILE WITHOUT EXPRESS PERMISSION.** Even a new file that you yourself created, such as a test code file. You have a horrible track record of deleting critically important files or otherwise throwing away tons of expensive work. As a result, you have permanently lost any and all rights to determine that a file or folder should be deleted.
@@ -73,7 +95,7 @@ We only use **Cargo** in this project, NEVER any other package manager.
 | `clap` + `clap_complete` | CLI argument parsing with shell completions |
 | `chrono` | RFC 3339 timestamps |
 | `ast-grep-core` + `ast-grep-language` | AST-based pattern matching for heredoc/inline-script content |
-| `fsqlite` | Telemetry database (FrankenSQLite with concurrent writing) |
+| `rusqlite` | Bundled upstream SQLite for best-effort telemetry history |
 | `rust-mcp-sdk` | MCP server integration (stdio transport) |
 | `tokio` | Async runtime for MCP server mode |
 | `ratatui` + `comfy-table` + `indicatif` + `console` | TUI/CLI visual polish |
@@ -173,19 +195,50 @@ platform-sensitive, follow these conventions:
 - **`.exe` suffix.** When constructing a path to the dcg binary, use
   `env!("CARGO_BIN_EXE_dcg")` / `assert_cmd::cargo::cargo_bin("dcg")` in tests, or
   `std::env::consts::EXE_SUFFIX` in `src`. **Never** a bare `push("dcg")` — the
-  Windows CI job greps for it and fails. Use `dirs::home_dir()` (not `HOME`,
-  which is unset on Windows) and set `USERPROFILE`/`TEMP`/`TMP` alongside `HOME`
-  in test isolation.
+  Windows CI job greps for it and fails. Resolve per-user paths only through
+  `config::home_dir()` / `user_config_dir()` / `user_data_dir()` /
+  `user_data_local_dir()` / `user_cache_dir()` — never `dirs::*` (clippy's
+  `disallowed-methods` rejects it) and never raw `HOME` (unset on Windows).
+  `dirs` resolves the Windows profile via the known-folder API and ignores
+  `USERPROFILE`, so a sandboxed Windows test run used to rewrite the operator's
+  real `~\.claude\settings.json` and allow-once store (bd-b2b1). Set
+  `USERPROFILE`/`TEMP`/`TMP` alongside `HOME` in test isolation; `USERPROFILE`
+  alone now relocates `%APPDATA%`/`%LOCALAPPDATA%` too when those are unset.
 - **Verify Windows branches from Linux** without a Windows box: `mingw` + the
   `x86_64-pc-windows-gnu` target are installed, so
   `cargo check --target x86_64-pc-windows-gnu --lib` (or `--bin dcg` / `--tests`)
-  compile-checks every `#[cfg(windows)]` path. `pwsh` is also available to run the
-  PowerShell installer/test scripts.
+  compile-checks every `#[cfg(windows)]` path. When `pwsh` is installed, use it
+  to run the PowerShell installer/test scripts; otherwise run those gates on the
+  native Windows release host.
 - **Windows packs.** `src/packs/windows/` holds the native-Windows packs
   (`windows.filesystem`/`windows.system` default-ON on Windows, `windows.misc`/
   `windows.powershell` opt-in). Patterns use inline `(?i)`; keyword arrays
-  enumerate realistic casings because the keyword quick-reject is case-sensitive
-  (see `src/packs/windows/mod.rs`). See [`docs/windows.md`](docs/windows.md).
+  may retain conventional casing variants for readability, but keyword
+  quick-rejection is ASCII case-insensitive so mixed-case Windows spellings
+  cannot skip the regex stage (see `src/packs/windows/mod.rs`). See
+  [`docs/windows.md`](docs/windows.md).
+- **The `careful_company_running_windows` preset.**
+  `src/packs/careful_company_running_windows/` holds six opt-in sub-packs
+  covering **outbound communication and data egress** (email, chat/webhooks,
+  HTTP upload, file transfer, tunnels) plus **tampering with the controls that
+  supervise the agent** (Defender/firewall/EDR, audit logs, and dcg's own
+  bypass/uninstall). It is the only pack ID with *curated transitive
+  membership*: enabling it also enables the pinned
+  `CAREFUL_COMPANY_PRESET_MEMBERS` list in `src/packs/mod.rs`
+  (`windows.*`, `database.*`, `storage.*`, `remote.*`, `backup.*`, `secrets.*`,
+  `cloud.*`). That list is deliberately explicit — do **not** convert it to
+  prefix matching, or future packs will join a security posture silently.
+  Two invariants to preserve when touching this area:
+  - **Tier order.** `windows.*` is tier 11 and the preset is tier 12, so
+    Windows packs keep claiming attribution for commands both match. Rule ids
+    (`pack_id:pattern_name`) are what allowlists key on, so reordering these
+    silently invalidates existing `windows.*` allowlist entries.
+  - **The `hfdt` trust boundary.** While any preset sub-pack is enabled,
+    `src/evaluator.rs` allows a command whose executable is `hfdt` **before any
+    pack runs** — including `core.*`. It is structural (whole-segment
+    executable match, no chains/redirection/substitution), but it does mean
+    enabling the preset *reduces* coverage for that one executable. Keep it
+    documented in `README.md` and `docs/careful-company-windows.md`.
 
 ---
 
@@ -217,10 +270,97 @@ cargo test safe_pattern_tests
 cargo test destructive_pattern_tests
 ```
 
+**Prefer `cargo nextest run` when touching anything that mutates the
+environment.** CI runs `cargo nextest run --profile ci`, and nextest gives each
+test its own process — verified by observation, not assumption: sampling a
+`--lib` run showed up to 128 concurrent per-test `--exact` invocations. That
+process isolation is what makes the `unsafe { env::set_var }` sites in test code
+sound, because it removes the concurrent reader.
+
+Under plain `cargo test` every test shares one process and runs on threads, and
+the crate has ~109 `env::var` call sites against ~22 `EnvVarGuard` uses, none of
+the readers taking the lock — plus native code (bundled SQLite reading `TMPDIR`)
+that cannot take a Rust lock even in principle. So `cargo test` is the
+configuration the single crate-wide `ENV_LOCK` cannot actually make safe (#445).
+No failure has been observed from this; the race is available, not active.
+
+`cargo test` stays documented above because filter and `--ignored` syntax differ
+between the two runners (nextest wants `--run-ignored`), and several workflows in
+this file depend on the `cargo test` spelling.
+
+### The Three Release-Blocking E2E Suites (read before touching perf or protocols)
+
+`cargo test` cannot catch the failure modes that have actually broken users.
+Three real-binary, no-mock suites exist specifically to close those gaps. All
+three must be green before any release.
+
+| Suite | Catches | Why unit tests can't |
+|-------|---------|----------------------|
+| `scripts/e2e_harness_matrix.sh` | Wire/bridge breakage for **every** agent (Claude Code, Codex, Gemini, Copilot, Hermes, Grok, agy, Crush, OMP) | Unit tests call Rust functions; harnesses parse **bytes**. Asserts decision field + exit code + stdout/stderr separation per protocol against the real binary. |
+| `scripts/perf_baseline.py --assert-budget-ms` | **#245**: evaluator cost silently eating the fixed hook deadline | The perf job is a *relative* ratchet — a uniform slowdown just gets re-baselined. This gate asserts paired `full_eval − DCG_BYPASS` p95 against the **shipped** `HOOK_EVALUATION_BUDGET_MS` with a hermetic HOME and scrubbed `DCG_*`; raw process latency remains separate evidence. |
+| `scripts/e2e_fleet_install.sh` | Published artifact missing/unrunnable per platform; installer picking the wrong triple; checksum/signature verification silently skipped; hook config non-idempotent | Nothing in-tree proves the **public download path** works on real Linux/macOS/Windows hardware. |
+
+```bash
+# Protocol/bridge conformance for all 8 harnesses (needs a release binary + jq)
+./scripts/e2e_harness_matrix.sh --binary target/release/dcg
+
+# Absolute evaluator-cost gate — the #245 guard. Budget MUST come from src/perf.rs.
+BUDGET_MS=$(sed -nE 's/^pub const HOOK_EVALUATION_BUDGET_MS: u64 = ([0-9_]+);$/\1/p' src/perf.rs | tr -d '_')
+python3 scripts/perf_baseline.py --bin target/release/dcg --skip-trace \
+  --assert-budget-ms "$BUDGET_MS" --assert-margin-pct 50
+
+# Real installs from the PUBLIC release on every DSR host
+./scripts/e2e_fleet_install.sh --version vX.Y.Z          # whole fleet
+./scripts/e2e_fleet_install.sh --version vX.Y.Z --local-only
+```
+
+Rules:
+- **Scrub ambient `DCG_*` before measuring anything.** Operators bitten by #245
+  export `DCG_HOOK_TIMEOUT_MS=5000` (an agent `settings.json` `env` block puts
+  it in every child process), so an un-scrubbed suite measures the *workaround*
+  and passes on exactly the machines that need protecting. `env -i` covers the
+  hook calls; the installer cannot use it (it needs the host PATH for
+  `curl`/`tar`/`xz`/`minisign`), so the probes also `unset` every `DCG_*` up
+  front. Assert `general.hook_timeout_source` too — a bare `>= 1000` check
+  cannot tell the shipped default from an inherited 5000.
+- **Set `DCG_SELF_HEAL_HOOK=0` before the installer runs, not after.** dcg
+  repairs a missing/stale hook entry whenever it runs in hook mode, and
+  released binaries up to v0.14.4 resolve the Windows settings path via the
+  Win32 known-folder API, which `USERPROFILE` cannot redirect — so a late
+  disable can rewrite a real machine's agent config. Current source honors
+  `USERPROFILE` (bd-b2b1), but the installer may still fetch an older release.
+- **Never hard-code the budget in `.github/workflows/ci.yml`.** It is grepped
+  out of `HOOK_EVALUATION_BUDGET_MS`; `perf::tests::ci_enforces_absolute_latency_gate_against_shipped_budget`
+  fails if that wiring is removed or the margin is loosened past 60%.
+- **Treat the JSON as the certificate, not stderr.** Gate mode records its
+  supplied/shipped/effective budgets, margin, derived limit, every per-case
+  verdict, 95/95 binomial tail-tolerance result, violations, and overall
+  PASS/FAIL in `latency_gate`; CI retains that artifact even when the gate
+  fails. Gate mode requires at least 59 samples; CI uses 100 and permits at
+  most one over-limit sample per case. When using `--output` in gate mode,
+  place it outside the repository; the harness rejects in-tree output so its
+  own certificate cannot dirty the source snapshot it claims to measure.
+- **Bind the binary to the checkout.** Gate mode requires a clean checkout and
+  exact equality between the binary's embedded `git describe --tags --dirty`
+  value and the repository's value. CI uses a full tag history so a shallow
+  clone cannot turn this proof into an unknown result.
+- Measure dcg's own cost as `full_eval − DCG_BYPASS`, never raw wall-clock:
+  process spawn (≈940ms under Windows PowerShell) sits **outside** the
+  evaluation deadline and would otherwise produce false alarms. For host
+  safety this certificate sets `DCG_SELF_HEAL_HOOK=0`, records that exclusion,
+  and therefore does not claim to measure self-healing work. Capture and
+  validate every timed child's actual wire decision after stopping its timer;
+  before/after semantic controls alone cannot catch intermittent fail-open
+  behavior inside the sample window.
+- The fleet suite installs into a scratch prefix with an isolated `HOME` and
+  `--no-configure`; it never touches a host's real agent hook config.
+- A probe that dies partway must FAIL, not pass: every probe emits
+  `probe_complete` and the runner asserts the full expected case set.
+
 ### End-to-End Testing
 
 ```bash
-# Run the E2E test script
+# Run the E2E test script (needs bash >= 4; macOS /bin/bash 3.2 breaks the summary)
 ./scripts/e2e_test.sh
 
 # Or test manually
@@ -357,7 +497,9 @@ Every Bash command passes through this hook. Performance is critical:
 ### Heredoc Detection Notes
 
 - **Rule IDs**: Heredoc patterns use stable IDs like `heredoc.python.shutil_rmtree` for allowlisting.
-- **Fail-open**: In hook mode, heredoc parse errors/timeouts must allow (do not block).
+- **Bounded failure**: Heredoc parse/AST failures use the configured bounded
+  fallback; disabling fallback blocks. Absolute hook-deadline exhaustion and
+  incomplete nested evaluation return `Indeterminate`, never `Allow`.
 - **Tests**: Prefer targeted tests in `src/ast_matcher.rs` and `src/heredoc.rs`.
   - `cargo test ast_matcher`
   - `cargo test heredoc`
@@ -397,11 +539,11 @@ When a command is blocked, dcg outputs JSON to stdout:
   "hookSpecificOutput": {
     "hookEventName": "PreToolUse",
     "permissionDecision": "deny",
-    "permissionDecisionReason": "BLOCKED by dcg\n\nTip: dcg explain \"git reset --hard HEAD~5\"\n\nReason: git reset --hard destroys uncommitted changes\n\nExplanation: Rewrites history and discards uncommitted changes.\n\nRule: core.git:reset-hard\n\nCommand: git reset --hard HEAD~5\n\nIf this operation is truly needed, ask the user for explicit permission and have them run the command manually.",
+    "permissionDecisionReason": "BLOCKED by dcg\n\nTip: dcg explain \"git reset --hard HEAD~5\"\n\nReason: git reset --hard destroys uncommitted changes\n\nExplanation: Rewrites history and discards uncommitted changes.\n\nRule: core.git:reset-hard\n\nIf this operation is truly needed, ask the user for explicit permission and have them run the command manually.",
     "ruleId": "core.git:reset-hard",
     "packId": "core.git",
     "severity": "critical",
-    "confidence": 0.95,
+    "confidence": 1.0,
     "allowOnceCode": "a1b2c3",
     "allowOnceFullHash": "sha256:abc123...",
     "remediation": {
@@ -420,7 +562,7 @@ When a command is blocked, dcg outputs JSON to stdout:
 | `ruleId` | `string` | Stable pattern ID (e.g., `"core.git:reset-hard"`) for allowlisting |
 | `packId` | `string` | Pack that matched (e.g., `"core.git"`) |
 | `severity` | `string` | `"critical"`, `"high"`, `"medium"`, or `"low"` |
-| `confidence` | `number` | Match confidence 0.0-1.0 |
+| `confidence` | `number?` | Match confidence 0.0–1.0 (two decimals) from `crate::confidence::compute_match_confidence`, the score the `[confidence]` warn threshold reads: 1.0 when the matched span is executed (command word, wrapper-invoked command, redirection target), lower when it sits in quoted data, a comment, or an inert command's arguments. Omitted when the match has no source span (e.g. inside `$(…)`, structural verdicts). |
 | `allowOnceCode` | `string` | Short code for `dcg allow-once` |
 | `remediation.safeAlternative` | `string?` | Suggested safe command |
 
@@ -557,8 +699,10 @@ DCG_BYPASS=1 <command>
 | `core.git:restore-discard` | `git restore <file>` (without `--staged`) | High |
 | `core.git:clean-force` | `git clean -f`, `git clean -fd` | High |
 | `core.git:force-push` | `git push --force`, `git push -f` | High |
-| `core.git:branch-force-delete` | `git branch -D` | High |
-| `core.git:stash-drop` | `git stash drop`, `git stash clear` | High |
+| `core.git:branch-delete` | `git branch -d`, `--delete` (merge-checked, no force) | High |
+| `core.git:branch-force-delete` | `git branch -D`, `--delete --force`, `-f`, `-M`, `-C` (a policy/allowlist entry for it also covers `branch-delete` unless that rule has its own) | High |
+| `core.git:stash-drop` | `git stash drop` — Medium, so the default policy **warns and lets it run** (the dropped stash stays recoverable via `git fsck` until gc) | Medium |
+| `core.git:stash-clear` | `git stash clear` | Critical |
 
 ### Core Filesystem Patterns (Always Enabled)
 
@@ -698,7 +842,7 @@ Runs on push to main only (benchmarks are noisy on PRs). Checks performance budg
 - Pattern match: < 1ms panic
 - Heredoc extract: < 2ms panic
 - Full heredoc pipeline: < 20ms panic
-- Hook fail-open deadline: 200ms
+- Hook evaluation deadline: 1000ms (exhaustion is indeterminate, never a silent allow)
 
 ### UBS Static Analysis
 
@@ -748,12 +892,18 @@ Automated dependency updates configured in `.github/dependabot.yml`:
 
 When fixes are ready for release, follow this process:
 
+The steps below describe the normal GitHub Actions path. If Actions cannot run
+or a native Windows artifact must be built locally, the more detailed
+**Local/DSR Release and Windows Deployment Runbook** near the end of this file
+is authoritative.
+
 ### 1. Verify CI Passes Locally
 
 ```bash
 cargo fmt --check
+cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
-cargo test --lib
+cargo test
 ```
 
 ### 2. Commit Changes
@@ -770,7 +920,10 @@ Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>"
 
 ### 3. Bump Version (if needed)
 
-The version in `Cargo.toml` determines the release tag. If the current version already has a failed release, you can reuse it. Otherwise bump appropriately:
+The version in `Cargo.toml` determines the release tag. A version may be reused
+after a failed *local, pre-tag* attempt. Once its tag has been pushed or a
+release has been published, treat that version as immutable and bump to a new
+patch version instead of moving the tag or replacing signed assets.
 
 - **Patch** (0.2.10 -> 0.2.11): Bug fixes, no new features
 - **Minor** (0.2.x -> 0.3.0): New features, backward compatible
@@ -803,10 +956,12 @@ gh release view v0.2.13  # Check assets were uploaded
 ```
 
 Expected assets per release:
-- `dcg-{target}.tar.xz` - Binary archive
-- `dcg-{target}.tar.xz.sha256` - Checksum
-- `dcg-{target}.tar.xz.sigstore.json` - Sigstore signature bundle
-- `install.sh`, `install.ps1` - Install scripts
+- `dcg-{target}.tar.xz` (Unix) or `.zip` (Windows) - Binary archive
+- `<archive>.sha256` - Mandatory per-artifact checksum
+- `<archive>.sigstore.json` - Sigstore signature bundle
+- `install.sh`, `install.ps1`, and their checksum/Sigstore sidecars
+- Manual DSR releases additionally include minisign signatures, SLSA
+  provenance, a build manifest, and the pinned public verification keys
 
 ### Troubleshooting Failed Releases
 
@@ -814,11 +969,12 @@ If CI fails:
 1. Check workflow run: `gh run list --workflow=dist.yml --limit=5`
 2. View failed job: `gh run view <run-id>`
 3. Fix issues locally, commit, and push again
-4. The same version tag will be updated on successful build
+4. If no public tag or release exists yet, retry the same version; otherwise
+   create a new patch release. Never force-move a public release tag.
 
 Common failures:
 - **Clippy errors**: Fix lints, ensure `cargo clippy -- -D warnings` passes
-- **Test failures**: Run `cargo test --lib` to reproduce
+- **Test failures**: Run `cargo test` to reproduce
 - **Format errors**: Run `cargo fmt` to fix
 
 ---
@@ -1263,6 +1419,346 @@ Treat cass as a way to avoid re-solving problems other agents already handled.
 
 ---
 
+## Local/DSR Release and Windows Deployment Runbook
+
+Use this fallback only when GitHub Actions cannot perform the release, when a
+native-host build is explicitly required, or when the user directs you to use
+DSR. It refines the shorter release checklist above. Do not jump straight to
+`dsr fallback`: keep source freezing, build, packaging, signing, publication,
+and public verification as separately inspectable stages.
+
+### Non-Negotiable Release Invariants
+
+1. **One immutable source identity.** The local `HEAD`, peeled release tag,
+   remote `main`, compatibility branch, build checkout, build manifest, and
+   published release must all name the same commit.
+2. **Frozen bytes before signatures.** Finish archive layout and names before
+   generating checksums, SLSA provenance, minisign signatures, or Sigstore
+   bundles. Any byte or filename change invalidates downstream metadata and
+   requires regenerating and reverifying it.
+3. **Integrity is not authenticity.** SHA256 is mandatory, but it does not
+   authenticate the publisher. Manual releases require the DSR minisign trust
+   path and the pinned local-release cosign trust path. Workflow releases use
+   GitHub Actions OIDC for Sigstore.
+4. **No destructive synchronization or cleanup.** Assume an automatic source
+   mirror may delete files until its dry-run proves otherwise. Never bypass dcg
+   to clean a checkout, output directory, key copy, or failed release. Rule 1
+   still applies to temporary files and directories.
+5. **A partial matrix must be deliberate.** A working Windows artifact does not
+   prove that every advertised target exists. Define the expected target/asset
+   matrix before building and either satisfy it or explicitly treat the release
+   as an emergency partial release with tested source-install fallback.
+
+### 1. Decide the Path and Freeze the Source
+
+First inspect Actions rather than waiting blindly:
+
+```bash
+gh run list --limit 20
+dsr check Dicklesworthstone/destructive_command_guard
+```
+
+If the manual path is justified, run all release gates *before* tagging:
+
+```bash
+cargo fmt --check
+cargo check --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo test
+cargo check --target x86_64-pc-windows-gnu --lib
+cargo build --release
+./scripts/e2e_test.sh --verbose
+pwsh -NoProfile -File ./scripts/e2e_test.ps1 -Verbose
+```
+
+Run any additional gates relevant to the changed surface. A release candidate
+with code changes receives the full suite; a crate-scoped or `--lib` run is not
+a release substitute. Both E2E scripts discover the release binary through
+`CARGO_TARGET_DIR` and reject a stale in-repository binary. If `--binary` /
+`-Binary` is supplied explicitly, pass an absolute path: the suites change
+directories while testing isolated configurations. If local PowerShell is
+unavailable, run the PowerShell suite against the native release candidate on
+the Windows build host before publication.
+
+Confirm the worktree contains only intentional release content, commit it, then
+create an annotated tag. Never force an existing public tag:
+
+```bash
+VERSION=vX.Y.Z
+git status --short
+git tag -a "$VERSION" -m "Release $VERSION"
+git push origin main
+git push origin main:master
+git push origin "$VERSION"
+```
+
+Choose exactly one owner for the tag and release. If the local path owns them,
+do not also let `release-automation` create the same tag in parallel.
+
+Record and compare the identities instead of trusting labels:
+
+```bash
+HEAD_SHA=$(git rev-parse HEAD)
+TAG_SHA=$(git rev-parse "${VERSION}^{commit}")
+test "$HEAD_SHA" = "$TAG_SHA"
+git ls-remote origin refs/heads/main refs/heads/master "refs/tags/$VERSION" "refs/tags/$VERSION^{}"
+```
+
+For an annotated tag, compare against the peeled `^{}`
+entry—not the tag-object SHA. If any identity differs, stop before building.
+Do not “repair” a published tag; make a patch release.
+
+### 2. Preflight DSR and the Native Windows Host
+
+Validate configuration, target naming, quality commands, host health, disk
+space, and the exact build plan:
+
+```bash
+dsr repos validate --repo destructive_command_guard
+dsr quality --tool destructive_command_guard --dry-run
+dsr health all --no-cache
+dsr build destructive_command_guard \
+  --version "${VERSION#v}" \
+  --target windows/amd64 \
+  --dry-run
+```
+
+The installer asset name, DSR `artifact_naming`, target triple, archive format,
+and release upload name must agree. A naming mismatch can silently trigger a
+source build instead of installing the native artifact.
+
+Treat DSR's automatic remote source sync as deletion-capable. Under this
+repository's no-deletion rule, do not sync into an existing checkout. For a
+native build:
+
+1. Create a brand-new checkout path on the Windows host at the exact tag.
+2. Verify that checkout's `HEAD` equals `TAG_SHA` and that its worktree is
+   clean.
+3. Temporarily point DSR's host source mapping at that fresh checkout.
+4. Export `DCG_RELEASE_BUILD=1` in the build environment (#320). The binary
+   embeds this marker at compile time so `dcg update` and `dcg doctor` can
+   prove release provenance; a DSR build without it is classified from git
+   metadata alone, which requires the checkout to sit exactly at the release
+   tag with a clean worktree (step 2 already guarantees that, so the marker is
+   belt-and-suspenders — set it anyway).
+5. Use a brand-new output path and run the build with `--no-sync`:
+
+   ```bash
+   dsr build destructive_command_guard \
+     --version "${VERSION#v}" \
+     --target windows/amd64 \
+     --no-sync \
+     --output-dir <brand-new-output-directory>
+   ```
+
+6. Restore the previous DSR host mapping immediately after collection, even
+   when the build or artifact collection fails.
+
+Do not remove the staged checkout or output directory without the user's
+written permission. Record the native host, target triple, commit SHA, Rust
+toolchain, build duration, and collected executable SHA256 in the release
+notes/manifest. Monitor a long native build instead of starting a competing
+build because it appears quiet.
+
+### 3. Package the Native Artifact Correctly
+
+DSR may successfully collect `dcg.exe` even when the coordinator lacks a ZIP
+tool. That is a packaging failure, not a compile failure. In that case, package
+the collected executable on Windows with PowerShell `Compress-Archive`.
+
+The Windows release ZIP must contain exactly one root entry named `dcg.exe`.
+Before signing:
+
+- Extract the ZIP into a new inspection directory.
+- Hash the extracted `dcg.exe`.
+- Confirm that hash equals the collected native PE hash recorded by DSR.
+- Run the extracted binary and confirm its version matches `VERSION`.
+- Confirm it is the native MSVC release build—not a GNU compile-check artifact,
+  debug binary, stale binary, or installer smoke fixture.
+
+Never rename arbitrary bytes to make them look like a ZIP, and never package a
+different binary merely because it has the expected filename.
+
+### 4. Freeze, Checksum, and Sign the Complete Asset Set
+
+Write down the expected assets before signing. Depending on release scope this
+includes archives, standalone binaries, installers, the build manifest,
+per-file `.sha256` sidecars, `SHA256SUMS`, SLSA `.intoto.jsonl` provenance,
+`.minisig` files, `.sigstore.json` bundles, and public verification keys.
+
+The order is strict:
+
+1. Finalize payload bytes and filenames.
+2. Gate on embedded build provenance (below) for every payload binary.
+3. Generate per-file SHA256 sidecars and the aggregate checksum manifest.
+4. Generate and verify SLSA provenance against the frozen payload.
+5. Sign publishable payloads and metadata with DSR minisign.
+6. Generate key-based cosign bundles for the local-release trust path.
+7. Independently verify every signature and bundle.
+
+**Embedded-provenance gate (mandatory, per binary, before any checksum).**
+The v0.13.0 macOS assets shipped with `VERGEN_GIT_DESCRIBE =
+"v0.13.0-dirty"` because they were built from a dirty checkout without
+`DCG_RELEASE_BUILD=1`; every install from those bytes then classified as
+`LocalAheadOfRelease` and `dcg update` refused to run on macOS (#344).
+The invariant a published binary must satisfy is: `classify_provenance()`
+== `Release`. Usable git metadata is authoritative and must equal
+`v<VERSION>` exactly; the `DCG_RELEASE_BUILD` marker is only a classifier
+fallback when the embedded describe is absent, empty, or the vergen
+placeholder. The marker never overrides a dirty, ahead-of-tag, or wrong-tag
+describe, and the release process is intentionally stricter: every published
+artifact must carry the exact usable describe. Execute each extracted binary
+on its native release host (including targets cross-compiled elsewhere) before
+signing it:
+
+```bash
+# Run this on every artifact's native target: extract the Commit token and
+# compare it exactly to the tag.
+EMBEDDED_DESCRIBE=$(./dcg --version 2>&1 \
+  | sed -nE 's/.*Commit:[[:space:]]+([^[:space:]]+).*/\1/p')
+[ "${EMBEDDED_DESCRIBE}" = "${VERSION}" ] \
+  || { echo "embedded describe is not exactly ${VERSION}: ${EMBEDDED_DESCRIBE:-<missing>}"; exit 1; }
+```
+
+A `strings` scan is useful diagnosis but is not this gate: it can miss a clean
+wrong tag, a missing describe, or a placeholder. If a native target cannot run
+the extracted binary and produce the exact comparison above, do not publish
+that artifact.
+
+A failure here means rebuilding from a brand-new checkout at the tag (step 2
+of the preflight) — never proceeding to checksums, and never "fixing" it by
+retagging around a dirty tree.
+
+Use DSR's configured private keys directly from its protected secret location.
+Private keys and password material must remain mode `600` and must never be
+copied into the repository, release directory, generic temporary directory, or
+remote build checkout. Publish only public keys and their fingerprints. If
+duplicate secret material is discovered, stop and follow Rule 1; do not set
+`DCG_BYPASS` or otherwise evade a blocked cleanup command.
+
+Before publication, confirm that:
+
+- `install.sh`, `install.ps1`, and `README.md` agree on the current minisign
+  public key and local cosign public-key fingerprint.
+- A retired key is accepted only for the exact historical release that used
+  it, never as an unbounded fallback.
+- The cosign verifier meets the installer's patched-version floor
+  (2.6.2+ on v2 or 3.0.4+ on v3); unknown, development, and prerelease version
+  strings fail closed for signature verification.
+
+Once signing begins, treat the directory as immutable. If a checksum generator,
+uploader, or packaging tool wants to rewrite `SHA256SUMS`, a sidecar, or an
+archive, stop and restart the checksum/signature stages from the newly frozen
+bytes.
+
+### 5. Verify Locally and on the Native Windows Machine
+
+Perform positive and negative tests before uploading:
+
+- SHA256, minisign, cosign, and SLSA verification all succeed independently.
+- A valid artifact paired with the wrong minisign signature fails.
+- A valid artifact paired with the wrong Sigstore bundle fails.
+- A modified artifact fails every applicable integrity/authenticity check.
+- `install.ps1` installs the local artifact into a fresh destination with
+  `-RequireMinisign -Verify -NoConfigure -Force`, using explicit local
+  artifact/checksum/signature/bundle inputs.
+- The installed binary hash equals the signed payload hash, reports the
+  expected version, and passes the installer self-test.
+
+Run the installer twice in a hermetic Windows home and confirm hook
+configuration is idempotent: one dcg-owned hook per supported integration,
+coexisting hooks preserved, valid JSON without a UTF-8 BOM, and no stale dcg
+entry. Run `dcg doctor` and `dcg config --format json`; do not guess config
+paths, enabled packs, timeout sources, or whether two visually similar hook
+entries are actually duplicates. On native Windows the canonical user config is
+`%APPDATA%\dcg\config.toml`; the legacy `~/.config/dcg/config.toml` may also be
+honored, so use the config report to identify the file that actually won.
+
+For the `careful_company_running_windows` preset, verify the effective 3000 ms
+default hook budget on a cold Windows process and confirm all six preset
+sub-packs plus the curated transitive members are active. Then test
+representative allow and deny cases through both PowerShell and `cmd.exe` hook
+payloads, including outbound mail/upload blocks and the structural `hfdt`
+exception (plain `hfdt` allowed; chaining, redirection, and substitution are not
+implicitly trusted). Exercise committed `.ps1`, `.cmd`, and `.bat` fixtures with
+`dcg scan` rather than placing an intentionally blocked test string on the
+guarded operator shell's own command line.
+
+Windows PowerShell 5.1 has two diagnostic traps:
+
+- Successful native programs such as cosign and `dcg --version` may write to
+  stderr. With `$ErrorActionPreference = 'Stop'` and merged streams, PowerShell
+  can wrap this as `NativeCommandError`. Temporarily make native stderr
+  non-terminating and decide success from the native process exit code.
+- `$LASTEXITCODE` can be stale after invoking a PowerShell script in-process.
+  For installer acceptance, launch a child PowerShell process, wait for it, and
+  inspect that process object's `ExitCode`.
+
+Older dcg versions could not replace their own running `dcg.exe`. The current
+updater has a deferred Windows swap path, but every release must retain the
+real-Windows running-binary update/rollback test. When recovering an older
+installation that lacks the fix, run the release installer directly.
+
+### 6. Inspect the Upload Plan, Then Publish
+
+Never assume an uploader is byte-preserving or complete. Run its dry-run/upload
+plan before signing when possible, and compare the selected filenames with the
+frozen expected-asset list.
+
+An observed DSR failure mode is regenerating aggregate checksum metadata during
+release assembly while omitting installers or `.sigstore.json` bundles from the
+selected upload set. If the current `dsr release` plan would mutate signed
+metadata or omit required files, do not use it for publication. DSR can still
+provide the native build, manifest, minisign signatures, and SLSA provenance;
+publish the frozen files with an explicit, enumerated `gh release create` /
+`gh release upload` invocation instead.
+
+Prefer assembling assets on a draft release. Never use `--clobber` on a signed
+asset and never replace an asset behind an existing public URL. If published
+bytes are wrong, withdraw the bad release as directed by the user and issue a
+new patch version.
+
+If a local release is now authoritative, inspect queued GitHub workflows. Cancel
+only `dist` / release-automation runs that could race to create or replace the
+same release. Do not cancel unrelated CI, coverage, or benchmark runs.
+
+### 7. Verify the Published Release From Scratch
+
+Download the release into a new local directory and verify it without relying
+on build-directory state:
+
+1. Compare the public asset names with the frozen expected-asset list.
+2. Verify the aggregate and per-file SHA256 data.
+3. Verify every minisign signature using the published/pinned public key.
+4. Verify every Sigstore bundle against the correct local-key or Actions-OIDC
+   trust root.
+5. Verify every SLSA subject digest against its public artifact.
+6. Confirm the release is public, non-draft, and has the intended prerelease
+   status.
+
+Then run the installer from the *public release URL* on the native Windows host
+into a fresh destination. Pin `-Version`, require minisign, enable `-Verify`,
+and confirm the installed hash, version, self-test, `dcg doctor`, effective
+config, hook idempotency, and representative PowerShell/`cmd.exe` policy
+behavior. A local-file install does not substitute for this public-path test.
+
+Finally verify the repository invariants again:
+
+```bash
+git status --short
+git rev-parse HEAD
+git rev-parse "${VERSION}^{commit}"
+git ls-remote origin refs/heads/main refs/heads/master "refs/tags/$VERSION" "refs/tags/$VERSION^{}"
+gh release view "$VERSION"
+```
+
+The release is complete only when the source identities agree, the worktree is
+clean, all intended assets are publicly downloadable and independently
+verifiable, and a fresh native Windows installation succeeds from the public
+release.
+
+---
+
 Note for Codex/GPT-5.2:
 
 You constantly bother me and stop working with concerned questions that look similar to this:
@@ -1286,3 +1782,5 @@ NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are cha
 ## Note on Built-in TODO Functionality
 
 Also, if I ask you to explicitly use your built-in TODO functionality, don't complain about this and say you need to use beads. You can use built-in TODOs if I tell you specifically to do so. Always comply with such orders.
+
+For any web requests you must make with curl or otherwise, identify yourself honestly: use a User-Agent that names this project, e.g. "destructive_command_guard-agent (+https://github.com/Dicklesworthstone/destructive_command_guard)". Never borrow another product's or company's crawler or client User-Agent, and never spoof a client to get past a block.
