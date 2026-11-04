@@ -50849,11 +50849,6 @@ mod tests {
         }
     }
 
-    /// dev-igbgn.6: moving the carrier's pack forward (#428) reorders the pack
-    /// list, and the keyword index's candidate bits are positional. Decoded
-    /// against the reordered list they named the wrong packs, so with
-    /// `database.mongodb` enabled beside `database.mysql` a here-string into
-    /// `mysql` reached no database rule at all and was allowed.
     #[test]
     fn an_index_built_for_another_pack_order_is_not_decoded_dev_h3yib1() {
         let enabled: std::collections::HashSet<String> = ["database.mysql", "database.mongodb"]
@@ -50886,6 +50881,11 @@ mod tests {
         );
     }
 
+    /// dev-igbgn.6: moving the carrier's pack forward (#428) reorders the pack
+    /// list, and the keyword index's candidate bits are positional. Decoded
+    /// against the reordered list they named the wrong packs, so with
+    /// `database.mongodb` enabled beside `database.mysql` a here-string into
+    /// `mysql` reached no database rule at all and was allowed.
     #[test]
     fn a_reordered_carrier_keeps_its_own_keyword_candidates_dev_igbgn_6() {
         let packs = [
