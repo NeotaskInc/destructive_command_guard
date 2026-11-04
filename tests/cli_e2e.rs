@@ -11469,6 +11469,14 @@ safe_patterns:
             } else {
                 fixture
             };
+            // Windows defaults attribute `rm -r` to the Remove-Item rule; this
+            // replay is about core.filesystem.
+            let base = std::fs::read_to_string(&fixture.config).expect("read confidence fixture");
+            std::fs::write(
+                &fixture.config,
+                base.replacen("[packs]\n", "[packs]\ndisabled = [\"windows\"]\n", 1),
+            )
+            .expect("exclude Windows default packs");
             let mut config = std::fs::OpenOptions::new()
                 .append(true)
                 .open(&fixture.config)
