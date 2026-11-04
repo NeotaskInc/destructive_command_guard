@@ -91,10 +91,10 @@ impl TestEnv {
         fs::write(
             &self.config_path,
             format!(
-                r#"[history]
+                r"[history]
 enabled = true
 database_path = '{}'
-"#,
+",
                 self.history_path.display()
             ),
         )
