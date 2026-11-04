@@ -60,6 +60,20 @@ fn create_destructive_patterns() -> Vec<DestructivePattern> {
             High,
             "Materialize and review the exact SQL before piping or redirecting it into sqlite3."
         ),
+        // The sqlite3 shell enables extension loading, so either form runs a native library with the user's rights
+        // (dev-hi855w).
+        destructive_pattern!(
+            "load-extension",
+            r"(?im)\bload_extension\s*\(|^\s*\.load\s",
+            "load_extension() / .load runs a native shared library inside sqlite3.",
+            High,
+            "SQLite's load_extension() function and the sqlite3 shell's .load command load and run a \
+             native shared library in the sqlite3 process, with your rights. That is arbitrary code, not \
+             SQL.\n\n\
+             Safer alternatives:\n\
+             - Review the library and where it came from first\n\
+             - Load only extensions installed by your package manager, by their full path"
+        ),
         // DROP TABLE
         destructive_pattern!(
             "drop-table",
