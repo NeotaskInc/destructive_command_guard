@@ -25624,11 +25624,8 @@ if ((Get-Command dcg -ErrorAction SilentlyContinue) -and (Test-Path "$HOME\.clau
     }
 
     fn reasonix_entry_for(path: &str) -> serde_json::Value {
-        reasonix_dcg_hook_entry_for_executable(
-            std::path::Path::new(&muse_test_absolute(path)),
-            false,
-        )
-        .expect("absolute path")
+        reasonix_dcg_hook_entry_for_executable(std::path::Path::new(&host_abs(path)), false)
+            .expect("absolute path")
     }
 
     /// #358: the settings merge keeps foreign keys and hooks, is idempotent,
