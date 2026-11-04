@@ -1505,6 +1505,9 @@ echo hello
         ] {
             let mut config = Config::default();
             config.policy.default_mode = Some(mode);
+            // Windows defaults attribute `rm -r` to the Critical Remove-Item
+            // rule, which no global mode may relax.
+            config.packs.disabled.push("windows".to_string());
             let result = run_simulation_from_reader(
                 &b"rm -r ./tree\n"[..],
                 SimulateLimits::default(),

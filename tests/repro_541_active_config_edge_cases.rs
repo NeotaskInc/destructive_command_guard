@@ -286,17 +286,25 @@ fn assert_doctor_healthy(env: &Env, config_dir: Option<&Path>, settings_path: &P
         "ok",
         "{document}"
     );
+    // A config dir given as "profiles/relative config" keeps its own separator in
+    // the reported path on Windows; compare separator-insensitively (Neotask fork,
+    // dev-32i0o2).
+    let names_settings = |text: &str| {
+        text.replace('\\', "/")
+            .contains(&settings_path.to_string_lossy().replace('\\', "/"))
+    };
     assert!(
-        check(&document, "claude_settings")["message"]
-            .as_str()
-            .expect("settings message")
-            .contains(settings_path.to_string_lossy().as_ref()),
+        names_settings(
+            check(&document, "claude_settings")["message"]
+                .as_str()
+                .expect("settings message")
+        ),
         "JSON must name the inspected settings file: {document}"
     );
     let pretty = env.run(config_dir, &["doctor", "--strict", "--format", "pretty"]);
     assert_success(&pretty);
     assert!(
-        output_text(&pretty).contains(settings_path.to_string_lossy().as_ref()),
+        names_settings(&output_text(&pretty)),
         "pretty output must name the inspected settings file: {}",
         output_text(&pretty)
     );

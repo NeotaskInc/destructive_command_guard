@@ -85,15 +85,14 @@ impl TestEnv {
         }
 
         // Create config that points to our history database
-        // The CLI reads database_path from config file via DCG_CONFIG env var
+        // The CLI reads database_path from config file via DCG_CONFIG env var.
+        // Neotask fork (dev-32i0o2): serialized as a TOML string, so a Windows
+        // path's backslashes and a directory's apostrophe survive.
         fs::write(
             &self.config_path,
             format!(
-                r#"[history]
-enabled = true
-database_path = "{}"
-"#,
-                self.history_path.display()
+                "[history]\nenabled = true\ndatabase_path = {}\n",
+                toml::Value::String(self.history_path.display().to_string())
             ),
         )
         .expect("Failed to write config");

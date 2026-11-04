@@ -1706,7 +1706,15 @@ mod allow_once_flow_tests {
             assert_eq!(entry.command_raw, command);
             assert_eq!(entry.source_short_code, code);
             assert_eq!(entry.scope_kind, AllowOnceScopeKind::Cwd);
-            assert_eq!(std::path::Path::new(&entry.scope_path), self.temp.path());
+            // Neotask fork (dev-32i0o2): the grant names its cwd canonically, which on
+            // Windows is the verbatim long path, not the temp dir's 8.3 short form.
+            assert_eq!(
+                std::fs::canonicalize(&entry.scope_path).expect("canonicalize grant scope"),
+                self.temp
+                    .path()
+                    .canonicalize()
+                    .expect("canonicalize temp dir"),
+            );
             assert!(entry.single_use);
             assert!(entry.consumed_at.is_none());
             entry
@@ -6839,7 +6847,7 @@ mod config_tests {
     fn doctor_warns_about_global_indefinite_user_rule_issue_545() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (_, xdg_config, _) = setup_doctor_env(&temp);
-        let path = xdg_config.join("dcg/allowlist.toml");
+        let path = xdg_config.join("dcg").join("allowlist.toml");
         let added = allowlist_doctor_command(&temp)
             .args([
                 "allowlist",
@@ -6962,7 +6970,7 @@ mod config_tests {
         ] {
             let temp = tempfile::tempdir().expect("tempdir");
             let (_, xdg_config, _) = setup_doctor_env(&temp);
-            let path = xdg_config.join("dcg/allowlist.toml");
+            let path = xdg_config.join("dcg").join("allowlist.toml");
             let original = format!(
                 "[[allow]]\nrule = \"core.git:reset-hard\"\nreason = \"reviewed exception\"\n{extra}\n"
             );
@@ -7100,7 +7108,7 @@ destructive_patterns:
         ] {
             let temp = tempfile::tempdir().expect("tempdir");
             let (_, xdg_config, _) = setup_doctor_env(&temp);
-            let path = xdg_config.join("dcg/allowlist.toml");
+            let path = xdg_config.join("dcg").join("allowlist.toml");
             let original = format!(
                 "[[allow]]\nrule = \"core.git:reset-hard\"\nreason = \"bounded exception\"\n{extra}\n"
             );
@@ -7129,7 +7137,7 @@ destructive_patterns:
         for scoped in [true, false] {
             let temp = tempfile::tempdir().expect("tempdir");
             let (_, xdg_config, _) = setup_doctor_env(&temp);
-            let path = xdg_config.join("dcg/allowlist.toml");
+            let path = xdg_config.join("dcg").join("allowlist.toml");
             let approved = temp.path().join("approved");
             std::fs::create_dir_all(&approved).expect("approved directory");
             let original = if scoped {
@@ -7194,12 +7202,12 @@ destructive_patterns:
         let fixtures = [
             (
                 "project",
-                temp.path().join(".dcg/allowlist.toml"),
+                temp.path().join(".dcg").join("allowlist.toml"),
                 "core.filesystem:rm-rf-root-home",
             ),
             (
                 "user",
-                xdg_config.join("dcg/allowlist.toml"),
+                xdg_config.join("dcg").join("allowlist.toml"),
                 "core.git:reset-hard",
             ),
             (
@@ -7264,14 +7272,14 @@ destructive_patterns:
         let fixtures = [
             (
                 "project",
-                temp.path().join(".dcg/allowlist.toml"),
+                temp.path().join(".dcg").join("allowlist.toml"),
                 "core.git:reset-hard",
                 "**/",
                 "git reset --hard",
             ),
             (
                 "user",
-                xdg_config.join("dcg/allowlist.toml"),
+                xdg_config.join("dcg").join("allowlist.toml"),
                 "core.git:clean-force",
                 "**/*",
                 "git clean -fd",
@@ -7348,7 +7356,7 @@ destructive_patterns:
         let temp = tempfile::tempdir().expect("tempdir");
         setup_doctor_env(&temp);
         std::fs::write(temp.path().join(".dcg.toml"), "").expect("untrusted project config");
-        let path = temp.path().join(".dcg/allowlist.toml");
+        let path = temp.path().join(".dcg").join("allowlist.toml");
         let original =
             "[[allow]]\nrule = \"core.git:reset-hard\"\nreason = \"inactive project rule\"\n";
         write_doctor_allowlist(&path, original);
@@ -7374,7 +7382,7 @@ destructive_patterns:
     fn doctor_reports_active_risk_alongside_malformed_allowlist_metadata() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (_, xdg_config, _) = setup_doctor_env(&temp);
-        let path = xdg_config.join("dcg/allowlist.toml");
+        let path = xdg_config.join("dcg").join("allowlist.toml");
         let original = r#"
 [[allow]]
 rule = "core.filesystem:rm-rf-general"
@@ -7424,7 +7432,7 @@ added_at = "invalid-audit-date"
     fn doctor_audits_non_string_expiration_as_runtime_interprets_it() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (_, xdg_config, _) = setup_doctor_env(&temp);
-        let path = xdg_config.join("dcg/allowlist.toml");
+        let path = xdg_config.join("dcg").join("allowlist.toml");
         // The loader ignores values of the wrong type for these optional
         // fields. Their presence must not make doctor invent an expiration.
         let original = r#"
@@ -11461,6 +11469,14 @@ safe_patterns:
             } else {
                 fixture
             };
+            // Windows defaults attribute `rm -r` to the Remove-Item rule; this
+            // replay is about core.filesystem.
+            let base = std::fs::read_to_string(&fixture.config).expect("read confidence fixture");
+            std::fs::write(
+                &fixture.config,
+                base.replacen("[packs]\n", "[packs]\ndisabled = [\"windows\"]\n", 1),
+            )
+            .expect("exclude Windows default packs");
             let mut config = std::fs::OpenOptions::new()
                 .append(true)
                 .open(&fixture.config)

@@ -20388,7 +20388,9 @@ fn contains_dynamic_shell_output(command: &str) -> bool {
         }
         if !in_single
             && (matches!(byte, b'$' | b'`')
-                || (!in_double && matches!(byte, b'*' | b'?' | b'[' | b'{' | b'~')))
+                || (!in_double
+                    && (matches!(byte, b'*' | b'?' | b'[' | b'{')
+                        || (byte == b'~' && posix_tilde_may_expand(bytes, index)))))
         {
             return true;
         }
@@ -23655,7 +23657,11 @@ fn mask_command_substitutions(command: &str) -> Result<MaskedCommand, String> {
                 }
             }
         }
-        if !in_single && !in_double && matches!(bytes[index], b'*' | b'?' | b'[' | b'{' | b'~') {
+        if !in_single
+            && !in_double
+            && (matches!(bytes[index], b'*' | b'?' | b'[' | b'{')
+                || (bytes[index] == b'~' && posix_tilde_may_expand(bytes, index)))
+        {
             let marker = unique_internal_marker(command, "GLOB", dynamic_markers.len());
             masked.push_str(&marker);
             dynamic_markers.push(marker);
@@ -23676,6 +23682,18 @@ fn mask_command_substitutions(command: &str) -> Result<MaskedCommand, String> {
         substitutions,
         dynamic_markers,
     })
+}
+
+/// A shell expands `~` only as a tilde prefix: at the start of a word, or
+/// after `=` or `:`. Inside a name such as the Windows short path
+/// `RUNNER~1` it is literal; anything else stays dynamic so the deny wins.
+fn posix_tilde_may_expand(bytes: &[u8], index: usize) -> bool {
+    index
+        .checked_sub(1)
+        .and_then(|previous| bytes.get(previous))
+        .is_none_or(|previous| {
+            !(previous.is_ascii_alphanumeric() || matches!(previous, b'_' | b'.' | b'-' | b'+'))
+        })
 }
 
 fn unique_internal_marker(command: &str, kind: &str, index: usize) -> String {
@@ -42198,7 +42216,65 @@ mod tests {
             );
         }
 
+        // A Windows short name such as `RUNNER~1` keeps a literal `~` mid-word.
+        let short_name_dir = temp.path().join("RUNNER~1");
+        std::fs::create_dir(&short_name_dir).expect("create short-name directory");
+        for (pack_id, prefix, suffix, name, body, allowed) in [
+            (
+                "database.postgresql",
+                "psql -f",
+                "",
+                "safe.psql",
+                "SELECT 1;\n",
+                true,
+            ),
+            (
+                "database.postgresql",
+                "psql -f",
+                "",
+                "dangerous.psql",
+                "DROP TABLE users;\n",
+                false,
+            ),
+            (
+                "database.mysql",
+                "mysql app -e 'source",
+                "'",
+                "safe.mysql",
+                "SELECT 1;\n",
+                true,
+            ),
+            (
+                "database.mysql",
+                "mysql app -e 'source",
+                "'",
+                "dangerous.mysql",
+                "TRUNCATE TABLE users;\n",
+                false,
+            ),
+        ] {
+            let path = short_name_dir.join(name);
+            std::fs::write(&path, body).expect("write short-name client script");
+            let command = format!(
+                "{prefix} {}{suffix}",
+                path.to_string_lossy().replace('\\', "/")
+            );
+            let result = evaluate_with_pack_ids(&command, &[pack_id]);
+            assert_eq!(result.is_allowed(), allowed, "{command}");
+            assert_ne!(
+                result
+                    .pattern_info
+                    .as_ref()
+                    .and_then(|info| info.pattern_name.as_deref()),
+                Some(INDIRECT_INPUT_RULE),
+                "a mid-word tilde is inspected, not treated as expansion: {command}"
+            );
+        }
+
         for (command, pack_id) in [
+            ("psql -f ~/schema.psql", "database.postgresql"),
+            ("psql --file=~/schema.psql", "database.postgresql"),
+            ("mysql app -e 'source ~/schema.sql'", "database.mysql"),
             ("psql -f \"$SQL_FILE\"", "database.postgresql"),
             ("mysql app -e 'source $SQL_FILE'", "database.mysql"),
             ("mongosh --file \"$JS_FILE\"", "database.mongodb"),
